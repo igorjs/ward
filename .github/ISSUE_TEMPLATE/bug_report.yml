@@ -1,0 +1,73 @@
+name: Bug Report
+description: Report a bug or unexpected behaviour.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Please fill out the sections below so we can reproduce and fix it.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+      placeholder: A clear description of the bug.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: Provide the smallest possible steps or configuration that reproduces the bug.
+      placeholder: |
+        1. Create a sandbox with `ward create --image alpine`
+        2. Run `ward exec <id> -- echo hello`
+        3. Observe the error...
+    validations:
+      required: true
+
+  - type: input
+    id: ward-version
+    attributes:
+      label: Ward Version
+      description: "Output of `ward --version`"
+      placeholder: "ward 0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating System
+      placeholder: "Ubuntu 24.04, kernel 6.8"
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Container Runtime
+      description: "containerd version, gVisor/runsc version"
+      placeholder: "containerd 2.3.0, runsc 20260501"
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: Error Output
+      description: Paste the full error message or logs.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other information that might help (configuration, related issues, workarounds).
+    validations:
+      required: false
