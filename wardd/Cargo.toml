@@ -1,0 +1,20 @@
+[package]
+name = "wardd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wardd"
+path = "src/main.rs"
+
+[dependencies]
+ward-core = { path = "../ward-core" }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+tower = "0.5"
+hyper-util = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
