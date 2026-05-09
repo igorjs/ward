@@ -34,13 +34,16 @@ struct SandboxEntry {
 pub struct SandboxManager {
     backend: Arc<KrunvmBackend>,
     entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
+    /// Maximum concurrent sandboxes. Prevents resource exhaustion from unbounded creation.
+    max_sandboxes: usize,
 }
 
 impl SandboxManager {
-    pub fn new(backend: Arc<KrunvmBackend>) -> Self {
+    pub fn new(backend: Arc<KrunvmBackend>, max_sandboxes: usize) -> Self {
         Self {
             backend,
             entries: Arc::new(RwLock::new(HashMap::new())),
+            max_sandboxes,
         }
     }
 
@@ -53,6 +56,15 @@ impl SandboxManager {
         crate::validate::image_ref(&req.image)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
+        }
+
+        // Enforce sandbox cap to prevent resource exhaustion.
+        let current = self.entries.read().await.len();
+        if current >= self.max_sandboxes {
+            return Err(ApiError::InvalidRequest(format!(
+                "sandbox limit reached ({}/{})",
+                current, self.max_sandboxes,
+            )));
         }
 
         let id = uuid::Uuid::new_v4().to_string();

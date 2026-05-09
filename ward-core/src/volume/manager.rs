@@ -35,13 +35,16 @@ struct VolumeEntry {
 pub struct VolumeManager {
     data_dir: PathBuf,
     volumes: Arc<RwLock<HashMap<String, VolumeEntry>>>,
+    /// Maximum number of volumes. Prevents metadata and inode exhaustion.
+    max_volumes: usize,
 }
 
 impl VolumeManager {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, max_volumes: usize) -> Self {
         Self {
             data_dir,
             volumes: Arc::new(RwLock::new(HashMap::new())),
+            max_volumes,
         }
     }
 
@@ -52,6 +55,15 @@ impl VolumeManager {
     /// Create a new volume, allocating backing storage on disk.
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
+
+        // Enforce volume cap to prevent resource exhaustion.
+        let current = self.volumes.read().await.len();
+        if current >= self.max_volumes {
+            return Err(ApiError::InvalidRequest(format!(
+                "volume limit reached ({}/{})",
+                current, self.max_volumes,
+            )));
+        }
 
         let id = uuid::Uuid::new_v4().to_string();
         let mount_path = self.data_dir.join("volumes").join(&id);

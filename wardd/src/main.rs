@@ -39,8 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the domain managers.
     let backend = Arc::new(KrunvmBackend::new(cfg.data_dir.clone()));
-    let sandbox_mgr = Arc::new(SandboxManager::new(Arc::clone(&backend)));
-    let volume_mgr = Arc::new(VolumeManager::new(cfg.data_dir.clone()));
+    let sandbox_mgr = Arc::new(SandboxManager::new(Arc::clone(&backend), cfg.max_sandboxes));
+    let volume_mgr = Arc::new(VolumeManager::new(cfg.data_dir.clone(), cfg.max_volumes));
 
     let grpc_service = WardGrpcServer::new(Arc::clone(&sandbox_mgr), Arc::clone(&volume_mgr));
 

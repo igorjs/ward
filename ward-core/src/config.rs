@@ -11,6 +11,12 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Log level filter string (e.g. "info", "debug", "ward=trace").
     pub log_level: String,
+    /// Maximum number of concurrent sandboxes. Prevents resource exhaustion.
+    pub max_sandboxes: usize,
+    /// Maximum number of volumes. Prevents metadata and inode exhaustion.
+    pub max_volumes: usize,
+    /// Maximum number of cached OCI images. Prevents disk exhaustion.
+    pub max_cached_images: usize,
 }
 
 impl Config {
@@ -30,10 +36,28 @@ impl Config {
 
         let log_level = std::env::var("WARD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
 
+        let max_sandboxes = std::env::var("WARD_MAX_SANDBOXES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+
+        let max_volumes = std::env::var("WARD_MAX_VOLUMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
+
+        let max_cached_images = std::env::var("WARD_MAX_CACHED_IMAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+
         Self {
             socket_path,
             data_dir,
             log_level,
+            max_sandboxes,
+            max_volumes,
+            max_cached_images,
         }
     }
 
