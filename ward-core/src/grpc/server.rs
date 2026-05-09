@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tonic::{Request, Response, Status};
+use tracing::error;
 
 use crate::pb::ward_server::Ward;
 use crate::pb::{
@@ -14,8 +15,40 @@ use crate::pb::{
     RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo,
     StreamEvent, StreamOutputRequest, VolumeInfo, WriteStdinRequest,
 };
+use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
 use crate::volume::VolumeManager;
+
+// ---------------------------------------------------------------------------
+// Error mapping: internal details logged server-side, generic message to client
+// ---------------------------------------------------------------------------
+
+/// Convert an ApiError to a gRPC Status, logging the real error server-side
+/// and returning a safe generic message to the client. This prevents internal
+/// implementation details (paths, errno codes, backend types) from leaking
+/// through the API.
+fn api_err_to_status(err: ApiError) -> Status {
+    match &err {
+        ApiError::SandboxNotFound(id) => Status::not_found(format!("sandbox not found: {id}")),
+        ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
+        ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
+        ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
+        ApiError::ImageNotFound(id) => Status::not_found(format!("image not found: {id}")),
+        ApiError::InvalidRequest(msg) => Status::invalid_argument(msg.clone()),
+        ApiError::Backend(detail) => {
+            error!(error = %detail, "backend error");
+            Status::internal("internal error")
+        }
+        ApiError::Internal(detail) => {
+            error!(error = %detail, "internal error");
+            Status::internal("internal error")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gRPC server
+// ---------------------------------------------------------------------------
 
 /// The main gRPC service implementation that delegates to domain managers.
 pub struct WardGrpcServer {
@@ -41,11 +74,7 @@ impl Ward for WardGrpcServer {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .sandbox
-            .create(req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let info = self.sandbox.create(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -54,11 +83,7 @@ impl Ward for WardGrpcServer {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .sandbox
-            .get(&req.id)
-            .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+        let info = self.sandbox.get(&req.id).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -66,11 +91,7 @@ impl Ward for WardGrpcServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        let sandboxes = self
-            .sandbox
-            .list()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let sandboxes = self.sandbox.list().await.map_err(api_err_to_status)?;
         Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
@@ -82,27 +103,19 @@ impl Ward for WardGrpcServer {
         self.sandbox
             .remove(&req.id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(api_err_to_status)?;
         Ok(Response::new(()))
     }
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .sandbox
-            .exec(req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let info = self.sandbox.exec(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
     async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .sandbox
-            .run(req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let info = self.sandbox.run(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -112,42 +125,42 @@ impl Ward for WardGrpcServer {
         &self,
         _request: Request<StreamOutputRequest>,
     ) -> Result<Response<Self::StreamOutputStream>, Status> {
-        Err(Status::unimplemented("stream_output: TODO"))
+        Err(Status::unimplemented("stream_output"))
     }
 
     async fn write_stdin(
         &self,
         _request: Request<WriteStdinRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("write_stdin: TODO"))
+        Err(Status::unimplemented("write_stdin"))
     }
 
     async fn kill_process(
         &self,
         _request: Request<KillProcessRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("kill_process: TODO"))
+        Err(Status::unimplemented("kill_process"))
     }
 
     async fn create_snapshot(
         &self,
         _request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
-        Err(Status::unimplemented("create_snapshot: TODO"))
+        Err(Status::unimplemented("create_snapshot"))
     }
 
     async fn restore_snapshot(
         &self,
         _request: Request<RestoreSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("restore_snapshot: TODO"))
+        Err(Status::unimplemented("restore_snapshot"))
     }
 
     async fn list_snapshots(
         &self,
         _request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
-        Err(Status::unimplemented("list_snapshots: TODO"))
+        Err(Status::unimplemented("list_snapshots"))
     }
 
     async fn create_volume(
@@ -155,11 +168,7 @@ impl Ward for WardGrpcServer {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<VolumeInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .volume
-            .create(req)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let info = self.volume.create(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -168,11 +177,7 @@ impl Ward for WardGrpcServer {
         request: Request<GetVolumeRequest>,
     ) -> Result<Response<VolumeInfo>, Status> {
         let req = request.into_inner();
-        let info = self
-            .volume
-            .get(&req.id)
-            .await
-            .map_err(|e| Status::not_found(e.to_string()))?;
+        let info = self.volume.get(&req.id).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -180,11 +185,7 @@ impl Ward for WardGrpcServer {
         &self,
         _request: Request<()>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
-        let volumes = self
-            .volume
-            .list()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let volumes = self.volume.list().await.map_err(api_err_to_status)?;
         Ok(Response::new(ListVolumesResponse { volumes }))
     }
 
@@ -196,7 +197,7 @@ impl Ward for WardGrpcServer {
         self.volume
             .remove(&req.id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(api_err_to_status)?;
         Ok(Response::new(()))
     }
 
@@ -204,16 +205,12 @@ impl Ward for WardGrpcServer {
         &self,
         _request: Request<GetEgressLogRequest>,
     ) -> Result<Response<EgressLogResponse>, Status> {
-        Err(Status::unimplemented("get_egress_log: TODO"))
+        Err(Status::unimplemented("get_egress_log"))
     }
 
     async fn get_health(&self, _request: Request<()>) -> Result<Response<HealthStatus>, Status> {
         let uptime_seconds = self.started_at.elapsed().as_secs();
-        let sandbox_count = self
-            .sandbox
-            .count()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))? as u32;
+        let sandbox_count = self.sandbox.count().await.map_err(api_err_to_status)? as u32;
 
         Ok(Response::new(HealthStatus {
             status: "ok".to_string(),
