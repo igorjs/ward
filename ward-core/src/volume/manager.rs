@@ -51,6 +51,8 @@ impl VolumeManager {
 
     /// Create a new volume, allocating backing storage on disk.
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
+        crate::validate::volume_name(&req.name)?;
+
         let id = uuid::Uuid::new_v4().to_string();
         let mount_path = self.data_dir.join("volumes").join(&id);
 
@@ -74,6 +76,7 @@ impl VolumeManager {
 
     /// Retrieve info for a volume by ID.
     pub async fn get(&self, id: &str) -> Result<PbVolumeInfo> {
+        crate::validate::entity_id(id, "volume")?;
         self.volumes
             .read()
             .await
@@ -97,6 +100,7 @@ impl VolumeManager {
 
     /// Remove a volume, deleting its backing storage.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        crate::validate::entity_id(id, "volume")?;
         let entry = self
             .volumes
             .write()

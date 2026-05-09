@@ -50,6 +50,11 @@ impl SandboxManager {
 
     /// Create a new sandbox.
     pub async fn create(&self, req: crate::pb::CreateSandboxRequest) -> Result<PbSandboxInfo> {
+        crate::validate::image_ref(&req.image)?;
+        if let Some(ref r) = req.resources {
+            crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
@@ -108,6 +113,7 @@ impl SandboxManager {
 
     /// Retrieve info for an existing sandbox.
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
+        crate::validate::entity_id(id, "sandbox")?;
         let info = self
             .backend
             .get_sandbox(id)
@@ -128,6 +134,7 @@ impl SandboxManager {
 
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        crate::validate::entity_id(id, "sandbox")?;
         // Cancel any pending timeout task.
         if let Some(entry) = self.entries.write().await.remove(id) {
             if let Some(handle) = entry.timeout_handle {
@@ -155,6 +162,8 @@ impl SandboxManager {
 
     /// Execute an arbitrary command inside a sandbox.
     pub async fn exec(&self, req: ExecRequest) -> Result<ProcessInfo> {
+        crate::validate::entity_id(&req.sandbox_id, "sandbox")?;
+        crate::validate::exec_command(&req.command)?;
         let handle = self
             .backend
             .exec(
@@ -179,6 +188,8 @@ impl SandboxManager {
 
     /// Run a language snippet inside a sandbox.
     pub async fn run(&self, req: RunRequest) -> Result<ProcessInfo> {
+        crate::validate::entity_id(&req.sandbox_id, "sandbox")?;
+        crate::validate::language_name(&req.language)?;
         use crate::protocol::default_runtimes;
 
         let runtime = default_runtimes()
