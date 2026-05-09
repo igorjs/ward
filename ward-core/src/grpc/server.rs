@@ -7,7 +7,7 @@ use tonic::{Request, Response, Status};
 
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, EgressLogRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
     EgressLogResponse, ExecRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
     HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
     ListSnapshotsResponse, ListVolumesResponse, ProcessInfo, RemoveSandboxRequest,
@@ -64,7 +64,7 @@ impl Ward for WardGrpcServer {
 
     async fn list_sandboxes(
         &self,
-        _request: Request<prost_types::Any>,
+        _request: Request<()>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         let sandboxes = self
             .sandbox
@@ -86,10 +86,7 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
-    async fn exec(
-        &self,
-        request: Request<ExecRequest>,
-    ) -> Result<Response<ProcessInfo>, Status> {
+    async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
         let info = self
             .sandbox
@@ -99,10 +96,7 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
-    async fn run(
-        &self,
-        request: Request<RunRequest>,
-    ) -> Result<Response<ProcessInfo>, Status> {
+    async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
         let info = self
             .sandbox
@@ -112,8 +106,7 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
-    type StreamOutputStream =
-        tokio_stream::wrappers::ReceiverStream<Result<StreamEvent, Status>>;
+    type StreamOutputStream = tokio_stream::wrappers::ReceiverStream<Result<StreamEvent, Status>>;
 
     async fn stream_output(
         &self,
@@ -185,7 +178,7 @@ impl Ward for WardGrpcServer {
 
     async fn list_volumes(
         &self,
-        _request: Request<prost_types::Any>,
+        _request: Request<()>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         let volumes = self
             .volume
@@ -214,10 +207,7 @@ impl Ward for WardGrpcServer {
         Err(Status::unimplemented("get_egress_log: TODO"))
     }
 
-    async fn get_health(
-        &self,
-        _request: Request<prost_types::Any>,
-    ) -> Result<Response<HealthStatus>, Status> {
+    async fn get_health(&self, _request: Request<()>) -> Result<Response<HealthStatus>, Status> {
         let uptime_seconds = self.started_at.elapsed().as_secs();
         let sandbox_count = self
             .sandbox
@@ -239,10 +229,7 @@ impl Ward for WardGrpcServer {
         }))
     }
 
-    async fn get_info(
-        &self,
-        _request: Request<prost_types::Any>,
-    ) -> Result<Response<DaemonInfo>, Status> {
+    async fn get_info(&self, _request: Request<()>) -> Result<Response<DaemonInfo>, Status> {
         Ok(Response::new(DaemonInfo {
             version: super::VERSION.to_string(),
             platform: std::env::consts::OS.to_string(),

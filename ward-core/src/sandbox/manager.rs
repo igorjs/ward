@@ -21,6 +21,7 @@ type Result<T> = std::result::Result<T, ApiError>;
 // ---------------------------------------------------------------------------
 
 struct SandboxEntry {
+    #[allow(dead_code)]
     egress: EgressProxy,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -51,10 +52,7 @@ impl SandboxManager {
     pub async fn create(&self, req: crate::pb::CreateSandboxRequest) -> Result<PbSandboxInfo> {
         let id = uuid::Uuid::new_v4().to_string();
 
-        let egress_policy = req
-            .egress
-            .map(pb_egress_to_protocol)
-            .unwrap_or_default();
+        let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
 
         let resources = req
             .resources
@@ -263,13 +261,9 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
 }
 
 fn system_time_to_timestamp(t: std::time::SystemTime) -> prost_types::Timestamp {
-    let d = t
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     prost_types::Timestamp {
         seconds: d.as_secs() as i64,
         nanos: d.subsec_nanos() as i32,
     }
 }
-
-use std::collections::HashMap;

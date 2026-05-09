@@ -141,9 +141,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // TODO: establish gRPC channel to the daemon socket.
-    let _socket = cli
-        .socket
-        .unwrap_or_else(|| default_socket());
+    let _socket = cli.socket.unwrap_or_else(default_socket);
 
     match cli.command {
         Commands::Create {
@@ -153,7 +151,9 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             timeout,
         } => {
-            println!("TODO: create sandbox image={image} memory={memory}MiB cpus={cpus} timeout={timeout}s env={env:?}");
+            println!(
+                "TODO: create sandbox image={image} memory={memory}MiB cpus={cpus} timeout={timeout}s env={env:?}"
+            );
         }
 
         Commands::List => {

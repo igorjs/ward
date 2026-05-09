@@ -52,11 +52,7 @@ impl KrunvmBackend {
         let ctx_id = self.krun_create_ctx()?;
         self.krun_apply_resources(ctx_id, &opts.resources)?;
 
-        let rootfs = self
-            .data_dir
-            .join("sandboxes")
-            .join(&id)
-            .join("rootfs");
+        let rootfs = self.data_dir.join("sandboxes").join(&id).join("rootfs");
 
         self.krun_set_root(ctx_id, &rootfs)?;
 
@@ -208,7 +204,8 @@ impl KrunvmBackend {
         {
             if limits.cpus > 0 {
                 // SAFETY: valid ctx_id, cpus is a plain u32.
-                let ret = unsafe { krun_sys::krun_set_vm_config(ctx_id, limits.cpus, limits.memory_mb) };
+                let ret =
+                    unsafe { krun_sys::krun_set_vm_config(ctx_id, limits.cpus, limits.memory_mb) };
                 if ret < 0 {
                     return Err(BackendError::Internal(format!(
                         "krun_set_vm_config failed: errno {}",
