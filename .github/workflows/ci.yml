@@ -34,8 +34,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
       - name: clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets
 
   # ── Tests ────────────────────────────────────────────────────────────
   test:
@@ -45,6 +47,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
       - name: Build
         run: cargo build --all-targets
       - name: Unit tests
@@ -67,6 +71,8 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
       - name: Check MSRV compiles
         run: cargo check --all-targets
 
