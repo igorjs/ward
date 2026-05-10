@@ -16,6 +16,13 @@ const MAX_TIMEOUT_SECONDS: u64 = 2_592_000; // 30 days
 #[allow(dead_code)]
 const MAX_VOLUME_SIZE_MB: u32 = 1_048_576; // 1 TiB
 
+/// Maximum sizes for cross-sandbox communication primitives.
+const MAX_TOPIC_LEN: usize = 128;
+const MAX_GROUP_LEN: usize = 64;
+/// 1 MiB per published message. Large enough for batched events; small enough
+/// to bound per-sandbox memory under burst traffic.
+pub const MAX_PUBLISH_PAYLOAD_BYTES: usize = 1_048_576;
+
 /// Validate an OCI image reference.
 /// Must be non-empty, no path traversal, no shell metacharacters.
 pub fn image_ref(image: &str) -> Result<(), ApiError> {
@@ -149,6 +156,75 @@ pub fn language_name(language: &str) -> Result<(), ApiError> {
         return Err(ApiError::InvalidRequest(
             "language name contains invalid characters".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a pub/sub topic name.
+///
+/// Topics use a dotted-segment syntax (e.g. `agent.results.build`). Restricting
+/// the character set keeps topics safe to render in logs, embed in metrics,
+/// and persist in audit records without escaping.
+pub fn topic_name(topic: &str) -> Result<(), ApiError> {
+    if topic.is_empty() {
+        return Err(ApiError::InvalidRequest("topic must not be empty".into()));
+    }
+    if topic.len() > MAX_TOPIC_LEN {
+        return Err(ApiError::InvalidRequest(format!(
+            "topic exceeds {MAX_TOPIC_LEN} characters"
+        )));
+    }
+    // Allow alphanumeric, dash, underscore, and dot (for namespacing).
+    if !topic
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(ApiError::InvalidRequest(
+            "topic must contain only alphanumeric characters, dashes, underscores, and dots".into(),
+        ));
+    }
+    // Leading/trailing/consecutive dots are confusing and ambiguous for routing.
+    if topic.starts_with('.') || topic.ends_with('.') || topic.contains("..") {
+        return Err(ApiError::InvalidRequest(
+            "topic must not have leading, trailing, or consecutive dots".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a communication group name.
+///
+/// Group names act as opaque routing keys: two sandboxes with identical group
+/// strings can exchange messages. They must be sanitisable for logs.
+pub fn group_name(group: &str) -> Result<(), ApiError> {
+    if group.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "communication group must not be empty when mode is GROUP".into(),
+        ));
+    }
+    if group.len() > MAX_GROUP_LEN {
+        return Err(ApiError::InvalidRequest(format!(
+            "communication group exceeds {MAX_GROUP_LEN} characters"
+        )));
+    }
+    if !group
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::InvalidRequest(
+            "communication group must contain only alphanumeric characters, dashes, and underscores"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that a publish payload does not exceed the per-message cap.
+pub fn publish_payload(payload: &[u8]) -> Result<(), ApiError> {
+    if payload.len() > MAX_PUBLISH_PAYLOAD_BYTES {
+        return Err(ApiError::InvalidRequest(format!(
+            "publish payload exceeds {MAX_PUBLISH_PAYLOAD_BYTES} bytes"
+        )));
     }
     Ok(())
 }

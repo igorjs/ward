@@ -12,7 +12,9 @@ use crate::egress::EgressProxy;
 use crate::pb::{
     ExecRequest, ProcessInfo, RunRequest, SandboxInfo as PbSandboxInfo, SandboxStatus,
 };
-use crate::protocol::{ApiError, CreateOpts, EgressPolicy, ResourceLimits};
+use crate::protocol::{
+    ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, ResourceLimits,
+};
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -58,6 +60,15 @@ impl SandboxManager {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
         }
 
+        // Validate communication policy: if a group is specified or mode is
+        // GROUP, the group name must be present and well-formed.
+        if let Some(ref c) = req.comms {
+            let mode = c.mode();
+            if mode == crate::pb::CommunicationMode::Group {
+                crate::validate::group_name(&c.group)?;
+            }
+        }
+
         // Enforce sandbox cap to prevent resource exhaustion.
         let current = self.entries.read().await.len();
         if current >= self.max_sandboxes {
@@ -76,6 +87,8 @@ impl SandboxManager {
             .map(pb_resources_to_protocol)
             .unwrap_or_default();
 
+        let comms = req.comms.map(pb_comms_to_protocol).unwrap_or_default();
+
         let opts = CreateOpts {
             image: req.image.clone(),
             mounts: vec![],
@@ -88,6 +101,7 @@ impl SandboxManager {
             } else {
                 Some(req.from_snapshot.clone())
             },
+            comms,
         };
 
         let info = self
@@ -248,6 +262,25 @@ fn pb_egress_to_protocol(pb: crate::pb::EgressPolicy) -> EgressPolicy {
         mode,
         domains: pb.domains,
     }
+}
+
+fn pb_comms_to_protocol(pb: crate::pb::CommunicationPolicy) -> CommunicationPolicy {
+    use crate::pb::CommunicationMode as PbMode;
+
+    // Default to Deny on Unspecified – matches the egress pattern where
+    // missing or unknown policy means "no access".
+    let mode = match pb.mode() {
+        PbMode::Group => CommunicationMode::Group,
+        PbMode::Deny | PbMode::Unspecified => CommunicationMode::Deny,
+    };
+
+    let group = if pb.group.is_empty() {
+        None
+    } else {
+        Some(pb.group)
+    };
+
+    CommunicationPolicy { mode, group }
 }
 
 fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {

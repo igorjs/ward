@@ -18,6 +18,8 @@ pub struct CreateOpts {
     pub env: HashMap<String, String>,
     /// If set, restore from this snapshot ID instead of a fresh image boot.
     pub from_snapshot: Option<String>,
+    /// Cross-sandbox pub/sub access policy. Defaults to `Deny`.
+    pub comms: CommunicationPolicy,
 }
 
 /// A filesystem bind-mount passed into a sandbox.
@@ -49,6 +51,28 @@ pub enum EgressMode {
     Allowlist,
     /// Allow all outbound traffic.
     Open,
+}
+
+// ---------------------------------------------------------------------------
+// Cross-sandbox communication
+// ---------------------------------------------------------------------------
+
+/// Policy declaring how a sandbox may use the daemon's pub/sub bus.
+#[derive(Debug, Clone, Default)]
+pub struct CommunicationPolicy {
+    pub mode: CommunicationMode,
+    /// Required when `mode` is `Group`. Two sandboxes with identical group
+    /// strings can publish/subscribe to each other's topics.
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CommunicationMode {
+    /// No publish or subscribe permitted (default-safe).
+    #[default]
+    Deny,
+    /// Membership in a named group; co-grouped sandboxes can communicate.
+    Group,
 }
 
 // ---------------------------------------------------------------------------
