@@ -1,0 +1,85 @@
+// Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
+
+use std::path::PathBuf;
+
+/// Daemon configuration, sourced from environment variables with sensible defaults.
+#[derive(Debug, Clone)]
+pub struct Config {
+    /// Unix socket path the gRPC server will bind to.
+    pub socket_path: PathBuf,
+    /// Root data directory for sandbox state, volumes, snapshots, and images.
+    pub data_dir: PathBuf,
+    /// Log level filter string (e.g. "info", "debug", "ward=trace").
+    pub log_level: String,
+}
+
+impl Config {
+    /// Build configuration from environment variables, falling back to platform defaults.
+    pub fn from_env() -> Self {
+        let socket_path = if let Ok(v) = std::env::var("WARD_SOCKET") {
+            PathBuf::from(v)
+        } else {
+            default_socket_path()
+        };
+
+        let data_dir = if let Ok(v) = std::env::var("WARD_DATA_DIR") {
+            PathBuf::from(v)
+        } else {
+            default_data_dir()
+        };
+
+        let log_level = std::env::var("WARD_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+
+        Self {
+            socket_path,
+            data_dir,
+            log_level,
+        }
+    }
+
+    /// Ensure all required directories exist, creating them if necessary.
+    pub fn ensure_dirs(&self) -> std::io::Result<()> {
+        if let Some(parent) = self.socket_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir_all(&self.data_dir)?;
+        std::fs::create_dir_all(self.data_dir.join("images"))?;
+        std::fs::create_dir_all(self.data_dir.join("sandboxes"))?;
+        std::fs::create_dir_all(self.data_dir.join("snapshots"))?;
+        std::fs::create_dir_all(self.data_dir.join("volumes"))?;
+        Ok(())
+    }
+}
+
+fn default_socket_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().join(".ward").join("ward.sock")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Prefer XDG_RUNTIME_DIR, fall back to /tmp/ward-$USER.
+        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            PathBuf::from(xdg).join("ward").join("ward.sock")
+        } else {
+            let user = std::env::var("USER").unwrap_or_else(|_| "ward".to_string());
+            PathBuf::from(format!("/tmp/ward-{}", user)).join("ward.sock")
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        home_dir().join(".ward").join("ward.sock")
+    }
+}
+
+fn default_data_dir() -> PathBuf {
+    home_dir().join(".ward").join("data")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/ward-home"))
+}
