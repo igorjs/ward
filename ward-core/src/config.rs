@@ -61,10 +61,21 @@ impl Config {
         }
     }
 
-    /// Ensure all required directories exist, creating them if necessary.
+    /// Ensure all required directories exist with secure permissions.
+    ///
+    /// The socket directory is set to 0700 (owner-only) to prevent other
+    /// users from listing contents or connecting to the daemon socket.
+    /// Data directories use the default umask since they contain daemon-managed
+    /// data not directly accessible to external users.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         if let Some(parent) = self.socket_path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Restrict socket directory to owner-only access.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+            }
         }
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.data_dir.join("images"))?;
@@ -102,8 +113,11 @@ fn default_data_dir() -> PathBuf {
     home_dir().join(".ward").join("data")
 }
 
+/// Resolve the user's home directory. Panics if HOME is unset rather than
+/// falling back to a world-writable location like /tmp, which would place
+/// daemon state (socket, data) in an insecure directory.
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/ward-home"))
+        .expect("HOME environment variable must be set; cannot determine safe default paths")
 }
