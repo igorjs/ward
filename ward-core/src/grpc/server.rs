@@ -209,7 +209,13 @@ impl Ward for WardGrpcServer {
         Err(Status::unimplemented("get_egress_log"))
     }
 
-    async fn publish(&self, _request: Request<PublishRequest>) -> Result<Response<()>, Status> {
+    async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        // Validate at the boundary so malformed requests fail fast with a
+        // distinct status code, even before the broker is implemented.
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
+        crate::validate::publish_payload(&req.payload).map_err(api_err_to_status)?;
         Err(Status::unimplemented("publish"))
     }
 
@@ -217,15 +223,20 @@ impl Ward for WardGrpcServer {
 
     async fn subscribe(
         &self,
-        _request: Request<SubscribeRequest>,
+        request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
         Err(Status::unimplemented("subscribe"))
     }
 
     async fn get_communication_log(
         &self,
-        _request: Request<GetCommunicationLogRequest>,
+        request: Request<GetCommunicationLogRequest>,
     ) -> Result<Response<CommunicationLogResponse>, Status> {
+        let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         Err(Status::unimplemented("get_communication_log"))
     }
 
