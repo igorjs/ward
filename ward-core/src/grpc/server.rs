@@ -8,12 +8,13 @@ use tracing::error;
 
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
-    EgressLogResponse, ExecRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
-    HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVolumesResponse, ProcessInfo, RemoveSandboxRequest,
-    RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo,
-    StreamEvent, StreamOutputRequest, VolumeInfo, WriteStdinRequest,
+    CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest,
+    DaemonInfo, EgressLogResponse, ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest,
+    GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
+    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest,
+    SandboxInfo, SnapshotInfo, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo,
+    WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -206,6 +207,26 @@ impl Ward for WardGrpcServer {
         _request: Request<GetEgressLogRequest>,
     ) -> Result<Response<EgressLogResponse>, Status> {
         Err(Status::unimplemented("get_egress_log"))
+    }
+
+    async fn publish(&self, _request: Request<PublishRequest>) -> Result<Response<()>, Status> {
+        Err(Status::unimplemented("publish"))
+    }
+
+    type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
+
+    async fn subscribe(
+        &self,
+        _request: Request<SubscribeRequest>,
+    ) -> Result<Response<Self::SubscribeStream>, Status> {
+        Err(Status::unimplemented("subscribe"))
+    }
+
+    async fn get_communication_log(
+        &self,
+        _request: Request<GetCommunicationLogRequest>,
+    ) -> Result<Response<CommunicationLogResponse>, Status> {
+        Err(Status::unimplemented("get_communication_log"))
     }
 
     async fn get_health(&self, _request: Request<()>) -> Result<Response<HealthStatus>, Status> {
