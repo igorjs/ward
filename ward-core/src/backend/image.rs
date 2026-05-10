@@ -102,15 +102,19 @@ impl ImageStore {
         // For now this is a stub that creates an empty rootfs directory so
         // the rest of the system can proceed in development/testing.
 
-        let slug = reference.replace([':', '/'], "_");
-        let rootfs = self.cache_dir.join(&slug).join("rootfs");
+        // Use a UUID-based directory name instead of deriving from the image
+        // reference. Deriving from user input (e.g. reference.replace('/', "_"))
+        // is vulnerable to path traversal if the reference contains ".." or
+        // other control sequences that survive the replacement.
+        let dir_name = uuid::Uuid::new_v4().to_string();
+        let rootfs = self.cache_dir.join(&dir_name).join("rootfs");
         tokio::fs::create_dir_all(&rootfs)
             .await
             .map_err(BackendError::Io)?;
 
         tracing::warn!(
             reference,
-            ?rootfs,
+            dir = %dir_name,
             "image pull not yet implemented – using empty rootfs stub"
         );
 
