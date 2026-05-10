@@ -1,0 +1,263 @@
+syntax = "proto3";
+
+package ward.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Ward service
+// ---------------------------------------------------------------------------
+
+service Ward {
+  // Sandbox lifecycle
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxInfo);
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxInfo);
+  rpc ListSandboxes(google.protobuf.Empty) returns (ListSandboxesResponse);
+  rpc RemoveSandbox(RemoveSandboxRequest) returns (google.protobuf.Empty);
+
+  // Execution
+  rpc Exec(ExecRequest) returns (ProcessInfo);
+  rpc Run(RunRequest) returns (ProcessInfo);
+  rpc StreamOutput(StreamOutputRequest) returns (stream StreamEvent);
+  rpc WriteStdin(WriteStdinRequest) returns (google.protobuf.Empty);
+  rpc KillProcess(KillProcessRequest) returns (google.protobuf.Empty);
+
+  // Snapshots
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
+  rpc RestoreSnapshot(RestoreSnapshotRequest) returns (google.protobuf.Empty);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+
+  // Volumes
+  rpc CreateVolume(CreateVolumeRequest) returns (VolumeInfo);
+  rpc GetVolume(GetVolumeRequest) returns (VolumeInfo);
+  rpc ListVolumes(google.protobuf.Empty) returns (ListVolumesResponse);
+  rpc RemoveVolume(RemoveVolumeRequest) returns (google.protobuf.Empty);
+
+  // Egress
+  rpc GetEgressLog(GetEgressLogRequest) returns (EgressLogResponse);
+
+  // Health
+  rpc GetHealth(google.protobuf.Empty) returns (HealthStatus);
+  rpc GetInfo(google.protobuf.Empty) returns (DaemonInfo);
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox messages
+// ---------------------------------------------------------------------------
+
+message CreateSandboxRequest {
+  string image = 1;
+  repeated Mount mounts = 2;
+  repeated string volume_ids = 3;
+  EgressPolicy egress = 4;
+  ResourceLimits resources = 5;
+  map<string, string> env = 6;
+  string from_snapshot = 7;  // optional: create from snapshot ID
+}
+
+message GetSandboxRequest {
+  string id = 1;
+}
+
+message RemoveSandboxRequest {
+  string id = 1;
+}
+
+message ListSandboxesResponse {
+  repeated SandboxInfo sandboxes = 1;
+}
+
+message SandboxInfo {
+  string id = 1;
+  SandboxStatus status = 2;
+  string image = 3;
+  google.protobuf.Timestamp created_at = 4;
+  string ip_address = 5;
+  ResourceLimits resources = 6;
+  google.protobuf.Timestamp expires_at = 7;
+}
+
+enum SandboxStatus {
+  SANDBOX_STATUS_UNSPECIFIED = 0;
+  SANDBOX_STATUS_CREATING = 1;
+  SANDBOX_STATUS_RUNNING = 2;
+  SANDBOX_STATUS_STOPPED = 3;
+  SANDBOX_STATUS_FAILED = 4;
+}
+
+message Mount {
+  string source = 1;
+  string target = 2;
+  bool readonly = 3;
+}
+
+message EgressPolicy {
+  EgressMode mode = 1;
+  repeated string domains = 2;
+}
+
+enum EgressMode {
+  EGRESS_MODE_UNSPECIFIED = 0;
+  EGRESS_MODE_DENY = 1;
+  EGRESS_MODE_ALLOWLIST = 2;
+  EGRESS_MODE_OPEN = 3;
+}
+
+message ResourceLimits {
+  uint32 cpus = 1;
+  uint32 memory_mb = 2;
+  uint32 pids_max = 3;
+  uint64 timeout_seconds = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Execution messages
+// ---------------------------------------------------------------------------
+
+message ExecRequest {
+  string sandbox_id = 1;
+  repeated string command = 2;
+  string working_dir = 3;
+  map<string, string> env = 4;
+}
+
+message RunRequest {
+  string sandbox_id = 1;
+  string language = 2;
+  string code = 3;
+}
+
+message ProcessInfo {
+  string pid = 1;
+  string sandbox_id = 2;
+  string status = 3;
+}
+
+message StreamOutputRequest {
+  string sandbox_id = 1;
+  string pid = 2;
+}
+
+message StreamEvent {
+  StreamEventType type = 1;
+  string line = 2;
+  int32 exit_code = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  uint64 duration_ms = 5;
+}
+
+enum StreamEventType {
+  STREAM_EVENT_TYPE_UNSPECIFIED = 0;
+  STREAM_EVENT_TYPE_STDOUT = 1;
+  STREAM_EVENT_TYPE_STDERR = 2;
+  STREAM_EVENT_TYPE_EXIT = 3;
+}
+
+message WriteStdinRequest {
+  string sandbox_id = 1;
+  string pid = 2;
+  bytes data = 3;
+}
+
+message KillProcessRequest {
+  string sandbox_id = 1;
+  string pid = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot messages
+// ---------------------------------------------------------------------------
+
+message CreateSnapshotRequest {
+  string sandbox_id = 1;
+  string label = 2;
+}
+
+message RestoreSnapshotRequest {
+  string sandbox_id = 1;
+  string snapshot_id = 2;
+}
+
+message ListSnapshotsRequest {
+  string sandbox_id = 1;
+}
+
+message ListSnapshotsResponse {
+  repeated SnapshotInfo snapshots = 1;
+}
+
+message SnapshotInfo {
+  string snapshot_id = 1;
+  string sandbox_id = 2;
+  string label = 3;
+  google.protobuf.Timestamp created_at = 4;
+  uint64 size_bytes = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Volume messages
+// ---------------------------------------------------------------------------
+
+message CreateVolumeRequest {
+  string name = 1;
+  uint32 size_mb = 2;
+}
+
+message GetVolumeRequest {
+  string id = 1;
+}
+
+message RemoveVolumeRequest {
+  string id = 1;
+}
+
+message ListVolumesResponse {
+  repeated VolumeInfo volumes = 1;
+}
+
+message VolumeInfo {
+  string id = 1;
+  string name = 2;
+  uint32 size_mb = 3;
+  google.protobuf.Timestamp created_at = 4;
+  string mount_path = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Egress messages
+// ---------------------------------------------------------------------------
+
+message GetEgressLogRequest {
+  string sandbox_id = 1;
+}
+
+message EgressLogResponse {
+  repeated EgressLogEntry entries = 1;
+}
+
+message EgressLogEntry {
+  string sandbox_id = 1;
+  string domain = 2;
+  string port = 3;
+  bool allowed = 4;
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Health messages
+// ---------------------------------------------------------------------------
+
+message HealthStatus {
+  string status = 1;
+  uint64 uptime_seconds = 2;
+  uint32 sandbox_count = 3;
+  google.protobuf.Timestamp checked_at = 4;
+}
+
+message DaemonInfo {
+  string version = 1;
+  string platform = 2;
+  string backend = 3;
+  string arch = 4;
+}
