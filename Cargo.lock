@@ -1693,8 +1693,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "hyper-util",
  "serde_json",
  "tokio",
+ "tonic",
+ "tower 0.5.3",
+ "ward-core",
 ]
 
 [[package]]
