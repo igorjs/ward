@@ -18,3 +18,7 @@ tokio = { version = "1", features = ["full"] }
 tonic = "0.12"
 tower = "0.5"
 ward-core = { path = "../ward-core" }
+
+[dev-dependencies]
+# Diff-style assertions for readable failures on multi-field structs.
+pretty_assertions = "1"

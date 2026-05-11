@@ -1694,6 +1694,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hyper-util",
+ "pretty_assertions",
  "serde_json",
  "tokio",
  "tonic",
