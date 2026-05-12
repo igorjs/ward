@@ -40,3 +40,7 @@ pretty_assertions = "1"
 # rstest: parameterised tests via #[case] attributes and reusable fixtures.
 # Cuts boilerplate when many cases share the same arrange-act-assert shape.
 rstest = "0.23"
+
+# tempfile: per-test temporary directories. Manager tests use a fresh
+# data_dir per test so parallel runs do not interfere.
+tempfile = "3"
