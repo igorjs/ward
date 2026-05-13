@@ -1934,7 +1934,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "wardd"
+name = "ward-daemon"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",

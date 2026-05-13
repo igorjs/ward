@@ -1,10 +1,14 @@
 [package]
-name = "wardd"
+name = "ward-daemon"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+# The binary keeps its short name `wardd` so users invoke the daemon
+# exactly the same way (`wardd`, `systemctl start wardd`, etc.). Only
+# the *crate* identity changes here — that's what shows up in
+# `cargo metadata` and what scripts pass to `cargo test -p`.
 [[bin]]
 name = "wardd"
 path = "src/main.rs"

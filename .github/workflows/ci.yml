@@ -77,7 +77,7 @@ jobs:
       - name: Build (required so assert_cmd finds wardd and ward binaries)
         run: cargo build --workspace
       - name: E2E tests (wardd subprocess + ward CLI)
-        run: cargo test -p wardd --tests
+        run: cargo test -p ward-daemon --tests
 
   # ── MSRV (minimum supported Rust version) ───────────────────────────
   # Reads rust-version from Cargo.toml; no extra tooling needed.
@@ -143,7 +143,7 @@ jobs:
           cargo llvm-cov \
             --no-report \
             --workspace \
-            --exclude wardd \
+            --exclude ward-daemon \
             --lib \
             --tests
       - name: Generate lcov report
