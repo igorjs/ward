@@ -27,3 +27,16 @@ uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
 tonic-build = "0.12"
+
+[dev-dependencies]
+# tokio-test: assert_ready!, assert_pending!, mock I/O streams, scripted streams.
+# Used for testing async code paths that depend on poll semantics.
+tokio-test = "0.4"
+
+# pretty_assertions: diff-style output on assert_eq! failures so multi-field
+# struct mismatches are readable instead of two opaque blobs.
+pretty_assertions = "1"
+
+# rstest: parameterised tests via #[case] attributes and reusable fixtures.
+# Cuts boilerplate when many cases share the same arrange-act-assert shape.
+rstest = "0.23"
