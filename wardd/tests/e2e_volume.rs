@@ -298,7 +298,10 @@ fn given_volume_cap_reached_when_user_removes_one_then_create_succeeds_again() {
         .stderr(predicate::str::contains("limit"));
 
     // Act: free a slot and retry.
-    ward().args(["volume", "remove", &first_id]).assert().success();
+    ward()
+        .args(["volume", "remove", &first_id])
+        .assert()
+        .success();
     let assertion = ward()
         .args(["volume", "create", "replacement", "--size", "10"])
         .assert();

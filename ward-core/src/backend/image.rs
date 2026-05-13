@@ -285,7 +285,12 @@ mod tests {
         store.ensure("python:3.12-slim").await.expect("python");
 
         // Act
-        let mut refs: Vec<String> = store.list().await.into_iter().map(|c| c.reference).collect();
+        let mut refs: Vec<String> = store
+            .list()
+            .await
+            .into_iter()
+            .map(|c| c.reference)
+            .collect();
         refs.sort();
 
         // Assert: order isn't guaranteed by HashMap iteration, so we sort
@@ -304,10 +309,7 @@ mod tests {
         let (store, tmp) = store_in_tempdir();
 
         // Act
-        let rootfs = store
-            .ensure("../../../etc/passwd")
-            .await
-            .expect("ensure");
+        let rootfs = store.ensure("../../../etc/passwd").await.expect("ensure");
 
         // Assert: canonicalise both sides so symlinks (macOS /private/var)
         // don't trip the comparison.

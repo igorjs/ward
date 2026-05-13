@@ -267,7 +267,10 @@ fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() 
     };
 
     // Fill the cap and capture the first sandbox id for removal.
-    let first = ward().args(["create", "alpine:1"]).output().expect("create");
+    let first = ward()
+        .args(["create", "alpine:1"])
+        .output()
+        .expect("create");
     assert!(first.status.success());
     let first_id = std::str::from_utf8(&first.stdout)
         .unwrap()
