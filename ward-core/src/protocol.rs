@@ -288,3 +288,132 @@ pub struct HealthStatus {
     pub sandbox_count: u32,
     pub checked_at: SystemTime,
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// These tests lock in the *security-critical defaults*. Any change that
+// silently weakens the isolation posture (e.g. flipping a default to "Open")
+// fails the test loudly rather than slipping through review unnoticed.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    // ----- Security invariants --------------------------------------------
+
+    #[test]
+    fn egress_mode_defaults_to_deny() {
+        // Critical: the safe default for outbound network access is DENY.
+        // Flipping this to Open or Allowlist silently breaks every sandbox
+        // that did not specify an explicit policy.
+        assert_eq!(EgressMode::default(), EgressMode::Deny);
+    }
+
+    #[test]
+    fn egress_policy_defaults_to_deny_with_empty_domains() {
+        let p = EgressPolicy::default();
+        assert_eq!(p.mode, EgressMode::Deny);
+        assert!(p.domains.is_empty());
+    }
+
+    #[test]
+    fn communication_mode_defaults_to_deny() {
+        // Same invariant as egress: cross-sandbox communication must be
+        // off by default. Sandboxes opt in via CommunicationMode::Group.
+        assert_eq!(CommunicationMode::default(), CommunicationMode::Deny);
+    }
+
+    #[test]
+    fn communication_policy_defaults_to_deny_with_no_group() {
+        let p = CommunicationPolicy::default();
+        assert_eq!(p.mode, CommunicationMode::Deny);
+        assert!(p.group.is_none());
+    }
+
+    // ----- Resource limits ------------------------------------------------
+
+    #[test]
+    fn resource_limits_default_is_all_zeros() {
+        // Zero is the convention for "use the configured default". The
+        // resource_limits validator accepts zero; the backend substitutes
+        // sensible values. If this default changes, validator tests will
+        // also need to update.
+        let r = ResourceLimits::default();
+        assert_eq!(r.cpus, 0);
+        assert_eq!(r.memory_mb, 0);
+        assert_eq!(r.pids_max, 0);
+        assert_eq!(r.timeout_seconds, 0);
+    }
+
+    // ----- Language runtime table -----------------------------------------
+
+    #[test]
+    fn default_runtimes_returns_all_supported_languages() {
+        let runtimes = default_runtimes();
+        let names: Vec<&str> = runtimes.iter().map(|r| r.name).collect();
+        // The set is curated, not derived — assert each known language is
+        // present so a typo when adding/removing one is caught.
+        assert!(names.contains(&"python"));
+        assert!(names.contains(&"node"));
+        assert!(names.contains(&"deno"));
+        assert!(names.contains(&"ruby"));
+        assert!(names.contains(&"go"));
+    }
+
+    #[test]
+    fn default_runtimes_have_consistent_fields() {
+        // Each entry must populate every field — empty strings would be a
+        // sentinel for "forgot to fill in" and break execution later.
+        for rt in default_runtimes() {
+            assert!(!rt.name.is_empty(), "runtime missing name: {rt:?}");
+            assert!(!rt.image.is_empty(), "runtime {} missing image", rt.name);
+            assert!(
+                !rt.entrypoint.is_empty(),
+                "runtime {} missing entrypoint",
+                rt.name
+            );
+            assert!(
+                !rt.file_ext.is_empty(),
+                "runtime {} missing file_ext",
+                rt.name
+            );
+        }
+    }
+
+    #[test]
+    fn default_runtimes_have_unique_names() {
+        // Two entries with the same `name` would make lookup ambiguous.
+        let runtimes = default_runtimes();
+        let mut names: Vec<&str> = runtimes.iter().map(|r| r.name).collect();
+        names.sort();
+        let original_len = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            original_len,
+            "duplicate runtime names: {names:?}"
+        );
+    }
+
+    // ----- ApiError display rendering -------------------------------------
+    //
+    // Error messages are surfaced to clients (for the variants that don't
+    // get sanitised). Their format is part of the API contract.
+
+    #[test]
+    fn api_error_display_includes_identifier() {
+        let err = ApiError::SandboxNotFound("ward_abc".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("ward_abc"), "expected ID in: {msg}");
+    }
+
+    #[test]
+    fn api_error_invalid_request_includes_reason() {
+        let err = ApiError::InvalidRequest("topic must not be empty".to_string());
+        let msg = format!("{err}");
+        assert!(msg.contains("topic must not be empty"), "got: {msg}");
+    }
+}
