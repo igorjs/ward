@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::backend::BackendError;
 use crate::backend::krunvm::KrunvmBackend;
@@ -15,6 +15,7 @@ use crate::pb::{
 };
 use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, ResourceLimits,
+    StreamEvent,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -43,6 +44,20 @@ struct SandboxEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Per-process tracking entry
+// ---------------------------------------------------------------------------
+
+/// State held for each process spawned via exec/run. The receiver is wrapped
+/// in `Mutex<Option<...>>` so the first `stream_output` call can take it; a
+/// second call sees `None` and returns InvalidRequest. Treating streams as
+/// single-consumer matches the gRPC server-streaming contract — clients fan
+/// out at the consumer side, not by re-opening the stream.
+struct ProcessRecord {
+    sandbox_id: String,
+    output_rx: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
+}
+
+// ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
 
@@ -52,6 +67,10 @@ pub struct SandboxManager {
     entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
     /// Maximum concurrent sandboxes. Prevents resource exhaustion from unbounded creation.
     max_sandboxes: usize,
+    /// Process records keyed by pid. Populated by exec/run; drained by
+    /// stream_output. Lives for the lifetime of the manager — small leak
+    /// bounded by sandbox lifetime, cleaned up when the sandbox is removed.
+    processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
 }
 
 impl SandboxManager {
@@ -60,6 +79,7 @@ impl SandboxManager {
             backend,
             entries: Arc::new(RwLock::new(HashMap::new())),
             max_sandboxes,
+            processes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -174,6 +194,15 @@ impl SandboxManager {
             }
         }
 
+        // Drop any process records that belong to this sandbox so they
+        // do not accumulate over a long-lived daemon's lifetime. The
+        // backend resources are torn down below; the in-memory bookkeeping
+        // goes here.
+        self.processes
+            .write()
+            .await
+            .retain(|_, rec| rec.sandbox_id != id);
+
         self.backend.remove_sandbox(id).await.map_err(backend_err)
     }
 
@@ -205,11 +234,54 @@ impl SandboxManager {
             .await
             .map_err(backend_err)?;
 
+        // Park the output channel under the pid so a later StreamOutput call
+        // can take it. The stdin_tx side is dropped here — exec doesn't take
+        // stdin in this API surface; WriteStdin is a separate RPC and will
+        // grow its own bookkeeping when implemented.
+        let pid = handle.pid.clone();
+        let record = ProcessRecord {
+            sandbox_id: req.sandbox_id.clone(),
+            output_rx: Mutex::new(handle.output_rx),
+        };
+        self.processes.write().await.insert(pid.clone(), record);
+
         Ok(ProcessInfo {
-            pid: handle.pid,
+            pid,
             sandbox_id: req.sandbox_id,
             status: "running".to_string(),
         })
+    }
+
+    /// Take the output receiver for a previously-started process. Single-
+    /// consumer: a second call returns InvalidRequest. The caller is
+    /// expected to drain the channel and translate events into whatever
+    /// stream type the transport needs.
+    pub async fn stream_output(
+        &self,
+        sandbox_id: &str,
+        pid: &str,
+    ) -> Result<mpsc::Receiver<StreamEvent>> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        crate::validate::entity_id(pid, "process")?;
+
+        let guard = self.processes.read().await;
+        let record = guard
+            .get(pid)
+            .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
+
+        // Defence in depth: a caller must address the process by the
+        // sandbox that owns it. Hiding pids across sandboxes prevents
+        // cross-tenant log harvesting if pids are guessed or leaked.
+        if record.sandbox_id != sandbox_id {
+            return Err(ApiError::ProcessNotFound(pid.to_string()));
+        }
+
+        record
+            .output_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| ApiError::InvalidRequest("output stream already consumed".into()))
     }
 
     /// Run a language snippet inside a sandbox.
@@ -344,6 +416,7 @@ mod tests {
         CreateSandboxRequest, EgressMode as PbEgressMode, EgressPolicy as PbEgressPolicy,
         ResourceLimits as PbResourceLimits,
     };
+    use crate::protocol::StreamEventKind;
     use pretty_assertions::assert_eq;
 
     /// Build a fresh SandboxManager pointed at a per-test data_dir.
@@ -908,5 +981,147 @@ mod tests {
 
         // Assert
         assert!(resp.is_ok());
+    }
+
+    // ----- stream_output -------------------------------------------------
+
+    #[tokio::test]
+    async fn given_exec_when_stream_output_then_drains_scripted_stdout_and_exit() {
+        // Arrange: exec parks the receiver under the pid; we take it back
+        // out and confirm the scripted stub events come through. The
+        // first event is a Stdout line; the second is the Exit(0) marker.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into(), "hi".into()],
+                ..Default::default()
+            })
+            .await
+            .expect("exec");
+
+        // Act
+        let mut rx = mgr
+            .stream_output(&s.id, &proc.pid)
+            .await
+            .expect("stream_output");
+
+        let first = rx.recv().await.expect("first event");
+        let second = rx.recv().await.expect("second event");
+        let after_close = rx.recv().await;
+
+        // Assert: shape only — the stub may evolve its line text, but
+        // (Stdout, then Exit, then None) is the contract.
+        assert_eq!(first.kind, StreamEventKind::Stdout);
+        assert_eq!(second.kind, StreamEventKind::Exit);
+        assert_eq!(second.exit_code, Some(0));
+        assert!(after_close.is_none(), "channel must close after Exit");
+    }
+
+    #[tokio::test]
+    async fn given_unknown_pid_when_stream_output_then_process_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act: well-formed UUID that was never produced by an exec call.
+        let err = mgr
+            .stream_output(&s.id, "00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("unknown pid");
+
+        // Assert
+        assert!(
+            matches!(err, ApiError::ProcessNotFound(_)),
+            "expected ProcessNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_pid_owned_by_other_sandbox_when_stream_output_then_process_not_found() {
+        // Arrange: two sandboxes, one process under the first. Asking
+        // for that pid from the second sandbox's perspective must hide
+        // its existence — pid is scoped to its owning sandbox.
+        let mgr = build_manager(4);
+        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s1.id.clone(),
+                command: vec!["echo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act: ask sandbox 2 about a pid that belongs to sandbox 1.
+        let err = mgr
+            .stream_output(&s2.id, &proc.pid)
+            .await
+            .expect_err("cross-sandbox pid");
+
+        // Assert: NotFound — leaking the existence of another sandbox's
+        // pid would be a tenant-isolation regression.
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_stream_output_consumed_when_called_again_then_invalid_request() {
+        // Arrange: single-consumer contract. Once a caller takes the
+        // receiver, subsequent calls see None.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let _first = mgr
+            .stream_output(&s.id, &proc.pid)
+            .await
+            .expect("first call");
+
+        // Act
+        let err = mgr
+            .stream_output(&s.id, &proc.pid)
+            .await
+            .expect_err("second call");
+
+        // Assert
+        assert!(
+            matches!(err, ApiError::InvalidRequest(_)),
+            "expected InvalidRequest, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_removed_when_stream_output_for_old_pid_then_process_not_found() {
+        // Arrange: removing a sandbox must drop its process records so
+        // they do not accumulate. Asking for a pid afterwards looks like
+        // it never existed.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        mgr.remove(&s.id).await.expect("remove");
+        let err = mgr
+            .stream_output(&s.id, &proc.pid)
+            .await
+            .expect_err("after remove");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 }
