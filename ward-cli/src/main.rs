@@ -225,15 +225,65 @@ async fn main() -> anyhow::Result<()> {
             command,
             workdir,
         } => {
-            println!("TODO: exec in sandbox {id} command={command:?} workdir={workdir:?}");
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c
+                .exec(ward_core::pb::ExecRequest {
+                    sandbox_id: id,
+                    command,
+                    working_dir: workdir.unwrap_or_default(),
+                    env: Default::default(),
+                })
+                .await?
+                .into_inner();
+            // pid is the handle the user passes back to `ward logs <id> <pid>`
+            // to retrieve streamed output once StreamOutput is implemented.
+            println!("pid: {}", resp.pid);
+            println!("status: {}", resp.status);
         }
 
         Commands::Run { id, language, code } => {
-            println!("TODO: run {language} in sandbox {id} code={code:?}");
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c
+                .run(ward_core::pb::RunRequest {
+                    sandbox_id: id,
+                    language,
+                    code,
+                })
+                .await?
+                .into_inner();
+            println!("pid: {}", resp.pid);
+            println!("status: {}", resp.status);
         }
 
         Commands::Logs { id, pid } => {
-            println!("TODO: stream logs for sandbox={id} pid={pid}");
+            // StreamOutput is a server-streaming RPC. The CLI drains the
+            // stream and prints each event with a stable prefix so scripts
+            // can grep "stdout:" / "stderr:" / "exit:" without parsing
+            // structured output.
+            let mut c = client::connect(&socket_path).await?;
+            let mut stream = c
+                .stream_output(ward_core::pb::StreamOutputRequest {
+                    sandbox_id: id,
+                    pid,
+                })
+                .await?
+                .into_inner();
+
+            while let Some(evt) = stream.message().await? {
+                let kind = match ward_core::pb::StreamEventType::try_from(evt.r#type)
+                    .unwrap_or(ward_core::pb::StreamEventType::Unspecified)
+                {
+                    ward_core::pb::StreamEventType::Stdout => "stdout",
+                    ward_core::pb::StreamEventType::Stderr => "stderr",
+                    ward_core::pb::StreamEventType::Exit => "exit",
+                    ward_core::pb::StreamEventType::Unspecified => "unspecified",
+                };
+                if kind == "exit" {
+                    println!("exit: {}", evt.exit_code);
+                } else {
+                    println!("{kind}: {}", evt.line);
+                }
+            }
         }
 
         Commands::Snapshot { id, label } => {
