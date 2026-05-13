@@ -44,3 +44,8 @@ rstest = "0.23"
 # tempfile: per-test temporary directories. Manager tests use a fresh
 # data_dir per test so parallel runs do not interfere.
 tempfile = "3"
+
+# proptest: property-based testing. Used alongside the example-based rstest
+# suite to generate random inputs and discover edge cases the author did
+# not enumerate. Targeted at validators and other pure-function boundaries.
+proptest = "1"
