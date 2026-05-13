@@ -1,6 +1,7 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod backend;
+pub mod comms;
 pub mod config;
 pub mod egress;
 pub mod grpc;
