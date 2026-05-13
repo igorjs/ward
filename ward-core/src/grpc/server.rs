@@ -145,22 +145,33 @@ impl Ward for WardGrpcServer {
 
     async fn create_snapshot(
         &self,
-        _request: Request<CreateSnapshotRequest>,
+        request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
+        // Validate identity inputs at the API boundary so that the eventual
+        // backend implementation can rely on well-formed IDs. The contract
+        // we're locking in here outlives `Unimplemented`: when snapshots
+        // ship, these validators continue to gate the happy path.
+        let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         Err(Status::unimplemented("create_snapshot"))
     }
 
     async fn restore_snapshot(
         &self,
-        _request: Request<RestoreSnapshotRequest>,
+        request: Request<RestoreSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::entity_id(&req.snapshot_id, "snapshot").map_err(api_err_to_status)?;
         Err(Status::unimplemented("restore_snapshot"))
     }
 
     async fn list_snapshots(
         &self,
-        _request: Request<ListSnapshotsRequest>,
+        request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         Err(Status::unimplemented("list_snapshots"))
     }
 
