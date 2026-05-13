@@ -223,3 +223,76 @@ fn given_unknown_pid_when_user_runs_logs_then_fails_with_not_found() {
         .failure()
         .stderr(predicate::str::contains(unknown_pid));
 }
+
+// ---------------------------------------------------------------------------
+// Feature: stdin
+// ---------------------------------------------------------------------------
+
+#[test]
+fn given_exec_when_user_writes_stdin_then_command_succeeds() {
+    // Arrange: exec returns a pid whose stdin channel is held alive by
+    // the stub's drain task — so a write succeeds even though the stub
+    // process has already finished its scripted output.
+    let daemon = common::Daemon::spawn();
+    let create_out = daemon
+        .cli()
+        .args(["create", "alpine"])
+        .output()
+        .expect("create");
+    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let exec_out = daemon
+        .cli()
+        .args(["exec", &id, "--", "cat"])
+        .output()
+        .expect("exec");
+    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
+
+    // Act: literal-arg form — avoids touching the CLI's own stdin in tests.
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["stdin", &id, &pid, "hello\n"]).assert();
+
+    // Assert: command succeeds and prints the "wrote" confirmation.
+    assertion
+        .success()
+        .stdout(predicate::str::contains("wrote"));
+}
+
+#[test]
+fn given_invalid_pid_when_user_writes_stdin_then_fails_with_clear_error() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args([
+            "stdin",
+            "00000000-0000-0000-0000-000000000000",
+            "not-hex-zzz",
+            "x",
+        ])
+        .assert();
+
+    // Assert
+    assertion
+        .failure()
+        .stderr(predicate::str::contains("process"));
+}
+
+#[test]
+fn given_unknown_pid_when_user_writes_stdin_then_fails_with_not_found() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+    let unknown_pid = "00000000-0000-0000-0000-000000000000";
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["stdin", unknown_pid, unknown_pid, "x"])
+        .assert();
+
+    // Assert: stderr echoes the offending pid so users can grep CI logs.
+    assertion
+        .failure()
+        .stderr(predicate::str::contains(unknown_pid));
+}
