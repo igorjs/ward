@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::backend::BackendError;
 use crate::backend::krunvm::KrunvmBackend;
 use crate::egress::EgressProxy;
 use crate::pb::{
@@ -17,6 +18,19 @@ use crate::protocol::{
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
+
+/// Translate a BackendError to the appropriate ApiError variant so that
+/// the gRPC layer can map it to the correct status code. The critical
+/// distinction is NotFound, which becomes Code::NotFound to the client.
+/// Wrapping everything in ApiError::Backend would collapse that signal
+/// into Code::Internal — wrong for "you asked about a sandbox that does
+/// not exist".
+fn backend_err(e: BackendError) -> ApiError {
+    match e {
+        BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
+        other => ApiError::Backend(other.to_string()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-sandbox tracking entry
@@ -108,7 +122,7 @@ impl SandboxManager {
             .backend
             .create_sandbox(id.clone(), &opts)
             .await
-            .map_err(|e| ApiError::Backend(e.to_string()))?;
+            .map_err(backend_err)?;
 
         let egress = EgressProxy::new(id.clone(), egress_policy);
 
@@ -140,21 +154,13 @@ impl SandboxManager {
     /// Retrieve info for an existing sandbox.
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
         crate::validate::entity_id(id, "sandbox")?;
-        let info = self
-            .backend
-            .get_sandbox(id)
-            .await
-            .map_err(|e| ApiError::SandboxNotFound(e.to_string()))?;
+        let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
         Ok(protocol_info_to_pb(info))
     }
 
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
-        let infos = self
-            .backend
-            .list_sandboxes()
-            .await
-            .map_err(|e| ApiError::Backend(e.to_string()))?;
+        let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;
         Ok(infos.into_iter().map(protocol_info_to_pb).collect())
     }
 
@@ -168,18 +174,12 @@ impl SandboxManager {
             }
         }
 
-        self.backend
-            .remove_sandbox(id)
-            .await
-            .map_err(|e| ApiError::Backend(e.to_string()))
+        self.backend.remove_sandbox(id).await.map_err(backend_err)
     }
 
     /// Return the number of active sandboxes.
     pub async fn count(&self) -> Result<usize> {
-        self.backend
-            .count()
-            .await
-            .map_err(|e| ApiError::Backend(e.to_string()))
+        self.backend.count().await.map_err(backend_err)
     }
 
     // -----------------------------------------------------------------------
@@ -203,7 +203,7 @@ impl SandboxManager {
                 req.env.clone(),
             )
             .await
-            .map_err(|e| ApiError::Backend(e.to_string()))?;
+            .map_err(backend_err)?;
 
         Ok(ProcessInfo {
             pid: handle.pid,
@@ -321,5 +321,406 @@ fn system_time_to_timestamp(t: std::time::SystemTime) -> prost_types::Timestamp 
     prost_types::Timestamp {
         seconds: d.as_secs() as i64,
         nanos: d.subsec_nanos() as i32,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// SandboxManager unit tests verify the in-process state machine — capacity
+// cap, timeout-task cancellation, and the conversion helpers — against the
+// stub backend (KrunvmBackend without the `krunvm` feature). Integration
+// tests for the same behaviour over gRPC live in tests/grpc_sandbox.rs.
+//
+// BDD names with AAA bodies. Each test builds its own manager pointed at a
+// per-test data_dir so they parallelise without sharing state.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pb::{
+        CommunicationMode as PbCommunicationMode, CommunicationPolicy as PbCommunicationPolicy,
+        CreateSandboxRequest, EgressMode as PbEgressMode, EgressPolicy as PbEgressPolicy,
+        ResourceLimits as PbResourceLimits,
+    };
+    use pretty_assertions::assert_eq;
+
+    /// Build a fresh SandboxManager pointed at a per-test data_dir.
+    /// Leaks the TempDir intentionally: tokio's async fs API outlives any
+    /// test-local scope, and the OS cleans /tmp on its own schedule.
+    fn build_manager(max_sandboxes: usize) -> Arc<SandboxManager> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let backend = Arc::new(KrunvmBackend::new(path));
+        Arc::new(SandboxManager::new(backend, max_sandboxes))
+    }
+
+    fn create_req(image: &str) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            image: image.to_string(),
+            ..Default::default()
+        }
+    }
+
+    // ----- create --------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_empty_manager_when_create_sandbox_then_returns_info_with_uuid() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let info = mgr
+            .create(create_req("alpine:latest"))
+            .await
+            .expect("create should succeed");
+
+        // Assert: the daemon assigns a UUID and echoes the image back.
+        assert_eq!(info.id.len(), 36);
+        assert_eq!(info.image, "alpine:latest");
+        // SandboxStatus::Creating = 1 in the generated enum.
+        assert_eq!(info.status, crate::pb::SandboxStatus::Creating as i32);
+    }
+
+    #[tokio::test]
+    async fn given_invalid_image_when_create_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act: empty image violates the validator's non-empty rule.
+        let err = mgr
+            .create(create_req(""))
+            .await
+            .expect_err("empty image must be rejected");
+
+        // Assert: validation produces InvalidRequest so the gRPC layer
+        // maps it to InvalidArgument.
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_path_traversal_image_when_create_then_returns_invalid_request() {
+        // Arrange: regression guard for the path-traversal validator rule.
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .create(create_req("../../etc/passwd"))
+            .await
+            .expect_err("path traversal must be rejected");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_oversized_cpus_when_create_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act: 9999 cpus exceeds MAX_CPUS=64.
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            resources: Some(PbResourceLimits {
+                cpus: 9999,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = mgr.create(req).await.expect_err("over-cap cpus");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_group_mode_without_group_name_when_create_then_returns_invalid_request() {
+        // Arrange: CommunicationMode::Group requires a non-empty group string.
+        let mgr = build_manager(4);
+
+        // Act
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            comms: Some(PbCommunicationPolicy {
+                mode: PbCommunicationMode::Group as i32,
+                group: String::new(),
+            }),
+            ..Default::default()
+        };
+        let err = mgr.create(req).await.expect_err("group without name");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_manager_at_capacity_when_create_then_returns_invalid_request_with_limit() {
+        // Arrange: fill to capacity.
+        let mgr = build_manager(2);
+        mgr.create(create_req("alpine:1")).await.unwrap();
+        mgr.create(create_req("alpine:2")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .create(create_req("alpine:3"))
+            .await
+            .expect_err("third over cap");
+
+        // Assert: cap surfaces as InvalidRequest mentioning "limit" so
+        // users can grep their logs.
+        match err {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("limit"), "expected 'limit' in: {msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    // ----- get -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_created_sandbox_when_get_by_id_then_returns_same_info() {
+        // Arrange
+        let mgr = build_manager(4);
+        let created = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let fetched = mgr.get(&created.id).await.expect("get");
+
+        // Assert: id and image round-trip identically.
+        assert_eq!(fetched.id, created.id);
+        assert_eq!(fetched.image, created.image);
+    }
+
+    #[tokio::test]
+    async fn given_unknown_id_when_get_sandbox_then_returns_sandbox_not_found() {
+        // Arrange: well-formed UUID the manager has never seen.
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .get("00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("unknown id");
+
+        // Assert
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_id_when_get_sandbox_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act: non-hex characters fail validate::entity_id before lookup.
+        let err = mgr
+            .get("not-a-valid-uuid-zzzz")
+            .await
+            .expect_err("malformed id");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    // ----- list ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_empty_manager_when_list_then_returns_empty_vec() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let sandboxes = mgr.list().await.expect("list");
+
+        // Assert
+        assert!(sandboxes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_three_sandboxes_when_list_then_returns_all_three() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.create(create_req("alpine:a")).await.unwrap();
+        mgr.create(create_req("alpine:b")).await.unwrap();
+        mgr.create(create_req("alpine:c")).await.unwrap();
+
+        // Act
+        let mut sandboxes = mgr.list().await.expect("list");
+
+        // Assert: every image appears. Sort before compare because HashMap
+        // order is unspecified.
+        sandboxes.sort_by(|x, y| x.image.cmp(&y.image));
+        let images: Vec<&str> = sandboxes.iter().map(|s| s.image.as_str()).collect();
+        assert_eq!(images, vec!["alpine:a", "alpine:b", "alpine:c"]);
+    }
+
+    // ----- remove --------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_created_sandbox_when_remove_then_get_returns_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        mgr.remove(&s.id).await.expect("remove");
+
+        // Assert
+        let err = mgr.get(&s.id).await.expect_err("must be gone");
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_unknown_id_when_remove_sandbox_then_returns_sandbox_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .remove("00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("unknown id");
+
+        // Assert
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_removed_when_create_then_cap_slot_is_freed() {
+        // Arrange: regression for cap-counter bookkeeping. Fill the cap,
+        // remove one, then create one more.
+        let mgr = build_manager(2);
+        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
+        let _s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+
+        // Act
+        mgr.remove(&s1.id).await.unwrap();
+        let s3 = mgr.create(create_req("alpine:3")).await;
+
+        // Assert
+        assert!(s3.is_ok(), "removing a sandbox must free a cap slot");
+    }
+
+    // ----- conversion helpers --------------------------------------------
+
+    #[test]
+    fn given_pb_egress_unspecified_when_convert_then_protocol_is_deny() {
+        // Arrange: regression guard for the security default. If the
+        // Unspecified arm ever maps to anything but Deny, sandboxes that
+        // omitted an egress policy would silently get more access.
+        let pb = PbEgressPolicy {
+            mode: PbEgressMode::Unspecified as i32,
+            domains: vec![],
+        };
+
+        // Act
+        let result = pb_egress_to_protocol(pb);
+
+        // Assert
+        assert_eq!(result.mode, EgressPolicy::default().mode);
+        assert!(result.domains.is_empty());
+    }
+
+    #[test]
+    fn given_pb_egress_open_when_convert_then_protocol_is_open() {
+        // Arrange
+        let pb = PbEgressPolicy {
+            mode: PbEgressMode::Open as i32,
+            domains: vec!["ignored.example".into()],
+        };
+
+        // Act
+        let result = pb_egress_to_protocol(pb);
+
+        // Assert: domain list is carried through even though Open ignores it.
+        assert_eq!(result.mode, crate::protocol::EgressMode::Open);
+        assert_eq!(result.domains, vec!["ignored.example"]);
+    }
+
+    #[test]
+    fn given_pb_egress_allowlist_when_convert_then_domains_round_trip() {
+        // Arrange
+        let pb = PbEgressPolicy {
+            mode: PbEgressMode::Allowlist as i32,
+            domains: vec!["api.example.com".into(), "*.cdn.net".into()],
+        };
+
+        // Act
+        let result = pb_egress_to_protocol(pb);
+
+        // Assert
+        assert_eq!(result.mode, crate::protocol::EgressMode::Allowlist);
+        assert_eq!(result.domains, vec!["api.example.com", "*.cdn.net"]);
+    }
+
+    #[test]
+    fn given_pb_comms_unspecified_when_convert_then_protocol_is_deny() {
+        // Arrange: same security-default invariant as egress.
+        let pb = PbCommunicationPolicy {
+            mode: PbCommunicationMode::Unspecified as i32,
+            group: String::new(),
+        };
+
+        // Act
+        let result = pb_comms_to_protocol(pb);
+
+        // Assert
+        assert_eq!(result.mode, CommunicationMode::Deny);
+        assert!(result.group.is_none());
+    }
+
+    #[test]
+    fn given_pb_comms_group_with_name_when_convert_then_group_is_populated() {
+        // Arrange
+        let pb = PbCommunicationPolicy {
+            mode: PbCommunicationMode::Group as i32,
+            group: "build-team".into(),
+        };
+
+        // Act
+        let result = pb_comms_to_protocol(pb);
+
+        // Assert
+        assert_eq!(result.mode, CommunicationMode::Group);
+        assert_eq!(result.group.as_deref(), Some("build-team"));
+    }
+
+    #[test]
+    fn given_pb_comms_empty_group_when_convert_then_group_is_none() {
+        // Arrange: empty string group → None on the Rust side. Distinguishes
+        // "no group specified" from "group named empty-string".
+        let pb = PbCommunicationPolicy {
+            mode: PbCommunicationMode::Deny as i32,
+            group: String::new(),
+        };
+
+        // Act
+        let result = pb_comms_to_protocol(pb);
+
+        // Assert
+        assert!(result.group.is_none());
+    }
+
+    #[test]
+    fn given_pb_resources_when_convert_then_every_field_round_trips() {
+        // Arrange
+        let pb = PbResourceLimits {
+            cpus: 4,
+            memory_mb: 8192,
+            pids_max: 256,
+            timeout_seconds: 3600,
+        };
+
+        // Act
+        let result = pb_resources_to_protocol(pb);
+
+        // Assert: each numeric field is copied verbatim. No coercion, no
+        // implicit defaulting — the validator already vetted the bounds.
+        assert_eq!(result.cpus, 4);
+        assert_eq!(result.memory_mb, 8192);
+        assert_eq!(result.pids_max, 256);
+        assert_eq!(result.timeout_seconds, 3600);
     }
 }
