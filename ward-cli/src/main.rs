@@ -82,6 +82,17 @@ enum Commands {
         pid: String,
     },
 
+    /// Write bytes to a process's stdin.
+    Stdin {
+        /// Sandbox ID.
+        id: String,
+        /// Process ID returned by exec/run.
+        pid: String,
+        /// Inline data. Use `-` (or omit) to read from the user's stdin
+        /// instead — handy for piping file contents or interactive use.
+        data: Option<String>,
+    },
+
     /// Snapshot management subcommands.
     #[command(subcommand)]
     Snapshot(SnapshotCommands),
@@ -295,6 +306,33 @@ async fn main() -> anyhow::Result<()> {
                     println!("{kind}: {}", evt.line);
                 }
             }
+        }
+
+        Commands::Stdin { id, pid, data } => {
+            // Three input modes:
+            //   ward stdin <id> <pid> "literal"     -> send the literal bytes
+            //   ward stdin <id> <pid> -             -> read from CLI's stdin
+            //   ward stdin <id> <pid>               -> same as -
+            // Reading our own stdin via read_to_end is the conventional Unix
+            // shape: lets users pipe files or other commands without juggling
+            // shell quoting.
+            let bytes = match data.as_deref() {
+                Some(literal) if literal != "-" => literal.as_bytes().to_vec(),
+                _ => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    std::io::stdin().read_to_end(&mut buf)?;
+                    buf
+                }
+            };
+            let mut c = client::connect(&socket_path).await?;
+            c.write_stdin(ward_core::pb::WriteStdinRequest {
+                sandbox_id: id,
+                pid,
+                data: bytes,
+            })
+            .await?;
+            println!("wrote");
         }
 
         Commands::Snapshot(snap_cmd) => match snap_cmd {
