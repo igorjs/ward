@@ -124,9 +124,36 @@ impl Ward for WardGrpcServer {
 
     async fn stream_output(
         &self,
-        _request: Request<StreamOutputRequest>,
+        request: Request<StreamOutputRequest>,
     ) -> Result<Response<Self::StreamOutputStream>, Status> {
-        Err(Status::unimplemented("stream_output"))
+        let req = request.into_inner();
+
+        // Manager runs the entity_id validators on both fields and the
+        // cross-sandbox ownership check before handing over the receiver.
+        let mut inner_rx = self
+            .sandbox
+            .stream_output(&req.sandbox_id, &req.pid)
+            .await
+            .map_err(api_err_to_status)?;
+
+        // Bridge: drain protocol::StreamEvent on the manager side, convert
+        // to the pb shape, push into the tonic-typed channel. A dedicated
+        // task keeps the bridge cancellation-safe — if the client hangs up,
+        // the bound channel's send fails and the task exits cleanly,
+        // dropping the inner receiver and shutting the pipeline down.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, Status>>(16);
+        tokio::spawn(async move {
+            while let Some(evt) = inner_rx.recv().await {
+                let pb_evt = stream_event_to_pb(evt);
+                if out_tx.send(Ok(pb_evt)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
     }
 
     async fn write_stdin(
@@ -276,5 +303,41 @@ impl Ward for WardGrpcServer {
             backend: "krunvm".to_string(),
             arch: std::env::consts::ARCH.to_string(),
         }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Conversions
+// ---------------------------------------------------------------------------
+
+/// Translate an internal `protocol::StreamEvent` into the on-wire pb shape.
+/// `exit_code` is widened from `Option<i32>` to `i32` because protobuf has
+/// no native optional integer; callers distinguish "exit event" by checking
+/// the `r#type` field, not by sniffing the integer.
+fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
+    use crate::pb::StreamEventType;
+    use crate::protocol::StreamEventKind;
+
+    let r#type = match evt.kind {
+        StreamEventKind::Stdout => StreamEventType::Stdout,
+        StreamEventKind::Stderr => StreamEventType::Stderr,
+        StreamEventKind::Exit => StreamEventType::Exit,
+    } as i32;
+
+    let timestamp = evt
+        .timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| prost_types::Timestamp {
+            seconds: d.as_secs() as i64,
+            nanos: d.subsec_nanos() as i32,
+        });
+
+    StreamEvent {
+        r#type,
+        line: evt.line,
+        exit_code: evt.exit_code.unwrap_or(0),
+        timestamp,
+        duration_ms: evt.duration_ms,
     }
 }
