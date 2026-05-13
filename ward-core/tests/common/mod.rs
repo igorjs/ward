@@ -24,6 +24,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint, Server};
 
 use ward_core::backend::krunvm::KrunvmBackend;
+use ward_core::comms::Broker;
 use ward_core::grpc::WardGrpcServer;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::ward_server::WardServer;
@@ -56,7 +57,12 @@ pub async fn test_server() -> WardClient<Channel> {
     std::fs::create_dir_all(&data_dir).expect("create temp data dir");
 
     let backend = Arc::new(KrunvmBackend::new(data_dir.clone()));
-    let sandbox_mgr = Arc::new(SandboxManager::new(Arc::clone(&backend), 4));
+    let broker = Arc::new(Broker::new());
+    let sandbox_mgr = Arc::new(SandboxManager::new(
+        Arc::clone(&backend),
+        Arc::clone(&broker),
+        4,
+    ));
     let volume_mgr = Arc::new(VolumeManager::new(data_dir, 4));
     let service = WardGrpcServer::new(sandbox_mgr, volume_mgr);
 
