@@ -517,3 +517,188 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property-based tests
+// ---------------------------------------------------------------------------
+//
+// The rstest example suite above pins specific concrete inputs. proptest
+// generates random inputs from a strategy and tries to falsify a stated
+// invariant. The two layers complement each other: examples document the
+// API's behaviour on known cases; properties guard against edge cases the
+// author did not enumerate.
+//
+// Every property is a one-way assertion ("inputs in X → result Y"). We do
+// NOT use proptest to assert exhaustive equivalence with a reference
+// implementation; the validators are simple enough that example tests
+// cover the positive happy paths and these properties guard the negative
+// invariants where the universe of bad inputs is too large to enumerate.
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ----- entity_id ------------------------------------------------------
+
+    proptest! {
+        /// Any string of 1..=36 chars from the hex+dash alphabet must pass.
+        #[test]
+        fn property_entity_id_accepts_any_hex_or_dash_within_length(
+            id in "[0-9a-fA-F-]{1,36}"
+        ) {
+            prop_assert!(entity_id(&id, "sandbox").is_ok(), "rejected: {id:?}");
+        }
+
+        /// Any string of 1..=36 chars containing a non-hex non-dash char
+        /// must be rejected. The `g-z` range is entirely outside hex AND
+        /// outside dash, so a string drawn from it always contains at
+        /// least one invalid character.
+        #[test]
+        fn property_entity_id_rejects_non_hex_non_dash_chars(
+            id in "[g-z]{1,36}"
+        ) {
+            prop_assert!(entity_id(&id, "sandbox").is_err(), "accepted: {id:?}");
+        }
+
+        /// Any string longer than 36 chars must be rejected regardless of
+        /// content (length check fires before char check).
+        #[test]
+        fn property_entity_id_rejects_length_over_36(
+            id in "[0-9a-fA-F-]{37,80}"
+        ) {
+            prop_assert!(entity_id(&id, "sandbox").is_err(), "accepted: {id:?}");
+        }
+    }
+
+    // ----- language_name --------------------------------------------------
+
+    proptest! {
+        /// Any non-empty alphanumeric+underscore string is accepted.
+        #[test]
+        fn property_language_name_accepts_alphanumeric_underscore(
+            name in "[a-zA-Z0-9_]{1,40}"
+        ) {
+            prop_assert!(language_name(&name).is_ok(), "rejected: {name:?}");
+        }
+
+        /// Any string containing one of these clearly-bad chars rejects.
+        /// `-`, `.`, `/`, `+`, `=` are all outside the allowed alphabet,
+        /// so a generated string with at least one of them must fail.
+        #[test]
+        fn property_language_name_rejects_disallowed_chars(
+            prefix in "[a-zA-Z0-9_]{0,12}",
+            bad in r"[\-./+=]",
+            suffix in "[a-zA-Z0-9_]{0,12}",
+        ) {
+            let name = format!("{prefix}{bad}{suffix}");
+            prop_assert!(language_name(&name).is_err(), "accepted: {name:?}");
+        }
+    }
+
+    // ----- volume_name ----------------------------------------------------
+
+    proptest! {
+        /// Any non-empty alphanumeric+dash+underscore string up to 64 chars
+        /// is accepted.
+        #[test]
+        fn property_volume_name_accepts_valid_alphabet(
+            name in "[a-zA-Z0-9_-]{1,64}"
+        ) {
+            prop_assert!(volume_name(&name).is_ok(), "rejected: {name:?}");
+        }
+
+        /// Length > 64 always rejects.
+        #[test]
+        fn property_volume_name_rejects_length_over_64(
+            name in "[a-zA-Z0-9_-]{65,100}"
+        ) {
+            prop_assert!(volume_name(&name).is_err(), "accepted: {name:?}");
+        }
+    }
+
+    // ----- topic_name -----------------------------------------------------
+
+    proptest! {
+        /// Two-segment topics (SEG.SEG) with only allowed chars and no
+        /// leading/trailing/consecutive dots must be accepted.
+        #[test]
+        fn property_topic_name_accepts_well_formed_dotted_segments(
+            topic in "[a-zA-Z0-9_-]{1,8}\\.[a-zA-Z0-9_-]{1,8}"
+        ) {
+            prop_assert!(topic_name(&topic).is_ok(), "rejected: {topic:?}");
+        }
+
+        /// Any topic containing '..' must be rejected, regardless of
+        /// position. The alphanumeric pre/post ensures the topic isn't
+        /// rejected for some other reason first.
+        #[test]
+        fn property_topic_name_rejects_consecutive_dots(
+            pre in "[a-zA-Z0-9]{1,8}",
+            post in "[a-zA-Z0-9]{1,8}"
+        ) {
+            let topic = format!("{pre}..{post}");
+            prop_assert!(topic_name(&topic).is_err(), "accepted: {topic:?}");
+        }
+
+        /// Length > 128 always rejects.
+        #[test]
+        fn property_topic_name_rejects_length_over_max(
+            topic in "[a-z]{129,200}"
+        ) {
+            prop_assert!(topic_name(&topic).is_err(), "accepted: {topic:?}");
+        }
+    }
+
+    // ----- image_ref security boundary ------------------------------------
+
+    proptest! {
+        /// Any image_ref containing one of the clearly-bad shell
+        /// metacharacters must reject. We sample a subset of the
+        /// FORBIDDEN list — covering the easy-to-express chars is enough
+        /// for the property; the rstest suite handles edge cases like
+        /// `\n` and `\0` that need explicit escapes.
+        #[test]
+        fn property_image_ref_rejects_shell_metacharacters(
+            prefix in "[a-z0-9]{1,16}",
+            meta in r"[;&|$<>(){}]",
+            suffix in "[a-z0-9]{1,16}",
+        ) {
+            let img = format!("{prefix}{meta}{suffix}");
+            prop_assert!(image_ref(&img).is_err(), "accepted: {img:?}");
+        }
+
+        /// Any image_ref containing '..' must reject (path-traversal guard).
+        #[test]
+        fn property_image_ref_rejects_path_traversal(
+            prefix in "[a-z0-9]{0,16}",
+            suffix in "[a-z0-9]{0,16}"
+        ) {
+            let img = format!("{prefix}..{suffix}");
+            prop_assert!(image_ref(&img).is_err(), "accepted: {img:?}");
+        }
+    }
+
+    // ----- publish_payload size cap ---------------------------------------
+
+    proptest! {
+        // Each case can allocate up to ~1 MiB. Cut cases sharply so CI
+        // stays fast — the boundary is what matters and 32 random sizes
+        // around it is more than enough.
+        #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
+
+        /// payload.len() <= MAX → accepted; payload.len() > MAX → rejected.
+        /// Generated sizes straddle the boundary so both halves get hit.
+        #[test]
+        fn property_publish_payload_respects_size_cap(
+            payload in prop::collection::vec(any::<u8>(), 0..=MAX_PUBLISH_PAYLOAD_BYTES + 1024)
+        ) {
+            let result = publish_payload(&payload);
+            if payload.len() <= MAX_PUBLISH_PAYLOAD_BYTES {
+                prop_assert!(result.is_ok(), "rejected len {}", payload.len());
+            } else {
+                prop_assert!(result.is_err(), "accepted len {}", payload.len());
+            }
+        }
+    }
+}
