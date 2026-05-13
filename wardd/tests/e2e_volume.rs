@@ -236,3 +236,76 @@ fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_messag
     let _ = wardd.kill();
     let _ = wardd.wait();
 }
+
+#[test]
+fn given_volume_cap_reached_when_user_removes_one_then_create_succeeds_again() {
+    // Arrange: bespoke spawn with a tiny cap, fill it, then exercise the
+    // recovery path. The integration tier already covers this; the E2E
+    // tier locks in the equivalent flow through the CLI surface — slot
+    // accounting bugs that only show up across the wire are caught here.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let socket = data_dir.path().join("ward.sock");
+
+    let mut wardd = std::process::Command::cargo_bin("wardd")
+        .unwrap()
+        .env("WARD_SOCKET", &socket)
+        .env("WARD_DATA_DIR", data_dir.path())
+        .env("WARD_LOG_LEVEL", "warn")
+        .env("WARD_MAX_VOLUMES", "2")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn wardd");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !socket.exists() {
+        let _ = wardd.kill();
+        let _ = wardd.wait();
+        panic!("daemon did not bind");
+    }
+
+    let ward = || {
+        let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
+        cmd.env("WARD_SOCKET", &socket);
+        cmd
+    };
+
+    // Fill the cap and capture the first volume id for removal.
+    let first = ward()
+        .args(["volume", "create", "v1", "--size", "10"])
+        .output()
+        .expect("create");
+    assert!(first.status.success());
+    let first_id = std::str::from_utf8(&first.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("id: ").map(str::trim))
+        .expect("id line")
+        .to_string();
+
+    ward()
+        .args(["volume", "create", "v2", "--size", "10"])
+        .assert()
+        .success();
+    ward()
+        .args(["volume", "create", "v3", "--size", "10"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("limit"));
+
+    // Act: free a slot and retry.
+    ward().args(["volume", "remove", &first_id]).assert().success();
+    let assertion = ward()
+        .args(["volume", "create", "replacement", "--size", "10"])
+        .assert();
+
+    // Assert
+    assertion.success().stdout(predicate::str::contains("id: "));
+
+    let _ = wardd.kill();
+    let _ = wardd.wait();
+}
