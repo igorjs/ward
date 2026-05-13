@@ -227,3 +227,69 @@ fn given_max_sandboxes_is_two_when_user_creates_third_then_fails_with_limit_mess
     let _ = wardd.kill();
     let _ = wardd.wait();
 }
+
+#[test]
+fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() {
+    // Arrange: same bespoke spawn shape as the cap-hit test above. The
+    // unit + integration tiers already prove this via direct calls; this
+    // E2E layer locks in the full user-visible flow (CLI → wardd → manager)
+    // so a regression in slot accounting is caught at the contract that
+    // ships to users.
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let socket = data_dir.path().join("ward.sock");
+
+    let mut wardd = std::process::Command::cargo_bin("wardd")
+        .unwrap()
+        .env("WARD_SOCKET", &socket)
+        .env("WARD_DATA_DIR", data_dir.path())
+        .env("WARD_LOG_LEVEL", "warn")
+        .env("WARD_MAX_SANDBOXES", "2")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn wardd");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !socket.exists() {
+        let _ = wardd.kill();
+        let _ = wardd.wait();
+        panic!("daemon did not bind");
+    }
+
+    let ward = || {
+        let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
+        cmd.env("WARD_SOCKET", &socket);
+        cmd
+    };
+
+    // Fill the cap and capture the first sandbox id for removal.
+    let first = ward().args(["create", "alpine:1"]).output().expect("create");
+    assert!(first.status.success());
+    let first_id = std::str::from_utf8(&first.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("id: ").map(str::trim))
+        .expect("id line")
+        .to_string();
+
+    ward().args(["create", "alpine:2"]).assert().success();
+    ward()
+        .args(["create", "alpine:3"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("limit"));
+
+    // Act: remove the first and try again.
+    ward().args(["remove", &first_id]).assert().success();
+    let assertion = ward().args(["create", "alpine:replacement"]).assert();
+
+    // Assert: success — the removed slot must be available to a new create.
+    assertion.success().stdout(predicate::str::contains("id: "));
+
+    let _ = wardd.kill();
+    let _ = wardd.wait();
+}
