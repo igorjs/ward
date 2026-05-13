@@ -153,13 +153,50 @@ async fn main() -> anyhow::Result<()> {
             cpus,
             timeout,
         } => {
-            println!(
-                "TODO: create sandbox image={image} memory={memory}MiB cpus={cpus} timeout={timeout}s env={env:?}"
-            );
+            // Parse KEY=VALUE env strings into a HashMap. Splitting on the
+            // first '=' lets values themselves contain '=', which matters
+            // for tokens, URLs, and serialised JSON.
+            let env_map: std::collections::HashMap<String, String> = env
+                .iter()
+                .filter_map(|s| {
+                    s.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect();
+
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c
+                .create_sandbox(ward_core::pb::CreateSandboxRequest {
+                    image,
+                    resources: Some(ward_core::pb::ResourceLimits {
+                        cpus,
+                        memory_mb: memory,
+                        pids_max: 0, // 0 == "use daemon default"
+                        timeout_seconds: timeout,
+                    }),
+                    env: env_map,
+                    ..Default::default()
+                })
+                .await?
+                .into_inner();
+
+            // One field per line for grep-friendly E2E assertions.
+            println!("id: {}", resp.id);
+            println!("status: {}", status_name(resp.status));
+            println!("image: {}", resp.image);
+            if !resp.ip_address.is_empty() {
+                println!("ip_address: {}", resp.ip_address);
+            }
         }
 
         Commands::List => {
-            println!("TODO: list sandboxes");
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c.list_sandboxes(()).await?.into_inner();
+            // Tab-separated columns: id, status, image. Empty output means
+            // no sandboxes — same convention as `ward volume list`.
+            for s in resp.sandboxes {
+                println!("{}\t{}\t{}", s.id, status_name(s.status), s.image);
+            }
         }
 
         Commands::Exec {
@@ -187,7 +224,10 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Remove { id } => {
-            println!("TODO: remove sandbox {id}");
+            let mut c = client::connect(&socket_path).await?;
+            c.remove_sandbox(ward_core::pb::RemoveSandboxRequest { id: id.clone() })
+                .await?;
+            println!("removed: {id}");
         }
 
         Commands::Volume(vol_cmd) => match vol_cmd {
@@ -247,4 +287,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Convert a `SandboxStatus` enum value (passed across the wire as i32)
+/// into the lowercase status name the CLI prints. Unknown values map to
+/// `"unspecified"` rather than panicking, so a newer daemon with an
+/// added status variant still produces readable (if unfamiliar) output.
+fn status_name(status: i32) -> &'static str {
+    use ward_core::pb::SandboxStatus;
+    match SandboxStatus::try_from(status).unwrap_or(SandboxStatus::Unspecified) {
+        SandboxStatus::Creating => "creating",
+        SandboxStatus::Running => "running",
+        SandboxStatus::Stopped => "stopped",
+        SandboxStatus::Failed => "failed",
+        SandboxStatus::Unspecified => "unspecified",
+    }
 }
