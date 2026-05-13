@@ -2,6 +2,9 @@
 
 //! ward – command-line interface to the Ward daemon.
 
+mod client;
+mod socket;
+
 use clap::{Parser, Subcommand};
 
 // ---------------------------------------------------------------------------
@@ -140,8 +143,7 @@ enum VolumeCommands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // TODO: establish gRPC channel to the daemon socket.
-    let _socket = cli.socket.unwrap_or_else(default_socket);
+    let socket_path = cli.socket.unwrap_or_else(socket::default_socket);
 
     match cli.command {
         Commands::Create {
@@ -201,44 +203,24 @@ async fn main() -> anyhow::Result<()> {
         },
 
         Commands::Health => {
-            println!("TODO: get health");
+            // Connect, call GetHealth, render plain-text output so E2E
+            // tests can grep simple fields without parsing structured output.
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c.get_health(()).await?.into_inner();
+            println!("status: {}", resp.status);
+            println!("uptime_seconds: {}", resp.uptime_seconds);
+            println!("sandbox_count: {}", resp.sandbox_count);
         }
 
         Commands::Info => {
-            println!("TODO: get info");
+            let mut c = client::connect(&socket_path).await?;
+            let resp = c.get_info(()).await?.into_inner();
+            println!("version: {}", resp.version);
+            println!("platform: {}", resp.platform);
+            println!("arch: {}", resp.arch);
+            println!("backend: {}", resp.backend);
         }
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn default_socket() -> String {
-    if let Ok(v) = std::env::var("WARD_SOCKET") {
-        return v;
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{home}/.ward/ward.sock")
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
-            format!("{xdg}/ward/ward.sock")
-        } else {
-            let user = std::env::var("USER").unwrap_or_else(|_| "ward".to_string());
-            format!("/tmp/ward-{user}/ward.sock")
-        }
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        "/tmp/ward.sock".to_string()
-    }
 }
