@@ -192,13 +192,37 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Volume(vol_cmd) => match vol_cmd {
             VolumeCommands::Create { name, size } => {
-                println!("TODO: create volume name={name} size={size}MiB");
+                let mut c = client::connect(&socket_path).await?;
+                let resp = c
+                    .create_volume(ward_core::pb::CreateVolumeRequest {
+                        name,
+                        size_mb: size,
+                    })
+                    .await?
+                    .into_inner();
+                // One field per line so E2E tests can grep without parsing
+                // structured output. Same convention as `ward info`.
+                println!("id: {}", resp.id);
+                println!("name: {}", resp.name);
+                println!("size_mb: {}", resp.size_mb);
+                println!("mount_path: {}", resp.mount_path);
             }
             VolumeCommands::List => {
-                println!("TODO: list volumes");
+                let mut c = client::connect(&socket_path).await?;
+                let resp = c.list_volumes(()).await?.into_inner();
+                // Tab-separated columns: stable for `awk` / `cut` in scripts.
+                // Empty output (no volumes) is the convention for "list found
+                // nothing"; users distinguish "no volumes" from "command failed"
+                // via the exit code, not by parsing stdout text.
+                for v in resp.volumes {
+                    println!("{}\t{}\t{}MiB", v.id, v.name, v.size_mb);
+                }
             }
             VolumeCommands::Remove { id } => {
-                println!("TODO: remove volume {id}");
+                let mut c = client::connect(&socket_path).await?;
+                c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
+                    .await?;
+                println!("removed: {id}");
             }
         },
 
