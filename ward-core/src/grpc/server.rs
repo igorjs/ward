@@ -158,9 +158,14 @@ impl Ward for WardGrpcServer {
 
     async fn write_stdin(
         &self,
-        _request: Request<WriteStdinRequest>,
+        request: Request<WriteStdinRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("write_stdin"))
+        let req = request.into_inner();
+        self.sandbox
+            .write_stdin(&req.sandbox_id, &req.pid, bytes::Bytes::from(req.data))
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
     }
 
     async fn kill_process(
