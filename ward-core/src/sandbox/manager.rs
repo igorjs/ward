@@ -237,6 +237,55 @@ impl SandboxManager {
     }
 
     // -----------------------------------------------------------------------
+    // Snapshots
+    // -----------------------------------------------------------------------
+
+    /// Take a snapshot of an existing sandbox. The label is free-form
+    /// (empty is allowed); callers use it to remember what the snapshot
+    /// represents.
+    pub async fn create_snapshot(
+        &self,
+        sandbox_id: &str,
+        label: &str,
+    ) -> Result<crate::protocol::SnapshotInfo> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        self.backend
+            .create_snapshot(sandbox_id, label)
+            .await
+            .map_err(backend_err)
+    }
+
+    /// Restore a sandbox from one of its snapshots. The backend rejects
+    /// cross-sandbox restore as NotFound; we translate that to
+    /// SnapshotNotFound here so the gRPC layer maps it to "snapshot not
+    /// found" rather than "sandbox not found" — the user's mental model
+    /// is "the snapshot doesn't exist for this sandbox", which is true
+    /// either way.
+    pub async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        crate::validate::entity_id(snapshot_id, "snapshot")?;
+        self.backend
+            .restore_snapshot(sandbox_id, snapshot_id)
+            .await
+            .map_err(|e| match e {
+                BackendError::NotFound(id) => ApiError::SnapshotNotFound(id),
+                other => ApiError::Backend(other.to_string()),
+            })
+    }
+
+    /// List all snapshots taken from a given sandbox.
+    pub async fn list_snapshots(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Vec<crate::protocol::SnapshotInfo>> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        self.backend
+            .list_snapshots(sandbox_id)
+            .await
+            .map_err(backend_err)
+    }
+
+    // -----------------------------------------------------------------------
     // Process execution
     // -----------------------------------------------------------------------
 
@@ -1444,6 +1493,90 @@ mod tests {
             .kill_process(&s.id, "not-hex-zzz")
             .await
             .expect_err("malformed pid");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    // ----- snapshots: error mapping at the manager boundary --------------
+
+    #[tokio::test]
+    async fn given_existing_sandbox_when_create_snapshot_then_returns_info() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let snap = mgr
+            .create_snapshot(&s.id, "checkpoint")
+            .await
+            .expect("create_snapshot");
+
+        // Assert
+        assert_eq!(snap.snapshot_id.len(), 36);
+        assert_eq!(snap.sandbox_id, s.id);
+        assert_eq!(snap.label, "checkpoint");
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_create_snapshot_then_sandbox_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .create_snapshot("00000000-0000-0000-0000-000000000000", "x")
+            .await
+            .expect_err("unknown sandbox");
+
+        // Assert: NOT SnapshotNotFound — the missing entity is the sandbox.
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_unknown_snapshot_when_restore_then_snapshot_not_found() {
+        // Arrange: regression for the per-call error mapping override —
+        // backend returns NotFound(snapshot_id) which the manager must
+        // translate to SnapshotNotFound (not SandboxNotFound).
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .restore_snapshot(&s.id, "00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("unknown snapshot");
+
+        // Assert
+        assert!(
+            matches!(err, ApiError::SnapshotNotFound(_)),
+            "expected SnapshotNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_no_snapshots_when_list_then_returns_empty_vec() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let snaps = mgr.list_snapshots(&s.id).await.unwrap();
+
+        // Assert
+        assert!(snaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_malformed_sandbox_id_when_create_snapshot_then_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .create_snapshot("not-hex-zzz", "x")
+            .await
+            .expect_err("malformed");
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
