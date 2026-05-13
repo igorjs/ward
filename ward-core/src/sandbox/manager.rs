@@ -47,14 +47,16 @@ struct SandboxEntry {
 // Per-process tracking entry
 // ---------------------------------------------------------------------------
 
-/// State held for each process spawned via exec/run. The receiver is wrapped
-/// in `Mutex<Option<...>>` so the first `stream_output` call can take it; a
-/// second call sees `None` and returns InvalidRequest. Treating streams as
-/// single-consumer matches the gRPC server-streaming contract — clients fan
-/// out at the consumer side, not by re-opening the stream.
+/// State held for each process spawned via exec/run. The output receiver is
+/// wrapped in `Mutex<Option<...>>` so the first `stream_output` call can take
+/// it; a second call sees `None` and returns InvalidRequest. The stdin
+/// sender is plain `Option<Sender>` because Sender is Clone — many concurrent
+/// WriteStdin calls can share it. `None` represents a process that doesn't
+/// accept stdin at all (real backend may produce these).
 struct ProcessRecord {
     sandbox_id: String,
     output_rx: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
+    stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,14 +236,14 @@ impl SandboxManager {
             .await
             .map_err(backend_err)?;
 
-        // Park the output channel under the pid so a later StreamOutput call
-        // can take it. The stdin_tx side is dropped here — exec doesn't take
-        // stdin in this API surface; WriteStdin is a separate RPC and will
-        // grow its own bookkeeping when implemented.
+        // Park both channels under the pid: StreamOutput takes the receiver,
+        // WriteStdin uses the sender. Either may be None if the backend
+        // produced a process without that channel attached.
         let pid = handle.pid.clone();
         let record = ProcessRecord {
             sandbox_id: req.sandbox_id.clone(),
             output_rx: Mutex::new(handle.output_rx),
+            stdin_tx: handle.stdin_tx,
         };
         self.processes.write().await.insert(pid.clone(), record);
 
@@ -282,6 +284,44 @@ impl SandboxManager {
             .await
             .take()
             .ok_or_else(|| ApiError::InvalidRequest("output stream already consumed".into()))
+    }
+
+    /// Forward bytes to a running process's stdin.
+    ///
+    /// Returns ProcessNotFound if the pid is unknown, scoped to a different
+    /// sandbox, or no longer accepting input (channel closed). Empty data
+    /// is a valid no-op — callers occasionally use it as a connectivity
+    /// probe before streaming real input.
+    pub async fn write_stdin(
+        &self,
+        sandbox_id: &str,
+        pid: &str,
+        data: bytes::Bytes,
+    ) -> Result<()> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        crate::validate::entity_id(pid, "process")?;
+
+        let guard = self.processes.read().await;
+        let record = guard
+            .get(pid)
+            .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
+        if record.sandbox_id != sandbox_id {
+            return Err(ApiError::ProcessNotFound(pid.to_string()));
+        }
+
+        let tx = record.stdin_tx.as_ref().ok_or_else(|| {
+            ApiError::InvalidRequest("process does not accept stdin".into())
+        })?;
+
+        // Send failure means the consumer side dropped — the process is
+        // effectively gone from the user's perspective. Surfacing as
+        // ProcessNotFound keeps callers from special-casing "closed-mid-
+        // write" separately from "unknown pid".
+        tx.send(data)
+            .await
+            .map_err(|_| ApiError::ProcessNotFound(pid.to_string()))?;
+
+        Ok(())
     }
 
     /// Run a language snippet inside a sandbox.
@@ -1123,5 +1163,116 @@ mod tests {
 
         // Assert
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    // ----- write_stdin ---------------------------------------------------
+
+    #[tokio::test]
+    async fn given_exec_when_write_stdin_then_send_succeeds() {
+        // Arrange: stub backend installs a drain task on stdin_rx, so a
+        // send always succeeds for the lifetime of the ProcessRecord.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let result = mgr
+            .write_stdin(&s.id, &proc.pid, bytes::Bytes::from_static(b"hello\n"))
+            .await;
+
+        // Assert
+        assert!(result.is_ok(), "write_stdin should succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn given_exec_when_write_empty_stdin_then_succeeds() {
+        // Arrange: empty data is a valid no-op send — sometimes used as
+        // a connectivity probe. The validator must not reject it.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let result = mgr.write_stdin(&s.id, &proc.pid, bytes::Bytes::new()).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_unknown_pid_when_write_stdin_then_process_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .write_stdin(
+                &s.id,
+                "00000000-0000-0000-0000-000000000000",
+                bytes::Bytes::from_static(b"x"),
+            )
+            .await
+            .expect_err("unknown pid");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_pid_owned_by_other_sandbox_when_write_stdin_then_process_not_found() {
+        // Arrange: tenant isolation regression guard — writing to a pid
+        // that belongs to a different sandbox must fail as if the pid
+        // didn't exist, not leak its existence.
+        let mgr = build_manager(4);
+        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s1.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let err = mgr
+            .write_stdin(&s2.id, &proc.pid, bytes::Bytes::from_static(b"x"))
+            .await
+            .expect_err("cross-sandbox");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_pid_when_write_stdin_then_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act: 'z' is not hex.
+        let err = mgr
+            .write_stdin(&s.id, "not-hex-zzz", bytes::Bytes::from_static(b"x"))
+            .await
+            .expect_err("malformed pid");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
     }
 }
