@@ -6,6 +6,7 @@ pub mod egress;
 pub mod grpc;
 pub mod protocol;
 pub mod sandbox;
+pub mod validate;
 pub mod volume;
 
 /// Generated protobuf types and gRPC service traits.
