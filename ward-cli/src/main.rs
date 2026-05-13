@@ -109,6 +109,27 @@ enum Commands {
     #[command(subcommand)]
     Volume(VolumeCommands),
 
+    /// Publish a message to a pub/sub topic from a sandbox.
+    Publish {
+        /// Sandbox ID this message is published as.
+        sandbox_id: String,
+        /// Topic name (e.g. "agent.results.build"). Dotted segments are
+        /// allowed, no leading/trailing/repeat dots.
+        topic: String,
+        /// Inline payload. For binary or stdin payloads, future flags
+        /// (`--file`, `-`) will route bytes here.
+        #[arg(default_value = "")]
+        payload: String,
+    },
+
+    /// Subscribe to a pub/sub topic. Streams messages until interrupted.
+    Subscribe {
+        /// Sandbox ID this subscription belongs to.
+        sandbox_id: String,
+        /// Topic name to subscribe to.
+        topic: String,
+    },
+
     /// Show daemon health.
     Health,
 
@@ -265,6 +286,41 @@ async fn main() -> anyhow::Result<()> {
                 println!("removed: {id}");
             }
         },
+
+        Commands::Publish {
+            sandbox_id,
+            topic,
+            payload,
+        } => {
+            let mut c = client::connect(&socket_path).await?;
+            c.publish(ward_core::pb::PublishRequest {
+                sandbox_id,
+                topic,
+                payload: payload.into_bytes(),
+            })
+            .await?;
+            println!("published");
+        }
+
+        Commands::Subscribe { sandbox_id, topic } => {
+            // Subscribe is server-streaming. We drain the stream and print
+            // each message until the user hits Ctrl-C or the daemon ends
+            // the stream. Until the broker is implemented, the daemon
+            // returns Unimplemented before any messages flow.
+            let mut c = client::connect(&socket_path).await?;
+            let mut stream = c
+                .subscribe(ward_core::pb::SubscribeRequest { sandbox_id, topic })
+                .await?
+                .into_inner();
+
+            while let Some(msg) = stream.message().await? {
+                // One message per block, fields prefixed for grep-ability.
+                println!("topic: {}", msg.topic);
+                println!("from_sandbox: {}", msg.from_sandbox);
+                println!("payload: {}", String::from_utf8_lossy(&msg.payload));
+                println!("---");
+            }
+        }
 
         Commands::Health => {
             // Connect, call GetHealth, render plain-text output so E2E
