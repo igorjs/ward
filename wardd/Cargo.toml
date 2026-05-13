@@ -18,3 +18,14 @@ tower = "0.5"
 hyper-util = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+# Spawn the compiled `ward` CLI binary and assert on its stdout / stderr /
+# exit code. `cargo_bin("ward")` resolves to the workspace-built binary.
+assert_cmd = "2"
+# Composable matchers for assert_cmd's stdout/stderr assertions
+# (str::contains, ends_with, regex, etc.).
+predicates = "3"
+# Per-test temp dirs that self-clean on drop. Used for per-test socket
+# paths and data dirs so E2E tests do not share state.
+tempfile = "3"
