@@ -8,13 +8,13 @@ use tracing::error;
 
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest,
-    DaemonInfo, EgressLogResponse, ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest,
-    GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
-    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest,
-    SandboxInfo, SnapshotInfo, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo,
-    WriteStdinRequest,
+    CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest,
+    CreateVolumeRequest, DaemonInfo, EgressLogResponse, ExecRequest, GetCommunicationLogRequest,
+    GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
+    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
+    Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
+    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StreamEvent,
+    StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -259,12 +259,20 @@ impl Ward for WardGrpcServer {
 
     async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        // Validate at the boundary so malformed requests fail fast with a
-        // distinct status code, even before the broker is implemented.
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
         crate::validate::publish_payload(&req.payload).map_err(api_err_to_status)?;
-        Err(Status::unimplemented("publish"))
+
+        // Delivery count is discarded by the proto (response is Empty) —
+        // callers learn about fan-out via GetCommunicationLog. Errors
+        // here cover Deny policy (InvalidArgument) and unregistered
+        // sandbox (NotFound).
+        self.sandbox
+            .broker()
+            .publish(&req.sandbox_id, &req.topic, bytes::Bytes::from(req.payload))
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
     }
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
@@ -276,7 +284,32 @@ impl Ward for WardGrpcServer {
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
-        Err(Status::unimplemented("subscribe"))
+
+        let mut inner_rx = self
+            .sandbox
+            .broker()
+            .subscribe(&req.sandbox_id, &req.topic)
+            .await
+            .map_err(api_err_to_status)?;
+
+        // Bridge: drain DeliveredMessage on the broker side, convert to
+        // the pb shape, push into the tonic-typed channel. Same cancellation
+        // model as StreamOutput — client hangup closes out_tx, the bridge
+        // task exits, inner_rx drops, broker reaps the subscription on its
+        // next publish.
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<Message, Status>>(16);
+        tokio::spawn(async move {
+            while let Some(msg) = inner_rx.recv().await {
+                let pb_msg = delivered_message_to_pb(msg);
+                if out_tx.send(Ok(pb_msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
     }
 
     async fn get_communication_log(
@@ -285,7 +318,12 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<CommunicationLogResponse>, Status> {
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-        Err(Status::unimplemented("get_communication_log"))
+
+        let entries = self.sandbox.broker().log(&req.sandbox_id).await;
+        let pb_entries = entries.into_iter().map(log_entry_to_pb).collect();
+        Ok(Response::new(CommunicationLogResponse {
+            entries: pb_entries,
+        }))
     }
 
     async fn get_health(&self, _request: Request<()>) -> Result<Response<HealthStatus>, Status> {
@@ -349,5 +387,38 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
         exit_code: evt.exit_code.unwrap_or(0),
         timestamp,
         duration_ms: evt.duration_ms,
+    }
+}
+
+/// Convert a SystemTime into a protobuf Timestamp. Returns None for
+/// pre-epoch values (which shouldn't happen in practice but we handle
+/// gracefully rather than panic).
+fn system_time_to_pb(ts: std::time::SystemTime) -> Option<prost_types::Timestamp> {
+    ts.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| prost_types::Timestamp {
+            seconds: d.as_secs() as i64,
+            nanos: d.subsec_nanos() as i32,
+        })
+}
+
+/// Translate a broker DeliveredMessage into the pb Message wire shape.
+fn delivered_message_to_pb(msg: crate::comms::DeliveredMessage) -> Message {
+    Message {
+        topic: msg.topic,
+        from_sandbox: msg.from_sandbox,
+        payload: msg.payload.to_vec(),
+        timestamp: system_time_to_pb(msg.timestamp),
+    }
+}
+
+/// Translate a broker LogEntry into the pb CommunicationLogEntry wire shape.
+fn log_entry_to_pb(entry: crate::comms::LogEntry) -> CommunicationLogEntry {
+    CommunicationLogEntry {
+        from_sandbox: entry.from_sandbox,
+        topic: entry.topic,
+        allowed: entry.allowed,
+        subscriber_count: entry.subscriber_count,
+        timestamp: system_time_to_pb(entry.timestamp),
     }
 }

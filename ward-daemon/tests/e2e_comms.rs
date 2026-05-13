@@ -2,16 +2,18 @@
 
 //! E2E scenarios for `ward publish` and `ward subscribe`.
 //!
-//! The broker is unimplemented in the daemon today; these scenarios
-//! validate the user-facing contract while the broker is built:
+//! The broker is wired end-to-end; the gRPC layer routes through
+//! `SandboxManager::broker()` which holds per-sandbox CommunicationPolicy.
 //!
-//!   1. Bad inputs (`.bad-topic`, empty topic) get an InvalidArgument
-//!      error message that mentions the offending field.
-//!   2. Valid inputs surface as an "unimplemented" error — the user is
-//!      told the feature isn't there yet, not that their input was bad.
+//! Scope of this file (validation + lifecycle, no two-sandbox fan-out):
 //!
-//! When the broker lands, this file expands with publish-then-receive
-//! scenarios. The negative-path coverage stays in place.
+//!   1. Bad inputs (`.bad-topic`, empty topic) get a validation error
+//!      that mentions the offending field.
+//!   2. Valid inputs against an unregistered sandbox surface as
+//!      "NotFound" — the broker doesn't know that sandbox.
+//!
+//! The positive cross-sandbox fan-out E2E lives separately and depends
+//! on the `--comms-mode` / `--comms-group` CLI flags landing first.
 
 mod common;
 
@@ -57,11 +59,10 @@ fn given_running_daemon_when_user_publishes_with_empty_topic_then_fails() {
 }
 
 #[test]
-fn given_running_daemon_when_user_publishes_with_valid_args_then_fails_with_unimplemented() {
-    // Arrange: this is the "broker stub contract" test at the E2E layer.
-    // A well-formed publish must surface as "unimplemented" rather than
-    // a validation error, so users know the broker is missing rather
-    // than thinking their input is bad.
+fn given_running_daemon_when_user_publishes_for_unregistered_sandbox_then_not_found() {
+    // Arrange: well-formed publish, but the sandbox id is not registered
+    // with the broker (no `ward create` ran). The broker returns
+    // SandboxNotFound; the CLI surfaces the gRPC NotFound status.
     let daemon = common::Daemon::spawn();
 
     // Act
@@ -70,13 +71,11 @@ fn given_running_daemon_when_user_publishes_with_valid_args_then_fails_with_unim
         .args(["publish", "deadbeef", "agent.results.build", "hello"])
         .assert();
 
-    // Assert: non-zero exit, stderr contains the "Unimplemented" status.
-    // When the broker lands, this test becomes the regression guard that
-    // confirms it ALSO accepts valid inputs (just with a different
-    // success criterion).
+    // Assert: stderr names the offending sandbox id so users can grep
+    // CI logs and immediately spot what's missing.
     assertion
         .failure()
-        .stderr(predicate::str::contains("Unimplemented"));
+        .stderr(predicate::str::contains("deadbeef"));
 }
 
 // ---------------------------------------------------------------------------
@@ -99,8 +98,9 @@ fn given_running_daemon_when_user_subscribes_with_empty_topic_then_fails() {
 }
 
 #[test]
-fn given_running_daemon_when_user_subscribes_with_valid_args_then_fails_with_unimplemented() {
-    // Arrange
+fn given_running_daemon_when_user_subscribes_for_unregistered_sandbox_then_not_found() {
+    // Arrange: symmetric with the publish case — unregistered sandbox
+    // surfaces as NotFound on subscribe too.
     let daemon = common::Daemon::spawn();
 
     // Act
@@ -110,5 +110,5 @@ fn given_running_daemon_when_user_subscribes_with_valid_args_then_fails_with_uni
     // Assert
     assertion
         .failure()
-        .stderr(predicate::str::contains("Unimplemented"));
+        .stderr(predicate::str::contains("deadbeef"));
 }
