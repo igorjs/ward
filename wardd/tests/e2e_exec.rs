@@ -296,3 +296,80 @@ fn given_unknown_pid_when_user_writes_stdin_then_fails_with_not_found() {
         .failure()
         .stderr(predicate::str::contains(unknown_pid));
 }
+
+// ---------------------------------------------------------------------------
+// Feature: kill
+// ---------------------------------------------------------------------------
+
+#[test]
+fn given_exec_when_user_runs_kill_then_succeeds_and_subsequent_stdin_fails() {
+    // Arrange: exec gives us a pid; kill removes it; a follow-up stdin
+    // write must fail because the ProcessRecord is gone. This is the
+    // user-visible idempotency contract.
+    let daemon = common::Daemon::spawn();
+    let create_out = daemon
+        .cli()
+        .args(["create", "alpine"])
+        .output()
+        .expect("create");
+    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let exec_out = daemon
+        .cli()
+        .args(["exec", &id, "--", "cat"])
+        .output()
+        .expect("exec");
+    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
+
+    // Act: kill succeeds and prints the killed pid for grep-friendly logs.
+    daemon
+        .cli()
+        .args(["kill", &id, &pid])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("killed: "));
+
+    // Follow-up write_stdin must fail — the pid is no longer addressable.
+    daemon
+        .cli()
+        .args(["stdin", &id, &pid, "x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(&pid));
+}
+
+#[test]
+fn given_unknown_pid_when_user_runs_kill_then_fails_with_not_found() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+    let unknown_pid = "00000000-0000-0000-0000-000000000000";
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["kill", unknown_pid, unknown_pid]).assert();
+
+    // Assert: stderr echoes the offending pid.
+    assertion
+        .failure()
+        .stderr(predicate::str::contains(unknown_pid));
+}
+
+#[test]
+fn given_malformed_pid_when_user_runs_kill_then_fails_with_clear_error() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+
+    // Act: 'z' is not hex.
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args([
+            "kill",
+            "00000000-0000-0000-0000-000000000000",
+            "not-hex-zzz",
+        ])
+        .assert();
+
+    // Assert: validator names the offending field.
+    assertion
+        .failure()
+        .stderr(predicate::str::contains("process"));
+}
