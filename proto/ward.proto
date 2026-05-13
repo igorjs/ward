@@ -37,6 +37,11 @@ service Ward {
   // Egress
   rpc GetEgressLog(GetEgressLogRequest) returns (EgressLogResponse);
 
+  // Cross-sandbox communication (pub/sub bus, daemon-mediated)
+  rpc Publish(PublishRequest) returns (google.protobuf.Empty);
+  rpc Subscribe(SubscribeRequest) returns (stream Message);
+  rpc GetCommunicationLog(GetCommunicationLogRequest) returns (CommunicationLogResponse);
+
   // Health
   rpc GetHealth(google.protobuf.Empty) returns (HealthStatus);
   rpc GetInfo(google.protobuf.Empty) returns (DaemonInfo);
@@ -54,6 +59,7 @@ message CreateSandboxRequest {
   ResourceLimits resources = 5;
   map<string, string> env = 6;
   string from_snapshot = 7;  // optional: create from snapshot ID
+  CommunicationPolicy comms = 8;  // cross-sandbox pub/sub access
 }
 
 message GetSandboxRequest {
@@ -260,4 +266,64 @@ message DaemonInfo {
   string platform = 2;
   string backend = 3;
   string arch = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-sandbox communication messages
+//
+// Sandboxes communicate via a daemon-mediated pub/sub bus. The daemon is the
+// broker for every message: this preserves the isolation boundary, allows
+// auditing (every publish is logged), and lets policy be enforced at the
+// hub rather than trusting each sandbox runtime.
+// ---------------------------------------------------------------------------
+
+// Communication policy declared at sandbox creation. Default mode is DENY:
+// the sandbox cannot publish or subscribe to any topic. GROUP mode opts the
+// sandbox into a named group; sandboxes sharing the same group name can
+// exchange messages.
+message CommunicationPolicy {
+  CommunicationMode mode = 1;
+  // Required when mode is GROUP. Treated as opaque identifier; sandboxes
+  // with identical group strings see each other's messages.
+  string group = 2;
+}
+
+enum CommunicationMode {
+  COMMUNICATION_MODE_UNSPECIFIED = 0;
+  COMMUNICATION_MODE_DENY = 1;
+  COMMUNICATION_MODE_GROUP = 2;
+}
+
+message PublishRequest {
+  string sandbox_id = 1;
+  string topic = 2;
+  bytes payload = 3;
+}
+
+message SubscribeRequest {
+  string sandbox_id = 1;
+  string topic = 2;
+}
+
+message Message {
+  string topic = 1;
+  string from_sandbox = 2;
+  bytes payload = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+message GetCommunicationLogRequest {
+  string sandbox_id = 1;
+}
+
+message CommunicationLogResponse {
+  repeated CommunicationLogEntry entries = 1;
+}
+
+message CommunicationLogEntry {
+  string from_sandbox = 1;
+  string topic = 2;
+  bool allowed = 3;
+  uint32 subscriber_count = 4;
+  google.protobuf.Timestamp timestamp = 5;
 }
