@@ -2,7 +2,6 @@
 
 //! Ward daemon – serves the gRPC API over a Unix socket.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use tonic::transport::Server;
@@ -16,7 +15,7 @@ use ward_core::sandbox::SandboxManager;
 use ward_core::volume::VolumeManager;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cfg = Config::from_env();
 
     // Initialise structured logging.
@@ -31,9 +30,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Ensure required directories exist.
-    cfg.ensure_dirs().map_err(|e| {
-        anyhow::anyhow!("failed to create directories: {}", e)
-    })?;
+    cfg.ensure_dirs()?;
 
     // Remove a stale socket file from a previous run.
     if cfg.socket_path.exists() {
@@ -80,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
 /// Resolves when SIGTERM is received (Unix only).
 #[cfg(unix)]
 async fn sigterm() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut stream = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     stream.recv().await;
 }

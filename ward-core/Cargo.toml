@@ -2,19 +2,25 @@
 name = "ward-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+krunvm = ["dep:krun-sys"]
+
 [dependencies]
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-krun-sys = "0.1"
-oci-distribution = "0.11"
+krun-sys = { version = "1.10", optional = true }
 prost = "0.13"
 prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 tonic = "0.12"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

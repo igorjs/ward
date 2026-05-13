@@ -9,6 +9,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Igor <igor@igorjs.dev>"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/igorjs/ward"
