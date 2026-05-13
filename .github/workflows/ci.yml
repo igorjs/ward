@@ -109,3 +109,65 @@ jobs:
           tool: cargo-deny
       - name: cargo deny
         run: cargo deny check
+
+  # ── Code coverage ───────────────────────────────────────────────────
+  # Uses cargo-llvm-cov (LLVM source-based instrumentation) which is the
+  # most accurate coverage tool for Rust and what the Rust project itself
+  # uses. Covers unit tests + ward-core integration tests; E2E coverage
+  # would require instrumenting subprocesses, deferred for now.
+  #
+  # Output appears on the workflow run page as a Job Summary so the
+  # coverage delta is visible on every PR without an external service.
+  # The lcov report is also uploaded as an artifact for offline analysis.
+  coverage:
+    needs: [clippy]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - name: Run tests with coverage instrumentation
+        # --no-report runs the test suite under coverage but defers report
+        # generation. This lets us emit multiple output formats (lcov for
+        # artifacts, text summary for the Job Summary) from a single test
+        # run, rather than recompiling and re-running for each format.
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov \
+            --no-report \
+            --workspace \
+            --exclude wardd \
+            --lib \
+            --tests
+      - name: Generate lcov report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate text summary
+        # --summary-only emits a per-file + total table to stdout. We
+        # capture it both as a file (for the Job Summary block below) and
+        # echo it so the raw output is visible in the CI log.
+        run: cargo llvm-cov report --summary-only | tee coverage-summary.txt
+      - name: Write GitHub Job Summary
+        run: |
+          {
+            echo "## Code Coverage"
+            echo ""
+            echo "Tool: \`cargo-llvm-cov\` (LLVM source-based instrumentation)"
+            echo "Scope: unit + ward-core integration tests (E2E excluded)"
+            echo ""
+            echo '```'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload lcov report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          retention-days: 14
