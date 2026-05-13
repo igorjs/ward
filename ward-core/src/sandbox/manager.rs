@@ -286,6 +286,42 @@ impl SandboxManager {
             .ok_or_else(|| ApiError::InvalidRequest("output stream already consumed".into()))
     }
 
+    /// Signal a process to terminate and drop its bookkeeping.
+    ///
+    /// Two steps: the backend is asked to signal (no-op in stub mode), then
+    /// the ProcessRecord is removed from the map so its channels drop. From
+    /// the user's perspective the pid disappears: subsequent stream_output,
+    /// write_stdin, and kill_process calls all return ProcessNotFound.
+    pub async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()> {
+        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        crate::validate::entity_id(pid, "process")?;
+
+        // Verify ownership in a read scope first — a kill of an unknown or
+        // cross-sandbox pid should fail with ProcessNotFound BEFORE the
+        // backend is touched. Taking the write lock conditionally avoids
+        // racing two concurrent kill calls into the backend.
+        {
+            let guard = self.processes.read().await;
+            let record = guard
+                .get(pid)
+                .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
+            if record.sandbox_id != sandbox_id {
+                return Err(ApiError::ProcessNotFound(pid.to_string()));
+            }
+        }
+
+        self.backend
+            .kill_process(sandbox_id, pid)
+            .await
+            .map_err(backend_err)?;
+
+        // Drop the record. stdin_tx drops here (drain task exits), output_rx
+        // either was already taken or drops too (consumer sees None).
+        self.processes.write().await.remove(pid);
+
+        Ok(())
+    }
+
     /// Forward bytes to a running process's stdin.
     ///
     /// Returns ProcessNotFound if the pid is unknown, scoped to a different
@@ -1269,6 +1305,123 @@ mod tests {
         // Act: 'z' is not hex.
         let err = mgr
             .write_stdin(&s.id, "not-hex-zzz", bytes::Bytes::from_static(b"x"))
+            .await
+            .expect_err("malformed pid");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    // ----- kill_process --------------------------------------------------
+
+    #[tokio::test]
+    async fn given_exec_when_kill_process_then_subsequent_write_stdin_fails() {
+        // Arrange: after a kill, the pid effectively no longer exists.
+        // Any of the per-process RPCs must report ProcessNotFound. We
+        // probe via write_stdin because it's the most observable side
+        // effect (send-to-closed-channel becomes an error).
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        mgr.kill_process(&s.id, &proc.pid)
+            .await
+            .expect("kill_process");
+        let err = mgr
+            .write_stdin(&s.id, &proc.pid, bytes::Bytes::from_static(b"x"))
+            .await
+            .expect_err("write after kill");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_kill_already_done_when_called_again_then_process_not_found() {
+        // Arrange: idempotency contract — once a pid is killed, subsequent
+        // kills must be NotFound, not silently OK. This prevents callers
+        // from masking real "I never knew about that pid" bugs as no-ops.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        mgr.kill_process(&s.id, &proc.pid).await.expect("first");
+
+        // Act
+        let err = mgr
+            .kill_process(&s.id, &proc.pid)
+            .await
+            .expect_err("second");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_unknown_pid_when_kill_process_then_process_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .kill_process(&s.id, "00000000-0000-0000-0000-000000000000")
+            .await
+            .expect_err("unknown pid");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_pid_owned_by_other_sandbox_when_kill_then_process_not_found() {
+        // Arrange: tenant isolation regression — pid belongs to sandbox A,
+        // sandbox B must not be able to kill it (or even confirm it exists).
+        let mgr = build_manager(4);
+        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let proc = mgr
+            .exec(ExecRequest {
+                sandbox_id: s1.id,
+                command: vec!["cat".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Act
+        let err = mgr
+            .kill_process(&s2.id, &proc.pid)
+            .await
+            .expect_err("cross-sandbox kill");
+
+        // Assert
+        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_pid_when_kill_process_then_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .kill_process(&s.id, "not-hex-zzz")
             .await
             .expect_err("malformed pid");
 
