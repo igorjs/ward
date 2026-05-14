@@ -723,4 +723,190 @@ mod tests {
         assert_eq!(result.pids_max, 256);
         assert_eq!(result.timeout_seconds, 3600);
     }
+
+    // ----- exec ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_existing_sandbox_when_exec_then_returns_process_info_with_pid() {
+        // Arrange: create a sandbox so exec has a target.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let resp = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into(), "hello".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            })
+            .await
+            .expect("exec");
+
+        // Assert: a UUID-shaped pid is returned, status is "running",
+        // sandbox_id round-trips. The stub does not actually execute
+        // the command, but the gRPC contract is identical.
+        assert_eq!(resp.pid.len(), 36);
+        assert_eq!(resp.sandbox_id, s.id);
+        assert_eq!(resp.status, "running");
+    }
+
+    #[tokio::test]
+    async fn given_empty_command_when_exec_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act: empty command must be rejected by the validator before
+        // it reaches the backend (where it would otherwise spawn nothing).
+        let err = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: s.id,
+                command: vec![],
+                working_dir: String::new(),
+                env: Default::default(),
+            })
+            .await
+            .expect_err("empty command must be rejected");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_malformed_sandbox_id_when_exec_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: "not-a-uuid-zzzz".into(),
+                command: vec!["echo".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            })
+            .await
+            .expect_err("malformed id");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_exec_then_returns_sandbox_not_found() {
+        // Arrange: well-formed UUID, but no sandbox with this ID exists.
+        // Exercises the backend_err mapping for BackendError::NotFound.
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+                command: vec!["echo".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            })
+            .await
+            .expect_err("unknown sandbox");
+
+        // Assert: SandboxNotFound (not the generic Backend variant) —
+        // regression guard for the manager's error-translation helper.
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    // ----- run -----------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_existing_sandbox_when_run_python_then_returns_process_info() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("python:3.12-slim")).await.unwrap();
+
+        // Act
+        let resp = mgr
+            .run(crate::pb::RunRequest {
+                sandbox_id: s.id.clone(),
+                language: "python".into(),
+                code: "print('hi')".into(),
+            })
+            .await
+            .expect("run");
+
+        // Assert: same contract as exec — pid + status from the stub.
+        assert_eq!(resp.pid.len(), 36);
+        assert_eq!(resp.sandbox_id, s.id);
+        assert_eq!(resp.status, "running");
+    }
+
+    #[tokio::test]
+    async fn given_unsupported_language_when_run_then_returns_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act: "cobol" is not in default_runtimes(); the runtime lookup
+        // returns InvalidRequest before the backend is ever called.
+        let err = mgr
+            .run(crate::pb::RunRequest {
+                sandbox_id: s.id,
+                language: "cobol".into(),
+                code: "DISPLAY 'hello'".into(),
+            })
+            .await
+            .expect_err("unsupported language");
+
+        // Assert
+        match err {
+            ApiError::InvalidRequest(msg) => {
+                assert!(
+                    msg.contains("unsupported language"),
+                    "expected message to mention 'unsupported language': {msg}",
+                );
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_invalid_language_name_when_run_then_returns_invalid_request() {
+        // Arrange: dash in the language name fails the language_name
+        // validator before the runtime lookup even runs.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+
+        // Act
+        let err = mgr
+            .run(crate::pb::RunRequest {
+                sandbox_id: s.id,
+                language: "py-thon".into(),
+                code: "print('hi')".into(),
+            })
+            .await
+            .expect_err("invalid language name");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_run_case_insensitive_language_when_lookup_then_matches() {
+        // Arrange: regression for `eq_ignore_ascii_case` matching against
+        // the runtime table. Users may type "Python" or "PYTHON" — both
+        // should resolve.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("python:3.12")).await.unwrap();
+
+        // Act
+        let resp = mgr
+            .run(crate::pb::RunRequest {
+                sandbox_id: s.id,
+                language: "PYTHON".into(),
+                code: "print(1)".into(),
+            })
+            .await;
+
+        // Assert
+        assert!(resp.is_ok());
+    }
 }
