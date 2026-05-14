@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::{BackendError, ProcessHandle, Result};
+use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::protocol::{
     CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo, StreamEvent,
     StreamEventKind,
@@ -54,9 +54,12 @@ impl KrunvmBackend {
             data_dir,
         }
     }
+}
 
+#[async_trait::async_trait]
+impl Backend for KrunvmBackend {
     /// Create a new sandbox and start the microVM.
-    pub async fn create_sandbox(&self, id: String, opts: &CreateOpts) -> Result<SandboxInfo> {
+    async fn create_sandbox(&self, id: String, opts: &CreateOpts) -> Result<SandboxInfo> {
         let ctx_id = self.krun_create_ctx()?;
         self.krun_apply_resources(ctx_id, &opts.resources)?;
 
@@ -96,7 +99,7 @@ impl KrunvmBackend {
     }
 
     /// Retrieve sandbox info by ID.
-    pub async fn get_sandbox(&self, id: &str) -> Result<SandboxInfo> {
+    async fn get_sandbox(&self, id: &str) -> Result<SandboxInfo> {
         self.sandboxes
             .read()
             .await
@@ -106,7 +109,7 @@ impl KrunvmBackend {
     }
 
     /// List all sandboxes.
-    pub async fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>> {
+    async fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>> {
         Ok(self
             .sandboxes
             .read()
@@ -117,7 +120,7 @@ impl KrunvmBackend {
     }
 
     /// Stop and remove a sandbox.
-    pub async fn remove_sandbox(&self, id: &str) -> Result<()> {
+    async fn remove_sandbox(&self, id: &str) -> Result<()> {
         let state = self
             .sandboxes
             .write()
@@ -142,7 +145,7 @@ impl KrunvmBackend {
     }
 
     /// Count of active sandboxes.
-    pub async fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<usize> {
         Ok(self.sandboxes.read().await.len())
     }
 
@@ -151,7 +154,7 @@ impl KrunvmBackend {
     /// closes them by dropping the ProcessRecord. The real backend will
     /// send SIGTERM/SIGKILL over vsock here; the public signature stays
     /// the same so the manager and gRPC layer never need to change.
-    pub async fn kill_process(&self, _sandbox_id: &str, _pid: &str) -> Result<()> {
+    async fn kill_process(&self, _sandbox_id: &str, _pid: &str) -> Result<()> {
         Ok(())
     }
 
@@ -166,7 +169,7 @@ impl KrunvmBackend {
 
     /// Take a snapshot of a sandbox's current state.
     /// Returns the SnapshotInfo with a freshly-minted snapshot_id.
-    pub async fn create_snapshot(&self, sandbox_id: &str, label: &str) -> Result<SnapshotInfo> {
+    async fn create_snapshot(&self, sandbox_id: &str, label: &str) -> Result<SnapshotInfo> {
         // Sandbox must exist — snapshotting a non-existent sandbox is a
         // user error, not an internal failure.
         if !self.sandboxes.read().await.contains_key(sandbox_id) {
@@ -194,7 +197,7 @@ impl KrunvmBackend {
     /// verifies the snapshot exists AND belongs to the named sandbox;
     /// the real backend will additionally swap the VM's rootfs and
     /// resume execution from the checkpoint.
-    pub async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()> {
+    async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()> {
         let guard = self.snapshots.read().await;
         let snap = guard
             .get(snapshot_id)
@@ -213,7 +216,7 @@ impl KrunvmBackend {
     /// vec for unknown sandboxes — list operations are intentionally
     /// lenient because callers commonly call list on missing entities
     /// to check existence.
-    pub async fn list_snapshots(&self, sandbox_id: &str) -> Result<Vec<SnapshotInfo>> {
+    async fn list_snapshots(&self, sandbox_id: &str) -> Result<Vec<SnapshotInfo>> {
         let guard = self.snapshots.read().await;
         let mut out: Vec<SnapshotInfo> = guard
             .values()
@@ -226,7 +229,7 @@ impl KrunvmBackend {
     }
 
     /// Exec a command inside a running sandbox.
-    pub async fn exec(
+    async fn exec(
         &self,
         sandbox_id: &str,
         command: Vec<String>,
@@ -293,7 +296,9 @@ impl KrunvmBackend {
             output_rx: Some(output_rx),
         })
     }
+}
 
+impl KrunvmBackend {
     // -----------------------------------------------------------------------
     // Private krun FFI wrappers – all unsafe confined here
     // -----------------------------------------------------------------------

@@ -11,6 +11,11 @@ default = []
 krunvm = ["dep:krun-sys"]
 
 [dependencies]
+# async-trait: makes Backend trait object-safe by boxing each async fn's
+# future. Used to hold `Arc<dyn Backend>` in SandboxManager so backends
+# (libkrun today, Firecracker/Virtualization.framework tomorrow) can be
+# swapped without generic infection through every test harness.
+async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 krun-sys = { version = "1.10", optional = true }

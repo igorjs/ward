@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
+use ward_core::backend::Backend;
 use ward_core::backend::krunvm::KrunvmBackend;
 use ward_core::comms::Broker;
 use ward_core::config::Config;
@@ -38,8 +39,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(&cfg.socket_path)?;
     }
 
-    // Build the domain managers.
-    let backend = Arc::new(KrunvmBackend::new(cfg.data_dir.clone()));
+    // Build the domain managers. The backend is held as Arc<dyn Backend>
+    // so future swaps (Firecracker on Linux, Apple Virtualization.framework
+    // on macOS) plug in by changing this line only.
+    let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(cfg.data_dir.clone()));
     let broker = Arc::new(Broker::new());
     let sandbox_mgr = Arc::new(SandboxManager::new(
         Arc::clone(&backend),
