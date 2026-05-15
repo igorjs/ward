@@ -333,3 +333,46 @@ async fn given_sandboxes_at_cap_when_create_one_more_then_invalid_argument() {
         err.message()
     );
 }
+
+#[tokio::test]
+async fn given_sandboxes_at_cap_when_one_removed_then_create_again_succeeds() {
+    // Arrange: regression for cap-counter bookkeeping. Fill the cap, then
+    // remove one, then create one more. If the bookkeeping leaks slots
+    // (e.g. decrements on failure paths it shouldn't), this test catches
+    // it. The volume manager has the symmetrical test; without this one,
+    // a regression in the sandbox slot accounting would slip past
+    // integration and only surface in production.
+    let mut client = common::test_server().await;
+    let mut ids = vec![];
+    for i in 0..4 {
+        let s = client
+            .create_sandbox(CreateSandboxRequest {
+                image: format!("alpine:{i}"),
+                ..Default::default()
+            })
+            .await
+            .expect("under cap")
+            .into_inner();
+        ids.push(s.id);
+    }
+
+    // Remove one to free a slot.
+    client
+        .remove_sandbox(RemoveSandboxRequest { id: ids[0].clone() })
+        .await
+        .expect("remove first sandbox");
+
+    // Act
+    let result = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:replacement".into(),
+            ..Default::default()
+        })
+        .await;
+
+    // Assert
+    assert!(
+        result.is_ok(),
+        "removing a sandbox must free a cap slot, got: {result:?}"
+    );
+}
