@@ -46,16 +46,54 @@ The CLA bot will record your signature automatically. You only need to do this o
 
 ### Prerequisites
 
-- Rust (latest stable, install via [rustup](https://rustup.rs/))
-- Linux (for integration tests with containerd/gVisor)
+- **Rust** (latest stable, install via [rustup](https://rustup.rs/))
+- **macOS arm64** or **Linux** (x86_64 / arm64). Intel Macs aren't currently
+  supported because libkrun's hypervisor backend uses Apple Silicon's HVF.
 
 ### Setup
+
+The default build works with no extra setup — the backend ships a
+stub mode that exercises the full code path without a real microVM:
 
 ```bash
 git clone https://github.com/igorjs/ward.git
 cd ward
 cargo build
+cargo test
 ```
+
+### Setup with real microVMs (libkrun)
+
+If you want `wardd` to boot actual microVMs (i.e. build with
+`--features krunvm`), you need libkrun and libkrunfw on the system.
+The release artefacts we publish to end users bundle these dylibs
+inside the binary's rpath — see `vendor/libkrun-build/README.md` — but
+developer builds rely on the system package manager:
+
+**macOS Apple Silicon**
+
+```bash
+brew tap slp/krun
+brew install slp/krun/libkrun slp/krun/libkrunfw
+cargo build --features krunvm
+```
+
+**Linux (Debian/Ubuntu)**
+
+```bash
+# Add the libkrun apt repo per upstream instructions:
+# https://github.com/containers/libkrun#installing
+sudo apt-get install -y libkrun-dev libkrunfw-dev
+cargo build --features krunvm
+```
+
+Why this isn't bundled at `cargo build` time: an attempt to vendor
+libkrun via `ward-core/build.rs` ran into a structural cargo issue
+(dependency build scripts run before dependents, so the build.rs
+couldn't prepare the environment for `krun-sys`). The "users install
+nothing but ward" promise is satisfied by *end-user release artefacts*
+(`.pkg`, `.deb`, install.sh) that bundle the dylibs — see
+`vendor/libkrun-build/` for the artefact production pipeline.
 
 ### Workflow
 
