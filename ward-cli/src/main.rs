@@ -82,22 +82,9 @@ enum Commands {
         pid: String,
     },
 
-    /// Snapshot a sandbox.
-    Snapshot {
-        /// Sandbox ID.
-        id: String,
-        /// Human-readable label for the snapshot.
-        #[arg(short, long, default_value = "")]
-        label: String,
-    },
-
-    /// Restore a sandbox from a snapshot.
-    Restore {
-        /// Sandbox ID.
-        id: String,
-        /// Snapshot ID to restore from.
-        snapshot_id: String,
-    },
+    /// Snapshot management subcommands.
+    #[command(subcommand)]
+    Snapshot(SnapshotCommands),
 
     /// Remove a sandbox.
     Remove {
@@ -153,6 +140,30 @@ enum VolumeCommands {
     Remove {
         /// Volume ID.
         id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SnapshotCommands {
+    /// Create a snapshot of a sandbox.
+    Create {
+        /// Sandbox ID to snapshot.
+        sandbox_id: String,
+        /// Human-readable label for the snapshot.
+        #[arg(short, long, default_value = "")]
+        label: String,
+    },
+    /// Restore a sandbox from a snapshot.
+    Restore {
+        /// Sandbox ID to restore into.
+        sandbox_id: String,
+        /// Snapshot ID to restore from.
+        snapshot_id: String,
+    },
+    /// List snapshots for a sandbox.
+    List {
+        /// Sandbox ID whose snapshots to list.
+        sandbox_id: String,
     },
 }
 
@@ -286,13 +297,53 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Snapshot { id, label } => {
-            println!("TODO: snapshot sandbox {id} label={label}");
-        }
-
-        Commands::Restore { id, snapshot_id } => {
-            println!("TODO: restore sandbox {id} from snapshot {snapshot_id}");
-        }
+        Commands::Snapshot(snap_cmd) => match snap_cmd {
+            SnapshotCommands::Create { sandbox_id, label } => {
+                let mut c = client::connect(&socket_path).await?;
+                let resp = c
+                    .create_snapshot(ward_core::pb::CreateSnapshotRequest {
+                        sandbox_id,
+                        label,
+                    })
+                    .await?
+                    .into_inner();
+                // One field per line so scripts can grep without parsing
+                // structured output. Same convention as `ward info` and
+                // `ward volume create`.
+                println!("snapshot_id: {}", resp.snapshot_id);
+                println!("sandbox_id: {}", resp.sandbox_id);
+                println!("label: {}", resp.label);
+                println!("size_bytes: {}", resp.size_bytes);
+            }
+            SnapshotCommands::Restore {
+                sandbox_id,
+                snapshot_id,
+            } => {
+                let mut c = client::connect(&socket_path).await?;
+                c.restore_snapshot(ward_core::pb::RestoreSnapshotRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    snapshot_id: snapshot_id.clone(),
+                })
+                .await?;
+                println!("restored: {sandbox_id} from {snapshot_id}");
+            }
+            SnapshotCommands::List { sandbox_id } => {
+                let mut c = client::connect(&socket_path).await?;
+                let resp = c
+                    .list_snapshots(ward_core::pb::ListSnapshotsRequest { sandbox_id })
+                    .await?
+                    .into_inner();
+                // Tab-separated columns: snapshot_id, sandbox_id, label,
+                // size_bytes. Stable for `awk` / `cut`. Empty output means
+                // no snapshots for this sandbox.
+                for s in resp.snapshots {
+                    println!(
+                        "{}\t{}\t{}\t{}B",
+                        s.snapshot_id, s.sandbox_id, s.label, s.size_bytes,
+                    );
+                }
+            }
+        },
 
         Commands::Remove { id } => {
             let mut c = client::connect(&socket_path).await?;
