@@ -134,6 +134,59 @@ Always sign commits: `git commit --signoff --gpg-sign`
 5. Submit a PR with a clear description of what and why.
 6. Address review feedback.
 
+## Releasing
+
+ward releases are cut by pushing a semver-tagged commit. CI produces
+pre-built archives for every supported target and publishes them to a
+GitHub Release; `install.sh` then resolves and downloads from that release.
+
+### Cutting a release
+
+```bash
+# Bump the version in the root Cargo.toml [workspace.package].
+git commit -am "chore: release v0.2.0"
+
+# Push the tag. The `release` workflow takes over from here.
+git tag -s v0.2.0 -m "ward 0.2.0"
+git push origin v0.2.0
+```
+
+### What the release workflow produces
+
+For every target in `{aarch64-apple-darwin, x86_64-unknown-linux-gnu,
+aarch64-unknown-linux-gnu}`:
+
+- `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`,
+  `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and `lib/libkrunfw.<ext>`
+  if the build is configured to bundle them (see below).
+- `ward-<version>-<target>.tar.gz.sha256` — checksum for `install.sh`
+  verification.
+
+### Bundling libkrun in the release
+
+The release workflow has two modes:
+
+- **Stub mode** (default for tag pushes): builds without the `krunvm`
+  feature. Binaries ship without microVM support — useful for the very
+  first release and for demoing the CLI surface without provisioning
+  hypervisor entitlements.
+- **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`):
+  builds with `--features ward-core/krunvm` and copies the matching
+  vendored `libkrun.dylib`/`libkrunfw.dylib` into the archive next to
+  the binaries. Requires the `vendor-libkrun` workflow to have run for
+  the pinned version and the corresponding SHA-256s to be committed in
+  `vendor/libkrun-build/checksums.txt`.
+
+### One-line install for users
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
+```
+
+The script auto-detects target, downloads the latest tarball, verifies
+its SHA-256 against the published `.sha256` file, and installs binaries
+to `$HOME/.ward/bin/` (overridable via `WARD_INSTALL_DIR`).
+
 ## Reporting Bugs
 
 Open a GitHub issue with:
