@@ -272,22 +272,130 @@ async fn given_unknown_sandbox_when_run_then_not_found() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn given_valid_stream_request_when_call_then_unimplemented_not_invalid() {
-    // Arrange: StreamOutput is not yet implemented in the daemon. This
-    // test locks in the contract that VALID inputs reach the stub —
-    // when streaming lands, the same test will need to be updated to
-    // expect a working stream rather than Unimplemented.
+async fn given_exec_when_stream_output_then_yields_stdout_then_exit_then_closes() {
+    // Arrange: exec parks the receiver; stream_output drains it. Under the
+    // stub backend the events are scripted (one stdout line + Exit(0)).
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s.id.clone(),
+            command: vec!["echo".into(), "hi".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Act: open the stream and drain it to completion.
+    let mut stream = client
+        .stream_output(StreamOutputRequest {
+            sandbox_id: s.id.clone(),
+            pid: proc.pid.clone(),
+        })
+        .await
+        .expect("stream_output")
+        .into_inner();
+
+    let mut events = vec![];
+    while let Some(evt) = stream.message().await.expect("message") {
+        events.push(evt);
+    }
+
+    // Assert: shape only — line text may evolve, but kind ordering and the
+    // closing-after-exit semantic must hold. The pb enum is 1 = Stdout,
+    // 3 = Exit.
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].r#type, ward_core::pb::StreamEventType::Stdout as i32);
+    assert_eq!(events[1].r#type, ward_core::pb::StreamEventType::Exit as i32);
+    assert_eq!(events[1].exit_code, 0);
+}
+
+#[tokio::test]
+async fn given_malformed_pid_when_stream_output_then_invalid_argument() {
+    // Arrange: entity_id rejects non-hex characters before the manager
+    // touches its process table.
     let mut client = common::test_server().await;
 
     // Act
     let err = client
         .stream_output(StreamOutputRequest {
-            sandbox_id: "deadbeef".into(),
-            pid: "deadbeef".into(),
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "not-hex-zzz".into(),
         })
         .await
-        .expect_err("stream stub returns unimplemented");
+        .expect_err("malformed pid");
 
     // Assert
-    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn given_unknown_pid_when_stream_output_then_not_found() {
+    // Arrange: well-formed pid that the manager never produced.
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .stream_output(StreamOutputRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "00000000-0000-0000-0000-000000000000".into(),
+        })
+        .await
+        .expect_err("unknown pid");
+
+    // Assert: NotFound (not Internal) — this is the gRPC translation of
+    // ApiError::ProcessNotFound.
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn given_stream_already_consumed_when_called_again_then_invalid_argument() {
+    // Arrange: single-consumer contract enforced at the manager level
+    // surfaces as InvalidArgument over the wire.
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s.id.clone(),
+            command: vec!["echo".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let _first = client
+        .stream_output(StreamOutputRequest {
+            sandbox_id: s.id.clone(),
+            pid: proc.pid.clone(),
+        })
+        .await
+        .expect("first call");
+
+    // Act
+    let err = client
+        .stream_output(StreamOutputRequest {
+            sandbox_id: s.id,
+            pid: proc.pid,
+        })
+        .await
+        .expect_err("second call");
+
+    // Assert
+    assert_eq!(err.code(), Code::InvalidArgument);
 }
