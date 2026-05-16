@@ -11,7 +11,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::{BackendError, ProcessHandle, Result};
-use crate::protocol::{CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus};
+use crate::protocol::{
+    CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, StreamEvent,
+    StreamEventKind,
+};
 
 // ---------------------------------------------------------------------------
 // Per-sandbox state
@@ -148,13 +151,40 @@ impl KrunvmBackend {
         let pid = uuid::Uuid::new_v4().to_string();
 
         // TODO: use krun_exec / vsock channel to run the command inside the VM.
-        let _ = command;
+        // For now the stub produces a tiny scripted output stream so that
+        // StreamOutput has something to deliver end-to-end. Tests assert on
+        // this scripted shape; when the real krun exec lands the producer
+        // task is replaced but the channel contract is unchanged.
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
+        let cmd_for_log = command.first().cloned().unwrap_or_default();
+        tokio::spawn(async move {
+            let started = std::time::SystemTime::now();
+            let _ = tx
+                .send(StreamEvent {
+                    kind: StreamEventKind::Stdout,
+                    line: format!("stub: {cmd_for_log}"),
+                    exit_code: None,
+                    timestamp: std::time::SystemTime::now(),
+                    duration_ms: 0,
+                })
+                .await;
+            let _ = tx
+                .send(StreamEvent {
+                    kind: StreamEventKind::Exit,
+                    line: String::new(),
+                    exit_code: Some(0),
+                    timestamp: std::time::SystemTime::now(),
+                    duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
+                })
+                .await;
+            // Sender drops here → channel closes → consumer sees None.
+        });
 
         Ok(ProcessHandle {
             pid,
             sandbox_id: sandbox_id.to_string(),
             stdin_tx: None,
-            output_rx: None,
+            output_rx: Some(rx),
         })
     }
 
