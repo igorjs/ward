@@ -15,7 +15,9 @@ mod common;
 
 use tonic::Code;
 
-use ward_core::pb::{CreateSandboxRequest, ExecRequest, RunRequest, StreamOutputRequest};
+use ward_core::pb::{
+    CreateSandboxRequest, ExecRequest, RunRequest, StreamOutputRequest, WriteStdinRequest,
+};
 
 // ---------------------------------------------------------------------------
 // Exec
@@ -398,4 +400,127 @@ async fn given_stream_already_consumed_when_called_again_then_invalid_argument()
 
     // Assert
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+// ---------------------------------------------------------------------------
+// WriteStdin
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_exec_when_write_stdin_with_valid_bytes_then_returns_empty_ok() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s.id.clone(),
+            command: vec!["cat".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Act
+    let resp = client
+        .write_stdin(WriteStdinRequest {
+            sandbox_id: s.id,
+            pid: proc.pid,
+            data: b"hello\n".to_vec(),
+        })
+        .await
+        .expect("write_stdin");
+
+    // Assert: Empty response on the wire becomes a unit Response.
+    let _: () = resp.into_inner();
+}
+
+#[tokio::test]
+async fn given_unknown_pid_when_write_stdin_then_not_found() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .write_stdin(WriteStdinRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "00000000-0000-0000-0000-000000000000".into(),
+            data: b"x".to_vec(),
+        })
+        .await
+        .expect_err("unknown pid");
+
+    // Assert
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn given_malformed_pid_when_write_stdin_then_invalid_argument() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .write_stdin(WriteStdinRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "not-hex-zzz".into(),
+            data: b"x".to_vec(),
+        })
+        .await
+        .expect_err("malformed pid");
+
+    // Assert
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn given_pid_from_different_sandbox_when_write_stdin_then_not_found() {
+    // Arrange: tenant isolation check at the wire boundary.
+    let mut client = common::test_server().await;
+    let s1 = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:1".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let s2 = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:2".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s1.id,
+            command: vec!["cat".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Act: address the pid via the WRONG sandbox.
+    let err = client
+        .write_stdin(WriteStdinRequest {
+            sandbox_id: s2.id,
+            pid: proc.pid,
+            data: b"x".to_vec(),
+        })
+        .await
+        .expect_err("cross-sandbox");
+
+    // Assert: NotFound — leaking pid existence across sandboxes would be a
+    // tenant-isolation regression.
+    assert_eq!(err.code(), Code::NotFound);
 }
