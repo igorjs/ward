@@ -131,6 +131,15 @@ impl KrunvmBackend {
         Ok(self.sandboxes.read().await.len())
     }
 
+    /// Signal a process to terminate. The stub does no real work because
+    /// the stub's "process" is just a pair of mpsc channels — the manager
+    /// closes them by dropping the ProcessRecord. The real backend will
+    /// send SIGTERM/SIGKILL over vsock here; the public signature stays
+    /// the same so the manager and gRPC layer never need to change.
+    pub async fn kill_process(&self, _sandbox_id: &str, _pid: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// Exec a command inside a running sandbox.
     pub async fn exec(
         &self,
