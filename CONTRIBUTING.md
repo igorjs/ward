@@ -102,14 +102,13 @@ sudo apt-get install -y libkrun-dev libkrunfw-dev
 cargo build --features krunvm
 ```
 
-Why this isn't bundled at `cargo build` time: an attempt to vendor
-libkrun via `ward-core/build.rs` ran into a structural cargo issue
-(dependency build scripts run before dependents, so the build.rs
-couldn't prepare the environment for `krun-sys`). The "users install
+Why this isn't bundled at `cargo build` time: the "users install
 nothing but ward" promise is satisfied by *end-user release artefacts*
-(`.pkg`, `.deb`, install.sh) that bundle the dylibs — bottles are
-produced by [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor)
-and consumed by `release.yml` in this repo.
+(`.pkg`, `.deb`, install.sh) that bundle the dylibs, not by per-build
+downloads. Bottles are produced by [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor)
+and consumed by `release.yml` in this repo. FFI declarations live in
+`ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys`
+crate, no bindgen, no libclang build-dep).
 
 ### Workflow
 

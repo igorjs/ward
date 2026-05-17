@@ -4,26 +4,23 @@
 //!
 //! - Always: compile `proto/ward.proto` into Rust types.
 //! - When `--features krunvm` is enabled: emit linker directives for
-//!   `libkrun` and `libkrunfw`. Discovery is left to the standard pkg-config
-//!   pipeline that `krun-sys`'s own build.rs already uses — that means
-//!   developers install the libraries once via `brew install slp/krun/libkrun
-//!   slp/krun/libkrunfw` (macOS) or distro packages (Linux). See
-//!   DEVELOPMENT.md for setup details.
+//!   `libkrun` and `libkrunfw`. FFI symbol declarations live in
+//!   `src/backend/krun_ffi.rs` (hand-maintained, no bindgen, no
+//!   `krun-sys` crate). The linker uses the system's default search
+//!   path: developers install the libraries once via `brew install
+//!   slp/krun/libkrun slp/krun/libkrunfw` (macOS) or distro packages
+//!   (Linux). See DEVELOPMENT.md for setup details.
 //!
-//! Why not vendor at build time? An earlier attempt (commit 40656e0) wired
-//! ward-core/build.rs to download pre-built libkrun bottles from GitHub
-//! Releases. It didn't work because cargo runs dependency build scripts
-//! BEFORE dependents — `krun-sys` is a transitive dep of ward-core, so its
-//! build.rs fires before ours, meaning we can't prepare `PKG_CONFIG_PATH`
-//! for it. The right fix is either a forked `ward-krun-sys` crate (heavy)
-//! or shifting the "no install required" promise to *end users* via
-//! prebuilt binary distribution (light). We chose the latter.
-//!
-//! Bottles for end-user release artefacts are produced by the separate
-//! `igorjs/ward-vendor` repo (public) and consumed by `release.yml` in
-//! this repo (under `--features krunvm` bundling mode). End users
-//! download a single self-contained artefact; devs install libkrun via
-//! their package manager once.
+//! Why not vendor at build time? End-user release artefacts ship the
+//! libraries pre-built via the separate `igorjs/ward-vendor` repo
+//! (public) and bundled by `release.yml` in this repo (under
+//! `--features krunvm`). End users download a single self-contained
+//! artefact; devs install libkrun via their package manager once.
+//! (An earlier in-tree download approach via build.rs was reverted in
+//! commit 5218cb6 because cargo runs dependency build scripts before
+//! dependents — the obstacle no longer applies now that we own the
+//! FFI surface directly, but the end-user UX still favours prebuilt
+//! distribution over per-build downloads.)
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()

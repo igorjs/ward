@@ -1,8 +1,10 @@
 # ADR-003: Isolation Backend
 
-**Status:** Accepted
+**Status:** Accepted (amended 2026-05-18, see Update section below)
 **Date:** 2026-05-12
 **Authors:** Igor
+
+> **Reader note:** the original Decision section below refers to the `krun-sys` crate as the binding layer. That is **no longer accurate**: as of 2026-05-18 ward declares the libkrun ABI directly via hand-maintained FFI in `ward-core/src/backend/krun_ffi.rs`. The libkrun choice itself is unchanged. See the [Update](#update--2026-05-18) section for the full rationale.
 
 ## Context
 
@@ -91,7 +93,28 @@ UUID-based directory names prevent path traversal attacks via maliciously crafte
 
 ## Consequences
 
-- `unsafe` code in Ward is limited to the `krunvm.rs` wrapper calling through `krun-sys`. The `krun-sys` crate itself contains the raw FFI declarations.
+- `unsafe` code in Ward is limited to the `krunvm.rs` wrapper. Raw FFI declarations live in `ward-core/src/backend/krun_ffi.rs` (see Update below).
 - The feature flag means default builds work everywhere (the stub backend exercises the full code path); real microVM execution requires `--features krunvm` and libkrun installed.
 - OCI image management is Ward's responsibility, not libkrun's.
 - If upstream publishes a safe Rust API for libkrun, Ward's wrapper layer becomes thinner.
+
+## Update — 2026-05-18
+
+The original decision (use libkrun, gated behind `--features krunvm`) is unchanged. What changed is the binding layer.
+
+**Before:** Ward depended on the `krun-sys` crate from crates.io, which uses `bindgen` + `pkg-config` to generate FFI declarations at build time.
+
+**After:** Ward declares the libkrun C ABI directly via hand-maintained `unsafe extern "C"` blocks in `ward-core/src/backend/krun_ffi.rs`.
+
+**Reasons:**
+
+1. **Upstream stale.** `krun-sys` 1.10.1 (Feb 2025) is pinned to libkrun's 1.10 ABI. Libkrun reached 1.18.0 by May 2026 with ~30 new functions that `krun-sys` doesn't expose. Ward needs several of them (`krun_setuid`/`krun_setgid` for non-root exec, `krun_add_net_tap` for egress proxying, `virtio-console-multiport` for combined stdout/stderr).
+2. **Removes the `libclang` build dependency.** `bindgen` requires `libclang` at build time, which is a non-trivial install on minimal CI runners and was the proximate cause of `--features krunvm` build failures in commits prior to 5218cb6.
+3. **API is auditable.** libkrun's C ABI is 60 functions with primitive/string/array signatures (no nested structs, no callback types). Maintaining these by hand is ~270 lines of trivially diff-able Rust. The cost of `bindgen`'s automation isn't justified at this size.
+4. **All 60 symbols are declared.** `krun-sys` 1.10.1 shipped 30 of them. Hand-rolling means full coverage in one pass plus first-class control over future bumps.
+
+**Linking:** the symbols still resolve through the system's libkrun + libkrunfw shared libraries. `ward-core/build.rs` emits `cargo:rustc-link-lib=krun` + `cargo:rustc-link-lib=krunfw` when the `krunvm` feature is on (work previously done by `krun-sys`'s own build.rs).
+
+**Maintenance:** on each libkrun bump, diff `containers/libkrun/include/libkrun.h` against `krun_ffi.rs` and translate any new signatures. Procedure tracked in `CONTRIBUTING.md` and issue #32.
+
+Implementation: issue #31.

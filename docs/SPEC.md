@@ -14,7 +14,7 @@ shaped the way it is.
 
 - [ADR-001: Project Scope, Purpose, and Layering](adr/001-project-scope.md)
 - [ADR-002: Language Choice (Rust)](adr/002-language.md)
-- [ADR-003: Isolation Backend (libkrun via `krun-sys`)](adr/003-isolation-backend.md)
+- [ADR-003: Isolation Backend (libkrun)](adr/003-isolation-backend.md)
 - [ADR-004: IPC Protocol (gRPC + protobuf)](adr/004-ipc-protocol.md)
 - [ADR-005: SDK Strategy (generated clients + idiomatic wrappers)](adr/005-sdk-strategy.md)
 - [ADR-006: Licensing (AGPL-3.0 daemon, Apache-2.0 SDKs)](adr/006-licensing.md)

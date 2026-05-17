@@ -1,9 +1,10 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! MicroVM backend using libkrun via krun-sys.
+//! MicroVM backend using libkrun.
 //!
-//! All `unsafe` calls to the krun-sys C bindings are confined to this module.
-//! The public API is fully safe Rust.
+//! All `unsafe` calls to the libkrun C ABI are confined to this module.
+//! FFI declarations live in `super::krun_ffi` (hand-maintained, no
+//! `krun-sys` crate, no bindgen). The public API is fully safe Rust.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -308,7 +309,7 @@ impl KrunvmBackend {
         // non-negative context ID on success, or a negative errno on failure.
         #[cfg(feature = "krunvm")]
         {
-            let ret = unsafe { krun_sys::krun_create_ctx() };
+            let ret = unsafe { super::krun_ffi::krun_create_ctx() };
             if ret < 0 {
                 return Err(BackendError::Internal(format!(
                     "krun_create_ctx failed: errno {}",
@@ -328,7 +329,7 @@ impl KrunvmBackend {
         #[cfg(feature = "krunvm")]
         {
             // SAFETY: ctx_id came from krun_create_ctx and has not been freed.
-            let ret = unsafe { krun_sys::krun_free_ctx(ctx_id) };
+            let ret = unsafe { super::krun_ffi::krun_free_ctx(ctx_id) };
             if ret < 0 {
                 return Err(BackendError::Internal(format!(
                     "krun_free_ctx failed: errno {}",
@@ -344,9 +345,20 @@ impl KrunvmBackend {
         #[cfg(feature = "krunvm")]
         {
             if limits.cpus > 0 {
-                // SAFETY: valid ctx_id, cpus is a plain u32.
-                let ret =
-                    unsafe { krun_sys::krun_set_vm_config(ctx_id, limits.cpus, limits.memory_mb) };
+                // libkrun's num_vcpus is uint8_t — values >255 cannot
+                // round-trip and silent truncation would produce a
+                // microVM with the wrong CPU count (or zero). Reject
+                // explicitly.
+                let num_vcpus: u8 = u8::try_from(limits.cpus).map_err(|_| {
+                    BackendError::Internal(format!(
+                        "cpus={} exceeds libkrun's uint8_t limit (255)",
+                        limits.cpus
+                    ))
+                })?;
+                // SAFETY: ctx_id came from krun_create_ctx and is live.
+                let ret = unsafe {
+                    super::krun_ffi::krun_set_vm_config(ctx_id, num_vcpus, limits.memory_mb)
+                };
                 if ret < 0 {
                     return Err(BackendError::Internal(format!(
                         "krun_set_vm_config failed: errno {}",
@@ -366,7 +378,7 @@ impl KrunvmBackend {
             let path = CString::new(rootfs.to_string_lossy().as_ref())
                 .map_err(|e| BackendError::Internal(e.to_string()))?;
             // SAFETY: path is a valid NUL-terminated C string; ctx_id is live.
-            let ret = unsafe { krun_sys::krun_set_root(ctx_id, path.as_ptr()) };
+            let ret = unsafe { super::krun_ffi::krun_set_root(ctx_id, path.as_ptr()) };
             if ret < 0 {
                 return Err(BackendError::Internal(format!(
                     "krun_set_root failed: errno {}",
