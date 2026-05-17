@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       include_libkrun:
-        description: "Bundle libkrun bottles (requires the vendor-libkrun release to exist)"
+        description: "Bundle libkrun bottles from igorjs/ward-vendor (requires a libkrun-v<version> release there)"
         required: false
         default: false
         type: boolean
@@ -99,25 +99,30 @@ jobs:
         with:
           shared-key: release-${{ matrix.target }}
 
-      # When libkrun bundling is requested, fetch the matching vendor
-      # bottle so we can both link against it AND ship it inside the
-      # archive. Skipped on stub builds.
+      # When libkrun bundling is requested, fetch the matching bottle
+      # from the ward-vendor repo (cross-repo gh release download) and
+      # verify against checksums pinned locally in this repo. Skipped
+      # on stub builds.
       - name: Fetch libkrun bottle
         if: needs.resolve.outputs.include_libkrun == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-build/version.txt)"
+          LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-version.txt)"
           TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p libkrun-vendor
           gh release download "libkrun-v${LIBKRUN_VERSION}" \
+            --repo igorjs/ward-vendor \
             --pattern "$TARBALL" \
             --pattern "${TARBALL}.sha256" \
             --dir libkrun-vendor
-          # Verify the bottle hash matches our committed checksums.
-          EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-build/checksums.txt | awk '{print $1}')"
+          # Verify the bottle hash matches the checksum pinned in ward.
+          # Pinning locally (rather than trusting the .sha256 sidecar
+          # from ward-vendor) means a compromise of ward-vendor cannot
+          # silently inject a different binary into ward releases.
+          EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-checksums.txt | awk '{print $1}')"
           if [[ -z "$EXPECTED" ]]; then
-            echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-build/checksums.txt"
+            echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-checksums.txt"
             exit 1
           fi
           if command -v sha256sum > /dev/null; then

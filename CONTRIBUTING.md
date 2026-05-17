@@ -81,8 +81,9 @@ cargo test
 If you want `wardd` to boot actual microVMs (i.e. build with
 `--features krunvm`), you need libkrun and libkrunfw on the system.
 The release artefacts we publish to end users bundle these dylibs
-inside the binary's rpath — see `vendor/libkrun-build/README.md` — but
-developer builds rely on the system package manager:
+inside the binary's rpath — bottle production lives in the separate
+[`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor) repo —
+but developer builds rely on the system package manager:
 
 **macOS Apple Silicon**
 
@@ -106,8 +107,9 @@ libkrun via `ward-core/build.rs` ran into a structural cargo issue
 (dependency build scripts run before dependents, so the build.rs
 couldn't prepare the environment for `krun-sys`). The "users install
 nothing but ward" promise is satisfied by *end-user release artefacts*
-(`.pkg`, `.deb`, install.sh) that bundle the dylibs — see
-`vendor/libkrun-build/` for the artefact production pipeline.
+(`.pkg`, `.deb`, install.sh) that bundle the dylibs — bottles are
+produced by [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor)
+and consumed by `release.yml` in this repo.
 
 ### Workflow
 
@@ -186,10 +188,11 @@ The release workflow has two modes:
   hypervisor entitlements.
 - **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`):
   builds with `--features ward-core/krunvm` and copies the matching
-  vendored `libkrun.dylib`/`libkrunfw.dylib` into the archive next to
-  the binaries. Requires the `vendor-libkrun` workflow to have run for
-  the pinned version and the corresponding SHA-256s to be committed in
-  `vendor/libkrun-build/checksums.txt`.
+  `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/ward-vendor`
+  GitHub Release into the archive next to the binaries. Requires the
+  `build` workflow at `ward-vendor` to have run for the pinned version
+  AND the resulting SHA-256s to be committed here in
+  `vendor/libkrun-checksums.txt`.
 
 ### One-line install for users
 

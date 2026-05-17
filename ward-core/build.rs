@@ -19,12 +19,11 @@
 //! or shifting the "no install required" promise to *end users* via
 //! prebuilt binary distribution (light). We chose the latter.
 //!
-//! The CI vendor pipeline in `vendor/libkrun-build/` still produces
-//! relocatable libkrun bottles — they feed into the release packaging
-//! workflow (forthcoming) that bundles dylibs alongside the wardd binary
-//! in `.pkg` / `.deb` / tarball artefacts. End users download a single
-//! self-contained artefact; devs install libkrun via their package
-//! manager once.
+//! Bottles for end-user release artefacts are produced by the separate
+//! `igorjs/ward-vendor` repo (public) and consumed by `release.yml` in
+//! this repo (under `--features krunvm` bundling mode). End users
+//! download a single self-contained artefact; devs install libkrun via
+//! their package manager once.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
