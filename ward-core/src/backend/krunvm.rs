@@ -18,8 +18,41 @@ use crate::protocol::{
 };
 
 // ---------------------------------------------------------------------------
+// libc bindings used only by the krunvm boot path
+// ---------------------------------------------------------------------------
+//
+// We need `write(2)` to poke the shutdown eventfd that libkrun returns
+// from `krun_get_shutdown_eventfd`. Declaring it directly here keeps
+// us off the `libc` crate dependency, which is otherwise unjustified
+// (one syscall, two-line declaration).
+
+#[cfg(feature = "krunvm")]
+unsafe extern "C" {
+    fn write(fd: std::ffi::c_int, buf: *const std::ffi::c_void, count: usize) -> isize;
+}
+
+// ---------------------------------------------------------------------------
 // Per-sandbox state
 // ---------------------------------------------------------------------------
+
+/// Resources tied to a running microVM. Only populated when the
+/// `krunvm` feature is enabled and `krun_start_enter` has been spawned.
+#[cfg(feature = "krunvm")]
+#[derive(Debug)]
+struct VmRuntime {
+    /// OS thread running the blocking `krun_start_enter` call. Joined
+    /// in `remove_sandbox` after the shutdown eventfd is poked. The
+    /// return value is `krun_start_enter`'s exit code (negative on
+    /// libkrun-side failure).
+    thread: std::thread::JoinHandle<i32>,
+    /// Eventfd handed out by `krun_get_shutdown_eventfd(ctx_id)`.
+    /// Writing 8 bytes of `u64(1)` to it asks the VM to unwind. We do
+    /// NOT close this fd ourselves: libkrun owns its lifetime and
+    /// reaps it during `krun_free_ctx`. Stored as a raw `c_int` for
+    /// that reason. Negative values are tolerated (some platforms
+    /// signal "no fd available" with -1).
+    shutdown_fd: std::os::fd::RawFd,
+}
 
 #[derive(Debug)]
 struct SandboxState {
@@ -27,6 +60,11 @@ struct SandboxState {
     /// krun context ID returned by krun_create_ctx().
     /// 0 means not yet started.
     ctx_id: u32,
+    /// VM thread + shutdown eventfd. `None` in stub builds and during
+    /// the brief window before `krun_start_enter` is spawned. Always
+    /// `Some` in `--features krunvm` after `create_sandbox` returns Ok.
+    #[cfg(feature = "krunvm")]
+    vm: Option<VmRuntime>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +98,11 @@ impl KrunvmBackend {
 #[async_trait::async_trait]
 impl Backend for KrunvmBackend {
     /// Create a new sandbox and start the microVM.
+    ///
+    /// Under `--features krunvm` this configures the libkrun context,
+    /// captures the shutdown eventfd, and spawns the dedicated OS
+    /// thread that runs `krun_start_enter`. The thread runs for the
+    /// lifetime of the VM and is reaped in `remove_sandbox`.
     async fn create_sandbox(&self, id: String, opts: &CreateOpts) -> Result<SandboxInfo> {
         let ctx_id = self.krun_create_ctx()?;
         self.krun_apply_resources(ctx_id, &opts.resources)?;
@@ -73,7 +116,13 @@ impl Backend for KrunvmBackend {
         }
 
         // TODO: apply mount points.
-        // TODO: call krun_start_enter in a dedicated thread.
+
+        // Spawn the VM thread *after* all configuration calls. libkrun
+        // requires krun_get_shutdown_eventfd + krun_start_enter to come
+        // last. In stub builds this is a no-op; the state's `vm` field
+        // doesn't exist.
+        #[cfg(feature = "krunvm")]
+        let vm = Some(self.krun_spawn_vm(&id, ctx_id)?);
 
         let now = std::time::SystemTime::now();
         let info = SandboxInfo {
@@ -93,6 +142,8 @@ impl Backend for KrunvmBackend {
         let state = SandboxState {
             info: info.clone(),
             ctx_id,
+            #[cfg(feature = "krunvm")]
+            vm,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -121,13 +172,29 @@ impl Backend for KrunvmBackend {
     }
 
     /// Stop and remove a sandbox.
+    ///
+    /// Under `--features krunvm` this signals the VM thread to shut
+    /// down via its eventfd, waits for the thread to exit (bounded),
+    /// then frees the libkrun context. The order matters: freeing the
+    /// context before the thread exits would race with the still-live
+    /// `krun_start_enter` call.
     async fn remove_sandbox(&self, id: &str) -> Result<()> {
-        let state = self
+        #[allow(unused_mut)]
+        let mut state = self
             .sandboxes
             .write()
             .await
             .remove(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+
+        // Signal + join the VM thread before freeing the context.
+        #[cfg(feature = "krunvm")]
+        if let Some(vm) = state.vm.take() {
+            // Errors here are already logged inside the helper; we don't
+            // surface them because the sandbox is being torn down and
+            // any further failure on krun_free_ctx is the actionable one.
+            let _ = self.krun_signal_and_join(id, vm).await;
+        }
 
         if state.ctx_id != 0 {
             self.krun_free_ctx(state.ctx_id)?;
@@ -345,7 +412,7 @@ impl KrunvmBackend {
         #[cfg(feature = "krunvm")]
         {
             if limits.cpus > 0 {
-                // libkrun's num_vcpus is uint8_t — values >255 cannot
+                // libkrun's num_vcpus is uint8_t; values >255 cannot
                 // round-trip and silent truncation would produce a
                 // microVM with the wrong CPU count (or zero). Reject
                 // explicitly.
@@ -388,6 +455,141 @@ impl KrunvmBackend {
         }
         let _ = (ctx_id, rootfs);
         Ok(())
+    }
+
+    /// Capture the shutdown eventfd and spawn the dedicated OS thread
+    /// that runs `krun_start_enter`. Must be called only after every
+    /// `krun_set_*` configuration call for the context.
+    ///
+    /// `krun_start_enter` blocks for the lifetime of the microVM, so we
+    /// do **not** put it on a tokio task or `spawn_blocking` pool slot.
+    /// A bare `std::thread::spawn` is the documented contract.
+    ///
+    /// Returns the runtime metadata to be stored in `SandboxState`. The
+    /// thread logs its own exit via `tracing` so failures surface in
+    /// the daemon log without the caller needing to await the handle.
+    #[cfg(feature = "krunvm")]
+    fn krun_spawn_vm(&self, sandbox_id: &str, ctx_id: u32) -> Result<VmRuntime> {
+        // SAFETY: ctx_id came from krun_create_ctx and is configured but
+        // not yet entered. Per libkrun's contract, this must be called
+        // before krun_start_enter; calling it after is a use-after-enter
+        // bug. We enforce ordering by sequencing here in create_sandbox.
+        let shutdown_fd = unsafe { super::krun_ffi::krun_get_shutdown_eventfd(ctx_id) };
+        if shutdown_fd < 0 {
+            // Negative is documented for some platforms (e.g. macOS may
+            // not have a usable eventfd). Don't fail the boot. Just
+            // accept that remove_sandbox won't be able to signal shutdown
+            // cleanly. Log so the operator knows.
+            tracing::warn!(
+                sandbox = %sandbox_id,
+                ctx_id,
+                ret = shutdown_fd,
+                "krun_get_shutdown_eventfd returned negative; shutdown signalling disabled"
+            );
+        }
+
+        let sandbox_id_for_thread = sandbox_id.to_string();
+        let thread = std::thread::Builder::new()
+            .name(format!("krun-vm-{sandbox_id}"))
+            .spawn(move || {
+                tracing::info!(
+                    sandbox = %sandbox_id_for_thread,
+                    ctx_id,
+                    "krun_start_enter starting"
+                );
+                // SAFETY: ctx_id is live and fully configured. This call
+                // blocks until the VM exits, either because guest init
+                // ran to completion, or because the shutdown eventfd was
+                // poked, or because libkrun failed early (missing init,
+                // bad rootfs, KVM unavailable, ...).
+                let ret = unsafe { super::krun_ffi::krun_start_enter(ctx_id) };
+                if ret < 0 {
+                    tracing::error!(
+                        sandbox = %sandbox_id_for_thread,
+                        ctx_id,
+                        errno = -ret,
+                        "krun_start_enter failed"
+                    );
+                } else {
+                    tracing::info!(
+                        sandbox = %sandbox_id_for_thread,
+                        ctx_id,
+                        code = ret,
+                        "krun_start_enter returned"
+                    );
+                }
+                ret
+            })
+            .map_err(|e| BackendError::Internal(format!("spawn VM thread failed: {e}")))?;
+
+        Ok(VmRuntime {
+            thread,
+            shutdown_fd,
+        })
+    }
+
+    /// Poke the shutdown eventfd, wait for the VM thread to exit, and
+    /// reap the thread. Best-effort: a stuck VM is detached after the
+    /// timeout rather than blocking `remove_sandbox` indefinitely.
+    ///
+    /// Returns the thread's exit code on a clean reap; `None` if we
+    /// timed out and detached the thread. Errors only on truly
+    /// catastrophic failures (none currently).
+    #[cfg(feature = "krunvm")]
+    async fn krun_signal_and_join(&self, sandbox_id: &str, vm: VmRuntime) -> Result<Option<i32>> {
+        // 1. Signal: write u64(1) to the eventfd. Best-effort. If the
+        //    fd is bogus or write fails, we still try to join in case
+        //    the VM is already on its way out for other reasons (guest
+        //    poweroff, OOM, etc).
+        if vm.shutdown_fd >= 0 {
+            let val: u64 = 1;
+            // SAFETY: shutdown_fd was obtained from krun_get_shutdown_eventfd
+            // and is valid until krun_free_ctx (which we call after this).
+            // We're writing exactly 8 bytes from a stack u64.
+            let n = unsafe {
+                write(
+                    vm.shutdown_fd,
+                    &val as *const u64 as *const std::ffi::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            if n < 0 {
+                tracing::warn!(
+                    sandbox = %sandbox_id,
+                    fd = vm.shutdown_fd,
+                    "write(shutdown_eventfd) failed; will still attempt to join"
+                );
+            }
+        }
+
+        // 2. Bounded join. `JoinHandle::join` is unbounded. If libkrun
+        //    or the host wedges, we'd block forever. Poll `is_finished`
+        //    instead, capped at JOIN_TIMEOUT.
+        const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        while start.elapsed() < JOIN_TIMEOUT {
+            if vm.thread.is_finished() {
+                let ret = vm
+                    .thread
+                    .join()
+                    .map_err(|_| BackendError::Internal("VM thread panicked".into()))?;
+                return Ok(Some(ret));
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+
+        // Timeout: detach. The thread keeps running but the daemon
+        // continues; libkrun resource leak is acknowledged but the
+        // alternative (block remove_sandbox forever) is worse. Operator
+        // visibility via log.
+        tracing::warn!(
+            sandbox = %sandbox_id,
+            timeout_s = JOIN_TIMEOUT.as_secs(),
+            "VM thread did not exit within timeout; detaching (libkrun context will leak)"
+        );
+        drop(vm.thread);
+        Ok(None)
     }
 }
 
