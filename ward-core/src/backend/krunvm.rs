@@ -155,11 +155,11 @@ impl KrunvmBackend {
         // StreamOutput has something to deliver end-to-end. Tests assert on
         // this scripted shape; when the real krun exec lands the producer
         // task is replaced but the channel contract is unchanged.
-        let (tx, rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
+        let (output_tx, output_rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
         let cmd_for_log = command.first().cloned().unwrap_or_default();
         tokio::spawn(async move {
             let started = std::time::SystemTime::now();
-            let _ = tx
+            let _ = output_tx
                 .send(StreamEvent {
                     kind: StreamEventKind::Stdout,
                     line: format!("stub: {cmd_for_log}"),
@@ -168,7 +168,7 @@ impl KrunvmBackend {
                     duration_ms: 0,
                 })
                 .await;
-            let _ = tx
+            let _ = output_tx
                 .send(StreamEvent {
                     kind: StreamEventKind::Exit,
                     line: String::new(),
@@ -177,14 +177,26 @@ impl KrunvmBackend {
                     duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
                 })
                 .await;
-            // Sender drops here → channel closes → consumer sees None.
+            // output_tx drops here → channel closes → consumer sees None.
+        });
+
+        // Stdin half: caller writes via stdin_tx; the drain task here keeps
+        // stdin_rx alive so writes don't immediately fail with "channel
+        // closed". Bytes are discarded — the real backend will pipe them
+        // into the VM over vsock. The drain task exits when ProcessRecord
+        // is dropped and stdin_tx with it.
+        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        tokio::spawn(async move {
+            while let Some(_chunk) = stdin_rx.recv().await {
+                // discard: real backend would forward to the VM's stdin
+            }
         });
 
         Ok(ProcessHandle {
             pid,
             sandbox_id: sandbox_id.to_string(),
-            stdin_tx: None,
-            output_rx: Some(rx),
+            stdin_tx: Some(stdin_tx),
+            output_rx: Some(output_rx),
         })
     }
 
