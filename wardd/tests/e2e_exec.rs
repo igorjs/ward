@@ -10,9 +10,8 @@
 //!   - exec with invalid args returns a clear validation error
 //!   - run for a supported language returns a pid
 //!   - run for cobol (unsupported) returns a clear error
-//!   - logs against the stub returns Unimplemented
-//!
-//! When streaming lands, this file expands with positive log scenarios.
+//!   - logs after exec emits a stdout line and an exit marker
+//!   - logs with an invalid pid surfaces the validation error
 
 mod common;
 
@@ -151,23 +150,76 @@ fn given_invalid_language_name_when_user_runs_then_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// Feature: logs (streaming output, currently unimplemented)
+// Feature: logs (streaming output)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_valid_log_request_when_user_runs_logs_then_fails_with_unimplemented() {
-    // Arrange: any valid IDs work — StreamOutput is unimplemented at the
-    // daemon, so the response is the same regardless of values.
+fn given_exec_when_user_runs_logs_then_streams_stdout_and_exit() {
+    // Arrange: exec returns a pid. The stub backend deposits a single
+    // stdout line and an Exit(0) event; `ward logs` drains both and
+    // prints "stdout: <line>" and "exit: 0".
     let daemon = common::Daemon::spawn();
+    let create_out = daemon
+        .cli()
+        .args(["create", "alpine:latest"])
+        .output()
+        .expect("create");
+    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let exec_out = daemon
+        .cli()
+        .args(["exec", &id, "--", "echo", "hello"])
+        .output()
+        .expect("exec");
+    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
 
     // Act
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["logs", "deadbeef", "deadbeef"]).assert();
+    let assertion = cmd.args(["logs", &id, &pid]).assert();
 
-    // Assert: non-zero exit and stderr says Unimplemented. When streaming
-    // lands, this test gets rewritten to assert on real stdout output;
-    // the negative-input tests above keep their shape.
+    // Assert: must succeed and stdout includes both the line prefix
+    // ("stdout:") and the exit marker ("exit: 0"). The exact content of
+    // the line is owned by the stub; tests assert the wire shape only.
+    assertion
+        .success()
+        .stdout(predicate::str::contains("stdout:"))
+        .stdout(predicate::str::contains("exit: 0"));
+}
+
+#[test]
+fn given_invalid_pid_when_user_runs_logs_then_fails_with_clear_error() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+
+    // Act: 'z' is not hex, so the entity_id validator rejects.
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args([
+            "logs",
+            "00000000-0000-0000-0000-000000000000",
+            "not-hex-zzz",
+        ])
+        .assert();
+
+    // Assert: non-zero exit, stderr names the offending field so the
+    // user knows what to fix without reading docs.
     assertion
         .failure()
-        .stderr(predicate::str::contains("Unimplemented"));
+        .stderr(predicate::str::contains("process"));
+}
+
+#[test]
+fn given_unknown_pid_when_user_runs_logs_then_fails_with_not_found() {
+    // Arrange: well-formed pid that no exec ever produced.
+    let daemon = common::Daemon::spawn();
+    let unknown_pid = "00000000-0000-0000-0000-000000000000";
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["logs", unknown_pid, unknown_pid]).assert();
+
+    // Assert: NotFound (not Internal). stderr should echo the offending
+    // pid for grep-friendly CI logs.
+    assertion
+        .failure()
+        .stderr(predicate::str::contains(unknown_pid));
 }
