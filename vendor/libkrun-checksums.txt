@@ -12,7 +12,8 @@
 #
 # Format: <hex sha256>  libkrun-<version>-<target>.tar.gz
 #
-# Example (placeholders — replace after first ward-vendor build):
-#   0000000000000000000000000000000000000000000000000000000000000000  libkrun-1.18.0-aarch64-apple-darwin.tar.gz
-#   0000000000000000000000000000000000000000000000000000000000000000  libkrun-1.18.0-x86_64-unknown-linux-gnu.tar.gz
-#   0000000000000000000000000000000000000000000000000000000000000000  libkrun-1.18.0-aarch64-unknown-linux-gnu.tar.gz
+# Produced by ward-vendor run #26003889190 (commit cac844d), released as
+# libkrun-v1.18.0 at https://github.com/igorjs/ward-vendor/releases/tag/libkrun-v1.18.0
+b1c61501676e234763661b4980ca3f4d1e872fc136049e6b5ec9042f6753a719  libkrun-1.18.0-aarch64-apple-darwin.tar.gz
+1977e74bb619d93bedb545652f216b544759722b04997fb408f899ab53e9d886  libkrun-1.18.0-x86_64-unknown-linux-gnu.tar.gz
+65dc63f1858597b5e80fd42f08afb91d249b03a2abea3205dff61c1f39ac06fa  libkrun-1.18.0-aarch64-unknown-linux-gnu.tar.gz
