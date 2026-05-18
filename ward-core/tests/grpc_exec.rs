@@ -16,7 +16,8 @@ mod common;
 use tonic::Code;
 
 use ward_core::pb::{
-    CreateSandboxRequest, ExecRequest, RunRequest, StreamOutputRequest, WriteStdinRequest,
+    CreateSandboxRequest, ExecRequest, KillProcessRequest, RunRequest, StreamOutputRequest,
+    WriteStdinRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -523,4 +524,123 @@ async fn given_pid_from_different_sandbox_when_write_stdin_then_not_found() {
     // Assert: NotFound — leaking pid existence across sandboxes would be a
     // tenant-isolation regression.
     assert_eq!(err.code(), Code::NotFound);
+}
+
+// ---------------------------------------------------------------------------
+// KillProcess
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn given_exec_when_kill_process_then_returns_empty_ok() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s.id.clone(),
+            command: vec!["cat".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Act
+    let resp = client
+        .kill_process(KillProcessRequest {
+            sandbox_id: s.id,
+            pid: proc.pid,
+        })
+        .await
+        .expect("kill_process");
+
+    // Assert: Empty response.
+    let _: () = resp.into_inner();
+}
+
+#[tokio::test]
+async fn given_killed_pid_when_write_stdin_then_not_found() {
+    // Arrange: across the wire, kill must make the pid unreachable for
+    // subsequent operations. Regression guard for ProcessRecord removal.
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let proc = client
+        .exec(ExecRequest {
+            sandbox_id: s.id.clone(),
+            command: vec!["cat".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    client
+        .kill_process(KillProcessRequest {
+            sandbox_id: s.id.clone(),
+            pid: proc.pid.clone(),
+        })
+        .await
+        .unwrap();
+
+    // Act
+    let err = client
+        .write_stdin(WriteStdinRequest {
+            sandbox_id: s.id,
+            pid: proc.pid,
+            data: b"x".to_vec(),
+        })
+        .await
+        .expect_err("write after kill");
+
+    // Assert
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn given_unknown_pid_when_kill_process_then_not_found() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .kill_process(KillProcessRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "00000000-0000-0000-0000-000000000000".into(),
+        })
+        .await
+        .expect_err("unknown pid");
+
+    // Assert
+    assert_eq!(err.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn given_malformed_pid_when_kill_process_then_invalid_argument() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .kill_process(KillProcessRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+            pid: "not-hex-zzz".into(),
+        })
+        .await
+        .expect_err("malformed pid");
+
+    // Assert
+    assert_eq!(err.code(), Code::InvalidArgument);
 }

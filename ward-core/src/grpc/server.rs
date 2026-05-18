@@ -170,9 +170,14 @@ impl Ward for WardGrpcServer {
 
     async fn kill_process(
         &self,
-        _request: Request<KillProcessRequest>,
+        request: Request<KillProcessRequest>,
     ) -> Result<Response<()>, Status> {
-        Err(Status::unimplemented("kill_process"))
+        let req = request.into_inner();
+        self.sandbox
+            .kill_process(&req.sandbox_id, &req.pid)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
     }
 
     async fn create_snapshot(
