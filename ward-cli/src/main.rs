@@ -93,6 +93,14 @@ enum Commands {
         data: Option<String>,
     },
 
+    /// Signal a process to terminate.
+    Kill {
+        /// Sandbox ID.
+        id: String,
+        /// Process ID returned by exec/run.
+        pid: String,
+    },
+
     /// Snapshot management subcommands.
     #[command(subcommand)]
     Snapshot(SnapshotCommands),
@@ -306,6 +314,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("{kind}: {}", evt.line);
                 }
             }
+        }
+
+        Commands::Kill { id, pid } => {
+            let mut c = client::connect(&socket_path).await?;
+            c.kill_process(ward_core::pb::KillProcessRequest {
+                sandbox_id: id,
+                pid: pid.clone(),
+            })
+            .await?;
+            println!("killed: {pid}");
         }
 
         Commands::Stdin { id, pid, data } => {
