@@ -316,8 +316,14 @@ async fn given_exec_when_stream_output_then_yields_stdout_then_exit_then_closes(
     // closing-after-exit semantic must hold. The pb enum is 1 = Stdout,
     // 3 = Exit.
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].r#type, ward_core::pb::StreamEventType::Stdout as i32);
-    assert_eq!(events[1].r#type, ward_core::pb::StreamEventType::Exit as i32);
+    assert_eq!(
+        events[0].r#type,
+        ward_core::pb::StreamEventType::Stdout as i32
+    );
+    assert_eq!(
+        events[1].r#type,
+        ward_core::pb::StreamEventType::Exit as i32
+    );
     assert_eq!(events[1].exit_code, 0);
 }
 

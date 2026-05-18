@@ -357,10 +357,7 @@ async fn main() -> anyhow::Result<()> {
             SnapshotCommands::Create { sandbox_id, label } => {
                 let mut c = client::connect(&socket_path).await?;
                 let resp = c
-                    .create_snapshot(ward_core::pb::CreateSnapshotRequest {
-                        sandbox_id,
-                        label,
-                    })
+                    .create_snapshot(ward_core::pb::CreateSnapshotRequest { sandbox_id, label })
                     .await?
                     .into_inner();
                 // One field per line so scripts can grep without parsing

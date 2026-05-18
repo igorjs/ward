@@ -287,9 +287,7 @@ fn given_unknown_pid_when_user_writes_stdin_then_fails_with_not_found() {
 
     // Act
     let mut cmd = daemon.cli();
-    let assertion = cmd
-        .args(["stdin", unknown_pid, unknown_pid, "x"])
-        .assert();
+    let assertion = cmd.args(["stdin", unknown_pid, unknown_pid, "x"]).assert();
 
     // Assert: stderr echoes the offending pid so users can grep CI logs.
     assertion

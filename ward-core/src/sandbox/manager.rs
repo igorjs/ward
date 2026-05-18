@@ -328,12 +328,7 @@ impl SandboxManager {
     /// sandbox, or no longer accepting input (channel closed). Empty data
     /// is a valid no-op — callers occasionally use it as a connectivity
     /// probe before streaming real input.
-    pub async fn write_stdin(
-        &self,
-        sandbox_id: &str,
-        pid: &str,
-        data: bytes::Bytes,
-    ) -> Result<()> {
+    pub async fn write_stdin(&self, sandbox_id: &str, pid: &str, data: bytes::Bytes) -> Result<()> {
         crate::validate::entity_id(sandbox_id, "sandbox")?;
         crate::validate::entity_id(pid, "process")?;
 
@@ -345,9 +340,10 @@ impl SandboxManager {
             return Err(ApiError::ProcessNotFound(pid.to_string()));
         }
 
-        let tx = record.stdin_tx.as_ref().ok_or_else(|| {
-            ApiError::InvalidRequest("process does not accept stdin".into())
-        })?;
+        let tx = record
+            .stdin_tx
+            .as_ref()
+            .ok_or_else(|| ApiError::InvalidRequest("process does not accept stdin".into()))?;
 
         // Send failure means the consumer side dropped — the process is
         // effectively gone from the user's perspective. Surfacing as
