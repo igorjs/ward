@@ -240,12 +240,12 @@ async fn publish_rejects_oversized_payload() {
 }
 
 #[tokio::test]
-async fn publish_with_valid_inputs_returns_unimplemented_not_invalid() {
+async fn publish_with_valid_inputs_for_unregistered_sandbox_returns_not_found() {
     let mut client = common::test_server().await;
 
-    // Sanity check: a well-formed request reaches the unimplemented stub
-    // (the broker isn't built yet). If the validator wrongly rejected this,
-    // we'd see InvalidArgument and miss the future broker implementation.
+    // Sanity check: a well-formed but unregistered sandbox reaches the
+    // broker, which returns SandboxNotFound -> Status::not_found. If the
+    // validator wrongly rejected this we'd see InvalidArgument instead.
     let err = client
         .publish(PublishRequest {
             sandbox_id: "deadbeef".into(),
@@ -253,12 +253,12 @@ async fn publish_with_valid_inputs_returns_unimplemented_not_invalid() {
             payload: b"hello".to_vec(),
         })
         .await
-        .expect_err("publish stub returns unimplemented");
+        .expect_err("publish for unregistered sandbox");
 
     assert_eq!(
         err.code(),
-        Code::Unimplemented,
-        "valid inputs must reach the stub, not be rejected by validation"
+        Code::NotFound,
+        "valid inputs must reach the broker; an unknown sandbox surfaces as NotFound"
     );
 }
 
