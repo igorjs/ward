@@ -45,6 +45,14 @@ enum Commands {
         /// Timeout in seconds (0 = no timeout).
         #[arg(long, default_value = "0")]
         timeout: u64,
+        /// Cross-sandbox communication mode: "deny" (default) or "group".
+        /// In group mode, sandboxes with identical --comms-group strings
+        /// can publish/subscribe to each other.
+        #[arg(long, default_value = "deny")]
+        comms_mode: String,
+        /// Group name for --comms-mode=group. Ignored in deny mode.
+        #[arg(long, default_value = "")]
+        comms_group: String,
     },
 
     /// List all sandboxes.
@@ -203,6 +211,8 @@ async fn main() -> anyhow::Result<()> {
             memory,
             cpus,
             timeout,
+            comms_mode,
+            comms_group,
         } => {
             // Parse KEY=VALUE env strings into a HashMap. Splitting on the
             // first '=' lets values themselves contain '=', which matters
@@ -215,6 +225,15 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
 
+            // Map the user-facing string to the pb enum. Unknown values
+            // bail out before the wire so the user gets a clear local
+            // error instead of an opaque InvalidArgument from the daemon.
+            let comms_mode_pb = match comms_mode.as_str() {
+                "deny" => ward_core::pb::CommunicationMode::Deny,
+                "group" => ward_core::pb::CommunicationMode::Group,
+                other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
+            };
+
             let mut c = client::connect(&socket_path).await?;
             let resp = c
                 .create_sandbox(ward_core::pb::CreateSandboxRequest {
@@ -226,6 +245,10 @@ async fn main() -> anyhow::Result<()> {
                         timeout_seconds: timeout,
                     }),
                     env: env_map,
+                    comms: Some(ward_core::pb::CommunicationPolicy {
+                        mode: comms_mode_pb as i32,
+                        group: comms_group,
+                    }),
                     ..Default::default()
                 })
                 .await?
