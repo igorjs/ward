@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "wardd",
+    "ward-daemon",
     "ward-cli",
     "ward-core",
 ]
