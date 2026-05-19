@@ -8,6 +8,7 @@ use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
 use ward_core::backend::krunvm::KrunvmBackend;
+use ward_core::comms::Broker;
 use ward_core::config::Config;
 use ward_core::grpc::WardGrpcServer;
 use ward_core::pb::ward_server::WardServer;
@@ -39,7 +40,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the domain managers.
     let backend = Arc::new(KrunvmBackend::new(cfg.data_dir.clone()));
-    let sandbox_mgr = Arc::new(SandboxManager::new(Arc::clone(&backend), cfg.max_sandboxes));
+    let broker = Arc::new(Broker::new());
+    let sandbox_mgr = Arc::new(SandboxManager::new(
+        Arc::clone(&backend),
+        Arc::clone(&broker),
+        cfg.max_sandboxes,
+    ));
     let volume_mgr = Arc::new(VolumeManager::new(cfg.data_dir.clone(), cfg.max_volumes));
 
     let grpc_service = WardGrpcServer::new(Arc::clone(&sandbox_mgr), Arc::clone(&volume_mgr));

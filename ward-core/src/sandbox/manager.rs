@@ -9,6 +9,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 
 use crate::backend::BackendError;
 use crate::backend::krunvm::KrunvmBackend;
+use crate::comms::Broker;
 use crate::egress::EgressProxy;
 use crate::pb::{
     ExecRequest, ProcessInfo, RunRequest, SandboxInfo as PbSandboxInfo, SandboxStatus,
@@ -66,6 +67,10 @@ struct ProcessRecord {
 /// Coordinates sandbox lifecycle across the backend and supporting subsystems.
 pub struct SandboxManager {
     backend: Arc<KrunvmBackend>,
+    /// Pub/sub broker shared with the gRPC layer. Manager owns lifecycle
+    /// notifications (register on create, deregister on remove); gRPC owns
+    /// the per-RPC routing (publish/subscribe/log).
+    broker: Arc<Broker>,
     entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
     /// Maximum concurrent sandboxes. Prevents resource exhaustion from unbounded creation.
     max_sandboxes: usize,
@@ -76,13 +81,20 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new(backend: Arc<KrunvmBackend>, max_sandboxes: usize) -> Self {
+    pub fn new(backend: Arc<KrunvmBackend>, broker: Arc<Broker>, max_sandboxes: usize) -> Self {
         Self {
             backend,
+            broker,
             entries: Arc::new(RwLock::new(HashMap::new())),
             max_sandboxes,
             processes: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Borrow the shared broker. Useful for the gRPC layer which needs
+    /// to call publish/subscribe/log without going through the manager.
+    pub fn broker(&self) -> Arc<Broker> {
+        Arc::clone(&self.broker)
     }
 
     // -----------------------------------------------------------------------
@@ -137,7 +149,7 @@ impl SandboxManager {
             } else {
                 Some(req.from_snapshot.clone())
             },
-            comms,
+            comms: comms.clone(),
         };
 
         let info = self
@@ -163,12 +175,19 @@ impl SandboxManager {
         };
 
         self.entries.write().await.insert(
-            id,
+            id.clone(),
             SandboxEntry {
                 egress,
                 timeout_handle,
             },
         );
+
+        // Register the comms policy with the broker so publish/subscribe
+        // calls from this sandbox have something to match against. Done
+        // after the entries-insert so we don't leak broker state if the
+        // local registration fails — though entries.insert can't actually
+        // fail here, the order keeps cleanup symmetric with remove().
+        self.broker.register_sandbox(id, comms).await;
 
         Ok(protocol_info_to_pb(info))
     }
@@ -204,6 +223,10 @@ impl SandboxManager {
             .write()
             .await
             .retain(|_, rec| rec.sandbox_id != id);
+
+        // Drop the comms registration too: drops the policy, the audit
+        // log, and any active subscriptions owned by this sandbox.
+        self.broker.deregister_sandbox(id).await;
 
         self.backend.remove_sandbox(id).await.map_err(backend_err)
     }
@@ -499,7 +522,8 @@ mod tests {
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
         let backend = Arc::new(KrunvmBackend::new(path));
-        Arc::new(SandboxManager::new(backend, max_sandboxes))
+        let broker = Arc::new(Broker::new());
+        Arc::new(SandboxManager::new(backend, broker, max_sandboxes))
     }
 
     fn create_req(image: &str) -> CreateSandboxRequest {
