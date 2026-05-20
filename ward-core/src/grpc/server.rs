@@ -184,13 +184,13 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
-        // Validate identity inputs at the API boundary so that the eventual
-        // backend implementation can rely on well-formed IDs. The contract
-        // we're locking in here outlives `Unimplemented`: when snapshots
-        // ship, these validators continue to gate the happy path.
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-        Err(Status::unimplemented("create_snapshot"))
+        let info = self
+            .sandbox
+            .create_snapshot(&req.sandbox_id, &req.label)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(snapshot_info_to_pb(info)))
     }
 
     async fn restore_snapshot(
@@ -198,9 +198,11 @@ impl Ward for WardGrpcServer {
         request: Request<RestoreSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-        crate::validate::entity_id(&req.snapshot_id, "snapshot").map_err(api_err_to_status)?;
-        Err(Status::unimplemented("restore_snapshot"))
+        self.sandbox
+            .restore_snapshot(&req.sandbox_id, &req.snapshot_id)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
     }
 
     async fn list_snapshots(
@@ -208,8 +210,13 @@ impl Ward for WardGrpcServer {
         request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-        Err(Status::unimplemented("list_snapshots"))
+        let snaps = self
+            .sandbox
+            .list_snapshots(&req.sandbox_id)
+            .await
+            .map_err(api_err_to_status)?;
+        let snapshots = snaps.into_iter().map(snapshot_info_to_pb).collect();
+        Ok(Response::new(ListSnapshotsResponse { snapshots }))
     }
 
     async fn create_volume(
@@ -420,5 +427,16 @@ fn log_entry_to_pb(entry: crate::comms::LogEntry) -> CommunicationLogEntry {
         allowed: entry.allowed,
         subscriber_count: entry.subscriber_count,
         timestamp: system_time_to_pb(entry.timestamp),
+    }
+}
+
+/// Translate an internal SnapshotInfo into the pb wire shape.
+fn snapshot_info_to_pb(info: crate::protocol::SnapshotInfo) -> SnapshotInfo {
+    SnapshotInfo {
+        snapshot_id: info.snapshot_id,
+        sandbox_id: info.sandbox_id,
+        label: info.label,
+        created_at: system_time_to_pb(info.created_at),
+        size_bytes: info.size_bytes,
     }
 }
