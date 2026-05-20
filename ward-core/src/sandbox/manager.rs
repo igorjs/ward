@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-use crate::backend::BackendError;
-use crate::backend::krunvm::KrunvmBackend;
+use crate::backend::{Backend, BackendError};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
 use crate::pb::{
@@ -66,7 +65,7 @@ struct ProcessRecord {
 
 /// Coordinates sandbox lifecycle across the backend and supporting subsystems.
 pub struct SandboxManager {
-    backend: Arc<KrunvmBackend>,
+    backend: Arc<dyn Backend>,
     /// Pub/sub broker shared with the gRPC layer. Manager owns lifecycle
     /// notifications (register on create, deregister on remove); gRPC owns
     /// the per-RPC routing (publish/subscribe/log).
@@ -81,7 +80,7 @@ pub struct SandboxManager {
 }
 
 impl SandboxManager {
-    pub fn new(backend: Arc<KrunvmBackend>, broker: Arc<Broker>, max_sandboxes: usize) -> Self {
+    pub fn new(backend: Arc<dyn Backend>, broker: Arc<Broker>, max_sandboxes: usize) -> Self {
         Self {
             backend,
             broker,
@@ -567,10 +566,11 @@ mod tests {
     /// Leaks the TempDir intentionally: tokio's async fs API outlives any
     /// test-local scope, and the OS cleans /tmp on its own schedule.
     fn build_manager(max_sandboxes: usize) -> Arc<SandboxManager> {
+        use crate::backend::krunvm::KrunvmBackend;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        let backend = Arc::new(KrunvmBackend::new(path));
+        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(path));
         let broker = Arc::new(Broker::new());
         Arc::new(SandboxManager::new(backend, broker, max_sandboxes))
     }
