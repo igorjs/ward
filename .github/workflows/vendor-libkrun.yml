@@ -1,12 +1,18 @@
 # Build relocatable libkrun + libkrunfw artefacts on a matrix of hosts and
-# publish them to a GitHub Release tagged `libkrun-v<version>`. Consumed by
-# `ward-core/build.rs` so end users never run a separate install command.
+# publish them to a GitHub Release tagged `libkrun-v<version>`. These bottles
+# are *not* consumed at developer build time — devs install libkrun via
+# `brew install slp/krun/libkrun slp/krun/libkrunfw` (see DEVELOPMENT.md).
 #
-# Gating: this workflow does NOT run on every push. Two triggers only:
-#   1. workflow_dispatch — manual trigger from the Actions tab.
-#   2. paths-filtered push to main affecting vendor/libkrun-build/**.
+# The bottles feed into the future release-packaging workflow that bundles
+# the libkrun dylibs alongside `wardd` and `ward` into per-platform end-user
+# artefacts (`.pkg`, `.deb`, install.sh tarballs). End users download one
+# self-contained file and never run a second install command.
 #
-# So ward source changes don't pay the 15-min libkrun build cost.
+# Gating: manual trigger only. Push triggers were removed once we shifted
+# the "zero install" promise to end-user packaging rather than per-dev
+# build.rs (see ward-core/build.rs comment for the architecture rationale).
+# Trigger this workflow when bumping `vendor/libkrun-build/version.txt`,
+# or ad-hoc before cutting a ward release that needs fresh bottles.
 
 name: vendor-libkrun
 
@@ -17,11 +23,6 @@ on:
         description: "Override version (otherwise read from vendor/libkrun-build/version.txt)"
         required: false
         type: string
-  push:
-    branches: [main]
-    paths:
-      - "vendor/libkrun-build/**"
-      - ".github/workflows/vendor-libkrun.yml"
 
 permissions:
   contents: write # required to create releases + upload artefacts
