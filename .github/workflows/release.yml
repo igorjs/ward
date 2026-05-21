@@ -186,7 +186,7 @@ jobs:
           ls -la "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256"
 
       - name: Upload artefact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ward-${{ matrix.target }}
           path: |
@@ -203,7 +203,7 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Download all artefacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -221,7 +221,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           name: ward ${{ needs.resolve.outputs.version }}
