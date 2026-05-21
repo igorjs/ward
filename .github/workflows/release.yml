@@ -1,0 +1,248 @@
+# Build per-target ward release artefacts on a version tag push and
+# publish them to a GitHub Release. Consumed by:
+#
+#   - install.sh (curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash)
+#   - homebrew-ward tap (formula points at the macOS arm64 tarball)
+#   - Linux .deb packaging (future job, gated on GPG secret being set)
+#
+# Goal: a fresh user runs install.sh, gets a working `ward` + `wardd`
+# binary, and never installs anything else. The libkrun dependency
+# (when --features krunvm is enabled) is bundled inside the archive
+# next to the binaries via rpath; the stub backend ships when
+# the feature is off.
+#
+# Gating: tag push only. `v*` semver tags trigger the full matrix.
+# Manual workflow_dispatch also supported for testing without cutting
+# a tag (uploads under a `dev-<sha>` release).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      include_libkrun:
+        description: "Bundle libkrun bottles (requires the vendor-libkrun release to exist)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Resolve version + decide build features once ───────────────────
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.r.outputs.version }}
+      tag: ${{ steps.r.outputs.tag }}
+      include_libkrun: ${{ steps.r.outputs.include_libkrun }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: r
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF##refs/tags/}"
+            VERSION="${TAG#v}"
+            INCLUDE_LIBKRUN="true"
+          else
+            # workflow_dispatch — synthesise a dev tag.
+            SHORT_SHA="$(echo ${{ github.sha }} | cut -c1-7)"
+            TAG="dev-${SHORT_SHA}"
+            VERSION="0.0.0-${SHORT_SHA}"
+            INCLUDE_LIBKRUN="${{ inputs.include_libkrun }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "include_libkrun=${INCLUDE_LIBKRUN}" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=${TAG} version=${VERSION} libkrun=${INCLUDE_LIBKRUN}"
+
+  # ── Build per target ───────────────────────────────────────────────
+  build:
+    needs: [resolve]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            dylib_ext: dylib
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            dylib_ext: so
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            dylib_ext: so
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install protoc
+        run: |
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
+          else
+            brew install protobuf
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # When libkrun bundling is requested, fetch the matching vendor
+      # bottle so we can both link against it AND ship it inside the
+      # archive. Skipped on stub builds.
+      - name: Fetch libkrun bottle
+        if: needs.resolve.outputs.include_libkrun == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-build/version.txt)"
+          TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
+          mkdir -p libkrun-vendor
+          gh release download "libkrun-v${LIBKRUN_VERSION}" \
+            --pattern "$TARBALL" \
+            --pattern "${TARBALL}.sha256" \
+            --dir libkrun-vendor
+          # Verify the bottle hash matches our committed checksums.
+          EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-build/checksums.txt | awk '{print $1}')"
+          if [[ -z "$EXPECTED" ]]; then
+            echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-build/checksums.txt"
+            exit 1
+          fi
+          if command -v sha256sum > /dev/null; then
+            ACTUAL="$(sha256sum "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          else
+            ACTUAL="$(shasum -a 256 "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          fi
+          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            echo "::error::SHA-256 mismatch for ${TARBALL}: expected ${EXPECTED}, got ${ACTUAL}"
+            exit 1
+          fi
+          # Extract for linking; the bottle layout is `lib/`, `include/`,
+          # and `lib/pkgconfig/libkrun.pc` per build.sh.
+          mkdir -p libkrun-vendor/extracted
+          tar -xzf "libkrun-vendor/${TARBALL}" -C libkrun-vendor/extracted
+          # Rewrite the placeholder prefix in libkrun.pc to the absolute
+          # extracted path so pkg-config + krun-sys find it.
+          PREFIX="$(pwd)/libkrun-vendor/extracted"
+          sed -i.bak "s|__VENDOR_PREFIX__|${PREFIX}|" \
+            "libkrun-vendor/extracted/lib/pkgconfig/libkrun.pc"
+          rm "libkrun-vendor/extracted/lib/pkgconfig/libkrun.pc.bak"
+          echo "PKG_CONFIG_PATH=${PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LIBKRUN_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          # On macOS, bindgen needs libclang. Xcode CLT provides it but
+          # not in a path bindgen searches by default.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            echo "LIBCLANG_PATH=/Library/Developer/CommandLineTools/usr/lib" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (stub backend)
+        if: needs.resolve.outputs.include_libkrun != 'true'
+        run: |
+          cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Build (with libkrun)
+        if: needs.resolve.outputs.include_libkrun == 'true'
+        run: |
+          cargo build --release --workspace --target ${{ matrix.target }} --features ward-core/krunvm
+
+      - name: Stage archive
+        run: |
+          VERSION="${{ needs.resolve.outputs.version }}"
+          TARGET="${{ matrix.target }}"
+          STAGE="ward-${VERSION}-${TARGET}"
+          mkdir -p "${STAGE}/bin" "${STAGE}/lib"
+          cp "target/${TARGET}/release/wardd" "${STAGE}/bin/"
+          cp "target/${TARGET}/release/ward" "${STAGE}/bin/"
+          cp LICENSE "${STAGE}/" 2>/dev/null || true
+          cp README.md "${STAGE}/" 2>/dev/null || true
+          if [[ "${{ needs.resolve.outputs.include_libkrun }}" == "true" ]]; then
+            cp "${LIBKRUN_PREFIX}/lib/libkrun.${{ matrix.dylib_ext }}"* "${STAGE}/lib/" 2>/dev/null || true
+            cp "${LIBKRUN_PREFIX}/lib/libkrunfw.${{ matrix.dylib_ext }}"* "${STAGE}/lib/" 2>/dev/null || true
+          fi
+          tar -czf "${STAGE}.tar.gz" "${STAGE}"
+          # Cross-platform SHA-256.
+          if command -v sha256sum > /dev/null; then
+            sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          else
+            shasum -a 256 "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          fi
+          ls -la "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ward-${{ matrix.target }}
+          path: |
+            ward-*-${{ matrix.target }}.tar.gz
+            ward-*-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Publish a single release with every per-target tarball ────────
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Summarise release contents
+        run: |
+          {
+            echo "## Release ${{ needs.resolve.outputs.tag }}"
+            echo ""
+            echo "**Artefacts** (paste into install.sh's CHECKSUMS table):"
+            echo ""
+            echo '```'
+            cat dist/*.sha256 | sort
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: ward ${{ needs.resolve.outputs.version }}
+          body: |
+            Pre-built ward binaries. Install with:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
+            ```
+
+            Or download a tarball directly and extract:
+
+            ```sh
+            tar -xzf ward-${{ needs.resolve.outputs.version }}-<target>.tar.gz
+            ./ward-${{ needs.resolve.outputs.version }}-<target>/bin/ward --help
+            ```
+
+            ## Supported targets
+
+            | Target                          | Backend                                |
+            | ------------------------------- | -------------------------------------- |
+            | `aarch64-apple-darwin`          | libkrun (HVF) when bundled, stub else  |
+            | `x86_64-unknown-linux-gnu`      | libkrun (KVM) when bundled, stub else  |
+            | `aarch64-unknown-linux-gnu`     | libkrun (KVM) when bundled, stub else  |
+          files: |
+            dist/ward-*.tar.gz
+            dist/ward-*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          prerelease: ${{ contains(needs.resolve.outputs.tag, 'dev-') }}

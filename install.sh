@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+#
+# ward installer.
+#
+# Detects the host platform, downloads the matching pre-built archive
+# from the ward GitHub Releases, verifies its SHA-256, and installs the
+# `ward` and `wardd` binaries under $WARD_INSTALL_DIR (default ~/.ward).
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | WARD_VERSION=v0.2.0 bash
+#   curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | WARD_INSTALL_DIR=/usr/local bash
+#
+# Environment:
+#   WARD_VERSION      Release tag to install. Defaults to the latest stable
+#                     release (whatever `latest` resolves to on GitHub).
+#   WARD_INSTALL_DIR  Prefix to install into. Binaries go in
+#                     $WARD_INSTALL_DIR/bin/; dylibs in $WARD_INSTALL_DIR/lib/.
+#                     Default: $HOME/.ward
+#   WARD_NO_MODIFY_PATH
+#                     If set to any non-empty value, skip the PATH update hint.
+#
+# Exit codes:
+#   0   Success.
+#   1   Unsupported platform.
+#   2   Required tool missing (curl, tar, sha256sum/shasum).
+#   3   Download failed.
+#   4   SHA-256 verification failed.
+#   5   Extraction failed.
+#   6   GitHub API call to resolve `latest` failed.
+
+set -euo pipefail
+
+WARD_REPO="${WARD_REPO:-igorjs/ward}"
+WARD_VERSION="${WARD_VERSION:-latest}"
+WARD_INSTALL_DIR="${WARD_INSTALL_DIR:-${HOME}/.ward}"
+TMP_DIR=""
+
+# Use ANSI colours when stdout is a TTY. Piping curl to bash typically
+# leaves stdout connected to the terminal, so colours work.
+if [[ -t 1 ]]; then
+  C_DIM="$(printf '\033[2m')"
+  C_BOLD="$(printf '\033[1m')"
+  C_GREEN="$(printf '\033[32m')"
+  C_RED="$(printf '\033[31m')"
+  C_RESET="$(printf '\033[0m')"
+else
+  C_DIM=""; C_BOLD=""; C_GREEN=""; C_RED=""; C_RESET=""
+fi
+
+log()  { printf "%s==>%s %s\n"   "$C_BOLD"  "$C_RESET" "$*"; }
+warn() { printf "%swarn:%s %s\n" "$C_BOLD"  "$C_RESET" "$*" >&2; }
+err()  { printf "%serror:%s %s\n" "$C_RED"  "$C_RESET" "$*" >&2; }
+ok()   { printf "%s✓%s %s\n"     "$C_GREEN" "$C_RESET" "$*"; }
+
+cleanup() {
+  if [[ -n "$TMP_DIR" && -d "$TMP_DIR" ]]; then
+    rm -rf -- "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------------------
+# Tooling sanity check
+# ---------------------------------------------------------------------------
+
+need() {
+  command -v "$1" > /dev/null 2>&1 || {
+    err "missing required tool: $1"
+    exit 2
+  }
+}
+need curl
+need tar
+# sha256: macOS uses `shasum -a 256`, Linux uses `sha256sum`. We'll detect.
+
+if command -v sha256sum > /dev/null 2>&1; then
+  SHA256_CMD="sha256sum"
+elif command -v shasum > /dev/null 2>&1; then
+  SHA256_CMD="shasum -a 256"
+else
+  err "missing required tool: sha256sum or shasum"
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+detect_target() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "$os" in
+    Darwin)
+      case "$arch" in
+        arm64 | aarch64) echo "aarch64-apple-darwin" ;;
+        *)
+          err "unsupported macOS architecture: $arch (ward currently supports Apple Silicon only)"
+          exit 1
+          ;;
+      esac
+      ;;
+    Linux)
+      case "$arch" in
+        x86_64) echo "x86_64-unknown-linux-gnu" ;;
+        aarch64 | arm64) echo "aarch64-unknown-linux-gnu" ;;
+        *)
+          err "unsupported Linux architecture: $arch"
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      err "unsupported operating system: $os"
+      exit 1
+      ;;
+  esac
+}
+
+TARGET="$(detect_target)"
+log "Detected target: ${C_BOLD}${TARGET}${C_RESET}"
+
+# ---------------------------------------------------------------------------
+# Resolve version
+# ---------------------------------------------------------------------------
+
+resolve_version() {
+  if [[ "$WARD_VERSION" != "latest" ]]; then
+    echo "$WARD_VERSION"
+    return
+  fi
+  # Public API call; no auth required for releases.
+  local url="https://api.github.com/repos/${WARD_REPO}/releases/latest"
+  local tag
+  tag="$(curl -fsSL "$url" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+  if [[ -z "$tag" ]]; then
+    err "could not resolve latest release tag from $url"
+    exit 6
+  fi
+  echo "$tag"
+}
+
+TAG="$(resolve_version)"
+VERSION="${TAG#v}"
+log "Installing ward ${C_BOLD}${VERSION}${C_RESET} (tag ${TAG})"
+
+# ---------------------------------------------------------------------------
+# Download + verify
+# ---------------------------------------------------------------------------
+
+TMP_DIR="$(mktemp -d)"
+ARCHIVE="ward-${VERSION}-${TARGET}.tar.gz"
+ARCHIVE_URL="https://github.com/${WARD_REPO}/releases/download/${TAG}/${ARCHIVE}"
+SHA_URL="${ARCHIVE_URL}.sha256"
+
+log "Downloading $ARCHIVE"
+if ! curl --fail --silent --show-error --location \
+        --output "${TMP_DIR}/${ARCHIVE}" "$ARCHIVE_URL"; then
+  err "failed to download $ARCHIVE_URL"
+  exit 3
+fi
+if ! curl --fail --silent --show-error --location \
+        --output "${TMP_DIR}/${ARCHIVE}.sha256" "$SHA_URL"; then
+  err "failed to download $SHA_URL"
+  exit 3
+fi
+
+log "Verifying SHA-256"
+EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ARCHIVE}.sha256")"
+ACTUAL_SHA="$(${SHA256_CMD} "${TMP_DIR}/${ARCHIVE}" | awk '{print $1}')"
+if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
+  err "SHA-256 mismatch — refusing to install"
+  err "expected: $EXPECTED_SHA"
+  err "got:      $ACTUAL_SHA"
+  exit 4
+fi
+ok "Checksum verified"
+
+# ---------------------------------------------------------------------------
+# Extract + install
+# ---------------------------------------------------------------------------
+
+log "Extracting"
+if ! tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "${TMP_DIR}"; then
+  err "tar extraction failed"
+  exit 5
+fi
+
+EXTRACTED_DIR="${TMP_DIR}/ward-${VERSION}-${TARGET}"
+if [[ ! -d "$EXTRACTED_DIR" ]]; then
+  err "unexpected archive layout — no ${EXTRACTED_DIR} after extract"
+  exit 5
+fi
+
+log "Installing to ${C_BOLD}${WARD_INSTALL_DIR}${C_RESET}"
+mkdir -p "${WARD_INSTALL_DIR}/bin" "${WARD_INSTALL_DIR}/lib"
+# Copy with -p to preserve mtimes and exec bits; -R for nested directories.
+cp -pR "${EXTRACTED_DIR}/bin/." "${WARD_INSTALL_DIR}/bin/"
+if [[ -d "${EXTRACTED_DIR}/lib" ]] && [[ -n "$(ls -A "${EXTRACTED_DIR}/lib" 2>/dev/null || true)" ]]; then
+  cp -pR "${EXTRACTED_DIR}/lib/." "${WARD_INSTALL_DIR}/lib/"
+fi
+# Documentation is best-effort.
+for f in LICENSE README.md; do
+  [[ -f "${EXTRACTED_DIR}/${f}" ]] && cp "${EXTRACTED_DIR}/${f}" "${WARD_INSTALL_DIR}/" || true
+done
+
+# ---------------------------------------------------------------------------
+# Smoke test + PATH hint
+# ---------------------------------------------------------------------------
+
+log "Smoke test"
+if "${WARD_INSTALL_DIR}/bin/ward" --version > /dev/null 2>&1; then
+  ok "ward installed: $(${WARD_INSTALL_DIR}/bin/ward --version 2>&1 | head -n1)"
+else
+  warn "the installed ward binary did not respond to --version. Continuing,"
+  warn "but you may need to investigate (rpath issues are the usual cause)."
+fi
+
+echo
+ok "Installed ward ${VERSION} to ${WARD_INSTALL_DIR}"
+echo
+
+if [[ -z "${WARD_NO_MODIFY_PATH:-}" ]]; then
+  case ":$PATH:" in
+    *":${WARD_INSTALL_DIR}/bin:"*) ;;
+    *)
+      echo "${C_DIM}# Add ward to your shell PATH:${C_RESET}"
+      echo "  export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\""
+      echo
+      echo "${C_DIM}# Permanently (bash):${C_RESET}"
+      echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.bashrc"
+      echo "${C_DIM}# Permanently (zsh):${C_RESET}"
+      echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.zshrc"
+      echo
+      ;;
+  esac
+fi
+
+echo "${C_DIM}# Start the daemon:${C_RESET}"
+echo "  wardd &"
+echo
+echo "${C_DIM}# Then use the CLI:${C_RESET}"
+echo "  ward info"
+echo "  ward health"
+echo "  ward create alpine"
