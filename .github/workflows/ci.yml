@@ -79,6 +79,57 @@ jobs:
       - name: E2E tests (wardd subprocess + ward CLI)
         run: cargo test -p ward-daemon --tests
 
+  # ── libkrun feature build ────────────────────────────────────────────
+  # Compiles + lints the workspace with the real libkrun backend enabled.
+  # Downloads the pinned libkrun bottle from igorjs/ward-vendor (the same
+  # source release.yml uses) and verifies it against the SHA-256 sums in
+  # vendor/libkrun-checksums.txt. Does NOT boot a microVM: standard runners
+  # lack /dev/kvm, so this tier proves FFI signatures, linking, and all
+  # non-boot logic compile. Real boot tests are gated behind WARD_KVM_TESTS
+  # for a future self-hosted KVM runner (see ward-core/tests/krun_boot.rs).
+  krunvm-build:
+    needs: [clippy]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - name: Fetch + verify libkrun bottle
+        run: |
+          set -euo pipefail
+          LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-version.txt)"
+          TARBALL="libkrun-${LIBKRUN_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          mkdir -p libkrun-vendor
+          gh release download "libkrun-v${LIBKRUN_VERSION}" \
+            --repo igorjs/ward-vendor \
+            --pattern "$TARBALL" \
+            --dir libkrun-vendor
+          EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-checksums.txt | awk '{print $1}')"
+          if [[ -z "$EXPECTED" ]]; then
+            echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-checksums.txt"
+            exit 1
+          fi
+          ACTUAL="$(sha256sum "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
+            echo "::error::SHA-256 mismatch for ${TARBALL}: expected ${EXPECTED}, got ${ACTUAL}"
+            exit 1
+          fi
+          mkdir -p libkrun-vendor/extracted
+          tar -xzf "libkrun-vendor/${TARBALL}" -C libkrun-vendor/extracted
+          PREFIX="$(pwd)/libkrun-vendor/extracted"
+          echo "LIBKRUN_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
+      - name: Build (--features krunvm)
+        run: cargo build --workspace --features ward-core/krunvm
+      - name: Clippy (--features krunvm)
+        run: cargo clippy --all-targets --features ward-core/krunvm -- -D warnings
+
   # ── MSRV (minimum supported Rust version) ───────────────────────────
   # Reads rust-version from Cargo.toml; no extra tooling needed.
   msrv:
