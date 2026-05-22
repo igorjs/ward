@@ -8,7 +8,13 @@ license.workspace = true
 
 [features]
 default = []
-krunvm = ["dep:krun-sys"]
+# Enables real libkrun integration. When off, the stub KrunvmBackend
+# returns synthetic IDs and scripted streams — covers tests + dev
+# without requiring libkrun installed. When on, `ward-core/build.rs`
+# emits the linker directives for libkrun + libkrunfw, and the
+# `backend::krun_ffi` module declares the FFI surface directly (no
+# bindgen, no krun-sys crate). See adr/003-isolation-backend.md.
+krunvm = []
 
 [dependencies]
 # async-trait: makes Backend trait object-safe by boxing each async fn's
@@ -18,7 +24,6 @@ krunvm = ["dep:krun-sys"]
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
-krun-sys = { version = "1.10", optional = true }
 prost = "0.13"
 prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }

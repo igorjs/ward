@@ -50,4 +50,4 @@ Ward is written in Rust.
 - MSRV is pinned to Rust 1.85 (workspace `rust-version`).
 - Cross-compilation targets: `aarch64-apple-darwin` (macOS), `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`.
 - Key dependencies: `tokio` (async runtime), `tonic` (gRPC server), `prost`/`prost-types` (protobuf), `async-trait` (Backend trait), `tracing` (structured logging).
-- libkrun integration is via the `krun-sys` crate, gated behind the `krunvm` cargo feature. Default builds use a stub backend; `--features krunvm` links real libkrun. See ADR-003.
+- libkrun integration is via hand-maintained `unsafe extern "C"` declarations in `ward-core/src/backend/krun_ffi.rs`, gated behind the `krunvm` cargo feature. Default builds use a stub backend; `--features krunvm` links real libkrun. See ADR-003.
