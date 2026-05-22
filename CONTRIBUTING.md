@@ -110,6 +110,73 @@ and consumed by `release.yml` in this repo. FFI declarations live in
 `ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys`
 crate, no bindgen, no libclang build-dep).
 
+### Bumping libkrun
+
+Ward pins a specific libkrun version in `vendor/libkrun-version.txt`
+and declares the C ABI by hand in `ward-core/src/backend/krun_ffi.rs`.
+When upstream releases a new version that ward should adopt, follow
+this procedure end-to-end. The same convention lives in
+[ADR-003 Update section](docs/adr/003-isolation-backend.md#update--2026-05-18).
+
+**1. Diff the header.** Run the helper script with the target version:
+
+```bash
+scripts/diff-libkrun.sh <new-version>
+# e.g. scripts/diff-libkrun.sh 1.19.0
+```
+
+It fetches `include/libkrun.h` for the currently-pinned version (from
+`vendor/libkrun-version.txt`) and the new version, and prints a unified
+diff. To list only added function declarations:
+
+```bash
+scripts/diff-libkrun.sh 1.19.0 | grep -E '^\+(int32_t|uint32_t|void) krun_'
+```
+
+**2. Translate new signatures.** For each added declaration in the
+diff, add a matching `unsafe extern "C"` line in
+`ward-core/src/backend/krun_ffi.rs`. Group by the existing section
+comments (Context lifecycle, VM config, Networking, GPU/display,
+Audio, Resource limits, Exec config, Firmware/kernel, TEE, vsock,
+Console/serial, Virt features, Logging, Shutdown signalling, Boot).
+Use the smallest correct Rust types: `int32_t` -> `i32`, `uint8_t` ->
+`u8`, `const char *` -> `*const c_char`, NUL-terminated `char **` ->
+`*const *const c_char`. Watch for `uint8_t` masquerading as a count
+field (silent truncation if Rust callers pass a larger type; surface
+as an error per the `krun_set_vm_config` precedent).
+
+**3. Remove deletions.** If any function disappeared upstream, remove
+its declaration here. Check libkrun's `ABI_VERSION` constant in
+upstream `Makefile` is unchanged across the bump; if it incremented,
+the SO version changed and we need a coordinated release rather than a
+drop-in bump.
+
+**4. Bump the pin and trigger a rebuild.** Edit
+`vendor/libkrun-version.txt` to the new version. If libkrunfw is also
+bumping, edit `vendor/libkrun-checksums.txt` (the comment block
+documents the format) and the matching files at
+[`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor):
+`version.txt` and `libkrunfw-version.txt`. Trigger the `build`
+workflow at ward-vendor manually via `workflow_dispatch`.
+
+**5. Update local checksums.** Once the ward-vendor build publishes,
+copy each per-target SHA-256 from the release into
+`vendor/libkrun-checksums.txt`. The release packaging workflow
+refuses to use any downloaded bottle whose hash isn't listed there,
+so this is the supply-chain pin.
+
+**6. Verify locally.** Run both build modes:
+
+```bash
+cargo build                          # stub path, must still compile
+cargo check --features krunvm        # FFI path, requires libkrun installed
+cargo test --workspace
+```
+
+**7. Commit as one PR.** Title: `chore(libkrun): bump to v<NEW>`.
+Include the diff summary in the PR body so reviewers can see what
+changed in the surface without re-running the script.
+
 ### Workflow
 
 ```bash
