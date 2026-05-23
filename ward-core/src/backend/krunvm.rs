@@ -13,9 +13,18 @@ use tokio::sync::RwLock;
 
 use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::protocol::{
-    CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo, StreamEvent,
-    StreamEventKind,
+    CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo,
 };
+
+/// vsock port the guest agent listens on; must match `ward-guest-agent`.
+/// Only referenced by the krunvm-gated FFI wrappers.
+#[allow(dead_code)]
+const AGENT_VSOCK_PORT: u32 = 1024;
+
+/// Path of the agent binary inside every sandbox rootfs.
+/// Only referenced by the krunvm-gated FFI wrappers.
+#[allow(dead_code)]
+const AGENT_GUEST_PATH: &str = "/ward-agent";
 
 // ---------------------------------------------------------------------------
 // libc bindings used only by the krunvm boot path
@@ -83,6 +92,10 @@ pub struct KrunvmBackend {
     /// libkrun checkpoint state under data_dir/snapshots/.
     snapshots: Arc<RwLock<HashMap<String, SnapshotInfo>>>,
     data_dir: std::path::PathBuf,
+    /// Per-process kill senders, keyed by pid. Populated by the real exec
+    /// path so `kill_process` can signal the agent connection; empty in stub
+    /// builds, where killing is a no-op.
+    processes: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<()>>>>,
 }
 
 impl KrunvmBackend {
@@ -91,6 +104,7 @@ impl KrunvmBackend {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             data_dir,
+            processes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -116,6 +130,12 @@ impl Backend for KrunvmBackend {
         }
 
         // TODO: apply mount points.
+
+        // Boot the guest agent as the entry process and expose its vsock
+        // over a host Unix socket so exec() can reach it. Compile-verified
+        // under --features krunvm; runtime requires a booting microVM.
+        self.krun_set_agent_entry(ctx_id)?;
+        self.krun_add_agent_vsock(ctx_id, &self.agent_socket_path(&id))?;
 
         // Spawn the VM thread *after* all configuration calls. libkrun
         // requires krun_get_shutdown_eventfd + krun_start_enter to come
@@ -217,12 +237,15 @@ impl Backend for KrunvmBackend {
         Ok(self.sandboxes.read().await.len())
     }
 
-    /// Signal a process to terminate. The stub does no real work because
-    /// the stub's "process" is just a pair of mpsc channels — the manager
-    /// closes them by dropping the ProcessRecord. The real backend will
-    /// send SIGTERM/SIGKILL over vsock here; the public signature stays
-    /// the same so the manager and gRPC layer never need to change.
-    async fn kill_process(&self, _sandbox_id: &str, _pid: &str) -> Result<()> {
+    /// Signal a process to terminate by sending a Kill over its agent
+    /// connection. In stub builds the process map is empty, so this is a
+    /// no-op (the manager tears the process down by dropping its channels).
+    async fn kill_process(&self, _sandbox_id: &str, pid: &str) -> Result<()> {
+        if let Some(kill_tx) = self.processes.write().await.remove(pid) {
+            // Best-effort: a closed receiver just means the process already
+            // exited and its bridge task is gone.
+            let _ = kill_tx.send(()).await;
+        }
         Ok(())
     }
 
@@ -315,54 +338,83 @@ impl Backend for KrunvmBackend {
 
         let pid = uuid::Uuid::new_v4().to_string();
 
-        // TODO: use krun_exec / vsock channel to run the command inside the VM.
-        // For now the stub produces a tiny scripted output stream so that
-        // StreamOutput has something to deliver end-to-end. Tests assert on
-        // this scripted shape; when the real krun exec lands the producer
-        // task is replaced but the channel contract is unchanged.
-        let (output_tx, output_rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
-        let cmd_for_log = command.first().cloned().unwrap_or_default();
-        tokio::spawn(async move {
-            let started = std::time::SystemTime::now();
-            let _ = output_tx
-                .send(StreamEvent {
-                    kind: StreamEventKind::Stdout,
-                    line: format!("stub: {cmd_for_log}"),
-                    exit_code: None,
-                    timestamp: std::time::SystemTime::now(),
-                    duration_ms: 0,
-                })
-                .await;
-            let _ = output_tx
-                .send(StreamEvent {
-                    kind: StreamEventKind::Exit,
-                    line: String::new(),
-                    exit_code: Some(0),
-                    timestamp: std::time::SystemTime::now(),
-                    duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
-                })
-                .await;
-            // output_tx drops here → channel closes → consumer sees None.
-        });
+        // Real path: connect to the sandbox's guest agent over its host-side
+        // Unix socket and bridge the connection to ProcessHandle channels.
+        // Compile-verified under --features krunvm; running it needs a booted
+        // microVM with the agent listening (see the spec's verification
+        // ceiling).
+        #[cfg(feature = "krunvm")]
+        let handle = {
+            let sock = self.agent_socket_path(sandbox_id);
+            let stream = tokio::net::UnixStream::connect(&sock).await.map_err(|e| {
+                BackendError::Exec(format!("connect to guest agent at {}: {e}", sock.display()))
+            })?;
+            let (handle, kill_tx) = super::agent::drive_exec(
+                stream,
+                pid,
+                sandbox_id.to_string(),
+                command,
+                _working_dir,
+                _env,
+            )
+            .await
+            .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
+            self.processes
+                .write()
+                .await
+                .insert(handle.pid.clone(), kill_tx);
+            handle
+        };
 
-        // Stdin half: caller writes via stdin_tx; the drain task here keeps
-        // stdin_rx alive so writes don't immediately fail with "channel
-        // closed". Bytes are discarded — the real backend will pipe them
-        // into the VM over vsock. The drain task exits when ProcessRecord
-        // is dropped and stdin_tx with it.
-        let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
-        tokio::spawn(async move {
-            while let Some(_chunk) = stdin_rx.recv().await {
-                // discard: real backend would forward to the VM's stdin
+        // Stub path: a tiny scripted output stream so StreamOutput has
+        // something to deliver end-to-end without a real VM. Tests assert on
+        // this shape.
+        #[cfg(not(feature = "krunvm"))]
+        let handle = {
+            use crate::protocol::{StreamEvent, StreamEventKind};
+            let (output_tx, output_rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
+            let cmd_for_log = command.first().cloned().unwrap_or_default();
+            tokio::spawn(async move {
+                let started = std::time::SystemTime::now();
+                let _ = output_tx
+                    .send(StreamEvent {
+                        kind: StreamEventKind::Stdout,
+                        line: format!("stub: {cmd_for_log}"),
+                        exit_code: None,
+                        timestamp: std::time::SystemTime::now(),
+                        duration_ms: 0,
+                    })
+                    .await;
+                let _ = output_tx
+                    .send(StreamEvent {
+                        kind: StreamEventKind::Exit,
+                        line: String::new(),
+                        exit_code: Some(0),
+                        timestamp: std::time::SystemTime::now(),
+                        duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
+                    })
+                    .await;
+                // output_tx drops here → channel closes → consumer sees None.
+            });
+
+            // Stdin half: the drain task keeps stdin_rx alive so writes don't
+            // fail with "channel closed"; bytes are discarded.
+            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+            tokio::spawn(async move {
+                while let Some(_chunk) = stdin_rx.recv().await {
+                    // discard
+                }
+            });
+
+            ProcessHandle {
+                pid,
+                sandbox_id: sandbox_id.to_string(),
+                stdin_tx: Some(stdin_tx),
+                output_rx: Some(output_rx),
             }
-        });
+        };
 
-        Ok(ProcessHandle {
-            pid,
-            sandbox_id: sandbox_id.to_string(),
-            stdin_tx: Some(stdin_tx),
-            output_rx: Some(output_rx),
-        })
+        Ok(handle)
     }
 }
 
@@ -455,6 +507,83 @@ impl KrunvmBackend {
         }
         let _ = (ctx_id, rootfs);
         Ok(())
+    }
+
+    /// Set the guest agent as the microVM's entry process. libkrun runs one
+    /// process per boot; ward boots the agent, which then serves exec
+    /// requests over vsock for the sandbox's lifetime.
+    ///
+    /// The agent binary is expected at `/ward-agent` inside the rootfs;
+    /// baking it there is part of the image/packaging pipeline.
+    fn krun_set_agent_entry(&self, ctx_id: u32) -> Result<()> {
+        #[cfg(feature = "krunvm")]
+        {
+            use std::ffi::CString;
+            let exec_path = CString::new(AGENT_GUEST_PATH)
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            // Empty argv/envp: a single null-pointer sentinel each.
+            let argv: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+            let envp: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+            // SAFETY: ctx_id is live; exec_path is a valid C string; argv and
+            // envp are null-terminated arrays as libkrun requires.
+            let ret = unsafe {
+                super::krun_ffi::krun_set_exec(
+                    ctx_id,
+                    exec_path.as_ptr(),
+                    argv.as_ptr(),
+                    envp.as_ptr(),
+                )
+            };
+            if ret < 0 {
+                return Err(BackendError::Internal(format!(
+                    "krun_set_exec failed: errno {}",
+                    -ret
+                )));
+            }
+        }
+        let _ = ctx_id;
+        Ok(())
+    }
+
+    /// Bridge the agent's guest vsock port to a host Unix socket. The daemon
+    /// connects to `sock_path` to reach the agent listening on
+    /// [`AGENT_VSOCK_PORT`] inside the guest.
+    fn krun_add_agent_vsock(&self, ctx_id: u32, sock_path: &std::path::Path) -> Result<()> {
+        #[cfg(feature = "krunvm")]
+        {
+            use std::ffi::CString;
+            let path = CString::new(sock_path.to_string_lossy().as_ref())
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            // `listen = false`: libkrun owns the host-side Unix socket and the
+            // daemon connects to it; traffic is forwarded to the guest's
+            // listening vsock port. (Boot-path semantics are verified once a
+            // KVM runner exists; see the spec's verification ceiling.)
+            // SAFETY: ctx_id is live; path is a valid C string.
+            let ret = unsafe {
+                super::krun_ffi::krun_add_vsock_port2(
+                    ctx_id,
+                    AGENT_VSOCK_PORT,
+                    path.as_ptr(),
+                    false,
+                )
+            };
+            if ret < 0 {
+                return Err(BackendError::Internal(format!(
+                    "krun_add_vsock_port2 failed: errno {}",
+                    -ret
+                )));
+            }
+        }
+        let _ = (ctx_id, sock_path);
+        Ok(())
+    }
+
+    /// Host-side Unix socket path bridging to the sandbox's agent vsock.
+    fn agent_socket_path(&self, sandbox_id: &str) -> std::path::PathBuf {
+        self.data_dir
+            .join("sandboxes")
+            .join(sandbox_id)
+            .join("agent.sock")
     }
 
     /// Capture the shutdown eventfd and spawn the dedicated OS thread

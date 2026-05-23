@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package ward.agent.v1;
+
+// ---------------------------------------------------------------------------
+// Ward guest-agent wire protocol (internal; not part of the public API).
+//
+// The agent runs as the entry process inside every microVM and listens on a
+// vsock port. The daemon opens one connection per executed process. On that
+// connection:
+//
+//   daemon -> agent : a single Exec, then any number of Stdin / Kill frames
+//   agent  -> daemon: Stdout / Stderr line frames, terminated by one Exited
+//
+// Frames are length-prefixed: a 4-byte big-endian length followed by the
+// encoded protobuf message. One connection carries exactly one process.
+// ---------------------------------------------------------------------------
+
+// Daemon -> agent.
+message Request {
+  oneof kind {
+    Exec exec = 1;
+    Stdin stdin = 2;
+    Kill kill = 3;
+  }
+}
+
+// Start a process. Must be the first frame on a connection.
+message Exec {
+  repeated string command = 1;          // argv; command[0] is the program
+  string working_dir = 2;               // empty = agent default (/)
+  map<string, string> env = 3;
+}
+
+// Feed bytes to the process's stdin. Empty data closes stdin (EOF).
+message Stdin {
+  bytes data = 1;
+}
+
+// Request termination of the running process (SIGKILL).
+message Kill {}
+
+// Agent -> daemon.
+message Event {
+  oneof kind {
+    Line stdout = 1;
+    Line stderr = 2;
+    Exited exited = 3;
+  }
+}
+
+// One line of output (newline already stripped).
+message Line {
+  string text = 1;
+}
+
+// Terminal event: the process exited. `code` is the exit status, or -1 if
+// the process was killed by a signal or produced no code.
+message Exited {
+  int32 code = 1;
+}

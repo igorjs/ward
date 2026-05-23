@@ -1,5 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
+pub mod agent;
 pub mod image;
 pub mod krunvm;
 
