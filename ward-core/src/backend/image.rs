@@ -3,9 +3,11 @@
 //! OCI image pull, unpack, and local cache management.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::io::{Cursor, Read};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use flate2::read::GzDecoder;
 use tokio::sync::RwLock;
 
 use super::{BackendError, Result};
@@ -26,6 +28,191 @@ pub struct CachedImage {
 }
 
 // ---------------------------------------------------------------------------
+// ImagePuller
+// ---------------------------------------------------------------------------
+
+/// Pulls an image reference and materialises its rootfs into `dest`,
+/// returning the manifest digest.
+///
+/// This is the seam between the cache bookkeeping (`ImageStore`) and the
+/// registry protocol (`OciPuller`). Tests inject a fake so cache, list,
+/// remove, and traversal behaviour can be exercised offline.
+#[async_trait::async_trait]
+pub trait ImagePuller: Send + Sync + std::fmt::Debug {
+    async fn pull(&self, reference: &str, dest: &Path) -> Result<String>;
+}
+
+/// Real puller: talks to an OCI registry over HTTPS, then unpacks each
+/// layer tarball into the destination rootfs.
+#[derive(Debug, Default)]
+pub struct OciPuller;
+
+#[async_trait::async_trait]
+impl ImagePuller for OciPuller {
+    async fn pull(&self, reference: &str, dest: &Path) -> Result<String> {
+        use oci_client::manifest;
+        use oci_client::secrets::RegistryAuth;
+        use oci_client::{Client, Reference};
+
+        let image_ref: Reference = reference.parse().map_err(|e| {
+            BackendError::Image(format!("invalid image reference {reference}: {e}"))
+        })?;
+
+        let client = Client::default();
+        let auth = RegistryAuth::Anonymous;
+        let accepted = vec![
+            manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
+            manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
+            manifest::IMAGE_LAYER_MEDIA_TYPE,
+        ];
+
+        let image = client
+            .pull(&image_ref, &auth, accepted)
+            .await
+            .map_err(|e| BackendError::Image(format!("pull {reference} failed: {e}")))?;
+
+        // Layers are applied bottom-up in manifest order; each is a tar
+        // diff over the accumulated filesystem.
+        for layer in &image.layers {
+            unpack_layer(&layer.data, &layer.media_type, dest)?;
+        }
+
+        Ok(image.digest.unwrap_or_else(|| "sha256:unknown".to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer unpacking (pure, registry-independent)
+// ---------------------------------------------------------------------------
+
+/// Unpack one image layer tarball into `dest`, applying OCI whiteouts.
+///
+/// `media_type` selects gzip vs. plain tar. Path traversal is prevented two
+/// ways: the `tar` crate refuses to write outside `dest`, and whiteout
+/// targets are resolved through [`safe_join`], which rejects `..` and
+/// absolute components.
+fn unpack_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<()> {
+    let reader: Box<dyn Read> = if media_type.ends_with("gzip") {
+        Box::new(GzDecoder::new(Cursor::new(data)))
+    } else {
+        Box::new(Cursor::new(data))
+    };
+
+    let mut archive = tar::Archive::new(reader);
+    archive.set_preserve_permissions(true);
+    // Never chown to the tar's recorded uid/gid: unpacking runs as an
+    // unprivileged user (CI, dev) and ownership is irrelevant until the
+    // rootfs is mounted into the guest, where the guest kernel owns it.
+    archive.set_preserve_ownerships(false);
+    archive.set_overwrite(true);
+
+    let entries = archive
+        .entries()
+        .map_err(|e| BackendError::Image(format!("read layer tar: {e}")))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| BackendError::Image(format!("read tar entry: {e}")))?;
+        let path = entry
+            .path()
+            .map_err(|e| BackendError::Image(format!("decode tar entry path: {e}")))?
+            .into_owned();
+
+        match classify_entry(&path) {
+            EntryKind::OpaqueWhiteout(dir) => apply_opaque_whiteout(dest, &dir)?,
+            EntryKind::Whiteout(target) => apply_whiteout(dest, &target)?,
+            EntryKind::Normal => {
+                entry
+                    .unpack_in(dest)
+                    .map_err(|e| BackendError::Image(format!("unpack tar entry: {e}")))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+enum EntryKind {
+    /// `.wh..wh..opq` — clear all existing contents of the parent dir.
+    OpaqueWhiteout(PathBuf),
+    /// `.wh.<name>` — delete the sibling `<name>`.
+    Whiteout(PathBuf),
+    Normal,
+}
+
+const WHITEOUT_PREFIX: &str = ".wh.";
+const OPAQUE_WHITEOUT: &str = ".wh..wh..opq";
+
+fn classify_entry(path: &Path) -> EntryKind {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return EntryKind::Normal;
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+
+    if name == OPAQUE_WHITEOUT {
+        EntryKind::OpaqueWhiteout(parent.to_path_buf())
+    } else if let Some(removed) = name.strip_prefix(WHITEOUT_PREFIX) {
+        EntryKind::Whiteout(parent.join(removed))
+    } else {
+        EntryKind::Normal
+    }
+}
+
+/// Delete the rootfs path named by a whiteout marker. Missing targets are
+/// not an error: a layer may whiteout something a sibling layer never
+/// created, which OCI treats as a no-op.
+fn apply_whiteout(dest: &Path, target: &Path) -> Result<()> {
+    let Some(full) = safe_join(dest, target) else {
+        return Ok(());
+    };
+    remove_path(&full)
+}
+
+/// Clear the contents of a directory named by an opaque whiteout, keeping
+/// the directory itself.
+fn apply_opaque_whiteout(dest: &Path, dir: &Path) -> Result<()> {
+    let Some(full) = safe_join(dest, dir) else {
+        return Ok(());
+    };
+    if !full.is_dir() {
+        return Ok(());
+    }
+    for child in std::fs::read_dir(&full).map_err(BackendError::Io)? {
+        let child = child.map_err(BackendError::Io)?;
+        remove_path(&child.path())?;
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(BackendError::Io(e)),
+    };
+    if meta.is_dir() {
+        std::fs::remove_dir_all(path).map_err(BackendError::Io)
+    } else {
+        std::fs::remove_file(path).map_err(BackendError::Io)
+    }
+}
+
+/// Join `rel` onto `base`, returning `None` if `rel` is absolute or contains
+/// a `..` component that could escape `base`.
+fn safe_join(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut out = base.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            // Absolute roots, drive prefixes, and parent-dir hops are all
+            // rejected outright rather than normalised — any of them is a
+            // sign of a hostile or malformed layer.
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir => return None,
+        }
+    }
+    Some(out)
+}
+
+// ---------------------------------------------------------------------------
 // ImageStore
 // ---------------------------------------------------------------------------
 
@@ -34,13 +221,21 @@ pub struct CachedImage {
 pub struct ImageStore {
     cache_dir: PathBuf,
     images: Arc<RwLock<HashMap<String, CachedImage>>>,
+    puller: Arc<dyn ImagePuller>,
 }
 
 impl ImageStore {
+    /// Production constructor: pulls from real registries.
     pub fn new(cache_dir: PathBuf) -> Self {
+        Self::with_puller(cache_dir, Arc::new(OciPuller))
+    }
+
+    /// Construct with an injected puller. Tests use this to stay offline.
+    pub fn with_puller(cache_dir: PathBuf, puller: Arc<dyn ImagePuller>) -> Self {
         Self {
             cache_dir,
             images: Arc::new(RwLock::new(HashMap::new())),
+            puller,
         }
     }
 
@@ -52,12 +247,12 @@ impl ImageStore {
         }
 
         // Slow path: pull, unpack, cache.
-        let rootfs = self.pull_and_unpack(reference).await?;
+        let (rootfs, digest) = self.pull_and_unpack(reference).await?;
 
         let entry = CachedImage {
             reference: reference.to_string(),
             rootfs_path: rootfs.clone(),
-            digest: "sha256:TODO".to_string(),
+            digest,
             pulled_at: std::time::SystemTime::now(),
         };
         self.images
@@ -97,11 +292,7 @@ impl ImageStore {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    async fn pull_and_unpack(&self, reference: &str) -> Result<PathBuf> {
-        // TODO: implement actual OCI pull via oci-distribution or skopeo.
-        // For now this is a stub that creates an empty rootfs directory so
-        // the rest of the system can proceed in development/testing.
-
+    async fn pull_and_unpack(&self, reference: &str) -> Result<(PathBuf, String)> {
         // Use a UUID-based directory name instead of deriving from the image
         // reference. Deriving from user input (e.g. reference.replace('/', "_"))
         // is vulnerable to path traversal if the reference contains ".." or
@@ -112,13 +303,8 @@ impl ImageStore {
             .await
             .map_err(BackendError::Io)?;
 
-        tracing::warn!(
-            reference,
-            dir = %dir_name,
-            "image pull not yet implemented – using empty rootfs stub"
-        );
-
-        Ok(rootfs)
+        let digest = self.puller.pull(reference, &rootfs).await?;
+        Ok((rootfs, digest))
     }
 
     /// Validate that a path looks like a usable rootfs.
@@ -140,45 +326,75 @@ impl ImageStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
     use pretty_assertions::assert_eq;
+    use std::io::Write;
     use tempfile::TempDir;
 
-    /// Build a fresh ImageStore rooted in a tempdir. The tempdir's `Drop`
-    /// cleans up at the end of the test, so each test stays hermetic and
-    /// never leaks state across runs.
+    // ----- Fake puller: keeps cache/list/remove tests offline -------------
+
+    /// Materialises a minimal rootfs (a `bin/` dir) without touching the
+    /// network, so the `ImageStore` bookkeeping can be tested hermetically.
+    #[derive(Debug)]
+    struct FakePuller;
+
+    #[async_trait::async_trait]
+    impl ImagePuller for FakePuller {
+        async fn pull(&self, _reference: &str, dest: &Path) -> Result<String> {
+            std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
+            Ok("sha256:fake".to_string())
+        }
+    }
+
     fn store_in_tempdir() -> (ImageStore, TempDir) {
         let tmp = TempDir::new().expect("tempdir");
-        let store = ImageStore::new(tmp.path().to_path_buf());
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), Arc::new(FakePuller));
         (store, tmp)
     }
+
+    // ----- tar fixture builders -------------------------------------------
+
+    /// Build a gzipped tar layer from (path, contents) file entries.
+    fn gzip_layer(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, *contents)
+                .expect("append file");
+        }
+        let tar_bytes = builder.into_inner().expect("finish tar");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip");
+        encoder.finish().expect("finish gzip")
+    }
+
+    /// Build a gzipped tar layer containing a single explicit-name entry
+    /// (used to inject whiteout markers, which aren't real files).
+    fn gzip_marker(path: &str) -> Vec<u8> {
+        gzip_layer(&[(path, b"")])
+    }
+
+    const GZIP_MEDIA: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
     // ----- is_cached: initial state --------------------------------------
 
     #[tokio::test]
     async fn given_fresh_store_when_is_cached_then_returns_false() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
-
-        // Act
-        let cached = store.is_cached("alpine:latest").await;
-
-        // Assert
-        assert!(!cached);
+        assert!(!store.is_cached("alpine:latest").await);
     }
 
     // ----- ensure: happy path --------------------------------------------
 
     #[tokio::test]
     async fn given_fresh_store_when_ensure_then_returns_existing_rootfs_path() {
-        // Arrange
         let (store, tmp) = store_in_tempdir();
-
-        // Act
         let rootfs = store.ensure("alpine:latest").await.expect("ensure");
-
-        // Assert: the returned path lives under the cache dir AND was
-        // materialised on disk by `pull_and_unpack`. Both matter — callers
-        // pass this path to libkrun which will fail on missing dirs.
         assert!(rootfs.starts_with(tmp.path()));
         assert!(rootfs.exists());
         assert!(rootfs.ends_with("rootfs"));
@@ -186,42 +402,24 @@ mod tests {
 
     #[tokio::test]
     async fn given_fresh_store_when_ensure_then_marks_image_cached() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
-
-        // Act
         store.ensure("alpine:latest").await.expect("ensure");
-
-        // Assert: the read-through of `is_cached` reflects the write.
         assert!(store.is_cached("alpine:latest").await);
     }
 
     #[tokio::test]
     async fn given_cached_image_when_ensure_again_then_returns_same_path() {
-        // Arrange: idempotency is critical because the slow path generates
-        // a fresh UUID directory each call. If the fast path ever broke,
-        // we'd silently leak rootfs dirs on every restart.
         let (store, _tmp) = store_in_tempdir();
         let first = store.ensure("alpine:latest").await.expect("first ensure");
-
-        // Act
         let second = store.ensure("alpine:latest").await.expect("second ensure");
-
-        // Assert
         assert_eq!(first, second);
     }
 
     #[tokio::test]
     async fn given_two_distinct_references_when_ensure_then_each_gets_unique_path() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
-
-        // Act
         let alpine = store.ensure("alpine:latest").await.expect("alpine");
         let python = store.ensure("python:3.12-slim").await.expect("python");
-
-        // Assert: separate cache entries → separate rootfs dirs. Sharing
-        // would corrupt one sandbox when another image is removed.
         assert_ne!(alpine, python);
         assert!(store.is_cached("alpine:latest").await);
         assert!(store.is_cached("python:3.12-slim").await);
@@ -231,32 +429,18 @@ mod tests {
 
     #[tokio::test]
     async fn given_cached_image_when_remove_then_directory_deleted_and_not_cached() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
         let rootfs = store.ensure("alpine:latest").await.expect("ensure");
         assert!(rootfs.exists());
-
-        // Act
         store.remove("alpine:latest").await.expect("remove");
-
-        // Assert: cache forgot it AND the on-disk dir is gone. Both halves
-        // matter — leaking either causes disk creep over time.
         assert!(!store.is_cached("alpine:latest").await);
         assert!(!rootfs.exists());
     }
 
     #[tokio::test]
     async fn given_uncached_reference_when_remove_then_returns_image_error() {
-        // Arrange: removing something that was never cached.
         let (store, _tmp) = store_in_tempdir();
-
-        // Act
         let err = store.remove("ghost:latest").await.expect_err("remove");
-
-        // Assert: must be Image, NOT NotFound — the SandboxManager reserves
-        // NotFound for sandbox identity and translates it to gRPC
-        // NotFound. Image errors map to Internal, which is the right
-        // signal for "your cache is in a weird state".
         match err {
             BackendError::Image(msg) => assert!(msg.contains("ghost:latest"), "got: {msg}"),
             other => panic!("expected Image, got {other:?}"),
@@ -267,24 +451,15 @@ mod tests {
 
     #[tokio::test]
     async fn given_fresh_store_when_list_then_returns_empty() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
-
-        // Act
-        let entries = store.list().await;
-
-        // Assert
-        assert!(entries.is_empty());
+        assert!(store.list().await.is_empty());
     }
 
     #[tokio::test]
     async fn given_multiple_ensures_when_list_then_returns_all_entries() {
-        // Arrange
         let (store, _tmp) = store_in_tempdir();
         store.ensure("alpine:latest").await.expect("alpine");
         store.ensure("python:3.12-slim").await.expect("python");
-
-        // Act
         let mut refs: Vec<String> = store
             .list()
             .await
@@ -292,9 +467,6 @@ mod tests {
             .map(|c| c.reference)
             .collect();
         refs.sort();
-
-        // Assert: order isn't guaranteed by HashMap iteration, so we sort
-        // before comparing. This is the contract callers should rely on too.
         assert_eq!(refs, vec!["alpine:latest", "python:3.12-slim"]);
     }
 
@@ -302,17 +474,8 @@ mod tests {
 
     #[tokio::test]
     async fn given_reference_with_traversal_when_ensure_then_path_stays_under_cache_dir() {
-        // Arrange: a malicious reference that would escape the cache dir
-        // if `pull_and_unpack` derived its directory name from the
-        // reference (e.g. via `reference.replace('/', "_")`). The fix in
-        // pull_and_unpack uses a UUID, so this stays under the cache.
         let (store, tmp) = store_in_tempdir();
-
-        // Act
         let rootfs = store.ensure("../../../etc/passwd").await.expect("ensure");
-
-        // Assert: canonicalise both sides so symlinks (macOS /private/var)
-        // don't trip the comparison.
         let canonical_root = rootfs.canonicalize().expect("canonical rootfs");
         let canonical_tmp = tmp.path().canonicalize().expect("canonical tmp");
         assert!(
@@ -327,21 +490,127 @@ mod tests {
 
     #[tokio::test]
     async fn given_ensure_when_list_then_entry_carries_reference_and_digest() {
-        // Arrange: digest is a stub today but the field is part of the
-        // contract; tests guard against accidental wipes.
         let (store, _tmp) = store_in_tempdir();
         store.ensure("alpine:latest").await.expect("ensure");
-
-        // Act
         let entry = store
             .list()
             .await
             .into_iter()
             .find(|c| c.reference == "alpine:latest")
             .expect("entry present");
-
-        // Assert
         assert_eq!(entry.reference, "alpine:latest");
-        assert!(!entry.digest.is_empty());
+        assert_eq!(entry.digest, "sha256:fake");
+    }
+
+    // ----- unpack_layer: file extraction ----------------------------------
+
+    #[test]
+    fn given_gzip_layer_when_unpack_then_files_written() {
+        let tmp = TempDir::new().expect("tempdir");
+        let layer = gzip_layer(&[("bin/sh", b"#!/bin/sh\n"), ("etc/hostname", b"ward\n")]);
+
+        unpack_layer(&layer, GZIP_MEDIA, tmp.path()).expect("unpack");
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("bin/sh")).expect("read sh"),
+            b"#!/bin/sh\n"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("etc/hostname")).expect("read hostname"),
+            b"ward\n"
+        );
+    }
+
+    #[test]
+    fn given_plain_tar_layer_when_unpack_then_files_written() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Build an uncompressed tar and declare a non-gzip media type.
+        let mut builder = tar::Builder::new(Vec::new());
+        let contents = b"plain";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "file.txt", &contents[..])
+            .expect("append");
+        let tar_bytes = builder.into_inner().expect("finish");
+
+        unpack_layer(
+            &tar_bytes,
+            "application/vnd.oci.image.layer.v1.tar",
+            tmp.path(),
+        )
+        .expect("unpack");
+
+        assert_eq!(
+            std::fs::read(tmp.path().join("file.txt")).expect("read"),
+            b"plain"
+        );
+    }
+
+    // ----- unpack_layer: whiteouts ----------------------------------------
+
+    #[test]
+    fn given_whiteout_marker_when_unpack_then_sibling_removed() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Lower layer creates a file...
+        unpack_layer(
+            &gzip_layer(&[("app/data.txt", b"x")]),
+            GZIP_MEDIA,
+            tmp.path(),
+        )
+        .expect("lower");
+        assert!(tmp.path().join("app/data.txt").exists());
+
+        // ...upper layer whites it out.
+        unpack_layer(&gzip_marker("app/.wh.data.txt"), GZIP_MEDIA, tmp.path()).expect("upper");
+
+        assert!(!tmp.path().join("app/data.txt").exists());
+        assert!(tmp.path().join("app").is_dir());
+    }
+
+    #[test]
+    fn given_opaque_whiteout_when_unpack_then_dir_contents_cleared() {
+        let tmp = TempDir::new().expect("tempdir");
+        unpack_layer(
+            &gzip_layer(&[("d/a.txt", b"a"), ("d/b.txt", b"b")]),
+            GZIP_MEDIA,
+            tmp.path(),
+        )
+        .expect("lower");
+
+        unpack_layer(&gzip_marker("d/.wh..wh..opq"), GZIP_MEDIA, tmp.path()).expect("opaque");
+
+        assert!(tmp.path().join("d").is_dir());
+        assert!(!tmp.path().join("d/a.txt").exists());
+        assert!(!tmp.path().join("d/b.txt").exists());
+    }
+
+    #[test]
+    fn given_whiteout_for_missing_target_when_unpack_then_no_error() {
+        let tmp = TempDir::new().expect("tempdir");
+        // Whiteout of something that was never created is a no-op, not an error.
+        unpack_layer(&gzip_marker("nope/.wh.ghost"), GZIP_MEDIA, tmp.path()).expect("unpack");
+    }
+
+    // ----- safe_join: traversal rejection ---------------------------------
+
+    #[test]
+    fn given_parent_dir_component_when_safe_join_then_rejected() {
+        assert!(safe_join(Path::new("/base"), Path::new("../escape")).is_none());
+        assert!(safe_join(Path::new("/base"), Path::new("a/../../escape")).is_none());
+    }
+
+    #[test]
+    fn given_absolute_path_when_safe_join_then_rejected() {
+        assert!(safe_join(Path::new("/base"), Path::new("/etc/passwd")).is_none());
+    }
+
+    #[test]
+    fn given_normal_relative_path_when_safe_join_then_joined() {
+        assert_eq!(
+            safe_join(Path::new("/base"), Path::new("a/b")),
+            Some(PathBuf::from("/base/a/b"))
+        );
     }
 }

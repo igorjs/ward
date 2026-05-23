@@ -47,7 +47,7 @@ Ward is written in Rust.
 
 - The daemon is a Cargo workspace with three crates: `ward-daemon` (daemon binary, formerly `wardd`), `ward-cli` (CLI binary), `ward-core` (shared library).
 - The binary inside `ward-daemon/` is still named `wardd` for invocation continuity (`systemctl start wardd`).
-- MSRV is pinned to Rust 1.85 (workspace `rust-version`).
+- MSRV is pinned to Rust 1.88 (workspace `rust-version`); raised from 1.85 when the OCI image-pull stack (`oci-client` → `jsonwebtoken`) required it.
 - Cross-compilation targets: `aarch64-apple-darwin` (macOS), `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`.
 - Key dependencies: `tokio` (async runtime), `tonic` (gRPC server), `prost`/`prost-types` (protobuf), `async-trait` (Backend trait), `tracing` (structured logging).
 - libkrun integration is via hand-maintained `unsafe extern "C"` declarations in `ward-core/src/backend/krun_ffi.rs`, gated behind the `krunvm` cargo feature. Default builds use a stub backend; `--features krunvm` links real libkrun. See ADR-003.

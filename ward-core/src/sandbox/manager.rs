@@ -208,10 +208,10 @@ impl SandboxManager {
     pub async fn remove(&self, id: &str) -> Result<()> {
         crate::validate::entity_id(id, "sandbox")?;
         // Cancel any pending timeout task.
-        if let Some(entry) = self.entries.write().await.remove(id) {
-            if let Some(handle) = entry.timeout_handle {
-                handle.abort();
-            }
+        if let Some(entry) = self.entries.write().await.remove(id)
+            && let Some(handle) = entry.timeout_handle
+        {
+            handle.abort();
         }
 
         // Drop any process records that belong to this sandbox so they

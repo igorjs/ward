@@ -24,6 +24,12 @@ krunvm = []
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
+# OCI image pull. native-tls (not rustls) keeps the dependency tree on
+# openssl (Apache-2.0) instead of ring/aws-lc, whose licenses fall
+# outside deny.toml's allowlist. default-features off drops the bundled
+# test-registry harness we don't ship.
+oci-client = { version = "0.17", default-features = false, features = ["native-tls"] }
 prost = "0.13"
 prost-types = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +37,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tar = "0.4"
 tonic = "0.12"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
