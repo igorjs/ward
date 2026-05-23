@@ -1,6 +1,6 @@
 # ADR-008: Egress Control and Network Isolation
 
-**Status:** Accepted (enforcement: design only)
+**Status:** Accepted (forward proxy implemented; in-VM traffic routing gated)
 **Date:** 2026-05-02
 **Authors:** Igor
 
@@ -31,7 +31,7 @@ Wildcard prefixes (`*.example.com`) are supported for subdomains. Bare wildcards
 
 ### Enforcement mechanism
 
-libkrun's microVM gives each sandbox its own kernel and network stack. Ward's `EgressProxy` (in `ward-core/src/egress/proxy.rs`) holds policy + audit log state today and will, in v1, route the VM's outbound traffic through an embedded forward proxy:
+libkrun's microVM gives each sandbox its own kernel and network stack. Ward's `EgressProxy` (in `ward-core/src/egress/proxy.rs`) implements an embedded forward proxy that the VM's outbound traffic is routed through:
 
 - HTTP CONNECT tunnelling for HTTPS traffic
 - Plain HTTP forwarding
@@ -43,7 +43,7 @@ DNS resolution happens on the host side, preventing DNS-based bypasses. The prox
 
 ### Current implementation state
 
-The `EgressProxy` type is in place and tracks policy + log entries via the API. **The actual on-the-wire interception is not yet implemented** — this is a deferred follow-up. The CLI / API surface is stable; only the network-layer enforcement is pending.
+The `EgressProxy` implements a working HTTP CONNECT forward proxy: it parses the CONNECT target, evaluates it against the policy (deny/open/allowlist), logs the decision, and either tunnels the connection or returns `403`. This is covered by tests over loopback, and `GetEgressLog` is wired. **What remains is routing each sandbox's traffic into its proxy** — attaching a TAP device (Linux) and redirecting guest egress through it — which is gated behind the `krunvm` boot path. The CLI / API surface is stable.
 
 ### What the proxy handles
 

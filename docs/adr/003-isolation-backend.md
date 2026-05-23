@@ -69,7 +69,7 @@ This separation matters because:
 
 libkrun takes a local filesystem path as the root; it does not pull images. Ward handles image management separately in `ward-core/src/backend/image.rs`:
 
-1. Pull OCI images (currently a stub; real implementation tracked as a follow-up).
+1. Pull OCI images via the `oci-client` crate and unpack their layer tarballs (gzip + whiteout handling) into the rootfs — implemented in `backend/image.rs`.
 2. Unpack image layers into `$WARD_DATA_DIR/images/<uuid>/rootfs`.
 3. Pass the unpacked directory to libkrun via `krun_set_root`.
 
