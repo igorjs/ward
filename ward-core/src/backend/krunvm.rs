@@ -129,7 +129,20 @@ impl Backend for KrunvmBackend {
             // TODO: configure virtio-net and attach egress proxy TAP.
         }
 
-        // TODO: apply mount points.
+        // Bind mounts → virtiofs shares; volumes → raw block devices. The
+        // mapping/validation is host-side; the attach FFI is gated and
+        // compile-verified under --features krunvm.
+        for (idx, m) in opts.mounts.iter().enumerate() {
+            // A deterministic, collision-free tag per mount. The guest agent
+            // mounts `tag` at `m.target`.
+            let tag = format!("ward-mnt-{idx}");
+            self.krun_add_mount(ctx_id, &tag, std::path::Path::new(&m.source), m.readonly)?;
+        }
+        // Volume attach (ext4 images as block devices via krun_add_disk) is
+        // deferred: the pinned libkrun 1.18.0 bottle exports no krun_add_disk*
+        // symbols (built without block-device support). volume_ids are still
+        // validated upstream; wiring them needs a block-capable libkrun build.
+        let _ = &opts.volume_ids;
 
         // Boot the guest agent as the entry process and expose its vsock
         // over a host Unix socket so exec() can reach it. Compile-verified
@@ -575,6 +588,43 @@ impl KrunvmBackend {
             }
         }
         let _ = (ctx_id, sock_path);
+        Ok(())
+    }
+
+    /// Share a host directory into the guest via virtiofs. `tag` is the
+    /// mount tag the guest uses to mount the share at the desired target.
+    fn krun_add_mount(
+        &self,
+        ctx_id: u32,
+        tag: &str,
+        source: &std::path::Path,
+        read_only: bool,
+    ) -> Result<()> {
+        #[cfg(feature = "krunvm")]
+        {
+            use std::ffi::CString;
+            let c_tag = CString::new(tag).map_err(|e| BackendError::Internal(e.to_string()))?;
+            let c_path = CString::new(source.to_string_lossy().as_ref())
+                .map_err(|e| BackendError::Internal(e.to_string()))?;
+            // shm_size 0 → libkrun's default DAX window.
+            // SAFETY: ctx_id is live; both C strings are valid and NUL-terminated.
+            let ret = unsafe {
+                super::krun_ffi::krun_add_virtiofs3(
+                    ctx_id,
+                    c_tag.as_ptr(),
+                    c_path.as_ptr(),
+                    0,
+                    read_only,
+                )
+            };
+            if ret < 0 {
+                return Err(BackendError::Internal(format!(
+                    "krun_add_virtiofs3 failed for {tag}: errno {}",
+                    -ret
+                )));
+            }
+        }
+        let _ = (ctx_id, tag, source, read_only);
         Ok(())
     }
 

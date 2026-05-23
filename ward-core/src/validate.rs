@@ -108,6 +108,32 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validate a bind mount's source (host) and target (guest) paths.
+///
+/// Both must be absolute, and neither may contain a `..` component — a guest
+/// `..` could escape its mount point, and a host `..` could widen what the
+/// caller intended to share.
+pub fn mount(source: &str, target: &str) -> Result<(), ApiError> {
+    for (label, path) in [("source", source), ("target", target)] {
+        if path.is_empty() {
+            return Err(ApiError::InvalidRequest(format!(
+                "mount {label} must not be empty"
+            )));
+        }
+        if !path.starts_with('/') {
+            return Err(ApiError::InvalidRequest(format!(
+                "mount {label} must be an absolute path: {path}"
+            )));
+        }
+        if path.split('/').any(|c| c == "..") {
+            return Err(ApiError::InvalidRequest(format!(
+                "mount {label} must not contain '..': {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a sandbox or volume ID (UUID format).
 pub fn entity_id(id: &str, entity: &str) -> Result<(), ApiError> {
     if id.is_empty() {
@@ -676,6 +702,33 @@ mod proptests {
         ) {
             let img = format!("{prefix}..{suffix}");
             prop_assert!(image_ref(&img).is_err(), "accepted: {img:?}");
+        }
+    }
+
+    // ----- mount paths ----------------------------------------------------
+
+    #[test]
+    fn given_absolute_paths_when_mount_then_ok() {
+        for (source, target) in [("/data", "/mnt/data"), ("/srv/app/cache", "/var/cache")] {
+            assert!(mount(source, target).is_ok(), "{source:?} -> {target:?}");
+        }
+    }
+
+    #[test]
+    fn given_invalid_paths_when_mount_then_invalid_request() {
+        let cases = [
+            ("data", "/mnt/data"),            // relative source
+            ("/data", "mnt/data"),            // relative target
+            ("", "/mnt/data"),                // empty source
+            ("/data", ""),                    // empty target
+            ("/data", "/mnt/../../etc"),      // traversal in target
+            ("/data/../secret", "/mnt/data"), // traversal in source
+        ];
+        for (source, target) in cases {
+            assert!(
+                matches!(mount(source, target), Err(ApiError::InvalidRequest(_))),
+                "expected rejection for {source:?} -> {target:?}",
+            );
         }
     }
 
