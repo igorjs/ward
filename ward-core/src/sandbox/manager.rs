@@ -38,7 +38,6 @@ fn backend_err(e: BackendError) -> ApiError {
 // ---------------------------------------------------------------------------
 
 struct SandboxEntry {
-    #[allow(dead_code)]
     egress: EgressProxy,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -202,6 +201,16 @@ impl SandboxManager {
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;
         Ok(infos.into_iter().map(protocol_info_to_pb).collect())
+    }
+
+    /// Return the egress decision log for a sandbox's proxy.
+    pub async fn egress_log(&self, id: &str) -> Result<Vec<crate::egress::LogEntry>> {
+        crate::validate::entity_id(id, "sandbox")?;
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        Ok(entry.egress.log_entries().await)
     }
 
     /// Remove a sandbox.

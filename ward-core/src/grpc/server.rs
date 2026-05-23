@@ -9,12 +9,13 @@ use tracing::error;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
     CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest,
-    CreateVolumeRequest, DaemonInfo, EgressLogResponse, ExecRequest, GetCommunicationLogRequest,
-    GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
-    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
-    Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
-    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StreamEvent,
-    StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse, ExecRequest,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
+    HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
+    ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo, PublishRequest,
+    RemoveSandboxRequest, RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo,
+    SnapshotInfo, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo,
+    WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -259,9 +260,37 @@ impl Ward for WardGrpcServer {
 
     async fn get_egress_log(
         &self,
-        _request: Request<GetEgressLogRequest>,
+        request: Request<GetEgressLogRequest>,
     ) -> Result<Response<EgressLogResponse>, Status> {
-        Err(Status::unimplemented("get_egress_log"))
+        let req = request.into_inner();
+        let log = self
+            .sandbox
+            .egress_log(&req.sandbox_id)
+            .await
+            .map_err(api_err_to_status)?;
+
+        let entries = log
+            .into_iter()
+            .map(|e| {
+                let d = e
+                    .timestamp
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                EgressLogEntry {
+                    sandbox_id: e.sandbox_id,
+                    domain: e.domain,
+                    // The proto carries the port as a string.
+                    port: e.port.to_string(),
+                    allowed: e.allowed,
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: d.as_secs() as i64,
+                        nanos: d.subsec_nanos() as i32,
+                    }),
+                }
+            })
+            .collect();
+
+        Ok(Response::new(EgressLogResponse { entries }))
     }
 
     async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
