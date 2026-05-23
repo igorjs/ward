@@ -4,7 +4,7 @@ members = [
     "ward-daemon",
     "ward-cli",
     "ward-core",
-    "ward-guest-agent",
+    "ward-agent",
 ]
 
 [workspace.package]

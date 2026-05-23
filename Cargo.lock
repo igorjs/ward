@@ -3128,6 +3128,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-agent"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-build",
+ "tokio",
+ "tokio-vsock",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ward-cli"
 version = "0.1.0"
 dependencies = [
@@ -3185,18 +3197,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ward-core",
-]
-
-[[package]]
-name = "ward-guest-agent"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-build",
- "tokio",
- "tokio-vsock",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -25,15 +25,12 @@ async fn main() -> std::io::Result<()> {
         .init();
 
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, AGENT_VSOCK_PORT))?;
-    tracing::info!(
-        port = AGENT_VSOCK_PORT,
-        "ward-guest-agent listening on vsock"
-    );
+    tracing::info!(port = AGENT_VSOCK_PORT, "ward-agent listening on vsock");
 
     loop {
         let (stream, _peer) = listener.accept().await?;
         tokio::spawn(async move {
-            if let Err(e) = ward_guest_agent::handle_connection(stream).await {
+            if let Err(e) = ward_agent::handle_connection(stream).await {
                 tracing::warn!(error = %e, "connection handler failed");
             }
         });
@@ -42,6 +39,6 @@ async fn main() -> std::io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("ward-guest-agent runs inside a Linux microVM; unsupported on this host");
+    eprintln!("ward-agent runs inside a Linux microVM; unsupported on this host");
     std::process::exit(1);
 }
