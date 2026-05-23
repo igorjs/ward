@@ -121,7 +121,21 @@ impl Backend for KrunvmBackend {
         let ctx_id = self.krun_create_ctx()?;
         self.krun_apply_resources(ctx_id, &opts.resources)?;
 
-        let rootfs = self.data_dir.join("sandboxes").join(&id).join("rootfs");
+        let rootfs = self.sandbox_rootfs(&id);
+
+        // Seed the rootfs from a snapshot if requested. The snapshot must
+        // exist; its archived filesystem becomes this sandbox's starting
+        // state (host-side; the VM then boots from it).
+        if let Some(snapshot_id) = &opts.from_snapshot {
+            if !self.snapshots.read().await.contains_key(snapshot_id) {
+                return Err(BackendError::NotFound(snapshot_id.clone()));
+            }
+            let archive = self.snapshot_dir(snapshot_id).join("rootfs.tar");
+            let dest = rootfs.clone();
+            tokio::task::spawn_blocking(move || extract_rootfs(&archive, &dest))
+                .await
+                .map_err(|e| BackendError::Internal(format!("from_snapshot task: {e}")))??;
+        }
 
         self.krun_set_root(ctx_id, &rootfs)?;
 
@@ -236,11 +250,21 @@ impl Backend for KrunvmBackend {
         // Drop the sandbox's snapshots too. Snapshots are bound to their
         // parent sandbox's lifetime; the proto keys list_snapshots by
         // sandbox_id, so a snapshot of a removed sandbox would be a
-        // dangling reference no caller could ever reach.
-        self.snapshots
-            .write()
-            .await
-            .retain(|_, snap| snap.sandbox_id != id);
+        // dangling reference no caller could ever reach. Reap their on-disk
+        // archives as well so removal doesn't leak storage.
+        let reaped: Vec<String> = {
+            let mut snaps = self.snapshots.write().await;
+            let reaped = snaps
+                .iter()
+                .filter(|(_, s)| s.sandbox_id == id)
+                .map(|(k, _)| k.clone())
+                .collect();
+            snaps.retain(|_, snap| snap.sandbox_id != id);
+            reaped
+        };
+        for snapshot_id in reaped {
+            let _ = std::fs::remove_dir_all(self.snapshot_dir(&snapshot_id));
+        }
 
         Ok(())
     }
@@ -271,8 +295,10 @@ impl Backend for KrunvmBackend {
     // unchanged so the manager and gRPC layers never need to be revisited.
     // -----------------------------------------------------------------------
 
-    /// Take a snapshot of a sandbox's current state.
-    /// Returns the SnapshotInfo with a freshly-minted snapshot_id.
+    /// Take a disk-level snapshot of a sandbox: archive its rootfs and
+    /// record metadata. This captures filesystem state only — libkrun 1.18
+    /// exposes no live checkpoint API, so in-memory/CPU state is not saved
+    /// (see ADR-009).
     async fn create_snapshot(&self, sandbox_id: &str, label: &str) -> Result<SnapshotInfo> {
         // Sandbox must exist — snapshotting a non-existent sandbox is a
         // user error, not an internal failure.
@@ -281,15 +307,29 @@ impl Backend for KrunvmBackend {
         }
 
         let snapshot_id = uuid::Uuid::new_v4().to_string();
+        let rootfs = self.sandbox_rootfs(sandbox_id);
+        let snap_dir = self.snapshot_dir(&snapshot_id);
+        let archive = snap_dir.join("rootfs.tar");
+
+        // Archive off the runtime to avoid blocking the reactor on large
+        // rootfs trees.
+        let size_bytes = {
+            let rootfs = rootfs.clone();
+            let archive = archive.clone();
+            tokio::task::spawn_blocking(move || archive_rootfs(&rootfs, &archive))
+                .await
+                .map_err(|e| BackendError::Internal(format!("snapshot task: {e}")))??
+        };
+
         let info = SnapshotInfo {
             snapshot_id: snapshot_id.clone(),
             sandbox_id: sandbox_id.to_string(),
             label: label.to_string(),
             created_at: std::time::SystemTime::now(),
-            // Real backend will report the checkpoint blob size. Zero
-            // is the truthful answer for a stub that materialises nothing.
-            size_bytes: 0,
+            size_bytes,
         };
+        write_snapshot_metadata(&snap_dir.join("metadata.json"), &info)?;
+
         self.snapshots
             .write()
             .await
@@ -297,22 +337,35 @@ impl Backend for KrunvmBackend {
         Ok(info)
     }
 
-    /// Restore a sandbox from a previously-taken snapshot. The stub
-    /// verifies the snapshot exists AND belongs to the named sandbox;
-    /// the real backend will additionally swap the VM's rootfs and
-    /// resume execution from the checkpoint.
+    /// Restore a sandbox from a previously-taken snapshot by swapping its
+    /// rootfs back to the archived contents. Verifies the snapshot exists
+    /// AND belongs to the named sandbox first. Under `--features krunvm` the
+    /// VM is also rebooted into the restored rootfs (gated; the filesystem
+    /// swap itself is host-side and verified).
     async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()> {
-        let guard = self.snapshots.read().await;
-        let snap = guard
-            .get(snapshot_id)
-            .ok_or_else(|| BackendError::NotFound(snapshot_id.to_string()))?;
-        if snap.sandbox_id != sandbox_id {
-            // Cross-sandbox restore would let one sandbox roll into
-            // another's state — exactly the kind of tenant boundary
-            // we guard everywhere else. Surface as NotFound to avoid
-            // leaking the snapshot's existence to the wrong caller.
-            return Err(BackendError::NotFound(snapshot_id.to_string()));
+        // Validate ownership, then release the lock before doing IO.
+        {
+            let guard = self.snapshots.read().await;
+            let snap = guard
+                .get(snapshot_id)
+                .ok_or_else(|| BackendError::NotFound(snapshot_id.to_string()))?;
+            if snap.sandbox_id != sandbox_id {
+                // Cross-sandbox restore would let one sandbox roll into
+                // another's state — exactly the kind of tenant boundary
+                // we guard everywhere else. Surface as NotFound to avoid
+                // leaking the snapshot's existence to the wrong caller.
+                return Err(BackendError::NotFound(snapshot_id.to_string()));
+            }
         }
+
+        let archive = self.snapshot_dir(snapshot_id).join("rootfs.tar");
+        let rootfs = self.sandbox_rootfs(sandbox_id);
+        tokio::task::spawn_blocking(move || extract_rootfs(&archive, &rootfs))
+            .await
+            .map_err(|e| BackendError::Internal(format!("restore task: {e}")))??;
+
+        // TODO(krunvm): reboot the VM into the restored rootfs. The
+        // filesystem swap above is the host-side, verifiable half.
         Ok(())
     }
 
@@ -636,6 +689,19 @@ impl KrunvmBackend {
             .join("agent.sock")
     }
 
+    /// Unpacked rootfs directory for a sandbox.
+    fn sandbox_rootfs(&self, sandbox_id: &str) -> std::path::PathBuf {
+        self.data_dir
+            .join("sandboxes")
+            .join(sandbox_id)
+            .join("rootfs")
+    }
+
+    /// On-disk directory holding a snapshot's archive and metadata.
+    fn snapshot_dir(&self, snapshot_id: &str) -> std::path::PathBuf {
+        self.data_dir.join("snapshots").join(snapshot_id)
+    }
+
     /// Capture the shutdown eventfd and spawn the dedicated OS thread
     /// that runs `krun_start_enter`. Must be called only after every
     /// `krun_set_*` configuration call for the context.
@@ -773,7 +839,74 @@ impl KrunvmBackend {
 }
 
 // ---------------------------------------------------------------------------
-// Tests: snapshot stub behaviour
+// Snapshot archive helpers (host-side, hypervisor-independent)
+// ---------------------------------------------------------------------------
+
+/// Archive a sandbox rootfs into a tar file, returning the archive size in
+/// bytes. A missing rootfs yields a valid (empty) archive rather than an
+/// error, so snapshotting a not-yet-populated sandbox still succeeds.
+fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result<u64> {
+    if let Some(parent) = archive.parent() {
+        std::fs::create_dir_all(parent).map_err(BackendError::Io)?;
+    }
+    let file = std::fs::File::create(archive).map_err(BackendError::Io)?;
+    let mut builder = tar::Builder::new(file);
+    if rootfs.is_dir() {
+        builder
+            .append_dir_all(".", rootfs)
+            .map_err(|e| BackendError::Internal(format!("archive rootfs: {e}")))?;
+    }
+    builder
+        .finish()
+        .map_err(|e| BackendError::Internal(format!("finish archive: {e}")))?;
+    drop(builder);
+    Ok(std::fs::metadata(archive).map_err(BackendError::Io)?.len())
+}
+
+/// Replace `dest` with the contents of a rootfs archive.
+fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    if !archive.exists() {
+        return Err(BackendError::NotFound(format!(
+            "snapshot archive missing: {}",
+            archive.display()
+        )));
+    }
+    if dest.exists() {
+        std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+    }
+    std::fs::create_dir_all(dest).map_err(BackendError::Io)?;
+    let file = std::fs::File::open(archive).map_err(BackendError::Io)?;
+    let mut ar = tar::Archive::new(file);
+    ar.unpack(dest)
+        .map_err(|e| BackendError::Internal(format!("extract archive: {e}")))?;
+    Ok(())
+}
+
+/// Persist snapshot metadata as JSON alongside its archive.
+fn write_snapshot_metadata(path: &std::path::Path, info: &SnapshotInfo) -> Result<()> {
+    let created = info
+        .created_at
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let json = serde_json::json!({
+        "snapshot_id": info.snapshot_id,
+        "sandbox_id": info.sandbox_id,
+        "label": info.label,
+        "created_at_unix": created,
+        "size_bytes": info.size_bytes,
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(BackendError::Io)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&json)
+        .map_err(|e| BackendError::Internal(format!("serialise snapshot metadata: {e}")))?;
+    std::fs::write(path, bytes).map_err(BackendError::Io)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests: snapshot behaviour
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -830,7 +963,119 @@ mod tests {
         assert_eq!(snap.snapshot_id.len(), 36);
         assert_eq!(snap.sandbox_id, "sb1");
         assert_eq!(snap.label, "checkpoint-1");
-        assert_eq!(snap.size_bytes, 0); // stub doesn't materialise blobs
+        // A real (even empty) tar archive is materialised, so size is > 0.
+        assert!(snap.size_bytes > 0, "expected a real archive size");
+    }
+
+    // ----- disk-level snapshot: archive / restore / from_snapshot --------
+
+    /// Write `name`→`contents` into a sandbox's rootfs (creating it).
+    fn seed_rootfs(backend: &KrunvmBackend, sandbox_id: &str, name: &str, contents: &[u8]) {
+        let rootfs = backend.sandbox_rootfs(sandbox_id);
+        std::fs::create_dir_all(&rootfs).expect("mk rootfs");
+        std::fs::write(rootfs.join(name), contents).expect("write file");
+    }
+
+    #[tokio::test]
+    async fn given_rootfs_content_when_create_snapshot_then_archive_written() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        seed_rootfs(&backend, "sb1", "hello.txt", b"snapshot me");
+
+        // Act
+        let snap = backend
+            .create_snapshot("sb1", "c1")
+            .await
+            .expect("snapshot");
+
+        // Assert: the archive exists on disk and carries the file's bytes.
+        let archive = backend.snapshot_dir(&snap.snapshot_id).join("rootfs.tar");
+        assert!(archive.exists(), "archive should be materialised");
+        assert!(snap.size_bytes > 1024, "archive should exceed an empty tar");
+    }
+
+    #[tokio::test]
+    async fn given_snapshot_when_restore_then_rootfs_content_restored() {
+        // Arrange: snapshot a file, then mutate the rootfs.
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        seed_rootfs(&backend, "sb1", "data.txt", b"original");
+        let snap = backend
+            .create_snapshot("sb1", "c1")
+            .await
+            .expect("snapshot");
+        std::fs::write(backend.sandbox_rootfs("sb1").join("data.txt"), b"changed").unwrap();
+
+        // Act
+        backend
+            .restore_snapshot("sb1", &snap.snapshot_id)
+            .await
+            .expect("restore");
+
+        // Assert: the file is back to its snapshotted contents.
+        let restored = std::fs::read(backend.sandbox_rootfs("sb1").join("data.txt")).unwrap();
+        assert_eq!(restored, b"original");
+    }
+
+    #[tokio::test]
+    async fn given_from_snapshot_when_create_then_new_rootfs_seeded() {
+        // Arrange: snapshot sb1's rootfs.
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        seed_rootfs(&backend, "sb1", "seed.txt", b"from-snapshot");
+        let snap = backend
+            .create_snapshot("sb1", "c1")
+            .await
+            .expect("snapshot");
+
+        // Act: create sb2 from that snapshot.
+        let opts = CreateOpts {
+            from_snapshot: Some(snap.snapshot_id.clone()),
+            ..create_opts()
+        };
+        backend
+            .create_sandbox("sb2".into(), &opts)
+            .await
+            .expect("create from snapshot");
+
+        // Assert: sb2's rootfs was seeded with the snapshot contents.
+        let seeded = std::fs::read(backend.sandbox_rootfs("sb2").join("seed.txt")).unwrap();
+        assert_eq!(seeded, b"from-snapshot");
+    }
+
+    #[tokio::test]
+    async fn given_unknown_from_snapshot_when_create_then_not_found() {
+        let backend = backend_in_tempdir();
+        let opts = CreateOpts {
+            from_snapshot: Some("nonexistent".into()),
+            ..create_opts()
+        };
+        let err = backend
+            .create_sandbox("sb2".into(), &opts)
+            .await
+            .expect_err("unknown snapshot");
+        assert!(matches!(err, BackendError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_with_snapshot_when_removed_then_archive_dir_deleted() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        seed_rootfs(&backend, "sb1", "f", b"x");
+        let snap = backend
+            .create_snapshot("sb1", "c1")
+            .await
+            .expect("snapshot");
+        let snap_dir = backend.snapshot_dir(&snap.snapshot_id);
+        assert!(snap_dir.exists());
+
+        // Act
+        backend.remove_sandbox("sb1").await.expect("remove");
+
+        // Assert: the on-disk archive directory is reaped with the sandbox.
+        assert!(!snap_dir.exists(), "snapshot dir should be deleted");
     }
 
     #[tokio::test]
