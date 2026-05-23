@@ -6,7 +6,7 @@
 
 ## Context
 
-Ward needs a protocol for communication between SDKs and the daemon, and between the remote management and daemon hosts. The protocol must support request/response patterns (create sandbox, get status) and server-streaming patterns (stdout/stderr output, subscribe to a pub/sub topic).
+Ward needs a protocol for communication between SDKs and the daemon, locally and over the network. The protocol must support request/response patterns (create sandbox, get status) and server-streaming patterns (stdout/stderr output, subscribe to a pub/sub topic).
 
 ### Evaluated
 
@@ -23,7 +23,7 @@ Ward uses **gRPC + protobuf** for all communication. The single source of truth 
 1. **One `.proto` file, all SDKs.** `ward.proto` defines every type and RPC. `protoc` generates typed clients for TypeScript, Python, Go, Rust, Ruby, Java, and more.
 2. **Schema evolution.** Protobuf's field numbering guarantees backwards compatibility.
 3. **Native streaming.** `StreamOutput` and `Subscribe` return `stream …` types. No SSE, no WebSocket, no polling.
-4. **Same protocol at every boundary.** SDK to daemon (Unix socket), remote management to daemon (TCP + mTLS), SDK to remote management: all gRPC, all the same `.proto`.
+4. **Same protocol at every boundary.** SDK to daemon (Unix socket) and remote clients to daemon (TCP + mTLS): all gRPC, all the same `.proto`.
 5. **Debuggable.** `grpcurl` provides the same debugging experience as curl.
 
 ### Transport
@@ -34,7 +34,7 @@ Ward uses **gRPC + protobuf** for all communication. The single source of truth 
 
 Overridable via `WARD_SOCKET` env var. Socket permissions 0600 (owner only).
 
-**Remote (remote management to daemon, SDK to remote management):** gRPC over TCP with mTLS or API key in metadata. Same `.proto`, same RPCs.
+**Remote (clients to daemon over the network):** gRPC over TCP with mTLS or API key in metadata. Same `.proto`, same RPCs.
 
 ### Service surface (canonical: `proto/ward.proto`)
 
@@ -88,7 +88,7 @@ The protobuf package is `ward.v1`. Breaking changes (removing fields, changing f
 
 **Local (Unix socket):** No authentication. Socket file permissions (0600) provide access control.
 
-**Remote (TCP):** API key in gRPC metadata (`authorization: Bearer ward-key-xxx`). mTLS for daemon-to-remote management.
+**Remote (TCP):** API key in gRPC metadata (`authorization: Bearer ward-key-xxx`). mTLS for daemon-to-daemon and remote client access.
 
 ### Error handling
 
@@ -112,4 +112,4 @@ Cross-tenant lookups (e.g. asking for a pid that belongs to a different sandbox)
 - The daemon uses `tonic` (Rust gRPC framework). tonic supports Unix socket listeners natively.
 - Generated bindings are produced at build time by `tonic-build` in `ward-core/build.rs`.
 - Binary protobuf on the wire is more efficient than JSON but not human-readable. `grpcurl` with `-format json` bridges this gap.
-- The remote management can proxy gRPC calls directly to daemon hosts without protocol translation.
+- Remote callers can reach daemon hosts directly without protocol translation.
