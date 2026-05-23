@@ -20,6 +20,9 @@ Thumbs.db
 .local/
 .claude/
 
+# Agent process artifacts (specs/plans), not project content
+docs/superpowers/
+
 # Environment
 .env
 .env.*
