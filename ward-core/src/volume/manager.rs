@@ -3,7 +3,7 @@
 //! VolumeManager: daemon-managed shared persistent volumes.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -13,6 +13,83 @@ use crate::pb::{CreateVolumeRequest, VolumeInfo as PbVolumeInfo};
 use crate::protocol::ApiError;
 
 type Result<T> = std::result::Result<T, ApiError>;
+
+/// Filename of the backing filesystem image inside a volume's directory.
+const VOLUME_IMAGE: &str = "volume.img";
+
+// ---------------------------------------------------------------------------
+// Volume formatter
+// ---------------------------------------------------------------------------
+
+/// Allocates and formats a volume's backing filesystem image.
+///
+/// Split out as a trait so tests can inject a no-op (the real formatter
+/// shells out to `mkfs.ext4`, which is Linux-only and unavailable on dev
+/// macOS hosts and in cross-platform unit tests).
+#[async_trait::async_trait]
+pub trait VolumeFormatter: Send + Sync + std::fmt::Debug {
+    /// Create a `size_mb`-megabyte filesystem image at `image_path`.
+    async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()>;
+}
+
+/// Production formatter: a sparse image sized with `truncate`-style
+/// `set_len`, then formatted ext4 via `mkfs.ext4`.
+#[derive(Debug, Default)]
+pub struct Ext4Formatter;
+
+#[async_trait::async_trait]
+impl VolumeFormatter for Ext4Formatter {
+    async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()> {
+        allocate_sparse_image(image_path, size_mb).await?;
+        run_mkfs_ext4(image_path).await
+    }
+}
+
+/// Create a sparse file of `size_mb` MiB at `path`. Sparse means the bytes
+/// are not written up front: the file reports the full length but only
+/// occupies disk as the guest writes into it.
+async fn allocate_sparse_image(path: &Path, size_mb: u32) -> Result<()> {
+    let len = u64::from(size_mb) * 1024 * 1024;
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("create volume image {}: {e}", path.display())))?;
+    file.set_len(len)
+        .await
+        .map_err(|e| ApiError::Internal(format!("size volume image to {len} bytes: {e}")))?;
+    Ok(())
+}
+
+/// Format an existing image file as ext4. `-F` forces mkfs to operate on a
+/// regular file (not a block device); `-q` silences the banner.
+async fn run_mkfs_ext4(path: &Path) -> Result<()> {
+    let output = tokio::process::Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg("-q")
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::Internal(
+                    "mkfs.ext4 not found; ext4 volume images require Linux (e2fsprogs)".to_string(),
+                )
+            } else {
+                ApiError::Internal(format!("spawn mkfs.ext4: {e}"))
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ApiError::Internal(format!(
+            "mkfs.ext4 failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -37,14 +114,27 @@ pub struct VolumeManager {
     volumes: Arc<RwLock<HashMap<String, VolumeEntry>>>,
     /// Maximum number of volumes. Prevents metadata and inode exhaustion.
     max_volumes: usize,
+    formatter: Arc<dyn VolumeFormatter>,
 }
 
 impl VolumeManager {
+    /// Production constructor: formats real ext4 images.
     pub fn new(data_dir: PathBuf, max_volumes: usize) -> Self {
+        Self::with_formatter(data_dir, max_volumes, Arc::new(Ext4Formatter))
+    }
+
+    /// Construct with an injected formatter. Tests pass a no-op so they
+    /// don't depend on `mkfs.ext4`.
+    pub fn with_formatter(
+        data_dir: PathBuf,
+        max_volumes: usize,
+        formatter: Arc<dyn VolumeFormatter>,
+    ) -> Self {
         Self {
             data_dir,
             volumes: Arc::new(RwLock::new(HashMap::new())),
             max_volumes,
+            formatter,
         }
     }
 
@@ -55,6 +145,13 @@ impl VolumeManager {
     /// Create a new volume, allocating backing storage on disk.
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
+
+        // A volume needs a concrete size to allocate its backing image.
+        if req.size_mb == 0 {
+            return Err(ApiError::InvalidRequest(
+                "volume size_mb must be greater than 0".to_string(),
+            ));
+        }
 
         // Enforce volume cap to prevent resource exhaustion.
         let current = self.volumes.read().await.len();
@@ -72,7 +169,11 @@ impl VolumeManager {
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-        // TODO: allocate a fixed-size filesystem image (e.g. ext4 via truncate + mkfs).
+        // Allocate the fixed-size ext4 image the sandbox will mount. The
+        // image lives inside the volume's directory and is attached to a
+        // microVM via krun_add_disk2 (see the mounts/attach work).
+        let image_path = mount_path.join(VOLUME_IMAGE);
+        self.formatter.format(&image_path, req.size_mb).await?;
 
         let entry = VolumeEntry {
             id: id.clone(),
@@ -165,6 +266,18 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    /// Test formatter: creates the image file at the requested size but
+    /// skips `mkfs.ext4`, so the CRUD tests run offline and on any OS.
+    #[derive(Debug)]
+    struct FakeFormatter;
+
+    #[async_trait::async_trait]
+    impl VolumeFormatter for FakeFormatter {
+        async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()> {
+            allocate_sparse_image(image_path, size_mb).await
+        }
+    }
+
     /// Build a VolumeManager with a per-test temp data dir.
     /// The TempDir is leaked intentionally: tokio's async fs API outlives
     /// any test-local scope and clean-up happens on process exit.
@@ -172,7 +285,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        VolumeManager::new(path, max_volumes)
+        VolumeManager::with_formatter(path, max_volumes, Arc::new(FakeFormatter))
     }
 
     fn req(name: &str, size_mb: u32) -> CreateVolumeRequest {
@@ -404,5 +517,78 @@ mod tests {
 
         // Assert
         assert!(v3.is_ok(), "removing a volume must free a slot");
+    }
+
+    // ----- backing image -------------------------------------------------
+
+    #[tokio::test]
+    async fn given_zero_size_when_create_then_returns_invalid_request() {
+        // Arrange: a sizeless volume can't be allocated.
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr.create(req("demo", 0)).await.expect_err("zero size");
+
+        // Assert: rejected before any disk work, as InvalidRequest.
+        match err {
+            ApiError::InvalidRequest(msg) => assert!(msg.contains("size_mb"), "got: {msg}"),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_create_when_succeeds_then_image_allocated_at_requested_size() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let v = mgr.create(req("demo", 8)).await.expect("create");
+
+        // Assert: the backing image exists inside the volume dir and reports
+        // the requested size (sparse, so on-disk usage may be less).
+        let image = std::path::Path::new(&v.mount_path).join(VOLUME_IMAGE);
+        let meta = std::fs::metadata(&image).expect("image metadata");
+        assert_eq!(meta.len(), 8 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn given_allocate_sparse_image_when_called_then_file_has_exact_length() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("v.img");
+
+        // Act
+        allocate_sparse_image(&path, 4).await.expect("allocate");
+
+        // Assert
+        let meta = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(meta.len(), 4 * 1024 * 1024);
+    }
+
+    /// Real `mkfs.ext4` path. Skips cleanly where e2fsprogs is absent (dev
+    /// macOS), so it's a no-op locally and exercises the real tool on Linux
+    /// CI.
+    #[tokio::test]
+    async fn given_ext4_formatter_when_format_then_produces_ext4_image() {
+        // Arrange: only meaningful where mkfs.ext4 exists.
+        let probe = tokio::process::Command::new("mkfs.ext4")
+            .arg("-V")
+            .output()
+            .await;
+        if probe.is_err() {
+            eprintln!("mkfs.ext4 unavailable — skipping real-format test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let image = dir.path().join("real.img");
+
+        // Act
+        Ext4Formatter.format(&image, 8).await.expect("format ext4");
+
+        // Assert: ext4 superblock magic 0xEF53 sits at offset 0x438
+        // (little-endian: bytes 0x53, 0xEF).
+        let bytes = std::fs::read(&image).expect("read image");
+        assert_eq!(&bytes[0x438..0x43A], &[0x53, 0xEF], "missing ext4 magic");
     }
 }

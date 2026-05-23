@@ -46,6 +46,10 @@ uuid = { version = "1", features = ["v4"] }
 tonic-build = "0.12"
 
 [dev-dependencies]
+# async-trait: integration-test harnesses implement the async VolumeFormatter
+# / Backend traits with a no-op, which requires the macro at test-crate scope.
+async-trait = "0.1"
+
 # tokio-test: assert_ready!, assert_pending!, mock I/O streams, scripted streams.
 # Used for testing async code paths that depend on poll semantics.
 tokio-test = "0.4"

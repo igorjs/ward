@@ -30,7 +30,24 @@ use ward_core::grpc::WardGrpcServer;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::ward_server::WardServer;
 use ward_core::sandbox::SandboxManager;
-use ward_core::volume::VolumeManager;
+use ward_core::volume::{VolumeFormatter, VolumeManager};
+
+/// No-op volume formatter for tests: the gRPC suite exercises volume CRUD
+/// behaviour, not the on-disk ext4 image, so we skip `mkfs.ext4` (Linux-only)
+/// and keep the harness offline and cross-platform.
+#[derive(Debug)]
+struct NoopFormatter;
+
+#[async_trait::async_trait]
+impl VolumeFormatter for NoopFormatter {
+    async fn format(
+        &self,
+        _image_path: &std::path::Path,
+        _size_mb: u32,
+    ) -> Result<(), ward_core::protocol::ApiError> {
+        Ok(())
+    }
+}
 
 /// Spin up a Ward gRPC server bound to a kernel-assigned loopback port and
 /// return a connected client.
@@ -64,7 +81,11 @@ pub async fn test_server() -> WardClient<Channel> {
         Arc::clone(&broker),
         4,
     ));
-    let volume_mgr = Arc::new(VolumeManager::new(data_dir, 4));
+    let volume_mgr = Arc::new(VolumeManager::with_formatter(
+        data_dir,
+        4,
+        Arc::new(NoopFormatter),
+    ));
     let service = WardGrpcServer::new(sandbox_mgr, volume_mgr);
 
     // 2) Bind to loopback on port 0 — the kernel picks a free port for us.
