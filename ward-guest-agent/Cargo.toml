@@ -1,0 +1,33 @@
+[package]
+name = "ward-guest-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The guest agent runs as the entry process inside every microVM. It is a
+# deliberately small binary (tokio + prost only) so it stays cheap to bake
+# into a rootfs. The vsock transport is Linux-only and gated per-target so
+# the crate still builds on dev macOS hosts (lib + unit tests).
+
+[dependencies]
+prost = "0.13"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "process",
+    "io-util",
+    "sync",
+] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-vsock = "0.7"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
