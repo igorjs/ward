@@ -43,7 +43,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.14"
 
 [dev-dependencies]
 # async-trait: integration-test harnesses implement the async VolumeFormatter
