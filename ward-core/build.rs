@@ -30,6 +30,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "krunvm")]
     {
+        // Release/CI builds extract the libkrun bottle to a custom prefix
+        // and export LIBKRUN_PREFIX. Point the linker at <prefix>/lib so
+        // -lkrun/-lkrunfw resolve. Local dev installs (brew, distro pkg)
+        // land on the default search path, so the env var is optional.
+        println!("cargo:rerun-if-env-changed=LIBKRUN_PREFIX");
+        if let Ok(prefix) = std::env::var("LIBKRUN_PREFIX") {
+            println!("cargo:rustc-link-search=native={prefix}/lib");
+        }
         println!("cargo:rustc-link-lib=krun");
         println!("cargo:rustc-link-lib=krunfw");
     }
