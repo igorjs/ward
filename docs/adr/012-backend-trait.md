@@ -9,7 +9,7 @@
 ADR-003 picked libkrun as the isolation backend. That decision is sound for ward's primary platforms (macOS arm64, Linux x86_64/arm64), but several questions are open:
 
 - **Multi-platform coverage**: libkrun does not support Windows or Intel Macs. If ward needs broader coverage, a backend like Firecracker (Linux servers) or Apple's `Virtualization.framework` (full macOS support) may be required alongside or instead.
-- **Snapshot support**: libkrun 1.10 lacks snapshot/restore in its public API (ADR-009). Firecracker has it. If the snapshot feature ramps in importance, swapping or supplementing the backend becomes attractive.
+- **Live snapshot support**: libkrun 1.18 lacks live checkpoint/restore in its public API, so ward's snapshots are disk-level only (ADR-009). Firecracker has live snapshots. If full memory/CPU checkpointing ramps in importance, swapping or supplementing the backend becomes attractive.
 - **Maturity**: libkrun is younger than Firecracker. Production deployment patterns are less well-trodden.
 
 Coupling `SandboxManager` to the concrete `KrunvmBackend` type makes swapping any of this a multi-week refactor. Doing it now, with one impl, is cheap insurance.

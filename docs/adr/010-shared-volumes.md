@@ -62,11 +62,13 @@ The daemon enforces a configurable maximum number of volumes via `WARD_MAX_VOLUM
 
 ### Backend implementation
 
-Volumes are host directories mounted into the VM via libkrun's `krun_set_mapped_volumes` (when the krunvm feature is enabled). For development without libkrun, the stub backend returns synthetic IDs and tracks state in memory.
+Each volume is backed by a fixed-size **ext4 image** (`volume.img`): the `VolumeManager` allocates a sparse file of the requested size and formats it with `mkfs.ext4` (see `volume/manager.rs`). Formatting is behind a `VolumeFormatter` trait so unit/gRPC tests run offline; the real formatter runs on Linux. For development without libkrun, the stub backend still returns synthetic sandbox IDs and tracks state in memory.
+
+Attaching a volume image into a microVM as a block device (`krun_add_disk`) is **deferred**: the pinned libkrun 1.18.0 bottle is built without block-device support (no `krun_add_disk*` symbols). Bind mounts are attached via virtiofs in the meantime; volume block-attach needs a block-capable libkrun build.
 
 ### Size limits
 
-The proto schema includes a `size_mb` field. Currently unenforced — once libkrun supports per-volume size capping (e.g. via a loop-mounted ext4 image), the daemon will respect it. Until then, volumes are plain directories without size enforcement.
+The proto schema's `size_mb` field is the size of the allocated ext4 image. A volume must request a size greater than zero (`InvalidArgument` otherwise). Per-volume usage is bounded by the image size once the volume is attached as a block device.
 
 ## Consequences
 
