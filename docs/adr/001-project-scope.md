@@ -33,16 +33,12 @@ A compiled Rust binary that runs as a daemon, exposes a Unix socket gRPC API, an
 
 ### Layer 2: SDKs (separate packages)
 
-Thin, typed clients in multiple languages that communicate with the daemon over Unix socket gRPC (locally) or TCP gRPC + auth (remote, via remote management). SDKs are transport layers only. Intelligence lives in the daemon.
-
-### Layer 3: remote management (separate project, proprietary)
-
-A fleet management layer for enterprise customers. Manages scheduling, scaling, authentication, and billing across multiple Ward daemon hosts. Supports self-managed (EC2 + libkrun) and serverless (Lambda + Fargate) backends. See the `internal-project` repo for that project's ADRs.
+Thin, typed clients in multiple languages that communicate with the daemon over Unix socket gRPC (locally) or TCP gRPC + auth (remote). SDKs are transport layers only. Intelligence lives in the daemon.
 
 ### Out of scope for Ward
 
 - AI agent orchestration, CI job scheduling, container image building
-- Multi-node distribution (remote management's responsibility)
+- Multi-node distribution and clustering
 - Weak isolation fallbacks (no Docker/runc mode)
 
 ## Consequences
@@ -50,4 +46,4 @@ A fleet management layer for enterprise customers. Manages scheduling, scaling, 
 - Ward is useful to any project needing isolated execution, not just AI tooling.
 - A single isolation backend (libkrun) simplifies testing, maintenance, and the mental model.
 - The SDK surface is small and stable because the API is simple.
-- Enterprise scale is the remote management's job, not the daemon's.
+- Multi-node and fleet-scale concerns stay out of the daemon.

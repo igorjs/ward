@@ -27,7 +27,7 @@ shaped the way it is.
 
 ### How to read
 
-- **ADR-001** establishes the boundary between the daemon, the SDKs, and the future remote management.
+- **ADR-001** establishes the boundary between the daemon and the SDKs.
 - **ADR-002–004** are the foundational tech choices (Rust, libkrun, gRPC).
 - **ADR-005–006** cover SDK strategy and licensing.
 - **ADR-007** covers platforms + feature-flag build modes.
@@ -48,7 +48,6 @@ The Ward ecosystem spans more than this repo. References:
 
 - `igorjs/ward` (this repo) — daemon (AGPL-3.0), CLI, registry tools
 - `igorjs/ward-sdk-*` (future) — language-specific SDKs (Apache-2.0)
-- `igorjs/internal-project` (private) — proprietary fleet management; not a derivative work of the daemon, see ADR-001 boundary discussion
 
 ## Protobuf schema
 

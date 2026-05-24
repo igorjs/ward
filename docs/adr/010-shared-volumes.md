@@ -74,4 +74,4 @@ The proto schema includes a `size_mb` field. Currently unenforced — once libkr
 - The daemon tracks volume-to-sandbox relationships to enforce deletion safety and report mount status.
 - SDKs gain a `Volumes` resource on the Ward client (`ward.volumes.create()`, `ward.volumes.list()`, `ward.volumes.remove()`).
 - Volume data persists on the host until explicitly deleted. Users must manage cleanup, especially in CI environments where volumes could accumulate.
-- No distributed volume support in v1. Volumes are local to a single host. Multi-node volume sharing would require a networked filesystem (NFS, EFS) and is the remote management's concern.
+- No distributed volume support in v1. Volumes are local to a single host. Multi-node volume sharing would require a networked filesystem (NFS, EFS) and is out of scope.
