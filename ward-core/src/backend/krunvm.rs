@@ -16,7 +16,7 @@ use crate::protocol::{
     CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo,
 };
 
-/// vsock port the guest agent listens on; must match `ward-guest-agent`.
+/// vsock port the guest agent listens on; must match `ward-agent`.
 /// Only referenced by the krunvm-gated FFI wrappers.
 #[allow(dead_code)]
 const AGENT_VSOCK_PORT: u32 = 1024;
