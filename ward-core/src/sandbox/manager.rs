@@ -124,6 +124,23 @@ impl SandboxManager {
             )));
         }
 
+        // Validate and convert bind mounts; the backend attaches them to the
+        // microVM. (Previously mounts were silently dropped.)
+        let mut mounts = Vec::with_capacity(req.mounts.len());
+        for m in &req.mounts {
+            crate::validate::mount(&m.source, &m.target)?;
+            mounts.push(crate::protocol::Mount {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                readonly: m.readonly,
+            });
+        }
+
+        // Validate volume references before they reach the backend.
+        for vid in &req.volume_ids {
+            crate::validate::entity_id(vid, "volume")?;
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
@@ -137,7 +154,7 @@ impl SandboxManager {
 
         let opts = CreateOpts {
             image: req.image.clone(),
-            mounts: vec![],
+            mounts,
             volume_ids: req.volume_ids.clone(),
             egress: egress_policy.clone(),
             resources,
