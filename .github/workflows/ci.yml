@@ -45,13 +45,21 @@ jobs:
   # tonic server). No subprocess management, sub-second runtime.
   test:
     needs: [clippy]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: Build (libraries + binaries)
         run: cargo build --workspace
       - name: Smoke test (binaries respond to --version)
@@ -74,29 +82,47 @@ jobs:
   # distinct from cheaper test failures.
   e2e:
     needs: [clippy]
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: Build (required so assert_cmd finds wardd and ward binaries)
         run: cargo build --workspace
       - name: E2E tests (wardd subprocess + ward CLI)
         run: cargo test -p ward-daemon --tests
 
   # ── libkrun feature build ────────────────────────────────────────────
-  # Compiles + lints the workspace with the real libkrun backend enabled.
-  # Downloads the pinned libkrun bottle from igorjs/ward-vendor (the same
-  # source release.yml uses) and verifies it against the SHA-256 sums in
-  # vendor/libkrun-checksums.txt. Does NOT boot a microVM: standard runners
-  # lack /dev/kvm, so this tier proves FFI signatures, linking, and all
-  # non-boot logic compile. Real boot tests are gated behind WARD_KVM_TESTS
-  # for a future self-hosted KVM runner (see ward-core/tests/krun_boot.rs).
+  # Compiles + lints the workspace with the real libkrun backend enabled
+  # on both supported host targets. Downloads the pinned libkrun bottle
+  # from igorjs/ward-vendor (the same source release.yml uses) and verifies
+  # it against the SHA-256 sums in vendor/libkrun-checksums.txt. Does NOT
+  # boot a microVM: standard runners lack hypervisor access (no /dev/kvm
+  # on Linux runners, no nested HVF on macOS runners), so this tier proves
+  # FFI signatures, linking, and all non-boot logic compile on each target.
+  # Real boot tests are gated behind WARD_KVM_TESTS for a future self-hosted
+  # KVM runner (see ward-core/tests/krun_boot.rs).
   krunvm-build:
     needs: [clippy]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -105,13 +131,18 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install protoc
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
       - name: Fetch + verify libkrun bottle
+        shell: bash
         run: |
           set -euo pipefail
           LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-version.txt)"
-          TARBALL="libkrun-${LIBKRUN_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p libkrun-vendor
           gh release download "libkrun-v${LIBKRUN_VERSION}" \
             --repo igorjs/ward-vendor \
@@ -122,7 +153,12 @@ jobs:
             echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-checksums.txt"
             exit 1
           fi
-          ACTUAL="$(sha256sum "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          # macOS runners may not ship coreutils' sha256sum; fall back to shasum.
+          if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL="$(sha256sum "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          else
+            ACTUAL="$(shasum -a 256 "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
+          fi
           if [[ "$EXPECTED" != "$ACTUAL" ]]; then
             echo "::error::SHA-256 mismatch for ${TARBALL}: expected ${EXPECTED}, got ${ACTUAL}"
             exit 1
@@ -131,7 +167,11 @@ jobs:
           tar -xzf "libkrun-vendor/${TARBALL}" -C libkrun-vendor/extracted
           PREFIX="$(pwd)/libkrun-vendor/extracted"
           echo "LIBKRUN_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            echo "DYLD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
+          else
+            echo "LD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
+          fi
       - name: Build (--features krunvm)
         run: cargo build --workspace --features ward-core/krunvm
       - name: Clippy (--features krunvm)
