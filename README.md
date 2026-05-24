@@ -24,13 +24,13 @@ egress controls and resource caps.
 
 ## Why ward
 
-| Concern | Docker | E2B / Daytona (SaaS) | ward |
-|---|---|---|---|
-| Kernel isolation | shared host kernel | yes (cloud microVMs) | yes (local microVMs) |
-| Local-first | yes | no, cloud dependency | yes |
-| Egress controls | weak by default | yes | deny default + per-sandbox allowlist |
-| Resource caps | yes (cgroups) | yes | per-VM CPU + memory + PID + timeout |
-| Vendor lock-in | none | yes | none, AGPL daemon, open SDKs |
+| Concern          | Docker             | E2B / Daytona (SaaS) | ward                                 |
+| ---------------- | ------------------ | -------------------- | ------------------------------------ |
+| Kernel isolation | shared host kernel | yes (cloud microVMs) | yes (local microVMs)                 |
+| Local-first      | yes                | no, cloud dependency | yes                                  |
+| Egress controls  | weak by default    | yes                  | deny default + per-sandbox allowlist |
+| Resource caps    | yes (cgroups)      | yes                  | per-VM CPU + memory + PID + timeout  |
+| Vendor lock-in   | none               | yes                  | none, AGPL daemon, open SDKs         |
 
 Docker is great at long-running services; it's wasteful and weakly
 isolated for ephemeral jobs. SaaS sandboxes have strong isolation but
@@ -137,7 +137,7 @@ The CLI surface today: `create`, `list`, `exec`, `run`, `logs`, `stdin`,
                                                          |
                                                          | gRPC over Unix socket
                                                          v
-+---------+   pull + unpack    +---------------------------------------+
++---------+   pull + unpack    +----------------------------------------+
 |  OCI    |  ----------------> |               wardd (daemon)           |
 | images  |                    |                                        |
 +---------+                    |  +----------+   +--------+   +-------+ |
@@ -147,10 +147,10 @@ The CLI surface today: `create`, `list`, `exec`, `run`, `logs`, `stdin`,
                                |        |            |            |     |
                                |        v            v            v     |
                                |  +-----------------------------------+ |
-                               |  |        Backend trait               | |
-                               |  |  (today: libkrun via krun_ffi)     | |
+                               |  |        Backend trait              | |
+                               |  |  (today: libkrun via krun_ffi)    | |
                                |  +-----+-----------------------------+ |
-                               +--------|---------------------------------+
+                               +--------|-------------------------------+
                                         |
                                         v
                               +------------------+
@@ -187,14 +187,14 @@ scripts/       Maintenance helpers (e.g. diff-libkrun.sh).
 
 ## Supported platforms
 
-| Platform | Architecture | Virtualisation | Status |
-|---|---|---|---|
-| macOS 12+ | Apple Silicon | Hypervisor.framework | first-class |
-| Linux 5.10+ | x86_64 | KVM | first-class |
-| Linux 5.10+ | arm64 | KVM | first-class |
-| macOS Intel | x86_64 | n/a | not supported |
-| Windows (native) | any | n/a | not supported |
-| Windows (WSL2) | x86_64 | KVM via WSL2 | community-supported |
+| Platform         | Architecture  | Virtualisation       | Status              |
+| ---------------- | ------------- | -------------------- | ------------------- |
+| macOS 12+        | Apple Silicon | Hypervisor.framework | first-class         |
+| Linux 5.10+      | x86_64        | KVM                  | first-class         |
+| Linux 5.10+      | arm64         | KVM                  | first-class         |
+| macOS Intel      | x86_64        | n/a                  | not supported       |
+| Windows (native) | any           | n/a                  | not supported       |
+| Windows (WSL2)   | x86_64        | KVM via WSL2         | community-supported |
 
 The default `cargo build` (stub backend) compiles on any platform Rust
 supports. Real VM boot needs `--features krunvm` and a supported
