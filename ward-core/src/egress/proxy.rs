@@ -6,9 +6,15 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
 use crate::protocol::EgressPolicy;
+
+/// Cap on the CONNECT request header we'll read before giving up, and on the
+/// number of header lines, to bound work from a hostile client.
+const MAX_HEADER_LINES: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Log entry
@@ -100,6 +106,108 @@ impl EgressProxy {
         }
         log.push_back(entry);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Forward-proxy server
+// ---------------------------------------------------------------------------
+
+impl EgressProxy {
+    /// Serve HTTP `CONNECT` forward-proxy requests on `listener` until it
+    /// stops yielding connections. Each request is checked against the
+    /// policy: allowed targets are tunnelled byte-for-byte, denied ones get
+    /// a `403`. Routing a sandbox's traffic into this listener is the
+    /// (Linux-gated) TAP step; the proxy itself is transport-agnostic.
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        loop {
+            match listener.accept().await {
+                Ok((client, _peer)) => {
+                    let proxy = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        if let Err(e) = proxy.handle_connect(client).await {
+                            tracing::debug!(error = %e, "egress connection ended");
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "egress proxy accept failed");
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn handle_connect(self: Arc<Self>, mut client: TcpStream) -> std::io::Result<()> {
+        let Some((host, port)) = read_connect_target(&mut client).await? else {
+            client
+                .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                .await?;
+            return Ok(());
+        };
+
+        if !self.check(&host, port).await {
+            client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            return Ok(());
+        }
+
+        let mut upstream = match TcpStream::connect((host.as_str(), port)).await {
+            Ok(s) => s,
+            Err(_) => {
+                client
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        Ok(())
+    }
+}
+
+/// Read a `CONNECT host:port HTTP/1.1` request line plus its headers from
+/// `client`, returning the parsed target. Returns `Ok(None)` for anything
+/// that isn't a well-formed CONNECT. A `CONNECT` client waits for the proxy's
+/// response before sending tunnel bytes, so buffering the header here does
+/// not swallow payload.
+async fn read_connect_target(client: &mut TcpStream) -> std::io::Result<Option<(String, u16)>> {
+    let mut reader = tokio::io::BufReader::new(client);
+
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).await? == 0 {
+        return Ok(None);
+    }
+
+    // Drain remaining headers up to the blank line (bounded).
+    for _ in 0..MAX_HEADER_LINES {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let target = parts.next().unwrap_or_default();
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        return Ok(None);
+    }
+
+    // target is host:port; rsplit so IPv6 literals keep their inner colons.
+    let Some((host, port_str)) = target.rsplit_once(':') else {
+        return Ok(None);
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        return Ok(None);
+    };
+    if host.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((host.to_string(), port)))
 }
 
 /// Match a domain against a pattern that may contain a leading `*` wildcard.
@@ -430,5 +538,123 @@ mod tests {
         assert!(!log[0].allowed);
         assert_eq!(log[1].domain, "allowed.com");
         assert!(log[1].allowed);
+    }
+
+    // ----- forward-proxy server -------------------------------------------
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// Start an echo server on loopback; returns its port. Each connection
+    /// echoes back whatever it receives until EOF.
+    async fn spawn_echo_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if sock.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// Start the proxy server on loopback; returns its port.
+    async fn spawn_proxy(proxy: Arc<EgressProxy>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(proxy.serve(listener));
+        port
+    }
+
+    /// Read a full HTTP response header (through the terminating blank line)
+    /// so no header bytes are left to corrupt subsequent tunnel reads.
+    async fn read_response_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buf.ends_with(b"\r\n\r\n") {
+            if stream.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[tokio::test]
+    async fn given_open_policy_when_connect_allowed_then_tunnels_bytes() {
+        // Arrange: an echo upstream and an Open proxy in front of it.
+        let echo_port = spawn_echo_server().await;
+        let proxy = Arc::new(build_proxy(EgressMode::Open, vec![]));
+        let proxy_port = spawn_proxy(Arc::clone(&proxy)).await;
+
+        // Act: CONNECT through the proxy to the echo server, then round-trip.
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let status = read_response_head(&mut client).await;
+        assert!(status.contains("200"), "expected 200, got {status:?}");
+
+        client.write_all(b"ward-egress").await.unwrap();
+        let mut echoed = [0u8; 11];
+        client.read_exact(&mut echoed).await.unwrap();
+
+        // Assert
+        assert_eq!(&echoed, b"ward-egress");
+        let log = proxy.log_entries().await;
+        assert!(log.iter().any(|e| e.domain == "127.0.0.1" && e.allowed));
+    }
+
+    #[tokio::test]
+    async fn given_deny_policy_when_connect_then_returns_403() {
+        // Arrange
+        let proxy = Arc::new(build_proxy(EgressMode::Deny, vec![]));
+        let proxy_port = spawn_proxy(Arc::clone(&proxy)).await;
+
+        // Act
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        client
+            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let status = read_response_head(&mut client).await;
+
+        // Assert: rejected, and the attempt is logged as denied.
+        assert!(status.contains("403"), "expected 403, got {status:?}");
+        let log = proxy.log_entries().await;
+        assert!(log.iter().any(|e| e.domain == "example.com" && !e.allowed));
+    }
+
+    #[tokio::test]
+    async fn given_allowlist_when_connect_to_unlisted_then_returns_403() {
+        // Arrange: allow only example.com; connect to the echo server (which
+        // presents as 127.0.0.1), which is not listed.
+        let echo_port = spawn_echo_server().await;
+        let proxy = Arc::new(build_proxy(EgressMode::Allowlist, vec!["example.com"]));
+        let proxy_port = spawn_proxy(Arc::clone(&proxy)).await;
+
+        // Act
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        client
+            .write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let status = read_response_head(&mut client).await;
+
+        // Assert
+        assert!(status.contains("403"), "expected 403, got {status:?}");
     }
 }
