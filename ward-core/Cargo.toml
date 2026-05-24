@@ -30,20 +30,24 @@ flate2 = "1"
 # outside deny.toml's allowlist. default-features off drops the bundled
 # test-registry harness we don't ship.
 oci-client = { version = "0.17", default-features = false, features = ["native-tls"] }
-prost = "0.13"
-prost-types = "0.13"
+prost = "0.14"
+prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tar = "0.4"
-tonic = "0.12"
+tonic = "0.14"
+# tonic 0.14 split prost integration into a separate crate; the generated
+# code (include_proto!) references it.
+tonic-prost = "0.14"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+# tonic 0.14 moved prost codegen out of tonic-build into tonic-prost-build.
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 # async-trait: integration-test harnesses implement the async VolumeFormatter
@@ -60,7 +64,7 @@ pretty_assertions = "1"
 
 # rstest: parameterised tests via #[case] attributes and reusable fixtures.
 # Cuts boilerplate when many cases share the same arrange-act-assert shape.
-rstest = "0.23"
+rstest = "0.26"
 
 # tempfile: per-test temporary directories. Manager tests use a fresh
 # data_dir per test so parallel runs do not interfere.
