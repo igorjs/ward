@@ -54,6 +54,13 @@ jobs:
         run: sudo apt-get install -y protobuf-compiler
       - name: Build (libraries + binaries)
         run: cargo build --workspace
+      - name: Smoke test (binaries respond to --version)
+        # Catches link errors and broken clap setups that compile but
+        # crash before any test runs the binary. Cheap (under a second)
+        # and runs before the test steps so failures surface fast.
+        run: |
+          ./target/debug/wardd --version
+          ./target/debug/ward --version
       - name: Unit tests (all crates)
         run: cargo test --workspace --lib --bins
       - name: Integration tests (ward-core)
