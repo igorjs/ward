@@ -60,15 +60,26 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Install e2fsprogs (macOS)
+        # mkfs.ext4 is preinstalled on Ubuntu; macOS ships nothing equivalent.
+        # The volume manager shells out to mkfs.ext4 to format the disk image
+        # libkrun mounts inside the microVM (ext4 regardless of host OS).
+        # Homebrew installs this keg-only so the sbin path needs to land on
+        # PATH explicitly via $GITHUB_PATH.
+        if: runner.os == 'macOS'
+        run: |
+          brew install e2fsprogs
+          echo "$(brew --prefix e2fsprogs)/sbin" >> "$GITHUB_PATH"
       - name: Build (libraries + binaries)
         run: cargo build --workspace
-      - name: Smoke test (binaries respond to --version)
+      - name: Smoke test (ward CLI responds to --version)
         # Catches link errors and broken clap setups that compile but
-        # crash before any test runs the binary. Cheap (under a second)
-        # and runs before the test steps so failures surface fast.
-        run: |
-          ./target/debug/wardd --version
-          ./target/debug/ward --version
+        # crash before any test runs the binary. Only `ward` (the CLI)
+        # has a clap parser; `wardd` is a daemon that ignores argv and
+        # binds its Unix socket on startup, so invoking it here would
+        # hang the job. Daemon link-check is covered by the subsequent
+        # e2e job which spawns wardd with a timeout via assert_cmd.
+        run: ./target/debug/ward --version
       - name: Unit tests (all crates)
         run: cargo test --workspace --lib --bins
       - name: Integration tests (ward-core)
@@ -97,6 +108,14 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Install e2fsprogs (macOS)
+        # e2e tests spin up the wardd binary which formats real ext4 images
+        # via mkfs.ext4. Ubuntu ships e2fsprogs; macOS needs it from Homebrew
+        # and the keg-only sbin appended to PATH for the daemon to find it.
+        if: runner.os == 'macOS'
+        run: |
+          brew install e2fsprogs
+          echo "$(brew --prefix e2fsprogs)/sbin" >> "$GITHUB_PATH"
       - name: Build (required so assert_cmd finds wardd and ward binaries)
         run: cargo build --workspace
       - name: E2E tests (wardd subprocess + ward CLI)
