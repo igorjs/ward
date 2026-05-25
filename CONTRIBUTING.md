@@ -82,7 +82,7 @@ If you want `wardd` to boot actual microVMs (i.e. build with
 `--features krunvm`), you need libkrun and libkrunfw on the system.
 The release artefacts we publish to end users bundle these dylibs
 inside the binary's rpath — bottle production lives in the separate
-[`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor) repo —
+[`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) repo —
 but developer builds rely on the system package manager:
 
 **macOS Apple Silicon**
@@ -105,7 +105,7 @@ cargo build --features krunvm
 Why this isn't bundled at `cargo build` time: the "users install
 nothing but ward" promise is satisfied by *end-user release artefacts*
 (`.pkg`, `.deb`, install.sh) that bundle the dylibs, not by per-build
-downloads. Bottles are produced by [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor)
+downloads. Bottles are produced by [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds)
 and consumed by `release.yml` in this repo. FFI declarations live in
 `ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys`
 crate, no bindgen, no libclang build-dep).
@@ -155,11 +155,11 @@ drop-in bump.
 `vendor/libkrun-version.txt` to the new version. If libkrunfw is also
 bumping, edit `vendor/libkrun-checksums.txt` (the comment block
 documents the format) and the matching files at
-[`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor):
+[`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds):
 `version.txt` and `libkrunfw-version.txt`. Trigger the `build`
-workflow at ward-vendor manually via `workflow_dispatch`.
+workflow at libkrun-builds manually via `workflow_dispatch`.
 
-**5. Update local checksums.** Once the ward-vendor build publishes,
+**5. Update local checksums.** Once the libkrun-builds build publishes,
 copy each per-target SHA-256 from the release into
 `vendor/libkrun-checksums.txt`. The release packaging workflow
 refuses to use any downloaded bottle whose hash isn't listed there,
@@ -254,9 +254,9 @@ The release workflow has two modes:
   hypervisor entitlements.
 - **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`):
   builds with `--features ward-core/krunvm` and copies the matching
-  `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/ward-vendor`
+  `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/libkrun-builds`
   GitHub Release into the archive next to the binaries. Requires the
-  `build` workflow at `ward-vendor` to have run for the pinned version
+  `build` workflow at `libkrun-builds` to have run for the pinned version
   AND the resulting SHA-256s to be committed here in
   `vendor/libkrun-checksums.txt`.
 

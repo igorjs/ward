@@ -124,7 +124,7 @@ jobs:
   # ── libkrun feature build ────────────────────────────────────────────
   # Compiles + lints the workspace with the real libkrun backend enabled
   # on both supported host targets. Downloads the pinned libkrun bottle
-  # from igorjs/ward-vendor (the same source release.yml uses) and verifies
+  # from igorjs/libkrun-builds (the same source release.yml uses) and verifies
   # it against the SHA-256 sums in vendor/libkrun-checksums.txt. Does NOT
   # boot a microVM: standard runners lack hypervisor access (no /dev/kvm
   # on Linux runners, no nested HVF on macOS runners), so this tier proves
@@ -164,7 +164,7 @@ jobs:
           TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p libkrun-vendor
           gh release download "libkrun-v${LIBKRUN_VERSION}" \
-            --repo igorjs/ward-vendor \
+            --repo igorjs/libkrun-builds \
             --pattern "$TARBALL" \
             --dir libkrun-vendor
           EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-checksums.txt | awk '{print $1}')"

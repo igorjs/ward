@@ -77,7 +77,7 @@ UUID-based directory names prevent path traversal attacks via maliciously crafte
 
 ### Linking
 
-`krun-sys`'s own `build.rs` uses pkg-config to find libkrun headers and library at build time. For developer builds, libkrun + libkrunfw must be installed via the system package manager (see CONTRIBUTING.md). For release artefacts, the libkrun dylibs are bundled alongside the binary via rpath; bottle production lives in the separate [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor) repo.
+`krun-sys`'s own `build.rs` uses pkg-config to find libkrun headers and library at build time. For developer builds, libkrun + libkrunfw must be installed via the system package manager (see CONTRIBUTING.md). For release artefacts, the libkrun dylibs are bundled alongside the binary via rpath; bottle production lives in the separate [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) repo.
 
 ### Isolation properties
 

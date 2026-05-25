@@ -12,7 +12,7 @@
 //!   (Linux). See DEVELOPMENT.md for setup details.
 //!
 //! Why not vendor at build time? End-user release artefacts ship the
-//! libraries pre-built via the separate `igorjs/ward-vendor` repo
+//! libraries pre-built via the separate `igorjs/libkrun-builds` repo
 //! (public) and bundled by `release.yml` in this repo (under
 //! `--features krunvm`). End users download a single self-contained
 //! artefact; devs install libkrun via their package manager once.

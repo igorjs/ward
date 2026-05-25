@@ -43,7 +43,7 @@ The default mode is what tests + CI run. It exercises every code path except act
 - macOS 12 (Monterey) or later
 - Apple Silicon (M1+)
 - Developer install: `brew install slp/krun/libkrun slp/krun/libkrunfw` (see CONTRIBUTING.md)
-- End-user install: libkrun dylibs bundled in release artefacts (built by [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor))
+- End-user install: libkrun dylibs bundled in release artefacts (built by [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds))
 
 **Linux:**
 - Kernel 5.10+ with KVM enabled (`/dev/kvm` accessible)

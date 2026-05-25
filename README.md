@@ -224,7 +224,7 @@ Live status, tickets, and priorities live on the
 
 ## Related repos
 
-- [`igorjs/ward-vendor`](https://github.com/igorjs/ward-vendor): builds the
+- [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds): builds the
   libkrun + libkrunfw bottles that release artefacts bundle. Independent
   versioning, manual `workflow_dispatch`.
 - `igorjs/ward-sdk-*` (planned): Apache-2.0 client libraries in Python,

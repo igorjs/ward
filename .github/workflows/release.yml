@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       include_libkrun:
-        description: "Bundle libkrun bottles from igorjs/ward-vendor (requires a libkrun-v<version> release there)"
+        description: "Bundle libkrun bottles from igorjs/libkrun-builds (requires a libkrun-v<version> release there)"
         required: false
         default: false
         type: boolean
@@ -100,7 +100,7 @@ jobs:
           shared-key: release-${{ matrix.target }}
 
       # When libkrun bundling is requested, fetch the matching bottle
-      # from the ward-vendor repo (cross-repo gh release download) and
+      # from the libkrun-builds repo (cross-repo gh release download) and
       # verify against checksums pinned locally in this repo. Skipped
       # on stub builds.
       - name: Fetch libkrun bottle
@@ -112,13 +112,13 @@ jobs:
           TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
           mkdir -p libkrun-vendor
           gh release download "libkrun-v${LIBKRUN_VERSION}" \
-            --repo igorjs/ward-vendor \
+            --repo igorjs/libkrun-builds \
             --pattern "$TARBALL" \
             --pattern "${TARBALL}.sha256" \
             --dir libkrun-vendor
           # Verify the bottle hash matches the checksum pinned in ward.
           # Pinning locally (rather than trusting the .sha256 sidecar
-          # from ward-vendor) means a compromise of ward-vendor cannot
+          # from libkrun-builds) means a compromise of libkrun-builds cannot
           # silently inject a different binary into ward releases.
           EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-checksums.txt | awk '{print $1}')"
           if [[ -z "$EXPECTED" ]]; then
