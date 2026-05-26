@@ -1,6 +1,7 @@
 {
   "bypass_actors": [
     {
+      "actor_id": 5,
       "actor_type": "RepositoryRole",
       "bypass_mode": "always"
     }
@@ -17,11 +18,9 @@
   "name": "main",
   "rules": [
     {
-      "parameters": null,
       "type": "deletion"
     },
     {
-      "parameters": null,
       "type": "non_fast_forward"
     },
     {
@@ -39,7 +38,6 @@
       "type": "pull_request"
     },
     {
-      "parameters": null,
       "type": "required_signatures"
     },
     {

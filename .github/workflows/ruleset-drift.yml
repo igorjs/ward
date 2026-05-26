@@ -59,18 +59,21 @@ jobs:
             exit 1
           fi
           # Project the response onto a stable subset of fields (drop
-          # IDs, timestamps, _links, node_ids — they change between
-          # rebuilds without representing a policy change) and sort
-          # arrays so member-order changes don't appear as drift.
-          # Pipe through `jq .` to pretty-print so the diff is readable
-          # when drift is detected.
+          # the server-managed metadata: id, node_id, _links, source,
+          # source_type, created_at, updated_at, current_user_can_bypass
+          # — they change between rebuilds without representing a
+          # policy change). Sort arrays so member-order changes don't
+          # appear as drift. Preserve every field GitHub *requires* on
+          # PUT (e.g. actor_id on bypass_actors) so the same JSON is
+          # apply-compatible — this projection feeds both drift
+          # detection and ruleset-apply.yml.
           gh api "repos/$REPO/rulesets/$RULESET_ID" --jq '{
             name,
             target,
             enforcement,
-            conditions: .conditions,
-            bypass_actors: ([.bypass_actors[]? | {actor_type, bypass_mode}] | sort_by(.actor_type, .bypass_mode)),
-            rules: ([.rules[]? | {type, parameters}] | sort_by(.type))
+            conditions,
+            bypass_actors: (.bypass_actors | sort_by(.actor_type, .actor_id)),
+            rules: (.rules | sort_by(.type))
           }' | jq . > current-ruleset.json
       - name: Diff against expected baseline
         env:
