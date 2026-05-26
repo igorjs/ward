@@ -40,6 +40,25 @@ unsafe extern "C" {
     fn write(fd: std::ffi::c_int, buf: *const std::ffi::c_void, count: usize) -> isize;
 }
 
+// macOS-only: renamex_np(2) with RENAME_SWAP atomically swaps two
+// existing paths. Used by extract_rootfs to close the SEC-014 residual
+// on Darwin (Linux uses rustix::fs::renameat_with(RENAME_EXCHANGE) for
+// the same effect). Declared inline rather than pulling in `libc`,
+// matching the minimalism precedent set by the `write(2)` declaration
+// above and `kill(2)` in ward-agent.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renamex_np(
+        from: *const std::ffi::c_char,
+        to: *const std::ffi::c_char,
+        flags: std::ffi::c_uint,
+    ) -> std::ffi::c_int;
+}
+/// RENAME_SWAP flag for renamex_np (from `<sys/stdio.h>` on Darwin).
+/// Swaps two existing paths atomically.
+#[cfg(target_os = "macos")]
+const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
+
 // ---------------------------------------------------------------------------
 // Per-sandbox state
 // ---------------------------------------------------------------------------
@@ -968,37 +987,58 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
         return Err(e);
     }
 
-    // SEC-014: atomic swap via renameat2(RENAME_EXCHANGE) on Linux —
-    // dest gets new contents, staging gets old contents (which we then
-    // drop). EXCHANGE requires both paths to exist; first-time restore
-    // (no dest yet) falls back to a plain rename. macOS lacks an
-    // equivalent atomic-exchange syscall; the unlink+rename two-step
-    // residual remains on Darwin (documented at the call site).
-    #[cfg(target_os = "linux")]
-    {
-        if dest.exists() {
-            use rustix::fs::{CWD, RenameFlags, renameat_with};
-            renameat_with(CWD, &staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
-                |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
-            )?;
-            // Drop the old contents that landed in staging post-swap.
-            let _ = std::fs::remove_dir_all(&staging);
-        } else {
-            std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Darwin residual: a crash between unlink and rename leaves
-        // `dest` absent (sandbox unbootable on next boot). renamex_np
-        // with RENAME_SWAP exists on macOS 10.12+ but rustix doesn't
-        // expose it yet; tracked as a follow-up.
-        if dest.exists() {
-            std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
-        }
+    // SEC-014: atomic swap. Each supported platform uses its native
+    // atomic-exchange syscall so a crash between unlink and rename can
+    // never leave `dest` absent. EXCHANGE / SWAP require both paths to
+    // exist; first-time restore (no dest yet) falls back to a plain
+    // rename. Linux: rustix renameat_with(RENAME_EXCHANGE). macOS:
+    // renamex_np(RENAME_SWAP) — declared inline above. Other Unix
+    // targets keep the two-step residual; ward doesn't support any.
+    if dest.exists() {
+        atomic_swap(&staging, dest)?;
+        let _ = std::fs::remove_dir_all(&staging);
+    } else {
         std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
     }
     Ok(())
+}
+
+/// Atomically swap two existing paths: after the call, `dest` holds
+/// what was in `staging` and `staging` holds what was in `dest`. Both
+/// paths must exist. Used by `extract_rootfs` (SEC-014).
+fn atomic_swap(staging: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
+            |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from_c = std::ffi::CString::new(staging.as_os_str().as_bytes())
+            .map_err(|e| BackendError::Internal(format!("staging path contains NUL: {e}")))?;
+        let to_c = std::ffi::CString::new(dest.as_os_str().as_bytes())
+            .map_err(|e| BackendError::Internal(format!("dest path contains NUL: {e}")))?;
+        // SAFETY: renamex_np with two NUL-terminated C strings we own
+        // and a fixed flag value is sound; failure returns -1 + errno.
+        let rc = unsafe { renamex_np(from_c.as_ptr(), to_c.as_ptr(), RENAME_SWAP) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(BackendError::Internal(format!("renamex_np SWAP: {err}")));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Non-Linux, non-macOS Unix: no atomic-swap syscall available
+        // in this codebase; fall back to the two-step residual. Ward
+        // doesn't support any of these targets today, so this branch
+        // exists only to keep the function total.
+        std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+        std::fs::rename(staging, dest).map_err(BackendError::Io)
+    }
 }
 
 /// Persist snapshot metadata as JSON alongside its archive.
