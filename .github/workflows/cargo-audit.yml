@@ -1,0 +1,46 @@
+name: cargo-audit
+
+# RustSec advisory check. Runs on every change to the dependency graph,
+# on every PR, and weekly to catch newly-published advisories against
+# unchanged dependencies. Treats any advisory match as a CI failure;
+# allowlisted issues live in `deny.toml` with documented justification.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/cargo-audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/cargo-audit.yml"
+  schedule:
+    # Weekly Monday 06:00 UTC — catches advisories published against
+    # deps that didn't change in this period.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        # --deny warnings: any RustSec advisory match fails the job.
+        # Ignored advisories belong in deny.toml (cargo-deny) with a
+        # justification, not in a CLI ignore list here.
+        run: cargo audit --deny warnings

@@ -43,7 +43,10 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       include_libkrun: ${{ steps.r.outputs.include_libkrun }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - id: r
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -79,8 +82,18 @@ jobs:
             runner: ubuntu-24.04-arm
             dylib_ext: so
     runs-on: ${{ matrix.runner }}
+    # SEC-012: SLSA build provenance requires OIDC token + write access
+    # to the attestation API. Scoped to this job so the publish job
+    # (which only needs `contents: write`) doesn't inherit them.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install protoc
         run: |
@@ -95,7 +108,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: release-${{ matrix.target }}
 
@@ -185,8 +198,21 @@ jobs:
           fi
           ls -la "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256"
 
+      # SEC-012: emit an in-toto SLSA build-provenance attestation for
+      # the release tarball. Sigstore signs the attestation with an
+      # OIDC-issued ephemeral key and records it in the public Rekor
+      # transparency log. End users (and install.sh, after the
+      # follow-up patch) verify with `gh attestation verify <file>
+      # --owner igorjs`. Defeats compromised-release attacks that the
+      # same-Release SHA-256 sidecar can't.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            ward-*-${{ matrix.target }}.tar.gz
+
       - name: Upload artefact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: ward-${{ matrix.target }}
           path: |
@@ -200,10 +226,13 @@ jobs:
     needs: [resolve, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download all artefacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
           merge-multiple: true
@@ -221,7 +250,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
           name: ward ${{ needs.resolve.outputs.version }}
