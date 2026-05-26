@@ -1,0 +1,90 @@
+name: ruleset-drift
+
+# Ruleset-as-code: compares the live state of the `main` branch
+# ruleset against .github/expected-ruleset.json. Any drift fails the
+# workflow + emits an annotated diff so a maintainer can decide:
+# either revert the change (if accidental) or update the baseline
+# (if intentional).
+#
+# Triggers:
+#   - weekly schedule (catch drift from manual UI edits)
+#   - on push to main when expected-ruleset.json changes (verify the
+#     committed baseline still matches reality after a deliberate
+#     ruleset edit)
+#   - workflow_dispatch for manual checks
+#
+# Required token scope: `Administration: Read` on the repo. The default
+# GITHUB_TOKEN has this scope for the calling repo.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - ".github/expected-ruleset.json"
+      - ".github/workflows/ruleset-drift.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # `administration: read` is needed to query rulesets via the REST API.
+  administration: read
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    env:
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Fetch live ruleset state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Resolve the ruleset named "main" by name, not by ID — the
+          # ID is creation-time stable but recreating the rule changes
+          # it; matching by name survives a ruleset rebuild.
+          RULESET_ID=$(gh api "repos/$REPO/rulesets" \
+            --jq '.[] | select(.name == "main") | .id')
+          if [ -z "$RULESET_ID" ]; then
+            echo "::error::no ruleset named 'main' found on $REPO"
+            exit 1
+          fi
+          # Project the response onto a stable subset of fields (drop
+          # IDs, timestamps, _links, node_ids — they change between
+          # rebuilds without representing a policy change) and sort
+          # arrays so member-order changes don't appear as drift.
+          # Pipe through `jq .` to pretty-print so the diff is readable
+          # when drift is detected.
+          gh api "repos/$REPO/rulesets/$RULESET_ID" --jq '{
+            name,
+            target,
+            enforcement,
+            conditions: .conditions,
+            bypass_actors: ([.bypass_actors[]? | {actor_type, bypass_mode}] | sort_by(.actor_type, .bypass_mode)),
+            rules: ([.rules[]? | {type, parameters}] | sort_by(.type))
+          }' | jq . > current-ruleset.json
+      - name: Diff against expected baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! diff -u .github/expected-ruleset.json current-ruleset.json; then
+            echo ""
+            echo "::error::Ruleset drift detected on main. Either:"
+            echo "  1. Revert the ruleset change via the GitHub UI"
+            echo "     (Settings -> Rules -> Rulesets -> main), OR"
+            echo "  2. If the change is intentional, update the baseline:"
+            echo "     gh api repos/$REPO/rulesets/<id> > .github/expected-ruleset.json"
+            echo "     then commit + open a PR explaining the policy change."
+            exit 1
+          fi
+          echo "Ruleset matches expected baseline."
