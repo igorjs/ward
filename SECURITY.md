@@ -6,50 +6,95 @@
 |---------|-----------|
 | 0.x (latest) | Yes |
 
-Only the latest version receives security patches. Upgrade to the latest version before reporting.
+Only the latest version receives security patches. Upgrade to the latest before reporting.
 
 ## Reporting a Vulnerability
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-To report a vulnerability, email: **oss@mail.igorjs.io**
+Email: **oss@mail.igorjs.io** (GPG key on request).
 
 Include:
+
 - Description of the vulnerability
-- Steps to reproduce
-- Affected versions
-- Impact assessment (what can an attacker do?)
+- Steps to reproduce (a minimal sandbox config + a series of `ward` commands is ideal)
+- Affected versions / commit SHAs
+- Impact assessment (what can an attacker do? what's the trust boundary crossed?)
 - Suggested fix (if you have one)
 
-### What to expect
+### Response timeline
 
 - **Acknowledgement** within 48 hours
-- **Assessment** within 7 days (severity, affected scope, fix plan)
-- **Fix and disclosure** within 30 days for critical issues, 90 days for others
+- **Triage** (severity, scope, fix plan) within 7 days
+- **Fix + coordinated disclosure** within 30 days for Critical, 90 days for High, best-effort thereafter
 
-If the report is accepted, you will be credited in the release notes (unless you prefer anonymity).
+You will be credited in release notes unless you ask for anonymity. If the report is declined (not a vulnerability or out of scope), you will receive an explanation and may open a public issue.
 
-If the report is declined (not a vulnerability, or out of scope), you will receive an explanation and may open a public issue.
+## Architecture context
 
-### Scope
+Ward runs untrusted code in **per-sandbox hardware-isolated microVMs** via [libkrun](https://github.com/containers/libkrun) — KVM on Linux, Hypervisor.framework on macOS arm64. There is no Docker/runc fallback, no gVisor layer, no shared kernel between sandboxes. The isolation boundary is hardware virtualisation. See [`docs/adr/003-isolation-backend.md`](docs/adr/003-isolation-backend.md) for the rationale.
 
-The following are in scope:
-- Sandbox escape (code execution outside the sandbox boundary)
-- Network isolation bypass (traffic escaping egress rules)
-- Container escape or privilege escalation
-- Resource limit bypass (CPU, memory, PID limits)
-- Denial of service via crafted API requests
-- Authentication/authorisation bypass on the daemon API
+The daemon (`wardd`) is designed to run as the invoking user, not root. State lives under `$HOME/.ward/` (or `$WARD_DATA_DIR`) with mode 0700; the gRPC Unix socket is bound mode 0600. The `--features krunvm` build links libkrun directly — there is no privileged helper binary.
 
-The following are out of scope:
-- Vulnerabilities in containerd or gVisor themselves (report upstream)
-- Issues requiring root access to the host (ward requires root to operate)
-- Social engineering attacks
-- Issues in test files or development tooling
+The libkrun C ABI is consumed via hand-maintained `unsafe extern "C"` declarations in [`ward-core/src/backend/krun_ffi.rs`](ward-core/src/backend/krun_ffi.rs) (no `krun-sys`, no `bindgen`, no `libclang` build-dep). All FFI sites carry SAFETY comments documenting the libkrun-side invariants they rely on.
 
-## Security Design Principles
+## Scope
 
-- **Defence in depth**: gVisor provides userspace kernel isolation on top of container namespaces
-- **Principle of least privilege**: sandboxes get only the resources and network access explicitly granted
-- **Egress filtering by default**: all outbound traffic is denied unless explicitly allowed
-- **No eval, no shell injection**: all container commands are passed as structured arrays, never shell strings
+**In scope:**
+
+- VM escape (guest code reaching the host filesystem, kernel, or another sandbox)
+- Egress isolation bypass (a sandbox reaching destinations outside its `EgressPolicy`)
+- Path traversal in OCI image unpack, snapshot restore, volume management, or bind-mount handling
+- Daemon API auth bypass (any path that reaches the gRPC server without the appropriate caller scope)
+- Resource limit bypass (vCPU / RAM / PID / timeout caps not enforced)
+- Memory-safety bugs in the hand-maintained libkrun FFI (`krun_ffi.rs` and its callers)
+- Incorrect default permissions on socket, data directories, volume images, or snapshot tarballs
+- Supply chain: tampered release artefacts, compromised CI, dependency CVEs against pinned versions
+- Privilege escalation from the daemon's user (e.g. wardd-user reaching root via a daemon bug)
+- DoS via crafted gRPC requests, OCI manifests, tar archives, or vsock frames
+
+**Out of scope:**
+
+- Bugs in libkrun, KVM, or Hypervisor.framework themselves (please report upstream first)
+- Bugs in third-party crates that already have a public CVE and a fix landed in an unreleased version (we track these via `cargo-audit` + Dependabot)
+- Social engineering / phishing of project maintainers (out of band)
+- Issues exclusively in test files (`#[cfg(test)]`, `tests/`) or development tooling (`scripts/`)
+- Brute-force / exhaustion attacks against the daemon's resource caps when the caps are already set correctly (the cap _is_ the defence)
+
+## Security design principles
+
+- **Defence in depth.** Hardware VM isolation + per-sandbox `EgressPolicy` + bounded resource limits + sandbox-scoped process IDs.
+- **Least privilege.** Sandboxes get only the host resources explicitly granted (no implicit host filesystem, no implicit network).
+- **Egress by allowlist, default deny.** Outbound traffic is blocked unless the sandbox's `EgressPolicy.Allowlist` permits the target. The forward proxy resolves hostnames server-side and refuses private / loopback / link-local / metadata-service addresses regardless of mode.
+- **No shell, no eval.** Exec interfaces take structured `argv` arrays; the daemon never builds shell strings from user input.
+- **Pinned supply chain.** Cargo deps locked via `Cargo.lock` + `cargo-deny` advisory check; third-party GitHub Actions pinned to commit SHA + Dependabot bumps; libkrun bottle pinned by SHA-256 in `vendor/libkrun-checksums.txt`; release artefacts signed via SLSA build provenance (sigstore-backed, verifiable with `gh attestation verify`).
+- **No fallback to weak isolation.** If `--features krunvm` is enabled and the host lacks KVM/HVF, the daemon fails with a clear error rather than silently degrading to namespaces.
+
+## Verifying release artefacts
+
+Pre-built ward releases are signed via [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance) generated by `actions/attest-build-provenance` in `release.yml`. Sigstore signs each attestation with an OIDC-issued ephemeral key bound to the workflow that produced it; the attestation is recorded in the public [Rekor](https://docs.sigstore.dev/logging/overview/) transparency log.
+
+To verify a downloaded tarball:
+
+```sh
+gh attestation verify ward-<version>-<target>.tar.gz --owner igorjs
+```
+
+A passing verification proves the artefact was built by `igorjs/ward`'s `release.yml` workflow at a specific commit, by GitHub's official runners, with no post-build tampering. The SHA-256 sidecar in the GitHub Release covers transport tampering only — `gh attestation verify` is the authoritative out-of-band check.
+
+## Hardening posture
+
+| Layer | Mechanism |
+|---|---|
+| Source review | DCO sign-off + CLA; CODEOWNERS gates sensitive paths (workflows, FFI, vendor, installer, this file) |
+| Static analysis | `cargo clippy --all-targets -D warnings`, `cargo deny check` |
+| Advisory scanning | `cargo-audit` weekly + on every dependency change |
+| Supply-chain posture | OpenSSF Scorecard weekly; badge published at https://api.scorecard.dev/ |
+| Runtime CI defence | `step-security/harden-runner` on every workflow job (audit mode on build workflows, block mode on API-only workflows) |
+| Action pinning | All third-party actions pinned to commit SHA; Dependabot keeps SHAs fresh |
+| Release integrity | SLSA build provenance attestations; SHA-256 sidecars (transport-only); install.sh checksum verification |
+| Branch protection | PR required + status checks required on `main`; admin bypass logged on GitHub's audit log |
+
+## Reporting reach
+
+If you find this policy unclear, or believe a finding falls in a grey area, email anyway. Coordinated disclosure works best when the reporter and maintainer are talking; we'd rather hear about it and decide together than miss a real issue because the policy left it ambiguous.

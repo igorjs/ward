@@ -1,0 +1,38 @@
+# CODEOWNERS for igorjs/ward
+#
+# Lines below this block require explicit review from @igorjs before
+# merge. GitHub uses the LAST matching pattern for each file, so put
+# specific paths after general ones. Patterns follow .gitignore syntax.
+#
+# Single-maintainer repo today; the file exists to:
+#   - flag PRs that touch sensitive paths (release pipeline, FFI,
+#     security policy, installer) for explicit review even by the
+#     maintainer
+#   - signal review expectations to outside contributors
+#   - stay correct when collaborators are added later
+
+# Default owner for everything not matched below.
+*                                       @igorjs
+
+# CI / supply chain — every change is high-blast-radius
+/.github/workflows/                     @igorjs
+/.github/dependabot.yml                 @igorjs
+/.github/CODEOWNERS                     @igorjs
+
+# Hand-maintained libkrun FFI surface (ADR-003 Update)
+/ward-core/src/backend/krun_ffi.rs      @igorjs
+
+# Bottle pinning + vendor checksums
+/vendor/                                @igorjs
+
+# End-user installer (curl | bash trust surface)
+/install.sh                             @igorjs
+
+# Security policy + audit artefacts
+/SECURITY.md                            @igorjs
+/analysis/                              @igorjs
+
+# Cargo dependency graph
+/Cargo.toml                             @igorjs
+/Cargo.lock                             @igorjs
+/deny.toml                              @igorjs
