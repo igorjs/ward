@@ -84,6 +84,15 @@ struct SandboxState {
 ///
 /// Each sandbox corresponds to one libkrun microVM context.  All unsafe krun
 /// FFI calls are isolated inside the private helpers of this struct.
+/// Per-process bookkeeping kept in `KrunvmBackend::processes`. The
+/// sandbox_id is what enables SEC-017/018: kill_process refuses to
+/// signal a pid whose owner doesn't match the caller's claim.
+#[derive(Debug)]
+struct ProcessRecord {
+    sandbox_id: String,
+    kill_tx: tokio::sync::mpsc::Sender<()>,
+}
+
 #[derive(Debug)]
 pub struct KrunvmBackend {
     sandboxes: Arc<RwLock<HashMap<String, SandboxState>>>,
@@ -92,10 +101,18 @@ pub struct KrunvmBackend {
     /// libkrun checkpoint state under data_dir/snapshots/.
     snapshots: Arc<RwLock<HashMap<String, SnapshotInfo>>>,
     data_dir: std::path::PathBuf,
-    /// Per-process kill senders, keyed by pid. Populated by the real exec
-    /// path so `kill_process` can signal the agent connection; empty in stub
-    /// builds, where killing is a no-op.
-    processes: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<()>>>>,
+    /// Per-process kill records, keyed by pid. Each record carries the
+    /// pid's owning sandbox_id alongside the kill channel so
+    /// `kill_process` can verify the caller-claimed sandbox owns the
+    /// pid before signalling. Populated by the real exec path; empty
+    /// in stub builds, where killing is a no-op.
+    ///
+    /// SEC-017/018: storing sandbox_id on the value side closes the
+    /// defence-in-depth gap where a future code path that calls
+    /// `Backend::kill_process` directly (without going through the
+    /// manager's ownership check) could signal a pid belonging to a
+    /// different sandbox.
+    processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
 }
 
 impl KrunvmBackend {
@@ -277,11 +294,29 @@ impl Backend for KrunvmBackend {
     /// Signal a process to terminate by sending a Kill over its agent
     /// connection. In stub builds the process map is empty, so this is a
     /// no-op (the manager tears the process down by dropping its channels).
-    async fn kill_process(&self, _sandbox_id: &str, pid: &str) -> Result<()> {
-        if let Some(kill_tx) = self.processes.write().await.remove(pid) {
-            // Best-effort: a closed receiver just means the process already
-            // exited and its bridge task is gone.
-            let _ = kill_tx.send(()).await;
+    ///
+    /// SEC-017/018: verifies that `sandbox_id` matches the recorded
+    /// owner of `pid` before signalling. A mismatched call returns
+    /// Ok(()) (treat as not-found, don't leak which sandbox owns the
+    /// pid per ADR-004) and logs a warning so misuse is visible.
+    async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()> {
+        let mut processes = self.processes.write().await;
+        let Some(record) = processes.get(pid) else {
+            return Ok(());
+        };
+        if record.sandbox_id != sandbox_id {
+            tracing::warn!(
+                caller_sandbox = %sandbox_id,
+                pid = %pid,
+                "kill_process: caller sandbox does not own pid; refusing without signalling"
+            );
+            return Ok(());
+        }
+        // Owner matches: remove + signal. Best-effort send — a closed
+        // receiver just means the process already exited and its bridge
+        // task is gone.
+        if let Some(record) = processes.remove(pid) {
+            let _ = record.kill_tx.send(()).await;
         }
         Ok(())
     }
@@ -425,10 +460,15 @@ impl Backend for KrunvmBackend {
             )
             .await
             .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
-            self.processes
-                .write()
-                .await
-                .insert(handle.pid.clone(), kill_tx);
+            // SEC-017/018: record (sandbox_id, kill_tx) so kill_process
+            // can verify ownership at signal time.
+            self.processes.write().await.insert(
+                handle.pid.clone(),
+                ProcessRecord {
+                    sandbox_id: sandbox_id.to_string(),
+                    kill_tx,
+                },
+            );
             handle
         };
 
@@ -1348,5 +1388,86 @@ mod tests {
             .await
             .expect_err("dangling snapshot");
         assert!(matches!(err, BackendError::NotFound(_)));
+    }
+
+    // ----- SEC-017/018: kill_process ownership verification -------------
+
+    #[tokio::test]
+    async fn given_pid_owned_by_sandbox_a_when_kill_with_sandbox_b_then_refused_silently() {
+        // Arrange: insert a process record claiming sandbox A owns this
+        // pid. (Stub-mode exec doesn't populate the map, so the test
+        // bypasses it and writes directly — that's the point: we're
+        // testing the Backend-trait-level guard, not the manager.)
+        let backend = backend_in_tempdir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sandbox-A".to_string(),
+                kill_tx: tx,
+            },
+        );
+
+        // Act: a caller claiming sandbox-B tries to kill pid-1.
+        backend
+            .kill_process("sandbox-B", "pid-1")
+            .await
+            .expect("kill_process should return Ok for the mismatch case");
+
+        // Assert: no kill signal was sent (the receiver should NOT have
+        // a message available immediately) AND the process record is
+        // still in the map (was not removed).
+        assert!(
+            rx.try_recv().is_err(),
+            "cross-sandbox kill leaked a signal — ownership check is broken"
+        );
+        assert!(
+            backend.processes.read().await.contains_key("pid-1"),
+            "cross-sandbox kill removed the process record — ownership check is broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_pid_owned_by_sandbox_a_when_kill_with_sandbox_a_then_signal_sent_and_removed() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sandbox-A".to_string(),
+                kill_tx: tx,
+            },
+        );
+
+        // Act: same-sandbox kill — should succeed.
+        backend
+            .kill_process("sandbox-A", "pid-1")
+            .await
+            .expect("kill_process should succeed for owner");
+
+        // Assert: signal received + record gone.
+        assert!(
+            rx.recv().await.is_some(),
+            "kill signal was not sent to the owner"
+        );
+        assert!(
+            !backend.processes.read().await.contains_key("pid-1"),
+            "process record was not removed after successful kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_unknown_pid_when_kill_then_ok_noop() {
+        // Arrange: empty processes map (the common case in stub mode).
+        let backend = backend_in_tempdir();
+
+        // Act + Assert: kill returns Ok even when pid is unknown —
+        // matches the pre-SEC-017/018 contract that the manager relies
+        // on for its lifecycle teardown path.
+        backend
+            .kill_process("sandbox-A", "pid-doesnt-exist")
+            .await
+            .expect("kill_process on unknown pid should be Ok no-op");
     }
 }
