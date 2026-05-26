@@ -94,7 +94,7 @@ A passing verification proves the artefact was built by `igorjs/ward`'s `release
 | Action pinning | All third-party actions pinned to commit SHA; Dependabot keeps SHAs fresh; `.github/workflows/workflow-hygiene.yml` fails CI on any new mutable tag |
 | Release integrity | SLSA build provenance attestations (sigstore + Rekor); SHA-256 sidecars (transport-only); `install.sh` verifies attestation via `gh attestation verify` |
 | Branch protection | PR required + status checks required on `main`; admin bypass logged on GitHub's audit log |
-| Ruleset-as-code | `.github/expected-ruleset.json` is the source of truth for the `main` ruleset. `.github/workflows/ruleset-apply.yml` PUTs it to the live API on every push to main that touches the baseline; `.github/workflows/ruleset-drift.yml` weekly-checks for out-of-band UI edits. Policy changes (e.g., adding a required check) require a PR that updates the JSON, gated by CODEOWNERS. |
+| Ruleset-as-code | Branch and tag rulesets for `main` are defined in Terraform under [`igorjs/repo-config`](https://github.com/igorjs/repo-config) (`repos/ward.tf`). HCP Terraform runs `terraform plan` on every PR and applies on merge. Drift from manual UI edits surfaces on the next plan. Policy changes (e.g., adding a required check, raising the approving-review count) require a PR in repo-config, gated by its CODEOWNERS. |
 
 ## Reporting reach
 
