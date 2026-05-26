@@ -41,6 +41,15 @@ jobs:
           tool: cargo-audit
       - name: cargo audit
         # --deny warnings: any RustSec advisory match fails the job.
-        # Ignored advisories belong in deny.toml (cargo-deny) with a
-        # justification, not in a CLI ignore list here.
-        run: cargo audit --deny warnings
+        #
+        # --ignore RUSTSEC-2023-0071 (Marvin timing attack on rsa
+        # 0.9.x): the deny.toml allowlist documents the acceptance,
+        # but cargo-audit doesn't read deny.toml — it needs its own
+        # CLI ignore. Rationale: rsa is pulled in transitively via
+        # oci-client -> jsonwebtoken for anonymous registry auth.
+        # Ward never holds an RSA private key and never performs
+        # RSA decryption with attacker-controlled ciphertext, so the
+        # Marvin sidechannel is not reachable. No upstream fix
+        # available yet; revisit when rsa publishes a constant-time
+        # release.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071

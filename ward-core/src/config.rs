@@ -147,20 +147,14 @@ fn create_dir_owner_only(path: &std::path::Path) -> std::io::Result<()> {
             Mode::empty(),
         )
         .map_err(|e: rustix::io::Errno| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "refusing to operate on path that is a symlink or non-directory: {} ({e})",
-                    path.display()
-                ),
-            )
+            std::io::Error::other(format!(
+                "refusing to operate on path that is a symlink or non-directory: {} ({e})",
+                path.display()
+            ))
         })?;
         rustix::fs::fchmod(&fd, Mode::from_bits_truncate(0o700)).map_err(
             |e: rustix::io::Errno| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("fchmod 0o700 on {}: {e}", path.display()),
-                )
+                std::io::Error::other(format!("fchmod 0o700 on {}: {e}", path.display()))
             },
         )?;
     }

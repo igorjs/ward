@@ -979,9 +979,7 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
         if dest.exists() {
             use rustix::fs::{CWD, RenameFlags, renameat_with};
             renameat_with(CWD, &staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
-                |e: rustix::io::Errno| {
-                    BackendError::Internal(format!("renameat2 EXCHANGE: {e}"))
-                },
+                |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
             )?;
             // Drop the old contents that landed in staging post-swap.
             let _ = std::fs::remove_dir_all(&staging);
