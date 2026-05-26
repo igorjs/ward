@@ -65,6 +65,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grpc_service = WardGrpcServer::new(Arc::clone(&sandbox_mgr), Arc::clone(&volume_mgr));
 
+    // SEC-009: cap per-message size on both decode and encode so a
+    // hostile (or buggy) client can't force the daemon to allocate
+    // multi-MiB buffers per request. Tonic defaults to 4 MiB decode /
+    // unbounded encode; we tighten both. The broker's own validator
+    // rejects publish payloads > 1 MiB AFTER decode, so the decode
+    // cap needs to be slightly above the broker cap (1.5 MiB) to let
+    // the validator return InvalidArgument cleanly rather than
+    // surfacing the decode cap as a confusing transport error.
+    const MAX_DECODE_BYTES: usize = 1_572_864; // 1.5 MiB
+    const MAX_ENCODE_BYTES: usize = 2_097_152; // 2 MiB
+    let ward_service = WardServer::new(grpc_service)
+        .max_decoding_message_size(MAX_DECODE_BYTES)
+        .max_encoding_message_size(MAX_ENCODE_BYTES);
+
     // Bind the Unix domain socket.
     // SEC-002: tokio::UnixListener::bind creates the socket with the process
     // umask, which on permissive defaults (or under root) leaves the socket
@@ -92,8 +106,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // SEC-009 + SEC-015: cap concurrency at two levels.
+    // - concurrency_limit_per_connection caps in-flight streams per
+    //   client connection. HTTP/2 supports many concurrent streams
+    //   per connection by default (100 is the spec recommendation);
+    //   we match that as a defensive ceiling.
+    // - tower::ConcurrencyLimitLayer caps in-flight RPCs across ALL
+    //   connections. Set to 2x max_sandboxes so the daemon can
+    //   service a peak operation per sandbox (e.g. one stream_output
+    //   each) without piling up unbounded tokio::spawn tasks.
+    const MAX_STREAMS_PER_CONN: u32 = 100;
+    let max_total_streams = cfg.max_sandboxes.saturating_mul(2);
     Server::builder()
-        .add_service(WardServer::new(grpc_service))
+        .concurrency_limit_per_connection(MAX_STREAMS_PER_CONN as usize)
+        .layer(tower::limit::ConcurrencyLimitLayer::new(max_total_streams))
+        .add_service(ward_service)
         .serve_with_incoming_shutdown(uds_stream, shutdown)
         .await?;
 
