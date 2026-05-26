@@ -22,6 +22,10 @@ tower = "0.5"
 hyper-util = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+# rustix: used to call umask(0o077) at the top of main() so the socket
+# bind never creates a permissive socket file in the first place
+# (closes the SEC-002 bind-then-chmod window).
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # Spawn the compiled `ward` CLI binary and assert on its stdout / stderr /

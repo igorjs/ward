@@ -968,15 +968,38 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
         return Err(e);
     }
 
-    // Residual SEC-014: the unlink + rename is not atomic. A crash
-    // between the two leaves `dest` absent. Closing this fully needs
-    // `renameat2(RENAME_EXCHANGE)` (Linux) via libc/rustix; tracked as
-    // a follow-up. Failure mode here is "sandbox unbootable on next
-    // boot" rather than "wrong rootfs served".
-    if dest.exists() {
-        std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+    // SEC-014: atomic swap via renameat2(RENAME_EXCHANGE) on Linux —
+    // dest gets new contents, staging gets old contents (which we then
+    // drop). EXCHANGE requires both paths to exist; first-time restore
+    // (no dest yet) falls back to a plain rename. macOS lacks an
+    // equivalent atomic-exchange syscall; the unlink+rename two-step
+    // residual remains on Darwin (documented at the call site).
+    #[cfg(target_os = "linux")]
+    {
+        if dest.exists() {
+            use rustix::fs::{CWD, RenameFlags, renameat_with};
+            renameat_with(CWD, &staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
+                |e: rustix::io::Errno| {
+                    BackendError::Internal(format!("renameat2 EXCHANGE: {e}"))
+                },
+            )?;
+            // Drop the old contents that landed in staging post-swap.
+            let _ = std::fs::remove_dir_all(&staging);
+        } else {
+            std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
+        }
     }
-    std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Darwin residual: a crash between unlink and rename leaves
+        // `dest` absent (sandbox unbootable on next boot). renamex_np
+        // with RENAME_SWAP exists on macOS 10.12+ but rustix doesn't
+        // expose it yet; tracked as a follow-up.
+        if dest.exists() {
+            std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+        }
+        std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
+    }
     Ok(())
 }
 

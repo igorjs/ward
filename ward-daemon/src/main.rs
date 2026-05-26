@@ -18,6 +18,18 @@ use ward_core::volume::VolumeManager;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // SEC-002: clamp the process umask BEFORE binding the Unix socket or
+    // creating data directories. Without this the socket file and the
+    // data tree inherit whatever umask the operator's shell set
+    // (usually 022; under root with umask 0, world-writable). With
+    // 0o077 every subsequent file/dir is born owner-only, closing the
+    // bind-then-chmod window that the subsequent explicit chmod on
+    // the socket file would otherwise leave open.
+    #[cfg(unix)]
+    {
+        rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o077));
+    }
+
     let cfg = Config::from_env();
 
     // Initialise structured logging.
