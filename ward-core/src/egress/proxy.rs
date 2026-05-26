@@ -144,15 +144,63 @@ impl EgressProxy {
                 .await?;
             return Ok(());
         };
+        // SEC-023: strip IPv6 brackets so tokio's connect resolves cleanly
+        // and the policy matcher sees the same host string the resolver does.
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_string();
 
         if !self.check(&host, port).await {
             client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             return Ok(());
         }
 
-        let mut upstream = match TcpStream::connect((host.as_str(), port)).await {
-            Ok(s) => s,
-            Err(_) => {
+        // SEC-005: resolve the target server-side and refuse if ANY resolved
+        // address falls in a private / loopback / link-local / multicast /
+        // unique-local range. Without this guard, a sandbox in Open egress
+        // mode (or Allowlist with an IP literal) can CONNECT
+        // 169.254.169.254:80 and hit the cloud metadata service from inside
+        // the security boundary — a confused-deputy SSRF.
+        //
+        // DNS-rebinding defence: we collect SocketAddrs from the resolve
+        // and connect to them DIRECTLY (never re-resolving the host
+        // string). A hostile resolver that returns a public IP first and
+        // a private IP second would otherwise bypass the check between
+        // resolve and connect.
+        let resolved: Vec<std::net::SocketAddr> =
+            match tokio::net::lookup_host((host.as_str(), port)).await {
+                Ok(addrs) => addrs.collect(),
+                Err(_) => {
+                    client
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                        .await?;
+                    return Ok(());
+                }
+            };
+        if resolved.iter().any(|sa| is_private_or_local(&sa.ip())) {
+            tracing::warn!(
+                sandbox = %self.sandbox_id,
+                host = %host,
+                "egress: rejected target resolving to private/local IP"
+            );
+            client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            return Ok(());
+        }
+
+        // Try each resolved SocketAddr in order. Connecting to a concrete
+        // address skips the second DNS lookup tokio does for (host, port)
+        // tuples, closing the rebinding window.
+        let mut upstream_opt = None;
+        for sa in &resolved {
+            if let Ok(s) = TcpStream::connect(sa).await {
+                upstream_opt = Some(s);
+                break;
+            }
+        }
+        let mut upstream = match upstream_opt {
+            Some(s) => s,
+            None => {
                 client
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
                     .await?;
@@ -208,6 +256,62 @@ async fn read_connect_target(client: &mut TcpStream) -> std::io::Result<Option<(
         return Ok(None);
     }
     Ok(Some((host.to_string(), port)))
+}
+
+/// SEC-005: return true if `ip` is in any range that should not be
+/// reachable via the egress proxy: private (RFC1918), loopback,
+/// link-local (catches 169.254.169.254 cloud metadata), multicast,
+/// unspecified, broadcast, CGNAT, IETF/TEST-NET/benchmarking/future-use
+/// reserved (IPv4), and unique-local / 6to4 / NAT64 / Teredo (IPv6).
+/// IPv4-mapped IPv6 addresses recurse so they inherit the full IPv4
+/// rule set.
+fn is_private_or_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // 0.0.0.0/8 reserved (Linux routes to loopback in some setups)
+                || oct[0] == 0
+                // 100.64.0.0/10 CGNAT
+                || (oct[0] == 100 && (oct[1] & 0xC0) == 0x40)
+                // 192.0.0.0/24 IETF protocol assignments (incl. 192.0.0.1)
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
+                // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 TEST-NET
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 2)
+                || (oct[0] == 198 && oct[1] == 51 && oct[2] == 100)
+                || (oct[0] == 203 && oct[1] == 0 && oct[2] == 113)
+                // 198.18.0.0/15 benchmarking
+                || (oct[0] == 198 && (oct[1] & 0xFE) == 18)
+                // 240.0.0.0/4 future-use (often unfiltered, reaches host)
+                || oct[0] >= 240
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local
+                || (seg[0] & 0xFFC0 == 0xFE80)
+                // fc00::/7 unique local
+                || (seg[0] & 0xFE00 == 0xFC00)
+                // 2002::/16 6to4 anycast — tunnels to arbitrary IPv4
+                || seg[0] == 0x2002
+                // 64:ff9b::/96 NAT64 — also tunnels to IPv4
+                || (seg[0] == 0x0064 && seg[1] == 0xFF9B)
+                // 2001::/32 Teredo tunnels
+                || (seg[0] == 0x2001 && seg[1] == 0x0000)
+                // IPv4-mapped IPv6 — recurse so the full v4 rule set applies.
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_private_or_local(&std::net::IpAddr::V4(v4)))
+                    .unwrap_or(false)
+        }
+    }
 }
 
 /// Match a domain against a pattern that may contain a leading `*` wildcard.

@@ -50,10 +50,15 @@ impl VolumeFormatter for Ext4Formatter {
 /// occupies disk as the guest writes into it.
 async fn allocate_sparse_image(path: &Path, size_mb: u32) -> Result<()> {
     let len = u64::from(size_mb) * 1024 * 1024;
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
+    // SEC-004: force 0600 on the backing image. Default umask yields 0644
+    // which exposes the volume's filesystem blocks (and anything the guest
+    // writes into them — secrets, keys, OCI image content) to other local
+    // users on multi-user hosts.
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let file = opts
         .open(path)
         .await
         .map_err(|e| ApiError::Internal(format!("create volume image {}: {e}", path.display())))?;

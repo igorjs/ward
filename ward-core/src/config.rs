@@ -106,12 +106,38 @@ impl Config {
 
     /// Ensure all required directories exist with secure permissions.
     ///
-    /// The socket directory is set to 0700 (owner-only) to prevent other
-    /// users from listing contents or connecting to the daemon socket.
-    /// Data directories use the default umask since they contain daemon-managed
-    /// data not directly accessible to external users.
+    /// SEC-002/003/004: every daemon-managed directory is forced to mode
+    /// 0700 so other local users on multi-user hosts cannot read volume
+    /// images, snapshot tarballs, or connect to the socket. Pre-existing
+    /// symlinks at the socket parent or `data_dir` cause a fail-fast
+    /// error rather than silently following the link (which would
+    /// otherwise let `set_permissions` chmod whatever the symlink
+    /// pointed at — e.g. `/etc`).
+    ///
+    /// Residual: there is a TOCTOU window between each symlink check
+    /// and the subsequent `create_dir_all` / `set_permissions`. Closing
+    /// that fully requires `O_NOFOLLOW` + `fchmod` on an opened fd,
+    /// which needs a `libc`/`nix`/`rustix` dependency; tracked as a
+    /// follow-up.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         if let Some(parent) = self.socket_path.parent() {
+            // SEC-003: refuse to operate if the socket parent path is a
+            // pre-existing symlink. Without this, an unprivileged local
+            // attacker can plant `ln -s /etc /tmp/ward-$USER` and the
+            // subsequent set_permissions(parent, 0o700) silently chmods
+            // the symlink target (e.g. /etc to mode 0700).
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "refusing to operate on existing symlink at socket dir: {}",
+                            parent.display()
+                        ),
+                    ));
+                }
+            }
             std::fs::create_dir_all(parent)?;
             // Restrict socket directory to owner-only access.
             #[cfg(unix)]
@@ -120,11 +146,39 @@ impl Config {
                 std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
             }
         }
+        // SEC-003/004: same symlink guard as the socket parent — refuse
+        // to follow a pre-existing symlink at data_dir, which would let
+        // the subsequent `set_permissions` chmod the link target.
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::symlink_metadata(&self.data_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "refusing to operate on existing symlink at data_dir: {}",
+                        self.data_dir.display()
+                    ),
+                ));
+            }
+        }
+        // SEC-004: data_dir trees default to umask 0755/0644 which leaks
+        // volume images and snapshot tarballs to other local users on
+        // multi-user hosts. Force 0700 on every subdirectory we create.
         std::fs::create_dir_all(&self.data_dir)?;
-        std::fs::create_dir_all(self.data_dir.join("images"))?;
-        std::fs::create_dir_all(self.data_dir.join("sandboxes"))?;
-        std::fs::create_dir_all(self.data_dir.join("snapshots"))?;
-        std::fs::create_dir_all(self.data_dir.join("volumes"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        for sub in ["images", "sandboxes", "snapshots", "volumes"] {
+            let path = self.data_dir.join(sub);
+            std::fs::create_dir_all(&path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
         Ok(())
     }
 }

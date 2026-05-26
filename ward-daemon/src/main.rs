@@ -54,7 +54,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_service = WardGrpcServer::new(Arc::clone(&sandbox_mgr), Arc::clone(&volume_mgr));
 
     // Bind the Unix domain socket.
+    // SEC-002: tokio::UnixListener::bind creates the socket with the process
+    // umask, which on permissive defaults (or under root) leaves the socket
+    // group/world-connectable. ADR-004 promises 0600 — enforce it here so
+    // only the daemon's owner can connect.
     let uds = tokio::net::UnixListener::bind(&cfg.socket_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg.socket_path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);
 
     tracing::info!(socket = %cfg.socket_path.display(), "listening");
