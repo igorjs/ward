@@ -696,30 +696,44 @@ mod tests {
         String::from_utf8_lossy(&buf).to_string()
     }
 
+    /// Regression for SEC-005: even with `EgressMode::Open` the proxy MUST
+    /// refuse targets that resolve to a private / loopback / link-local
+    /// address. Pre-SEC-005 this test asserted the opposite (Open mode
+    /// tunnels bytes through to loopback); after the patch, the SSRF
+    /// guard rejects the loopback target server-side and returns 403.
+    /// Tunnel-bytes behaviour for genuine public targets is not unit-
+    /// testable without network access; the `check()` arms are covered
+    /// by `given_open_policy_when_check_any_domain_then_returns_true`.
     #[tokio::test]
-    async fn given_open_policy_when_connect_allowed_then_tunnels_bytes() {
-        // Arrange: an echo upstream and an Open proxy in front of it.
+    async fn given_open_policy_when_connect_to_loopback_then_refused_by_ssrf_guard() {
+        // Arrange: an echo upstream we'd LIKE to reach if the guard
+        // weren't in the way, and an Open proxy in front of it.
         let echo_port = spawn_echo_server().await;
         let proxy = Arc::new(build_proxy(EgressMode::Open, vec![]));
         let proxy_port = spawn_proxy(Arc::clone(&proxy)).await;
 
-        // Act: CONNECT through the proxy to the echo server, then round-trip.
+        // Act
         let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
         client
             .write_all(format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\n\r\n").as_bytes())
             .await
             .unwrap();
         let status = read_response_head(&mut client).await;
-        assert!(status.contains("200"), "expected 200, got {status:?}");
 
-        client.write_all(b"ward-egress").await.unwrap();
-        let mut echoed = [0u8; 11];
-        client.read_exact(&mut echoed).await.unwrap();
-
-        // Assert
-        assert_eq!(&echoed, b"ward-egress");
+        // Assert: SEC-005 guard fires after policy check but before
+        // upstream connect. The log entry still shows allowed=true
+        // because check() ran first (the guard is a separate layer);
+        // operators inspecting the audit trail need both signals to
+        // understand why a connect didn't reach its target.
+        assert!(
+            status.contains("403"),
+            "expected 403 (SEC-005 loopback guard), got {status:?}"
+        );
         let log = proxy.log_entries().await;
-        assert!(log.iter().any(|e| e.domain == "127.0.0.1" && e.allowed));
+        assert!(
+            log.iter().any(|e| e.domain == "127.0.0.1" && e.allowed),
+            "Open-policy check() should still log the attempt as policy-allowed"
+        );
     }
 
     #[tokio::test]
