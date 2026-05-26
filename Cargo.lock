@@ -3132,6 +3132,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-client"
+version = "0.1.0"
+dependencies = [
+ "hyper-util",
+ "pretty_assertions",
+ "prost",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tower",
+ "ward-core",
+]
+
+[[package]]
 name = "ward-core"
 version = "0.1.0"
 dependencies = [

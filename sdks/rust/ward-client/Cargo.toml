@@ -1,0 +1,31 @@
+[package]
+name = "ward-client"
+version = "0.1.0"
+description = "Rust client for the ward sandbox daemon"
+license = "Apache-2.0"
+authors = ["Igor Santos <oss@mail.igorjs.io>"]
+repository = "https://github.com/igorjs/ward"
+homepage = "https://github.com/igorjs/ward"
+documentation = "https://docs.rs/ward-client"
+keywords = ["ward", "sandbox", "microvm", "isolation", "grpc"]
+categories = ["api-bindings", "virtualization"]
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+# Reuses ward-core's generated protobuf types so callers stay in sync
+# with the daemon's source-of-truth proto definitions. Once this crate
+# is extracted into igorjs/ward-sdk-rs, the proto types either get
+# vendored or republished as a separate crate.
+ward-core = { path = "../../../ward-core" }
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+tonic = "0.14"
+prost = "0.14"
+thiserror = "2"
+tower = "0.5"
+hyper-util = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+pretty_assertions = "1"
+tempfile = "3"
