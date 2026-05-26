@@ -106,27 +106,59 @@ impl Config {
 
     /// Ensure all required directories exist with secure permissions.
     ///
-    /// The socket directory is set to 0700 (owner-only) to prevent other
-    /// users from listing contents or connecting to the daemon socket.
-    /// Data directories use the default umask since they contain daemon-managed
-    /// data not directly accessible to external users.
+    /// SEC-002/003/004: every daemon-managed directory is forced to
+    /// mode 0700 via `fchmod` on a file descriptor opened with
+    /// `O_NOFOLLOW | O_DIRECTORY`. This closes the TOCTOU window that
+    /// the previous `symlink_metadata` + `set_permissions` pattern
+    /// left open — `O_NOFOLLOW` errors on a symlink leaf, and
+    /// `fchmod` operates on the fd, not the path, so even an attacker
+    /// who races a symlink swap after the open call cannot redirect
+    /// the chmod to the symlink's target (e.g. `/etc`).
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         if let Some(parent) = self.socket_path.parent() {
-            std::fs::create_dir_all(parent)?;
-            // Restrict socket directory to owner-only access.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-            }
+            create_dir_owner_only(parent)?;
         }
-        std::fs::create_dir_all(&self.data_dir)?;
-        std::fs::create_dir_all(self.data_dir.join("images"))?;
-        std::fs::create_dir_all(self.data_dir.join("sandboxes"))?;
-        std::fs::create_dir_all(self.data_dir.join("snapshots"))?;
-        std::fs::create_dir_all(self.data_dir.join("volumes"))?;
+        create_dir_owner_only(&self.data_dir)?;
+        for sub in ["images", "sandboxes", "snapshots", "volumes"] {
+            create_dir_owner_only(&self.data_dir.join(sub))?;
+        }
         Ok(())
     }
+}
+
+/// Create `path` recursively with owner-only permissions (0700) and
+/// no-symlink-follow semantics on Unix. On non-Unix targets falls back
+/// to `create_dir_all` without the chmod step.
+///
+/// Algorithm:
+///   1. `create_dir_all` materialises any missing intermediate dirs.
+///   2. Open the leaf with `O_NOFOLLOW | O_DIRECTORY` — errors if the
+///      leaf is a symlink. Holding the fd defeats post-open path swaps.
+///   3. `fchmod(fd, 0o700)` — operates on the fd, not the path, so a
+///      racing symlink swap cannot redirect the chmod.
+fn create_dir_owner_only(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+        let fd = open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .map_err(|e: rustix::io::Errno| {
+            std::io::Error::other(format!(
+                "refusing to operate on path that is a symlink or non-directory: {} ({e})",
+                path.display()
+            ))
+        })?;
+        rustix::fs::fchmod(&fd, Mode::from_bits_truncate(0o700)).map_err(
+            |e: rustix::io::Errno| {
+                std::io::Error::other(format!("fchmod 0o700 on {}: {e}", path.display()))
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn default_socket_path(

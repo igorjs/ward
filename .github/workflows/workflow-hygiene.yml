@@ -1,0 +1,48 @@
+name: workflow-hygiene
+
+# Enforces the supply-chain invariants set up by the
+# security/hardening-pass PR so future workflow changes can't silently
+# regress them:
+#
+#   1. Every workflow job has a step-security/harden-runner first step
+#      (one harden-runner per `steps:` block).
+#   2. No third-party action uses a mutable major-version tag like
+#      `@v6`. SHA-pinning is required; the only exception is
+#      dtolnay/rust-toolchain's published rolling tags (@stable,
+#      @nightly, @master) — that's their documented release convention.
+#   3. No new `uses:` line is missing a `# v<N>` trailing comment
+#      (the SHA-pin loses its human-readable version label otherwise).
+#
+# Runs on every PR that touches .github/ and weekly to catch drift
+# that lands via direct push or admin bypass.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/workflow-hygiene.sh"
+      - ".github/workflows/workflow-hygiene.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Run workflow-hygiene checks
+        run: bash .github/workflow-hygiene.sh

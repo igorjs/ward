@@ -44,6 +44,13 @@ tonic = "0.14"
 tonic-prost = "0.14"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+# rustix: portable POSIX syscall wrappers without the libc unsafe surface.
+# Used in config::ensure_dirs (O_NOFOLLOW + fchmod via fd to close the
+# SEC-003 TOCTOU window) and backend::krunvm::extract_rootfs
+# (renameat2 RENAME_EXCHANGE on Linux for SEC-014 atomic snapshot swap).
+# Already a transitive dep via tempfile -> native-tls; promoted to a
+# direct dep so the rustix usage is explicit in this crate's manifest.
+rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
 # tonic 0.14 moved prost codegen out of tonic-build into tonic-prost-build.

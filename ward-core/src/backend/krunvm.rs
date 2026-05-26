@@ -849,7 +849,17 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
     if let Some(parent) = archive.parent() {
         std::fs::create_dir_all(parent).map_err(BackendError::Io)?;
     }
-    let file = std::fs::File::create(archive).map_err(BackendError::Io)?;
+    // SEC-004: snapshot tar contains the full guest rootfs (including any
+    // secrets the guest wrote to disk). Force 0600 so other local users
+    // on multi-user hosts cannot read another tenant's snapshots.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(archive).map_err(BackendError::Io)?;
     let mut builder = tar::Builder::new(file);
     if rootfs.is_dir() {
         builder
@@ -864,6 +874,16 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
 }
 
 /// Replace `dest` with the contents of a rootfs archive.
+///
+/// SEC-001: bare `tar::Archive::unpack` follows on-disk symlinks and can
+/// write entries outside `dest` (e.g. an archive containing a `etc ->
+/// /etc` symlink followed by files under `etc/cron.d/`). We enumerate
+/// entries explicitly, reject absolute paths, parent-traversal, and
+/// unsafe symlink/hardlink targets, then use `entry.unpack_in(dest)`
+/// (which re-validates each path against the destination root).
+///
+/// SEC-014: stage into a sibling temp dir and atomically rename on
+/// success so a partial extract does not leave `dest` half-populated.
 fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
     if !archive.exists() {
         return Err(BackendError::NotFound(format!(
@@ -871,14 +891,113 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
             archive.display()
         )));
     }
-    if dest.exists() {
-        std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
-    }
-    std::fs::create_dir_all(dest).map_err(BackendError::Io)?;
+    let parent = dest.parent().ok_or_else(|| {
+        BackendError::Internal(format!("restore: no parent for {}", dest.display()))
+    })?;
+    let staging = parent.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&staging).map_err(BackendError::Io)?;
+
     let file = std::fs::File::open(archive).map_err(BackendError::Io)?;
     let mut ar = tar::Archive::new(file);
-    ar.unpack(dest)
-        .map_err(|e| BackendError::Internal(format!("extract archive: {e}")))?;
+    // set_overwrite(true): tar crate replaces existing destination files
+    // instead of erroring (safe here because we extract into a fresh
+    // staging dir). set_preserve_permissions(false): drop setuid/setgid
+    // bits from tar headers. Combined with per-entry path validation
+    // below and `unpack_in` (which enforces destination containment),
+    // the extract cannot write outside `staging`.
+    ar.set_overwrite(true);
+    ar.set_preserve_permissions(false);
+
+    // Wrap the per-entry loop so we can clean up `staging` on ANY error
+    // path (including unpack_in failures) without repeating the call
+    // site at every `?`.
+    let extract_result = (|| -> Result<()> {
+        for entry in ar
+            .entries()
+            .map_err(|e| BackendError::Internal(format!("read archive: {e}")))?
+        {
+            let mut entry =
+                entry.map_err(|e| BackendError::Internal(format!("read entry: {e}")))?;
+            let path = entry
+                .path()
+                .map_err(|e| BackendError::Internal(format!("entry path: {e}")))?
+                .into_owned();
+            // Reject absolute paths and any traversal component.
+            if path.is_absolute()
+                || path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::RootDir
+                    )
+                })
+            {
+                return Err(BackendError::Internal(format!(
+                    "snapshot archive contains unsafe path: {}",
+                    path.display()
+                )));
+            }
+            // Reject symlink/hardlink entries pointing outside the dest.
+            if matches!(
+                entry.header().entry_type(),
+                tar::EntryType::Symlink | tar::EntryType::Link
+            ) {
+                let link = entry
+                    .link_name()
+                    .map_err(|e| BackendError::Internal(format!("link target: {e}")))?
+                    .ok_or_else(|| BackendError::Internal("link entry missing target".into()))?
+                    .into_owned();
+                if link.is_absolute()
+                    || link
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    return Err(BackendError::Internal(format!(
+                        "snapshot archive contains unsafe link target: {}",
+                        link.display()
+                    )));
+                }
+            }
+            entry.unpack_in(&staging).map_err(|e| {
+                BackendError::Internal(format!("extract entry {}: {e}", path.display()))
+            })?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = extract_result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    // SEC-014: atomic swap via renameat2(RENAME_EXCHANGE) on Linux —
+    // dest gets new contents, staging gets old contents (which we then
+    // drop). EXCHANGE requires both paths to exist; first-time restore
+    // (no dest yet) falls back to a plain rename. macOS lacks an
+    // equivalent atomic-exchange syscall; the unlink+rename two-step
+    // residual remains on Darwin (documented at the call site).
+    #[cfg(target_os = "linux")]
+    {
+        if dest.exists() {
+            use rustix::fs::{CWD, RenameFlags, renameat_with};
+            renameat_with(CWD, &staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
+                |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
+            )?;
+            // Drop the old contents that landed in staging post-swap.
+            let _ = std::fs::remove_dir_all(&staging);
+        } else {
+            std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Darwin residual: a crash between unlink and rename leaves
+        // `dest` absent (sandbox unbootable on next boot). renamex_np
+        // with RENAME_SWAP exists on macOS 10.12+ but rustix doesn't
+        // expose it yet; tracked as a follow-up.
+        if dest.exists() {
+            std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+        }
+        std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
+    }
     Ok(())
 }
 
