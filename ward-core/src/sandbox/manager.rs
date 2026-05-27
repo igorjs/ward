@@ -126,9 +126,17 @@ impl SandboxManager {
 
         // Validate and convert bind mounts; the backend attaches them to the
         // microVM. (Previously mounts were silently dropped.)
+        //
+        // SEC-020: WARD_ALLOW_HOST_MOUNTS=1 lifts the source-path
+        // allowlist for trusted operator workflows (e.g. CI runners
+        // that need to mount arbitrary host paths). Read per-request
+        // — env reads are cheap relative to a sandbox creation.
+        let allow_host_mounts = std::env::var("WARD_ALLOW_HOST_MOUNTS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let mut mounts = Vec::with_capacity(req.mounts.len());
         for m in &req.mounts {
-            crate::validate::mount(&m.source, &m.target)?;
+            crate::validate::mount(&m.source, &m.target, m.readonly, allow_host_mounts)?;
             mounts.push(crate::protocol::Mount {
                 source: m.source.clone(),
                 target: m.target.clone(),
