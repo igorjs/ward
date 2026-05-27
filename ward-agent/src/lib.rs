@@ -24,7 +24,14 @@ use proto::{Event, Exec, Exited, Line, Request, event, request};
 
 /// Frames larger than this are rejected as malformed, protecting the agent
 /// from a hostile or buggy peer that advertises a huge length.
-const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+///
+/// SEC-010: lowered from 16 MiB to 2 MiB. The daemon caps broker publish
+/// payloads at 1 MiB (validate::MAX_PUBLISH_PAYLOAD_BYTES) and the gRPC
+/// decode cap at 1.5 MiB; the agent frame cap mirrors those bounds with
+/// protobuf-wrapping headroom. A peer that opens many connections and
+/// claims `len = MAX_FRAME_BYTES - 1` on each can no longer force a
+/// multi-MiB allocation per connection before the read.
+const MAX_FRAME_BYTES: u32 = 2 * 1024 * 1024;
 
 /// SIGKILL. Declared inline rather than pulling in the `libc` crate (the
 /// same minimalism as `ward-core`'s hand-rolled FFI); the value is 9 on
@@ -47,11 +54,16 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf);
+    // SEC-010: reject zero-length frames explicitly. A well-formed
+    // protobuf message is never empty; len=0 either indicates a buggy
+    // peer or an attacker probing for allocation behaviour.
+    if len == 0 {
+        return Err(std::io::Error::other("frame length must be non-zero"));
+    }
     if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame too large: {len} bytes"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "frame too large: {len} bytes (max {MAX_FRAME_BYTES})"
+        )));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;

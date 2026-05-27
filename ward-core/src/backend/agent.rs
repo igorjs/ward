@@ -27,7 +27,12 @@ pub mod proto {
 
 use proto::{Event, Exec, Request, event, request};
 
-const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// SEC-010: lowered from 16 MiB to 2 MiB to match the daemon's broker
+/// publish-payload cap (1 MiB) plus protobuf-wrapping headroom. The
+/// previous 16 MiB cap allowed a hostile guest agent (or a compromised
+/// vsock bridge) to force a 16 MiB allocation per connection before
+/// any payload arrived.
+const MAX_FRAME_BYTES: u32 = 2 * 1024 * 1024;
 
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
@@ -37,11 +42,15 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<V
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf);
+    // SEC-010: reject zero-length frames. Well-formed protobuf is never
+    // empty; len=0 is either a buggy peer or an attacker probe.
+    if len == 0 {
+        return Err(std::io::Error::other("frame length must be non-zero"));
+    }
     if len > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame too large: {len} bytes"),
-        ));
+        return Err(std::io::Error::other(format!(
+            "frame too large: {len} bytes (max {MAX_FRAME_BYTES})"
+        )));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
