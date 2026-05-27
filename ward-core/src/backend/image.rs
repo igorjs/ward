@@ -58,6 +58,26 @@ impl ImagePuller for OciPuller {
             BackendError::Image(format!("invalid image reference {reference}: {e}"))
         })?;
 
+        // SEC-019 (part 1): registry allowlist enforcement.
+        // WARD_REGISTRY_ALLOWLIST is comma-separated; unset = allow any
+        // registry (today's default, backwards-compatible). When set,
+        // image_ref.registry() (which defaults to docker.io for
+        // unqualified refs) is checked against the list.
+        //
+        // Cosign signature verification (the second half of SEC-019) is
+        // tracked separately; it requires `sigstore-rs` which is a
+        // larger dep evaluation.
+        let allowlist_env = std::env::var("WARD_REGISTRY_ALLOWLIST").ok();
+        if let Some(ref allowlist) = allowlist_env
+            && !is_registry_allowed(image_ref.registry(), allowlist)
+        {
+            return Err(BackendError::Image(format!(
+                "registry {} is not in WARD_REGISTRY_ALLOWLIST ({})",
+                image_ref.registry(),
+                allowlist
+            )));
+        }
+
         let client = Client::default();
         let auth = RegistryAuth::Anonymous;
         let accepted = vec![
@@ -79,6 +99,18 @@ impl ImagePuller for OciPuller {
 
         Ok(image.digest.unwrap_or_else(|| "sha256:unknown".to_string()))
     }
+}
+
+/// SEC-019: check whether `registry` falls in the comma-separated
+/// `WARD_REGISTRY_ALLOWLIST`. Whitespace around each entry is
+/// trimmed; empty entries are ignored. Match is case-insensitive
+/// (registry hostnames are DNS-style).
+fn is_registry_allowed(registry: &str, allowlist: &str) -> bool {
+    allowlist
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|entry| entry.eq_ignore_ascii_case(registry))
 }
 
 // ---------------------------------------------------------------------------
@@ -612,5 +644,51 @@ mod tests {
             safe_join(Path::new("/base"), Path::new("a/b")),
             Some(PathBuf::from("/base/a/b"))
         );
+    }
+
+    // ----- SEC-019: WARD_REGISTRY_ALLOWLIST parsing -----------------------
+
+    #[test]
+    fn given_exact_match_when_is_registry_allowed_then_true() {
+        assert!(is_registry_allowed("docker.io", "docker.io"));
+        assert!(is_registry_allowed("ghcr.io", "docker.io,ghcr.io,quay.io"));
+    }
+
+    #[test]
+    fn given_no_match_when_is_registry_allowed_then_false() {
+        assert!(!is_registry_allowed("evil.io", "docker.io,ghcr.io"));
+    }
+
+    #[test]
+    fn given_whitespace_around_entries_when_is_registry_allowed_then_trimmed() {
+        // Allowlists copy-pasted from docs / env files often contain
+        // spaces around commas; tolerate them rather than surprising
+        // the operator with "I added it, why is it not working?".
+        assert!(is_registry_allowed("ghcr.io", " docker.io ,  ghcr.io  "));
+    }
+
+    #[test]
+    fn given_empty_entries_when_is_registry_allowed_then_ignored() {
+        // Trailing comma, double comma, etc. — common typos. None
+        // should match an empty registry string, but the rest of the
+        // list should still work.
+        assert!(is_registry_allowed("docker.io", "docker.io,,"));
+        assert!(!is_registry_allowed("", "docker.io,,ghcr.io"));
+    }
+
+    #[test]
+    fn given_case_difference_when_is_registry_allowed_then_match() {
+        // Registry hostnames are DNS-style and case-insensitive.
+        assert!(is_registry_allowed("Docker.IO", "docker.io"));
+        assert!(is_registry_allowed("docker.io", "DOCKER.IO"));
+    }
+
+    #[test]
+    fn given_empty_allowlist_when_is_registry_allowed_then_false() {
+        // An explicit empty list rejects every registry. Operators who
+        // want "allow everything" leave WARD_REGISTRY_ALLOWLIST unset
+        // entirely (and the pull-site check skips the function call).
+        assert!(!is_registry_allowed("docker.io", ""));
+        assert!(!is_registry_allowed("docker.io", "   "));
     }
 }
