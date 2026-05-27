@@ -113,6 +113,10 @@ impl SandboxManager {
 
     /// Create a new sandbox.
     pub async fn create(&self, req: crate::pb::CreateSandboxRequest) -> Result<PbSandboxInfo> {
+        // Metrics: time the full create path (validation + backend boot +
+        // bookkeeping). Recorded on every call regardless of outcome
+        // because the failure rate matters as much as the success rate.
+        let _create_start = std::time::Instant::now();
         crate::validate::image_ref(&req.image)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
@@ -224,6 +228,14 @@ impl SandboxManager {
         // fail here, the order keeps cleanup symmetric with remove().
         self.broker.register_sandbox(id, comms).await;
 
+        // Metrics: success path. Failure paths (the early `?`s above)
+        // already counted via the validate layer; this records the
+        // sandbox-creation-actually-happened signal an operator wants.
+        metrics::counter!("wardd_sandbox_create_total").increment(1);
+        metrics::histogram!("wardd_sandbox_create_duration_seconds")
+            .record(_create_start.elapsed().as_secs_f64());
+        metrics::gauge!("wardd_sandbox_active").increment(1.0);
+
         Ok(protocol_info_to_pb(info))
     }
 
@@ -254,11 +266,14 @@ impl SandboxManager {
     pub async fn remove(&self, id: &str) -> Result<()> {
         crate::validate::entity_id(id, "sandbox")?;
         // Cancel any pending timeout task.
-        if let Some(entry) = self.entries.write().await.remove(id)
-            && let Some(handle) = entry.timeout_handle
-        {
-            handle.abort();
-        }
+        let removed = if let Some(entry) = self.entries.write().await.remove(id) {
+            if let Some(handle) = entry.timeout_handle {
+                handle.abort();
+            }
+            true
+        } else {
+            false
+        };
 
         // Drop any process records that belong to this sandbox so they
         // do not accumulate over a long-lived daemon's lifetime. The
@@ -273,7 +288,15 @@ impl SandboxManager {
         // log, and any active subscriptions owned by this sandbox.
         self.broker.deregister_sandbox(id).await;
 
-        self.backend.remove_sandbox(id).await.map_err(backend_err)
+        let result = self.backend.remove_sandbox(id).await.map_err(backend_err);
+        // Metrics: decrement active gauge only when the entry actually
+        // existed; remove() can be called on already-gone sandboxes
+        // from the timeout watcher race.
+        if removed {
+            metrics::counter!("wardd_sandbox_remove_total").increment(1);
+            metrics::gauge!("wardd_sandbox_active").decrement(1.0);
+        }
+        result
     }
 
     /// Return the number of active sandboxes.

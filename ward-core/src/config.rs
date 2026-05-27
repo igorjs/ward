@@ -24,6 +24,11 @@ pub struct Config {
     /// so the security posture isn't per-request mutable from anyone
     /// who can poke the daemon's environment.
     pub allow_host_mounts: bool,
+    /// Prometheus metrics scrape endpoint. `None` (default) means metrics
+    /// are recorded but no HTTP exporter is installed; the daemon stays
+    /// Unix-socket-only. Set `WARD_METRICS_ADDR=127.0.0.1:9100` (or any
+    /// SocketAddr) to opt in to scraping.
+    pub metrics_addr: Option<std::net::SocketAddr>,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -38,6 +43,7 @@ pub struct ConfigEnv {
     pub ward_max_volumes: Option<String>,
     pub ward_max_cached_images: Option<String>,
     pub ward_allow_host_mounts: Option<String>,
+    pub ward_metrics_addr: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -54,6 +60,7 @@ impl Config {
             ward_max_volumes: std::env::var("WARD_MAX_VOLUMES").ok(),
             ward_max_cached_images: std::env::var("WARD_MAX_CACHED_IMAGES").ok(),
             ward_allow_host_mounts: std::env::var("WARD_ALLOW_HOST_MOUNTS").ok(),
+            ward_metrics_addr: std::env::var("WARD_METRICS_ADDR").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -113,6 +120,15 @@ impl Config {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        // WARD_METRICS_ADDR is opt-in; unparseable values fall back to
+        // None rather than crashing the daemon at startup. The daemon
+        // emits a warn for a non-empty unparseable value so a typo is
+        // visible without bringing the process down.
+        let metrics_addr = env
+            .ward_metrics_addr
+            .as_deref()
+            .and_then(|v| v.parse::<std::net::SocketAddr>().ok());
+
         Self {
             socket_path,
             data_dir,
@@ -121,6 +137,7 @@ impl Config {
             max_volumes,
             max_cached_images,
             allow_host_mounts,
+            metrics_addr,
         }
     }
 

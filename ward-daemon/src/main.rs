@@ -82,6 +82,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Install the Prometheus exporter when WARD_METRICS_ADDR is set.
+    // Without an exporter, metrics::counter!() / histogram!() are no-ops
+    // (the recorder facade discards them), so call sites elsewhere
+    // can instrument unconditionally without paying for it when
+    // metrics aren't scraped.
+    if let Some(addr) = cfg.metrics_addr {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .install()
+            .map_err(|e| format!("install prometheus exporter on {addr}: {e}"))?;
+        tracing::info!(metrics = %addr, "metrics scrape endpoint listening at /metrics");
+    }
+
     tracing::info!(
         socket = %cfg.socket_path.display(),
         data_dir = %cfg.data_dir.display(),
