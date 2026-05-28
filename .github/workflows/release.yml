@@ -349,7 +349,12 @@ jobs:
       base64-subjects: ${{ needs.combine_hashes.outputs.hashes }}
       upload-assets: true
       upload-tag-name: ${{ needs.resolve.outputs.tag }}
-      provenance-name: ward-${{ needs.resolve.outputs.version }}.intoto.jsonl
+      # `provenance-name` intentionally omitted: a custom value here
+      # breaks the generator's internal secure-download composite (the
+      # downstream UNTRUSTED_PATH ends up empty, softprops then creates
+      # the release with `files: ""` and 0 attestation assets). The
+      # default name is `<workflow-name>.intoto.jsonl`, which the
+      # internal pipeline knows how to find.
 
   # ── Publish a single release with every per-target tarball ────────
   publish:
