@@ -313,7 +313,9 @@ impl Backend for KrunvmBackend {
                 // Owner matches; safe to remove + signal. `unwrap` is sound
                 // because we just observed the entry under the write lock,
                 // which we have held continuously.
-                let record = processes.remove(pid).expect("entry observed under write lock");
+                let record = processes
+                    .remove(pid)
+                    .expect("entry observed under write lock");
                 // Best-effort send: a closed receiver just means the
                 // process already exited and its bridge task is gone.
                 let _ = record.kill_tx.send(()).await;
