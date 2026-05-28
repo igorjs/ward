@@ -3143,7 +3143,6 @@ dependencies = [
  "tokio",
  "tonic",
  "tower",
- "ward-core",
 ]
 
 [[package]]

@@ -9,15 +9,20 @@ homepage = "https://github.com/igorjs/ward"
 documentation = "https://docs.rs/ward-client"
 keywords = ["ward", "sandbox", "microvm", "isolation", "grpc"]
 categories = ["api-bindings", "virtualization"]
-edition = "2024"
-rust-version = "1.85"
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate is intentionally Apache-2.0 while the workspace is AGPL-3.0-only.
+# That split only holds if `ward-client` has zero `path =` dependency on any
+# AGPL crate (ward-core, ward-daemon, ward-agent). Linking AGPL code at the
+# Cargo level produces a derivative work under AGPL terms, which would silently
+# override the Apache-2.0 declaration here. When the gRPC stub wiring lands,
+# the .proto-generated types must be sourced from one of:
+#   1. a separate `ward-proto` crate published under Apache-2.0, or
+#   2. local codegen vendored into this crate's `src/proto/`,
+# never via `path = "../../../ward-core"`.
 
 [dependencies]
-# Reuses ward-core's generated protobuf types so callers stay in sync
-# with the daemon's source-of-truth proto definitions. Once this crate
-# is extracted into igorjs/ward-sdk-rs, the proto types either get
-# vendored or republished as a separate crate.
-ward-core = { path = "../../../ward-core" }
 tokio = { version = "1", features = ["net", "rt", "macros"] }
 tonic = "0.14"
 prost = "0.14"

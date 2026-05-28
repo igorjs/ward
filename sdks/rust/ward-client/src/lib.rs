@@ -117,17 +117,23 @@ impl WardClient {
     // ── Sandbox lifecycle ───────────────────────────────────────────
 
     pub async fn create_sandbox(&mut self, _opts: CreateOptions) -> Result<Sandbox, WardError> {
-        unimplemented!("first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate")
+        unimplemented!(
+            "first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate"
+        )
     }
 
     pub async fn remove_sandbox(&mut self, _id: &str) -> Result<(), WardError> {
-        unimplemented!("first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate")
+        unimplemented!(
+            "first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate"
+        )
     }
 
     // ── Process operations ──────────────────────────────────────────
 
     pub async fn run(&mut self, _id: &str, _argv: &[&str]) -> Result<ExecResult, WardError> {
-        unimplemented!("first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate")
+        unimplemented!(
+            "first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate"
+        )
     }
 
     /// Stream stdout / stderr / exit events from a running process.
@@ -137,7 +143,9 @@ impl WardClient {
         _id: &str,
         _pid: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>, WardError> {
-        unimplemented!("first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate")
+        unimplemented!(
+            "first-cut scaffold; wire to gRPC stub when ward-cli is refactored to consume this crate"
+        )
     }
 
     /// Inspect the configured connection target. Useful for tests +

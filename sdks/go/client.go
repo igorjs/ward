@@ -3,7 +3,7 @@
 // Wraps the gRPC API in proto/ward.proto with idiomatic Go: context.Context
 // for cancellation, struct-of-options for keyword-style args, errors as
 // values. The protobuf stubs are generated from the .proto file via
-// `buf generate` (or `protoc-gen-go-grpc` directly) — see README for
+// `buf generate` (or `protoc-gen-go-grpc` directly). See README for
 // the codegen step.
 //
 // Status: first-cut scaffold. The exported types are stable; the gRPC
@@ -120,17 +120,15 @@ func WithTCP(target string) Option {
 }
 
 // Client is the gRPC client for the ward daemon.
+//
+// The grpc.ClientConn and generated stub fields will be added when proto
+// codegen lands. Leaving them off until then keeps godoc honest about the
+// struct shape and avoids `unused`-style placeholder fields surfacing in
+// stack traces or `%+v` formatting.
 type Client struct {
 	socketPath string
 	tcpTarget  string
-	// Lazily-initialised gRPC connection + stub.
-	// Wired up in Connect() once proto codegen lands.
-	_conn unused
-	_stub unused
 }
-
-// unused is a placeholder for fields that depend on generated proto types.
-type unused struct{}
 
 // Connect dials the daemon using the supplied options.
 func Connect(_ctx context.Context, opts ...Option) (*Client, error) {

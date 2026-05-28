@@ -1,9 +1,9 @@
 /**
  * Thin Promise-based wrapper over the ward gRPC API.
  *
- * The protobuf stubs (./proto) are generated from proto/ward.proto via
- * `npm run proto:generate`. Until that runs the method bodies throw
- * NotImplementedError — treat this file as the SHAPE of the SDK rather
+ * The protobuf stubs will be generated from proto/ward.proto when the
+ * gRPC wire-up lands. Until then the method bodies throw
+ * NotImplementedError. Treat this file as the SHAPE of the SDK rather
  * than a turn-key import path.
  */
 
