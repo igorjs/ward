@@ -64,7 +64,7 @@ channel on exit, and `Sandbox` exposes the same to tear itself down:
 
 ```python
 with WardClient.connect() as client, client.sandbox("alpine:latest") as sb:
-    print(sb.run(["uname", "-a"]).stdout)
+    print(client.run(sb.id, ["uname", "-a"]).stdout)
 # sandbox removed here, even on exception
 ```
 
@@ -72,23 +72,31 @@ with WardClient.connect() as client, client.sandbox("alpine:latest") as sb:
 
 | Constructor | Behaviour |
 |---|---|
-| `WardClient.connect()` | Connect to `$HOME/.ward/ward.sock` (or `$XDG_RUNTIME_DIR/ward/ward.sock` on Linux) |
+| `WardClient.connect()` | Connect to the daemon's default socket for the current platform (see `default_socket_path()`) |
 | `WardClient.connect(socket_path="/path/to/sock")` | Connect to an explicit Unix socket |
-| `WardClient.connect_tcp("host:port")` | Connect over TCP — requires the daemon-side TCP/auth work from [ADR-013](../../docs/adr/013-multi-tenant-auth.md) (not yet implemented) |
+| `WardClient.connect_tcp("host:port")` | Connect over TCP. Requires the daemon-side TCP/auth work from [ADR-013](../../docs/adr/013-multi-tenant-auth.md) (not yet implemented) |
+
+`default_socket_path()` resolves identically to the Rust daemon's
+default: on macOS, `$HOME/.ward/ward.sock`; on Linux, either
+`$XDG_RUNTIME_DIR/ward/ward.sock` (when XDG is set) or
+`/tmp/ward-$USER/ward.sock` (when it isn't). Misalignment with the
+daemon would mean a default-configured client silently failing to
+connect to a default-configured daemon, so the SDK matches the Rust
+resolution exactly.
 
 ## Why a Python SDK
 
 ward's lead use case per its README is "AI agent sandboxing". Most AI / LLM
-tooling is Python — autonomous coding agents (Claude Code, OpenInterpreter,
+tooling is Python: autonomous coding agents (Claude Code, OpenInterpreter,
 Aider), Jupyter notebook drivers, LangChain / LlamaIndex / DSPy integrations,
 function-calling backends. A first-class Python wrapper is the path of
 least resistance from "I'm building an agent" to "and I want it sandboxed".
 
 For other languages:
 
-- TypeScript SDK — [#40](https://github.com/igorjs/ward/issues/40)
-- Go SDK — [#41](https://github.com/igorjs/ward/issues/41)
-- Rust SDK — [#42](https://github.com/igorjs/ward/issues/42)
+- TypeScript SDK: [#40](https://github.com/igorjs/ward/issues/40)
+- Go SDK: [#41](https://github.com/igorjs/ward/issues/41)
+- Rust SDK: [#42](https://github.com/igorjs/ward/issues/42)
 
 ## Licence
 

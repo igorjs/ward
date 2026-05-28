@@ -1,5 +1,9 @@
 [build-system]
-requires = ["hatchling>=1.18"]
+# 1.27+ supports PEP 639 SPDX `license = "..."` strings without
+# emitting deprecation warnings or falling back to the legacy
+# `License:` metadata field. Older hatchling silently downgrades the
+# wheel metadata and trips lint warnings on modern pip / twine.
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -13,7 +17,9 @@ authors = [{ name = "Igor Santos", email = "oss@mail.igorjs.io" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    # PEP 639 superseded the License classifier with the SPDX `license`
+    # field above; keeping both trips a deprecation warning on
+    # twine / setuptools >=77 and is redundant.
     "Programming Language :: Python :: 3",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Distributed Computing",

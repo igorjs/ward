@@ -6,7 +6,7 @@ Advanced callers can drop into ``ward_sdk.proto`` for full access.
 
 Note: the protobuf stubs (``ward_sdk.proto``) are generated at install
 time via ``grpcio-tools`` (see README). Until that step runs, the
-``WardClient`` methods raise NotImplementedError — treat this file as
+``WardClient`` methods raise NotImplementedError. Treat this file as
 the SHAPE of the SDK rather than a turn-key import path.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import Iterator, Optional, Sequence
@@ -22,14 +23,28 @@ from typing import Iterator, Optional, Sequence
 def default_socket_path() -> pathlib.Path:
     """Resolve the path wardd is listening on for the current user.
 
-    Mirrors ``ward-core/src/config.rs::default_socket_path``:
-    - macOS: ``$HOME/.ward/ward.sock``
-    - Linux: ``$XDG_RUNTIME_DIR/ward/ward.sock`` if set, else
-      ``$HOME/.ward/ward.sock``
+    Mirrors ``ward-core/src/config.rs::default_socket_path`` exactly so
+    a default-configured Python client connects to a default-configured
+    daemon without extra plumbing:
+
+    - macOS: ``$HOME/.ward/ward.sock`` (XDG is ignored even if set).
+    - Linux: ``$XDG_RUNTIME_DIR/ward/ward.sock`` when XDG is set, else
+      ``/tmp/ward-$USER/ward.sock`` (matching the Rust fallback;
+      the daemon never silently uses ``$HOME`` on Linux).
+    - Other Unix: ``$HOME/.ward/ward.sock``.
+
+    Raises ``RuntimeError`` only when the chosen branch needs ``HOME``
+    or ``USER`` and the relevant variable is unset; misalignment with
+    the Rust default would be worse than a loud failure.
     """
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg:
-        return pathlib.Path(xdg) / "ward" / "ward.sock"
+    if sys.platform == "linux":
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            return pathlib.Path(xdg) / "ward" / "ward.sock"
+        user = os.environ.get("USER") or "ward"
+        return pathlib.Path(f"/tmp/ward-{user}") / "ward.sock"
+
+    # macOS (darwin) + anything else falls through to the home-based default.
     home = os.environ.get("HOME")
     if not home:
         raise RuntimeError("HOME is not set; cannot resolve default ward socket path")

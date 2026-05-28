@@ -1,8 +1,8 @@
 """Smoke tests for ward-sdk.
 
 These confirm the package surface compiles + imports correctly. They
-do NOT exercise the gRPC stubs — that requires a running wardd, which
-belongs in integration tests rather than unit tests. When the proto
+do NOT exercise the gRPC stubs (that requires a running wardd, which
+belongs in integration tests rather than unit tests). When the proto
 codegen lands and ``WardClient`` is wired up, add round-trip tests
 that spawn a wardd via ``subprocess`` and exercise create/exec/remove.
 """
@@ -10,6 +10,7 @@ that spawn a wardd via ``subprocess`` and exercise create/exec/remove.
 from __future__ import annotations
 
 import pathlib
+import sys
 
 import pytest
 
@@ -22,20 +23,35 @@ def test_package_version_is_string() -> None:
     assert ward_sdk.__version__.count(".") >= 1
 
 
-def test_default_socket_path_uses_xdg_runtime_dir_when_set(
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-only XDG path")
+def test_default_socket_path_uses_xdg_runtime_dir_on_linux(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
-    monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("USER", "test")
     assert default_socket_path() == pathlib.Path("/run/user/1000/ward/ward.sock")
 
 
-def test_default_socket_path_falls_back_to_home(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux-only /tmp fallback")
+def test_default_socket_path_falls_back_to_tmp_user_on_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # XDG unset on Linux must NOT fall back to $HOME; the Rust daemon
+    # uses /tmp/ward-$USER in that branch, so the SDK has to match.
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    monkeypatch.setenv("HOME", "/home/test")
-    assert default_socket_path() == pathlib.Path("/home/test/.ward/ward.sock")
+    monkeypatch.setenv("USER", "alice")
+    assert default_socket_path() == pathlib.Path("/tmp/ward-alice/ward.sock")
 
 
+@pytest.mark.skipif(sys.platform == "linux", reason="macOS / other Unix branch")
+def test_default_socket_path_uses_home_on_macos(monkeypatch: pytest.MonkeyPatch) -> None:
+    # macOS ignores XDG even if set; the Rust daemon does too.
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setenv("HOME", "/Users/test")
+    assert default_socket_path() == pathlib.Path("/Users/test/.ward/ward.sock")
+
+
+@pytest.mark.skipif(sys.platform == "linux", reason="HOME-required branch is macOS / other")
 def test_default_socket_path_raises_when_home_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("HOME", raising=False)
@@ -43,11 +59,16 @@ def test_default_socket_path_raises_when_home_unset(monkeypatch: pytest.MonkeyPa
         default_socket_path()
 
 
-def test_client_connect_defaults_to_socket(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+def test_client_connect_defaults_to_platform_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cross-platform: assert connect() round-trips whatever default_socket_path
+    # produces for this platform. The platform-specific value is covered by the
+    # cases above.
     monkeypatch.setenv("HOME", "/home/test")
+    monkeypatch.setenv("USER", "test")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    expected = default_socket_path()
     client = WardClient.connect()
-    assert client.socket_path == pathlib.Path("/home/test/.ward/ward.sock")
+    assert client.socket_path == expected
     assert client.tcp_target is None
 
 
