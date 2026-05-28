@@ -992,8 +992,18 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
     // never leave `dest` absent. EXCHANGE / SWAP require both paths to
     // exist; first-time restore (no dest yet) falls back to a plain
     // rename. Linux: rustix renameat_with(RENAME_EXCHANGE). macOS:
-    // renamex_np(RENAME_SWAP) — declared inline above. Other Unix
-    // targets keep the two-step residual; ward doesn't support any.
+    // renamex_np(RENAME_SWAP), declared inline above. Other Unix
+    // targets keep the two-step residual; ward does not support any.
+    //
+    // The `dest.exists()` / `atomic_swap()` pair looks like a TOCTOU
+    // window, but the snapshot directory is owned exclusively by
+    // ward-core: no other process (or, with the daemon's serialised
+    // per-sandbox state, even another thread within the daemon)
+    // races us between these two calls. A concurrent restore for the
+    // same sandbox is impossible by the SandboxManager's contract,
+    // and an external attacker who could create `dest` between the
+    // check and the swap would already have arbitrary write access
+    // to the daemon's data directory.
     if dest.exists() {
         atomic_swap(&staging, dest)?;
         let _ = std::fs::remove_dir_all(&staging);
@@ -1021,8 +1031,20 @@ fn atomic_swap(staging: &std::path::Path, dest: &std::path::Path) -> Result<()> 
             .map_err(|e| BackendError::Internal(format!("staging path contains NUL: {e}")))?;
         let to_c = std::ffi::CString::new(dest.as_os_str().as_bytes())
             .map_err(|e| BackendError::Internal(format!("dest path contains NUL: {e}")))?;
-        // SAFETY: renamex_np with two NUL-terminated C strings we own
-        // and a fixed flag value is sound; failure returns -1 + errno.
+        // SAFETY: the four documented invariants for this `unsafe` call:
+        //   1. `from_c` and `to_c` each point to a NUL-terminated C
+        //      string we own (via `CString`), kept alive for the
+        //      duration of the call (the `CString`s are bound to
+        //      named locals in this scope).
+        //   2. `RENAME_SWAP` (= 0x2) is a documented flag from
+        //      Darwin's `<sys/stdio.h>`; passing it is the contract
+        //      this call exists for.
+        //   3. `renamex_np` does not require `from` and `to` to be
+        //      non-aliased; both being the same path would simply
+        //      no-op (and would never happen in this codebase).
+        //   4. Errno is read via `std::io::Error::last_os_error()`
+        //      immediately after the -1 return, before any other
+        //      libc call could clobber it on this thread.
         let rc = unsafe { renamex_np(from_c.as_ptr(), to_c.as_ptr(), RENAME_SWAP) };
         if rc != 0 {
             let err = std::io::Error::last_os_error();
