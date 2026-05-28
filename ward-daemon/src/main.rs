@@ -82,6 +82,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Loud warning when WARD_METRICS_ADDR is set but unparseable.
+    // Config::from_values silently falls back to None on parse failure
+    // (so a typo cannot crash the daemon at startup) but operators
+    // who set the var expecting /metrics to appear deserve to see why
+    // it did not. Empty / unset values stay silent (the documented
+    // opt-out).
+    if cfg.metrics_addr.is_none()
+        && let Ok(raw) = std::env::var("WARD_METRICS_ADDR")
+        && !raw.trim().is_empty()
+    {
+        tracing::warn!(
+            value = %raw,
+            "WARD_METRICS_ADDR is set but did not parse as a SocketAddr (expected host:port); Prometheus exporter NOT installed"
+        );
+    }
+
     // Install the Prometheus exporter when WARD_METRICS_ADDR is set.
     // Without an exporter, metrics::counter!() / histogram!() are no-ops
     // (the recorder facade discards them), so call sites elsewhere
