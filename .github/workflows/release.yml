@@ -155,7 +155,14 @@ jobs:
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends protobuf-compiler
+            # libprotobuf-dev brings the well-known proto files
+            # (google/protobuf/empty.proto, timestamp.proto, etc.) that
+            # protobuf-compiler alone does not install on Ubuntu 24.04
+            # under --no-install-recommends. Without them, prost-build
+            # fails with "File not found" on the google.protobuf imports
+            # in ward.proto.
+            sudo apt-get install -y --no-install-recommends \
+              protobuf-compiler libprotobuf-dev
           else
             brew install protobuf
           fi
