@@ -12,13 +12,8 @@ jobs:
   update:
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
-        with:
-          egress-policy: block
-          allowed-endpoints: >
-            api.github.com:443
       - name: Update open PRs with latest main
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -36,7 +31,7 @@ jobs:
                   repo: context.repo.repo,
                   pull_number: pr.number,
                 });
-                core.info(`Updated PR #${pr.number}`);
+                core.info(`Updated PR #${pr.number}: ${pr.title}`);
               } catch (err) {
                 if (err.status === 422) {
                   core.info(`PR #${pr.number} already up-to-date`);
