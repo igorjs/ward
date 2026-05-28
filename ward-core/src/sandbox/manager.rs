@@ -72,19 +72,31 @@ pub struct SandboxManager {
     entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
     /// Maximum concurrent sandboxes. Prevents resource exhaustion from unbounded creation.
     max_sandboxes: usize,
+    /// SEC-020: snapshot of `Config::allow_host_mounts` taken at daemon
+    /// startup. Stored on the manager so the security posture is read
+    /// once and cannot mutate mid-process (in particular, a sandbox
+    /// escape that touches `/proc/<pid>/environ` cannot widen it).
+    allow_host_mounts: bool,
     /// Process records keyed by pid. Populated by exec/run; drained by
-    /// stream_output. Lives for the lifetime of the manager — small leak
-    /// bounded by sandbox lifetime, cleaned up when the sandbox is removed.
+    /// stream_output. Lives for the lifetime of the manager; the leak
+    /// is bounded by sandbox lifetime and cleaned up when the sandbox
+    /// is removed.
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
 }
 
 impl SandboxManager {
-    pub fn new(backend: Arc<dyn Backend>, broker: Arc<Broker>, max_sandboxes: usize) -> Self {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        broker: Arc<Broker>,
+        max_sandboxes: usize,
+        allow_host_mounts: bool,
+    ) -> Self {
         Self {
             backend,
             broker,
             entries: Arc::new(RwLock::new(HashMap::new())),
             max_sandboxes,
+            allow_host_mounts,
             processes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -127,16 +139,16 @@ impl SandboxManager {
         // Validate and convert bind mounts; the backend attaches them to the
         // microVM. (Previously mounts were silently dropped.)
         //
-        // SEC-020: WARD_ALLOW_HOST_MOUNTS=1 lifts the source-path
-        // allowlist for trusted operator workflows (e.g. CI runners
-        // that need to mount arbitrary host paths). Read per-request
-        // — env reads are cheap relative to a sandbox creation.
-        let allow_host_mounts = std::env::var("WARD_ALLOW_HOST_MOUNTS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // SEC-020: `self.allow_host_mounts` is the Config snapshot taken
+        // at daemon startup, NOT a per-request env read. This makes the
+        // security posture stable for the daemon's lifetime: a sandbox
+        // escape that reads `/proc/<pid>/environ` and finds
+        // `WARD_ALLOW_HOST_MOUNTS=1` cannot widen subsequent requests'
+        // mount allowlist, because the validator reads the snapshot,
+        // not the live env.
         let mut mounts = Vec::with_capacity(req.mounts.len());
         for m in &req.mounts {
-            crate::validate::mount(&m.source, &m.target, m.readonly, allow_host_mounts)?;
+            crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
             mounts.push(crate::protocol::Mount {
                 source: m.source.clone(),
                 target: m.target.clone(),
@@ -606,7 +618,15 @@ mod tests {
         std::mem::forget(dir);
         let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(path));
         let broker = Arc::new(Broker::new());
-        Arc::new(SandboxManager::new(backend, broker, max_sandboxes))
+        // Default to allow_host_mounts=false so the cap path is exercised
+        // by the existing test corpus; per-test overrides go through a
+        // dedicated builder if they need the opt-in.
+        Arc::new(SandboxManager::new(
+            backend,
+            broker,
+            max_sandboxes,
+            /* allow_host_mounts = */ false,
+        ))
     }
 
     fn create_req(image: &str) -> CreateSandboxRequest {

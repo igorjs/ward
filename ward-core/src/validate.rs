@@ -323,6 +323,44 @@ mod tests {
     use pretty_assertions::assert_eq;
     use rstest::rstest;
 
+    // ----- SEC-020 mount allowlist + sensitive-path boundaries -------------
+
+    #[test]
+    fn given_homeless_path_when_is_default_allowed_then_rejected() {
+        // Regression guard: the allowlist matches by prefix WITH a
+        // trailing slash, so `/homeless` must NOT match `/home/`.
+        // Without the trailing slash a naive prefix check would let a
+        // sandbox bind-mount the operator's `/homeless` directory.
+        assert!(!is_default_allowed_source("/homeless/secrets"));
+        assert!(!is_default_allowed_source("/homeless"));
+    }
+
+    #[test]
+    fn given_etcetera_path_when_is_sensitive_then_not_flagged() {
+        // Symmetric to the allowlist case: `/etc` must match `/etc` and
+        // `/etc/passwd`, but NOT `/etcetera`. The `format!("{root}/")`
+        // suffix is what enforces the boundary.
+        assert!(!is_sensitive_host_path("/etcetera"));
+        assert!(!is_sensitive_host_path("/etcetera/passwd"));
+    }
+
+    #[test]
+    fn given_etc_root_and_subpath_when_is_sensitive_then_flagged() {
+        // Positive boundary cases: the bare root and any subpath under
+        // it both count as sensitive. Both must require `readonly`.
+        assert!(is_sensitive_host_path("/etc"));
+        assert!(is_sensitive_host_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn given_tmp_and_var_lib_ward_roots_when_is_default_allowed_then_ok() {
+        // Bare root paths (without trailing slash) should match the
+        // allowlist; otherwise mounting `/tmp` itself would inexplicably
+        // fail while mounting `/tmp/subdir` would succeed.
+        assert!(is_default_allowed_source("/tmp"));
+        assert!(is_default_allowed_source("/var/lib/ward"));
+    }
+
     // ----- image_ref ------------------------------------------------------
 
     #[rstest]

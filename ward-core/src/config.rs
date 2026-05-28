@@ -17,6 +17,13 @@ pub struct Config {
     pub max_volumes: usize,
     /// Maximum number of cached OCI images. Prevents disk exhaustion.
     pub max_cached_images: usize,
+    /// SEC-020: when true, the mount validator accepts arbitrary host
+    /// paths as bind-mount sources. False by default (the safe option:
+    /// only `/home/`, `/tmp/`, `/var/lib/ward/` are allowed). Set by
+    /// `WARD_ALLOW_HOST_MOUNTS=1` at the daemon. Read once at startup
+    /// so the security posture isn't per-request mutable from anyone
+    /// who can poke the daemon's environment.
+    pub allow_host_mounts: bool,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -30,6 +37,7 @@ pub struct ConfigEnv {
     pub ward_max_sandboxes: Option<String>,
     pub ward_max_volumes: Option<String>,
     pub ward_max_cached_images: Option<String>,
+    pub ward_allow_host_mounts: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -45,6 +53,7 @@ impl Config {
             ward_max_sandboxes: std::env::var("WARD_MAX_SANDBOXES").ok(),
             ward_max_volumes: std::env::var("WARD_MAX_VOLUMES").ok(),
             ward_max_cached_images: std::env::var("WARD_MAX_CACHED_IMAGES").ok(),
+            ward_allow_host_mounts: std::env::var("WARD_ALLOW_HOST_MOUNTS").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -94,6 +103,16 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(64);
 
+        // SEC-020: accept "1" or "true" (case-insensitive) as opt-in.
+        // Any other value, including unset, is treated as the safe
+        // default (deny). Strict parsing keeps a typo like
+        // `WARD_ALLOW_HOST_MOUNTS=yes` from being silently honoured.
+        let allow_host_mounts = env
+            .ward_allow_host_mounts
+            .as_deref()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Self {
             socket_path,
             data_dir,
@@ -101,6 +120,7 @@ impl Config {
             max_sandboxes,
             max_volumes,
             max_cached_images,
+            allow_host_mounts,
         }
     }
 
@@ -390,6 +410,53 @@ mod tests {
         };
         let cfg = Config::from_values(env);
         assert_eq!(cfg.max_cached_images, 128);
+    }
+
+    // ----- WARD_ALLOW_HOST_MOUNTS (SEC-020) ------------------------------
+
+    #[test]
+    fn given_no_allow_host_mounts_when_from_values_then_default_is_false() {
+        // Default-deny is the security posture; an unset env var must
+        // resolve to false rather than a permissive surprise.
+        let env = env_with_home();
+        let cfg = Config::from_values(env);
+        assert!(!cfg.allow_host_mounts);
+    }
+
+    #[test]
+    fn given_allow_host_mounts_one_when_from_values_then_enabled() {
+        let env = ConfigEnv {
+            ward_allow_host_mounts: Some("1".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert!(cfg.allow_host_mounts);
+    }
+
+    #[test]
+    fn given_allow_host_mounts_true_case_insensitive_when_from_values_then_enabled() {
+        for v in ["true", "TRUE", "True", "tRuE"] {
+            let env = ConfigEnv {
+                ward_allow_host_mounts: Some(v.into()),
+                ..env_with_home()
+            };
+            let cfg = Config::from_values(env);
+            assert!(cfg.allow_host_mounts, "{v:?} should enable");
+        }
+    }
+
+    #[test]
+    fn given_allow_host_mounts_other_value_when_from_values_then_disabled() {
+        // Strict parsing: only "1" or "true" enable. "yes", "on", "0",
+        // and the empty string all leave the safe default in place.
+        for v in ["yes", "on", "0", "false", "", "TruE!"] {
+            let env = ConfigEnv {
+                ward_allow_host_mounts: Some(v.into()),
+                ..env_with_home()
+            };
+            let cfg = Config::from_values(env);
+            assert!(!cfg.allow_host_mounts, "{v:?} must NOT enable");
+        }
     }
 
     // ----- Platform-specific socket defaults -----------------------------
