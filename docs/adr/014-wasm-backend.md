@@ -7,14 +7,14 @@
 ## Context
 
 ward's primary isolation backend is libkrun ([ADR-003](003-isolation-backend.md))
-— hardware-virtualised microVMs, sub-second boot, real Linux kernel
+via hardware-virtualised microVMs, sub-second boot, real Linux kernel
 per sandbox. The Backend trait ([ADR-012](012-backend-trait.md)) abstracts
 this so future backends can plug in.
 
 A growing class of workloads doesn't need a full microVM:
 
-- Untrusted JS/Python/Rust **function** snippets from an LLM — "compute
-  the sum of this list", "transform this JSON" — that need code
+- Untrusted JS/Python/Rust **function** snippets from an LLM ("compute
+  the sum of this list", "transform this JSON") that need code
   evaluation but no OS surface, no syscalls beyond memory + math, no
   network.
 - Plugin systems where third-party code extends a host application.
@@ -60,9 +60,9 @@ methods map awkwardly. The honest answer: WASM only supports a subset:
 |---|---|
 | `create_sandbox` | Instantiate a wasmtime `Engine` + `Store`. Module URL stored, not yet loaded. |
 | run a command | Map `command[0]` to a wasm export name. Args / env passed via WASI. |
-| `kill_process(pid)` | `Store::epoch_deadline` interrupt or `Store::interrupt_handle().interrupt()` |
+| `kill_process(pid)` | Epoch interruption: `Engine::increment_epoch()` after `Config::epoch_interruption(true)`. (The older `Store::interrupt_handle().interrupt()` API is removed in current wasmtime releases.) |
 | `get_sandbox`, `list_sandboxes`, `remove_sandbox` | Same shape as libkrun |
-| `create_snapshot`, `restore_snapshot` | **Unsupported** — wasmtime has no checkpoint API today. Return `Unimplemented`. |
+| `create_snapshot`, `restore_snapshot` | **Unsupported**: wasmtime has no checkpoint API today. Return `Unimplemented`. |
 
 Some operations don't make sense:
 - Bind mounts → WASI dirs (different mechanism but conceptually similar)
@@ -77,9 +77,9 @@ WASM modules are not OCI images. Three options:
 1. **OCI artifact spec.** WASM modules wrapped in OCI manifests
    (wasi-oci specifies this). Reuses the OCI registry infrastructure
    ward already has.
-2. **Bare module URL.** `wasm:https://example.com/module.wasm` —
+2. **Bare module URL.** `wasm:https://example.com/module.wasm`:
    simpler but no signing / discovery story.
-3. **Local file.** `wasm:///path/to/module.wasm` — for development.
+3. **Local file.** `wasm:///path/to/module.wasm` for development.
 
 Pick option 1 (OCI artifact spec) as the primary path: lets ward's
 existing image-pull machinery work for WASM with minimal change.
@@ -106,7 +106,7 @@ reference in `image`.
   sandbox for JS functions" hasn't come up. Building speculatively
   invites premature complexity.
 - **WASM ecosystem is fast-moving.** Component model, WASI 0.3,
-  WIT bindings — what's idiomatic today may be obsolete in 6 months.
+  WIT bindings; what's idiomatic today may be obsolete in 6 months.
   Waiting reduces churn.
 - **The hard part is the API design, not the implementation.** Once
   the `Isolation` field and `WasmtimeBackend` skeleton are agreed,
@@ -120,7 +120,7 @@ reference in `image`.
   or the gRPC layer.
 - Users get a "use the right isolation for the workload" mental model:
   microVM when you need a kernel, WASM when you need a function.
-- ward's threat model becomes more nuanced — different sandboxes
+- ward's threat model becomes more nuanced: different sandboxes
   on the same daemon may have different isolation strengths.
   [SECURITY.md](../../SECURITY.md) needs an "Isolation modes" section
   when this lands.

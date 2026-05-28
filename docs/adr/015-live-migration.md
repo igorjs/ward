@@ -12,14 +12,14 @@ Today ward's sandboxes are **ephemeral**:
   sandbox.
 - `ward snapshot create` ([ADR-009](009-snapshots.md)) captures
   **disk-only** state: the sandbox's rootfs as a tarball. Memory, CPU
-  registers, open file descriptors, vsock state — none of these are
+  registers, open file descriptors, vsock state. None of these are
   serialised. Restore creates a new VM that boots from the captured
   rootfs.
 - Cross-host migration is not supported (and isn't really possible
   without live state capture).
 
 This is fine for the lead use case (ephemeral untrusted code execution
-for AI agents — see [examples/ai-agent-sandbox/](../../examples/ai-agent-sandbox/)).
+for AI agents, the workflow ward was designed around).
 It is **not** fine for emerging use cases:
 
 1. **Long-running sandboxes.** A workload that runs for hours or days
@@ -43,7 +43,7 @@ etc.
   API** as of the time of this ADR. Some support exists internally but
   is gated behind unreleased work.
 - **Firecracker** has had live snapshot/restore (CRIU-style) since
-  2019; it's a primary differentiator.
+  v0.23.0 (early 2020); it's a primary differentiator.
 - **CRIU itself** could be used at the host level (ward checkpoints the
   libkrun process); fragile because libkrun + KVM/HVF state isn't
   CRIU-safe in general.
@@ -119,7 +119,7 @@ message ForkRequest {
 }
 ```
 
-The source sandbox is **paused, snapshotted, then forked** — N new
+The source sandbox is **paused, snapshotted, then forked**: N new
 sandboxes resume from the snapshot's memory state. Useful for:
 
 - Warm-starting test runners

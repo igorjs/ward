@@ -9,7 +9,7 @@
 ward today is a **single-user daemon**:
 
 - `wardd` binds a Unix domain socket at mode `0600` under `$HOME/.ward` (or
-  `$XDG_RUNTIME_DIR/ward/`) — only the invoking OS user can connect.
+  `$XDG_RUNTIME_DIR/ward/`); only the invoking OS user can connect.
 - The gRPC API has no authn layer: any client connecting to the socket
   can call any method (the OS-level peer-UID check via the socket is the
   authentication boundary).
@@ -29,9 +29,9 @@ This is appropriate for the documented usage today: a developer running
    doesn't extend.
 3. **Remote access.** [ADR-004](004-ipc-protocol.md) gestures at "Remote
    (TCP): API key in gRPC metadata (`authorization: Bearer ward-key-xxx`).
-   mTLS for daemon-to-daemon." Neither is implemented. The audit
-   ([analysis/main/raw-audit.md](../../analysis/main/raw-audit.md))
-   flagged the gap (SEC-008 cluster).
+   mTLS for daemon-to-daemon." Neither is implemented. The internal
+   security audit flagged the gap (the SEC-008 cluster), and the
+   hardening PR closed everything except the multi-tenant arm.
 
 This ADR proposes the shape of multi-tenant authn/authz when (if) the
 use case arrives, so future-Igor isn't designing it from scratch under
@@ -114,14 +114,15 @@ operations filter to caller-owned by default; admin principals see all.
 ## Consequences
 
 - ward keeps a tight single-user posture by default. The Unix socket
-  permission model + the recent SEC-002/003/004 hardening (PR #38) is
+  permission model + the recent SEC-002/003/004 hardening (PR
+  [#38](https://github.com/igorjs/ward/pull/38)) is
   the boundary.
 - [SECURITY.md](../../SECURITY.md) explicitly lists "multi-tenant
   authn/authz" as out-of-scope for now; updates if/when this ADR is
   accepted.
 - Two related issues remain open as triggers: when either lands, this
   ADR is re-opened and implementation starts.
-  - [#56](https://github.com/igorjs/ward/issues/56) — this ADR's tracking issue
+  - [#56](https://github.com/igorjs/ward/issues/56) is this ADR's tracking issue
   - Any future "wardd for shared dev box" / "wardd at the office" use case
 
 ## Alternatives considered
