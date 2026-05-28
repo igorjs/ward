@@ -59,22 +59,38 @@ impl ImagePuller for OciPuller {
         })?;
 
         // SEC-019 (part 1): registry allowlist enforcement.
-        // WARD_REGISTRY_ALLOWLIST is comma-separated; unset = allow any
-        // registry (today's default, backwards-compatible). When set,
-        // image_ref.registry() (which defaults to docker.io for
-        // unqualified refs) is checked against the list.
+        // WARD_REGISTRY_ALLOWLIST is comma-separated; unset OR
+        // empty-after-trim = allow any registry (the documented
+        // operator opt-out; the daemon emits a startup warn for the
+        // empty-string case so a typo does not silently disable the
+        // check). When set with content, image_ref.registry()
+        // (defaults to docker.io for unqualified refs) is checked
+        // against the list. The lookup tolerates legacy / pasted
+        // forms (`https://`, trailing slash, `index.docker.io` ->
+        // `docker.io`) so an operator who pastes a URL into the env
+        // var does not get a silently-rejecting daemon.
+        //
+        // Read per-pull deliberately: pulls are network-bound (hundreds
+        // of ms minimum) so a 50-ns env-var read is irrelevant, and
+        // staying out of Config keeps the OciPuller composable in
+        // tests without a startup config dance.
         //
         // Cosign signature verification (the second half of SEC-019) is
-        // tracked separately; it requires `sigstore-rs` which is a
-        // larger dep evaluation.
-        let allowlist_env = std::env::var("WARD_REGISTRY_ALLOWLIST").ok();
-        if let Some(ref allowlist) = allowlist_env
-            && !is_registry_allowed(image_ref.registry(), allowlist)
+        // tracked separately; it requires `sigstore-rs`, a larger
+        // dep evaluation.
+        if let Ok(raw) = std::env::var("WARD_REGISTRY_ALLOWLIST")
+            && !raw.trim().is_empty()
+            && !is_registry_allowed(image_ref.registry(), &raw)
         {
             return Err(BackendError::Image(format!(
-                "registry {} is not in WARD_REGISTRY_ALLOWLIST ({})",
+                "registry {} is not in WARD_REGISTRY_ALLOWLIST ({}); \
+                 set WARD_REGISTRY_ALLOWLIST to include {} (e.g. \
+                 \"docker.io,ghcr.io,{}\"), or unset the variable to \
+                 allow any registry",
                 image_ref.registry(),
-                allowlist
+                raw,
+                image_ref.registry(),
+                image_ref.registry(),
             )));
         }
 
@@ -102,15 +118,46 @@ impl ImagePuller for OciPuller {
 }
 
 /// SEC-019: check whether `registry` falls in the comma-separated
-/// `WARD_REGISTRY_ALLOWLIST`. Whitespace around each entry is
-/// trimmed; empty entries are ignored. Match is case-insensitive
-/// (registry hostnames are DNS-style).
+/// `WARD_REGISTRY_ALLOWLIST`. Each entry is normalised before compare:
+///
+/// 1. trim surrounding whitespace
+/// 2. strip a leading `http://` or `https://` (operators occasionally
+///    paste full URLs)
+/// 3. drop trailing `/` (so `docker.io/` and `docker.io` are equivalent)
+/// 4. treat `index.docker.io` as an alias for `docker.io` (the legacy
+///    Docker hostname; the OCI Reference parser normalises in the
+///    opposite direction, so allowlist entries written either way must
+///    both match)
+///
+/// Match is case-insensitive (DNS hostnames are case-insensitive). Empty
+/// entries after normalisation are ignored.
 fn is_registry_allowed(registry: &str, allowlist: &str) -> bool {
+    let needle = normalise_registry(registry);
     allowlist
         .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .any(|entry| entry.eq_ignore_ascii_case(registry))
+        .map(normalise_registry)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry == needle)
+}
+
+fn normalise_registry(s: &str) -> String {
+    let mut s = s.trim();
+    for prefix in ["https://", "http://"] {
+        if let Some(stripped) = s.strip_prefix(prefix) {
+            s = stripped;
+            break;
+        }
+    }
+    let s = s.trim_end_matches('/').to_ascii_lowercase();
+    // Docker Hub legacy hostname `index.docker.io` resolves to the same
+    // registry as `docker.io`. The OCI Reference parser emits one or
+    // the other depending on the input; allowlist entries written
+    // either way must both match.
+    if s == "index.docker.io" {
+        "docker.io".to_string()
+    } else {
+        s
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,10 +732,51 @@ mod tests {
 
     #[test]
     fn given_empty_allowlist_when_is_registry_allowed_then_false() {
-        // An explicit empty list rejects every registry. Operators who
-        // want "allow everything" leave WARD_REGISTRY_ALLOWLIST unset
-        // entirely (and the pull-site check skips the function call).
+        // The function itself rejects an empty list (nothing to match
+        // against). The pull-site short-circuits before the call when
+        // the env var is empty-after-trim, so this case is the "caller
+        // bypassed the short-circuit" contract guard; daemon startup
+        // also emits a warn so the empty-string operator footgun is
+        // loud, not silent.
         assert!(!is_registry_allowed("docker.io", ""));
         assert!(!is_registry_allowed("docker.io", "   "));
+    }
+
+    #[test]
+    fn given_index_docker_io_alias_when_is_registry_allowed_then_normalised() {
+        // Legacy hostname `index.docker.io` is the same registry as
+        // `docker.io`. Allowlists written either way must accept refs
+        // produced by oci_client's Reference parser (which may emit
+        // either form depending on input).
+        assert!(is_registry_allowed("index.docker.io", "docker.io"));
+        assert!(is_registry_allowed("docker.io", "index.docker.io"));
+    }
+
+    #[test]
+    fn given_https_scheme_prefix_when_is_registry_allowed_then_stripped() {
+        // Operators occasionally paste full URLs (`https://ghcr.io`)
+        // into the env var rather than bare hostnames. Tolerate that
+        // rather than silently rejecting every ghcr pull. Same for
+        // http://.
+        assert!(is_registry_allowed("ghcr.io", "https://ghcr.io"));
+        assert!(is_registry_allowed("ghcr.io", "http://ghcr.io"));
+    }
+
+    #[test]
+    fn given_trailing_slash_when_is_registry_allowed_then_stripped() {
+        // `docker.io/` and `docker.io` are equivalent registry
+        // identifiers; the trailing-slash form is what you get from
+        // copy-paste of a URL like `https://docker.io/`.
+        assert!(is_registry_allowed("docker.io", "docker.io/"));
+        assert!(is_registry_allowed("docker.io", "https://docker.io/"));
+    }
+
+    #[test]
+    fn given_localhost_with_port_when_is_registry_allowed_then_exact_match() {
+        // Private-registry users pin a port; the normaliser must NOT
+        // strip the port. `localhost:5000` only matches itself.
+        assert!(is_registry_allowed("localhost:5000", "localhost:5000"));
+        assert!(!is_registry_allowed("localhost:5000", "localhost"));
+        assert!(!is_registry_allowed("localhost", "localhost:5000"));
     }
 }
