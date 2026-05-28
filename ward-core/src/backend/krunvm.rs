@@ -298,25 +298,35 @@ impl Backend for KrunvmBackend {
     /// SEC-017/018: verifies that `sandbox_id` matches the recorded
     /// owner of `pid` before signalling. A mismatched call returns
     /// Ok(()) (treat as not-found, don't leak which sandbox owns the
-    /// pid per ADR-004) and logs a warning so misuse is visible.
+    /// pid per ADR-004) and logs at `debug!` so misuse is visible to
+    /// operators who turn the level up; using `warn!` would surface
+    /// the (caller, pid) pair on default-level shipping, which itself
+    /// is the cross-tenant correlation ADR-004 wants suppressed.
     async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()> {
         let mut processes = self.processes.write().await;
-        let Some(record) = processes.get(pid) else {
-            return Ok(());
-        };
-        if record.sandbox_id != sandbox_id {
-            tracing::warn!(
-                caller_sandbox = %sandbox_id,
-                pid = %pid,
-                "kill_process: caller sandbox does not own pid; refusing without signalling"
-            );
-            return Ok(());
-        }
-        // Owner matches: remove + signal. Best-effort send — a closed
-        // receiver just means the process already exited and its bridge
-        // task is gone.
-        if let Some(record) = processes.remove(pid) {
-            let _ = record.kill_tx.send(()).await;
+        // Single match over the borrowed entry: the prior `get` + `remove`
+        // pair had a dead-code defensive branch (the second `Some` was
+        // unreachable under the held write lock) that misled readers
+        // into thinking there was a real `None` case to handle.
+        match processes.get(pid) {
+            Some(record) if record.sandbox_id == sandbox_id => {
+                // Owner matches; safe to remove + signal. `unwrap` is sound
+                // because we just observed the entry under the write lock,
+                // which we have held continuously.
+                let record = processes.remove(pid).expect("entry observed under write lock");
+                // Best-effort send: a closed receiver just means the
+                // process already exited and its bridge task is gone.
+                let _ = record.kill_tx.send(()).await;
+            }
+            Some(_) => {
+                tracing::debug!(
+                    target: "ward::security_audit",
+                    caller_sandbox = %sandbox_id,
+                    pid = %pid,
+                    "kill_process: caller sandbox does not own pid; refusing without signalling"
+                );
+            }
+            None => {}
         }
         Ok(())
     }
