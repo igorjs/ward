@@ -1,9 +1,10 @@
-# Ward rollout plan (post 2026-05-29 session)
+# Session 2026-05-29: SLSA L3 rollout + 13-branch consolidation
 
-This document captures where `main` is after the SLSA L3 + 13-branch
-consolidation campaign, and what's still required before a real v0.1.0
-release. It lives under `tmp/` because it's a planning artefact, not
-project documentation; once v0.1.0 ships this file can be deleted.
+This document captures the state of `main` after the SLSA L3
+attestation work and the 13-branch consolidation campaign that ran on
+2026-05-29, plus what's still required before a real v0.1.0 release.
+Filed under `docs/sessions/` as a session log; future sessions can
+reference it by date.
 
 ## Current state of `main`
 
@@ -154,9 +155,6 @@ Without #9 + #10 specifically, `ward exec` is decorative under
   formatter for macOS.
 - Dependabot PR open (`dependabot/go_modules/sdks/go/google.golang.org/grpc-1.79.3`)
   bumping go.mod grpc dep. Routine.
-- `tmp/` directory is NOT gitignored. This `tmp/ROLLOUT-PLAN.md` is
-  intentionally tracked under a `tmp/rollout-plan` branch so it has
-  a stable URL; delete the branch + the file once v0.1.0 ships.
 - One commit (`fix(release): add libprotobuf-dev for well-known proto
   includes on Linux`) was accidentally direct-pushed to `main` during
   the SLSA L3 saga because `git checkout -b X origin/main` made the
