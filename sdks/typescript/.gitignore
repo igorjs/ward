@@ -1,0 +1,6 @@
+node_modules/
+dist/
+src/proto/*.ts
+src/proto/*.js
+*.log
+.env

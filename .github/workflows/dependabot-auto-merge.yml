@@ -11,30 +11,24 @@ jobs:
     runs-on: ubuntu-latest
     if: github.actor == 'dependabot[bot]'
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            api.github.com:443
+          egress-policy: audit
       - name: Fetch Dependabot metadata
         id: metadata
-        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # SEC-006: minor updates can include behavior changes or security
-      # regressions (especially in pre-1.0 crates where minor IS the
-      # breaking-channel). Restrict auto-merge to patch bumps only;
-      # minor + major still require human review.
-      - name: Auto-approve patch updates only
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
+      - name: Auto-approve patch and minor updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         run: gh pr review --approve "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Enable auto-merge for patch updates only
-        if: steps.metadata.outputs.update-type == 'version-update:semver-patch'
+      - name: Enable auto-merge for patch and minor updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
         run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}

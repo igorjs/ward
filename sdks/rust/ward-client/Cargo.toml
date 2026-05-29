@@ -1,0 +1,36 @@
+[package]
+name = "ward-client"
+version = "0.1.0"
+description = "Rust client for the ward sandbox daemon"
+license = "Apache-2.0"
+authors = ["Igor Santos <oss@mail.igorjs.io>"]
+repository = "https://github.com/igorjs/ward"
+homepage = "https://github.com/igorjs/ward"
+documentation = "https://docs.rs/ward-client"
+keywords = ["ward", "sandbox", "microvm", "isolation", "grpc"]
+categories = ["api-bindings", "virtualization"]
+edition.workspace = true
+rust-version.workspace = true
+
+# This crate is intentionally Apache-2.0 while the workspace is AGPL-3.0-only.
+# That split only holds if `ward-client` has zero `path =` dependency on any
+# AGPL crate (ward-core, ward-daemon, ward-agent). Linking AGPL code at the
+# Cargo level produces a derivative work under AGPL terms, which would silently
+# override the Apache-2.0 declaration here. When the gRPC stub wiring lands,
+# the .proto-generated types must be sourced from one of:
+#   1. a separate `ward-proto` crate published under Apache-2.0, or
+#   2. local codegen vendored into this crate's `src/proto/`,
+# never via `path = "../../../ward-core"`.
+
+[dependencies]
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+tonic = "0.14"
+prost = "0.14"
+thiserror = "2"
+tower = "0.5"
+hyper-util = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+pretty_assertions = "1"
+tempfile = "3"

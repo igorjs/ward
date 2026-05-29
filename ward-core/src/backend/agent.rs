@@ -27,7 +27,12 @@ pub mod proto {
 
 use proto::{Event, Exec, Request, event, request};
 
-const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+/// SEC-010: lowered from 16 MiB to 2 MiB to match the daemon's broker
+/// publish-payload cap (1 MiB) plus protobuf-wrapping headroom. The
+/// previous 16 MiB cap allowed a hostile guest agent (or a compromised
+/// vsock bridge) to force a 16 MiB allocation per connection before
+/// any payload arrived.
+const MAX_FRAME_BYTES: u32 = 2 * 1024 * 1024;
 
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
@@ -37,10 +42,20 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<V
         Err(e) => return Err(e),
     }
     let len = u32::from_be_bytes(len_buf);
+    // SEC-010: reject zero-length frames. Well-formed protobuf is never
+    // empty; len=0 is either a buggy peer or an attacker probe. Use
+    // `InvalidData` (not `Other`) so the error kind matches the
+    // semantic category and log filters can route on it.
+    if len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame length must be non-zero",
+        ));
+    }
     if len > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("frame too large: {len} bytes"),
+            format!("frame too large: {len} bytes (max {MAX_FRAME_BYTES})"),
         ));
     }
     let mut buf = vec![0u8; len as usize];
@@ -48,9 +63,26 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<V
     Ok(Some(buf))
 }
 
+/// SEC-010: mirror the reader's len/cap rejection on the write side so
+/// the protocol invariant holds symmetrically. Without this the daemon
+/// could ship a malformed `len = 0` frame (from a future `Request::default()`
+/// caller) to the guest, where the agent's reader would reject it as
+/// `InvalidData` and surface the failure as an opaque peer disconnect.
 async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "frame payload must be non-empty",
+        ));
+    }
     let len = u32::try_from(bytes.len())
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "frame exceeds u32"))?;
+    if len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("frame too large to write: {len} bytes (max {MAX_FRAME_BYTES})"),
+        ));
+    }
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(bytes).await?;
     w.flush().await?;
@@ -244,6 +276,75 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    // ----- SEC-010 frame invariants ----------------------------------------
+
+    #[tokio::test]
+    async fn given_zero_length_header_when_read_frame_then_invalid_data() {
+        // Arrange
+        let (mut client, mut server) = tokio::io::duplex(8);
+        client.write_all(&0u32.to_be_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Act
+        let err = read_frame(&mut server)
+            .await
+            .expect_err("len=0 must be rejected");
+
+        // Assert: same contract as the agent side; symmetric kind enables
+        // shared log filters.
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("non-zero"));
+    }
+
+    #[tokio::test]
+    async fn given_over_cap_length_header_when_read_frame_then_invalid_data() {
+        // Arrange
+        let (mut client, mut server) = tokio::io::duplex(8);
+        let oversized = MAX_FRAME_BYTES + 1;
+        client.write_all(&oversized.to_be_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        // Act
+        let err = read_frame(&mut server)
+            .await
+            .expect_err("over-cap must be rejected");
+
+        // Assert
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn given_empty_payload_when_write_frame_then_invalid_input() {
+        // Arrange
+        let mut sink: Vec<u8> = Vec::new();
+
+        // Act
+        let err = write_frame(&mut sink, &[])
+            .await
+            .expect_err("empty payload must be rejected");
+
+        // Assert
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(sink.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_over_cap_payload_when_write_frame_then_invalid_input() {
+        // Arrange
+        let mut sink: Vec<u8> = Vec::new();
+        let oversize = vec![0u8; (MAX_FRAME_BYTES as usize) + 1];
+
+        // Act
+        let err = write_frame(&mut sink, &oversize)
+            .await
+            .expect_err("over-cap payload must be rejected");
+
+        // Assert
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(sink.is_empty());
     }
 
     #[tokio::test]
