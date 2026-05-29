@@ -51,6 +51,11 @@ uuid = { version = "1", features = ["v4"] }
 # Already a transitive dep via tempfile -> native-tls; promoted to a
 # direct dep so the rustix usage is explicit in this crate's manifest.
 rustix = { version = "1", features = ["fs"] }
+# metrics: zero-overhead recorder façade. Daemon installs the
+# prometheus exporter; this crate emits the counters/gauges/histograms
+# the daemon scrapes. No-op if no exporter is installed (i.e. when
+# `metrics-exporter-prometheus` isn't wired up by the binary).
+metrics = "0.24"
 
 [build-dependencies]
 # tonic 0.14 moved prost codegen out of tonic-build into tonic-prost-build.

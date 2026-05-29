@@ -113,6 +113,10 @@ impl SandboxManager {
 
     /// Create a new sandbox.
     pub async fn create(&self, req: crate::pb::CreateSandboxRequest) -> Result<PbSandboxInfo> {
+        // Metrics: time the full create path (validation + backend boot +
+        // bookkeeping). Recorded on every call regardless of outcome
+        // because the failure rate matters as much as the success rate.
+        let create_start = std::time::Instant::now();
         crate::validate::image_ref(&req.image)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
@@ -195,15 +199,40 @@ impl SandboxManager {
 
         let egress = EgressProxy::new(id.clone(), egress_policy);
 
-        // Register a timeout watcher if requested.
+        // Register a timeout watcher if requested. The watcher routes the
+        // cleanup through `cleanup_sandbox_inner` (with from_timeout=true)
+        // so the bookkeeping side effects, entry removal, process record
+        // purge, broker deregistration, and the active-gauge decrement,
+        // match the user-initiated remove path exactly. Without this the
+        // gauge would never drop on timeout-driven shutdowns, gradually
+        // overstating "active sandboxes" forever after the first timer
+        // fires.
         let timeout_handle = if info.resources.timeout_seconds > 0 {
+            let entries = Arc::clone(&self.entries);
+            let broker = Arc::clone(&self.broker);
             let backend = Arc::clone(&self.backend);
+            let processes = Arc::clone(&self.processes);
             let sandbox_id = id.clone();
             let secs = info.resources.timeout_seconds;
             Some(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                tracing::info!(sandbox_id, "sandbox timeout reached, removing");
-                let _ = backend.remove_sandbox(&sandbox_id).await;
+                tracing::info!(sandbox_id = %sandbox_id, "sandbox timeout reached, removing");
+                if let Err(e) = Self::cleanup_sandbox_inner(
+                    &entries,
+                    &broker,
+                    &backend,
+                    &processes,
+                    &sandbox_id,
+                    /* from_timeout = */ true,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        sandbox_id = %sandbox_id,
+                        error = %e,
+                        "backend remove failed during timeout cleanup; local state still purged"
+                    );
+                }
             }))
         } else {
             None
@@ -223,6 +252,14 @@ impl SandboxManager {
         // local registration fails — though entries.insert can't actually
         // fail here, the order keeps cleanup symmetric with remove().
         self.broker.register_sandbox(id, comms).await;
+
+        // Metrics: success path. Failure paths (the early `?`s above)
+        // already counted via the validate layer; this records the
+        // sandbox-creation-actually-happened signal an operator wants.
+        metrics::counter!("wardd_sandbox_create_total").increment(1);
+        metrics::histogram!("wardd_sandbox_create_duration_seconds")
+            .record(create_start.elapsed().as_secs_f64());
+        metrics::gauge!("wardd_sandbox_active").increment(1.0);
 
         Ok(protocol_info_to_pb(info))
     }
@@ -253,27 +290,60 @@ impl SandboxManager {
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
         crate::validate::entity_id(id, "sandbox")?;
-        // Cancel any pending timeout task.
-        if let Some(entry) = self.entries.write().await.remove(id)
-            && let Some(handle) = entry.timeout_handle
-        {
-            handle.abort();
-        }
+        Self::cleanup_sandbox_inner(
+            &self.entries,
+            &self.broker,
+            &self.backend,
+            &self.processes,
+            id,
+            /* from_timeout = */ false,
+        )
+        .await
+        .map_err(backend_err)
+    }
 
-        // Drop any process records that belong to this sandbox so they
-        // do not accumulate over a long-lived daemon's lifetime. The
-        // backend resources are torn down below; the in-memory bookkeeping
-        // goes here.
-        self.processes
+    /// Shared cleanup path for user-initiated `remove()` and timer-driven
+    /// expiry. Both must produce identical state: the entry leaves the
+    /// `entries` map, the process records for that sandbox are dropped,
+    /// the broker forgets the comms policy, the backend tears the
+    /// sandbox down, and the `wardd_sandbox_active` gauge decrements.
+    ///
+    /// The `from_timeout` flag exists so the timer-driven path does not
+    /// abort its own `JoinHandle`. Aborting the handle for the task we
+    /// are currently running in would cancel the task at the next
+    /// `.await`, leaving the cleanup half-applied. The user-driven path
+    /// holds no such constraint and must abort the timer so a removed
+    /// sandbox does not get torn down a second time when the timer
+    /// later fires.
+    async fn cleanup_sandbox_inner(
+        entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
+        broker: &Arc<Broker>,
+        backend: &Arc<dyn Backend>,
+        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
+        id: &str,
+        from_timeout: bool,
+    ) -> std::result::Result<(), BackendError> {
+        let removed = if let Some(entry) = entries.write().await.remove(id) {
+            if !from_timeout && let Some(handle) = entry.timeout_handle {
+                handle.abort();
+            }
+            true
+        } else {
+            false
+        };
+
+        processes
             .write()
             .await
             .retain(|_, rec| rec.sandbox_id != id);
+        broker.deregister_sandbox(id).await;
 
-        // Drop the comms registration too: drops the policy, the audit
-        // log, and any active subscriptions owned by this sandbox.
-        self.broker.deregister_sandbox(id).await;
-
-        self.backend.remove_sandbox(id).await.map_err(backend_err)
+        let result = backend.remove_sandbox(id).await;
+        if removed {
+            metrics::counter!("wardd_sandbox_remove_total").increment(1);
+            metrics::gauge!("wardd_sandbox_active").decrement(1.0);
+        }
+        result
     }
 
     /// Return the number of active sandboxes.
@@ -856,6 +926,42 @@ mod tests {
             .expect_err("unknown id");
 
         // Assert
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_with_timeout_when_timer_fires_then_routed_through_shared_cleanup() {
+        // Arrange: regression guard for the metrics-gauge leak. Pre-fix,
+        // the timeout watcher called `backend.remove_sandbox` directly,
+        // bypassing `cleanup_sandbox_inner` so the entries map never
+        // shrank and `wardd_sandbox_active` never decremented. Now both
+        // paths must agree.
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            resources: Some(PbResourceLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let s = mgr.create(req).await.expect("create");
+        assert_eq!(mgr.entries.read().await.len(), 1, "precondition");
+
+        // Act: wait past the timeout so the watcher fires.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+        // Assert: the entries map shrank (proof the shared cleanup ran
+        // rather than the old direct backend call), and the sandbox is
+        // gone from the backend's perspective.
+        assert!(
+            mgr.entries.read().await.is_empty(),
+            "entries map must shrink after timeout"
+        );
+        let err = mgr
+            .get(&s.id)
+            .await
+            .expect_err("must be gone after timeout");
         assert!(matches!(err, ApiError::SandboxNotFound(_)));
     }
 
