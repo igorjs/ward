@@ -60,6 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&backend),
         Arc::clone(&broker),
         cfg.max_sandboxes,
+        cfg.allow_host_mounts,
     ));
     let volume_mgr = Arc::new(VolumeManager::new(cfg.data_dir.clone(), cfg.max_volumes));
 
