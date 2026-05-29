@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "sdks/rust/ward-client",
     "ward-daemon",
     "ward-cli",
     "ward-core",
