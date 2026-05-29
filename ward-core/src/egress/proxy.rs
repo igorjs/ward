@@ -73,6 +73,12 @@ impl EgressProxy {
                 .any(|pattern| matches_domain(pattern, domain)),
         };
 
+        // Metrics: labelled by decision so operators can alert on the
+        // ratio (a sudden spike in `denied` may indicate a runaway
+        // sandbox or a misconfigured allowlist).
+        let decision = if allowed { "allowed" } else { "denied" };
+        metrics::counter!("wardd_egress_check_total", "decision" => decision).increment(1);
+
         self.record(domain, port, allowed).await;
         allowed
     }

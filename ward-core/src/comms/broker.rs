@@ -163,6 +163,7 @@ impl Broker {
             .unwrap_or_default();
 
         let mut delivered = 0u32;
+        let mut dropped = 0u32;
         let mut per_subscriber_entries: Vec<(String, LogEntry)> = vec![];
         for (sub_id, tx) in candidates {
             let sub_policy = match state.policies.get(&sub_id).cloned() {
@@ -195,7 +196,17 @@ impl Broker {
                         timestamp,
                     },
                 ));
+            } else {
+                // try_send returned Err: queue full (the slow-subscriber
+                // case the audit's SEC-016 flagged). Count it so operators
+                // can alert on broker_drop_total rising.
+                dropped += 1;
             }
+        }
+        metrics::counter!("wardd_broker_publish_total").increment(1);
+        metrics::counter!("wardd_broker_deliver_total").increment(delivered as u64);
+        if dropped > 0 {
+            metrics::counter!("wardd_broker_drop_total").increment(dropped as u64);
         }
 
         // Apply per-subscriber log entries.
