@@ -40,6 +40,25 @@ unsafe extern "C" {
     fn write(fd: std::ffi::c_int, buf: *const std::ffi::c_void, count: usize) -> isize;
 }
 
+// macOS-only: renamex_np(2) with RENAME_SWAP atomically swaps two
+// existing paths. Used by extract_rootfs to close the SEC-014 residual
+// on Darwin (Linux uses rustix::fs::renameat_with(RENAME_EXCHANGE) for
+// the same effect). Declared inline rather than pulling in `libc`,
+// matching the minimalism precedent set by the `write(2)` declaration
+// above and `kill(2)` in ward-agent.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn renamex_np(
+        from: *const std::ffi::c_char,
+        to: *const std::ffi::c_char,
+        flags: std::ffi::c_uint,
+    ) -> std::ffi::c_int;
+}
+/// RENAME_SWAP flag for renamex_np (from `<sys/stdio.h>` on Darwin).
+/// Swaps two existing paths atomically.
+#[cfg(target_os = "macos")]
+const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
+
 // ---------------------------------------------------------------------------
 // Per-sandbox state
 // ---------------------------------------------------------------------------
@@ -84,6 +103,15 @@ struct SandboxState {
 ///
 /// Each sandbox corresponds to one libkrun microVM context.  All unsafe krun
 /// FFI calls are isolated inside the private helpers of this struct.
+/// Per-process bookkeeping kept in `KrunvmBackend::processes`. The
+/// sandbox_id is what enables SEC-017/018: kill_process refuses to
+/// signal a pid whose owner doesn't match the caller's claim.
+#[derive(Debug)]
+struct ProcessRecord {
+    sandbox_id: String,
+    kill_tx: tokio::sync::mpsc::Sender<()>,
+}
+
 #[derive(Debug)]
 pub struct KrunvmBackend {
     sandboxes: Arc<RwLock<HashMap<String, SandboxState>>>,
@@ -92,10 +120,18 @@ pub struct KrunvmBackend {
     /// libkrun checkpoint state under data_dir/snapshots/.
     snapshots: Arc<RwLock<HashMap<String, SnapshotInfo>>>,
     data_dir: std::path::PathBuf,
-    /// Per-process kill senders, keyed by pid. Populated by the real exec
-    /// path so `kill_process` can signal the agent connection; empty in stub
-    /// builds, where killing is a no-op.
-    processes: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<()>>>>,
+    /// Per-process kill records, keyed by pid. Each record carries the
+    /// pid's owning sandbox_id alongside the kill channel so
+    /// `kill_process` can verify the caller-claimed sandbox owns the
+    /// pid before signalling. Populated by the real exec path; empty
+    /// in stub builds, where killing is a no-op.
+    ///
+    /// SEC-017/018: storing sandbox_id on the value side closes the
+    /// defence-in-depth gap where a future code path that calls
+    /// `Backend::kill_process` directly (without going through the
+    /// manager's ownership check) could signal a pid belonging to a
+    /// different sandbox.
+    processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
 }
 
 impl KrunvmBackend {
@@ -277,11 +313,41 @@ impl Backend for KrunvmBackend {
     /// Signal a process to terminate by sending a Kill over its agent
     /// connection. In stub builds the process map is empty, so this is a
     /// no-op (the manager tears the process down by dropping its channels).
-    async fn kill_process(&self, _sandbox_id: &str, pid: &str) -> Result<()> {
-        if let Some(kill_tx) = self.processes.write().await.remove(pid) {
-            // Best-effort: a closed receiver just means the process already
-            // exited and its bridge task is gone.
-            let _ = kill_tx.send(()).await;
+    ///
+    /// SEC-017/018: verifies that `sandbox_id` matches the recorded
+    /// owner of `pid` before signalling. A mismatched call returns
+    /// Ok(()) (treat as not-found, don't leak which sandbox owns the
+    /// pid per ADR-004) and logs at `debug!` so misuse is visible to
+    /// operators who turn the level up; using `warn!` would surface
+    /// the (caller, pid) pair on default-level shipping, which itself
+    /// is the cross-tenant correlation ADR-004 wants suppressed.
+    async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()> {
+        let mut processes = self.processes.write().await;
+        // Single match over the borrowed entry: the prior `get` + `remove`
+        // pair had a dead-code defensive branch (the second `Some` was
+        // unreachable under the held write lock) that misled readers
+        // into thinking there was a real `None` case to handle.
+        match processes.get(pid) {
+            Some(record) if record.sandbox_id == sandbox_id => {
+                // Owner matches; safe to remove + signal. `unwrap` is sound
+                // because we just observed the entry under the write lock,
+                // which we have held continuously.
+                let record = processes
+                    .remove(pid)
+                    .expect("entry observed under write lock");
+                // Best-effort send: a closed receiver just means the
+                // process already exited and its bridge task is gone.
+                let _ = record.kill_tx.send(()).await;
+            }
+            Some(_) => {
+                tracing::debug!(
+                    target: "ward::security_audit",
+                    caller_sandbox = %sandbox_id,
+                    pid = %pid,
+                    "kill_process: caller sandbox does not own pid; refusing without signalling"
+                );
+            }
+            None => {}
         }
         Ok(())
     }
@@ -425,10 +491,15 @@ impl Backend for KrunvmBackend {
             )
             .await
             .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
-            self.processes
-                .write()
-                .await
-                .insert(handle.pid.clone(), kill_tx);
+            // SEC-017/018: record (sandbox_id, kill_tx) so kill_process
+            // can verify ownership at signal time.
+            self.processes.write().await.insert(
+                handle.pid.clone(),
+                ProcessRecord {
+                    sandbox_id: sandbox_id.to_string(),
+                    kill_tx,
+                },
+            );
             handle
         };
 
@@ -968,37 +1039,80 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
         return Err(e);
     }
 
-    // SEC-014: atomic swap via renameat2(RENAME_EXCHANGE) on Linux —
-    // dest gets new contents, staging gets old contents (which we then
-    // drop). EXCHANGE requires both paths to exist; first-time restore
-    // (no dest yet) falls back to a plain rename. macOS lacks an
-    // equivalent atomic-exchange syscall; the unlink+rename two-step
-    // residual remains on Darwin (documented at the call site).
-    #[cfg(target_os = "linux")]
-    {
-        if dest.exists() {
-            use rustix::fs::{CWD, RenameFlags, renameat_with};
-            renameat_with(CWD, &staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
-                |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
-            )?;
-            // Drop the old contents that landed in staging post-swap.
-            let _ = std::fs::remove_dir_all(&staging);
-        } else {
-            std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Darwin residual: a crash between unlink and rename leaves
-        // `dest` absent (sandbox unbootable on next boot). renamex_np
-        // with RENAME_SWAP exists on macOS 10.12+ but rustix doesn't
-        // expose it yet; tracked as a follow-up.
-        if dest.exists() {
-            std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
-        }
+    // SEC-014: atomic swap. Each supported platform uses its native
+    // atomic-exchange syscall so a crash between unlink and rename can
+    // never leave `dest` absent. EXCHANGE / SWAP require both paths to
+    // exist; first-time restore (no dest yet) falls back to a plain
+    // rename. Linux: rustix renameat_with(RENAME_EXCHANGE). macOS:
+    // renamex_np(RENAME_SWAP), declared inline above. Other Unix
+    // targets keep the two-step residual; ward does not support any.
+    //
+    // The `dest.exists()` / `atomic_swap()` pair looks like a TOCTOU
+    // window, but the snapshot directory is owned exclusively by
+    // ward-core: no other process (or, with the daemon's serialised
+    // per-sandbox state, even another thread within the daemon)
+    // races us between these two calls. A concurrent restore for the
+    // same sandbox is impossible by the SandboxManager's contract,
+    // and an external attacker who could create `dest` between the
+    // check and the swap would already have arbitrary write access
+    // to the daemon's data directory.
+    if dest.exists() {
+        atomic_swap(&staging, dest)?;
+        let _ = std::fs::remove_dir_all(&staging);
+    } else {
         std::fs::rename(&staging, dest).map_err(BackendError::Io)?;
     }
     Ok(())
+}
+
+/// Atomically swap two existing paths: after the call, `dest` holds
+/// what was in `staging` and `staging` holds what was in `dest`. Both
+/// paths must exist. Used by `extract_rootfs` (SEC-014).
+fn atomic_swap(staging: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        renameat_with(CWD, staging, CWD, dest, RenameFlags::EXCHANGE).map_err(
+            |e: rustix::io::Errno| BackendError::Internal(format!("renameat2 EXCHANGE: {e}")),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let from_c = std::ffi::CString::new(staging.as_os_str().as_bytes())
+            .map_err(|e| BackendError::Internal(format!("staging path contains NUL: {e}")))?;
+        let to_c = std::ffi::CString::new(dest.as_os_str().as_bytes())
+            .map_err(|e| BackendError::Internal(format!("dest path contains NUL: {e}")))?;
+        // SAFETY: the four documented invariants for this `unsafe` call:
+        //   1. `from_c` and `to_c` each point to a NUL-terminated C
+        //      string we own (via `CString`), kept alive for the
+        //      duration of the call (the `CString`s are bound to
+        //      named locals in this scope).
+        //   2. `RENAME_SWAP` (= 0x2) is a documented flag from
+        //      Darwin's `<sys/stdio.h>`; passing it is the contract
+        //      this call exists for.
+        //   3. `renamex_np` does not require `from` and `to` to be
+        //      non-aliased; both being the same path would simply
+        //      no-op (and would never happen in this codebase).
+        //   4. Errno is read via `std::io::Error::last_os_error()`
+        //      immediately after the -1 return, before any other
+        //      libc call could clobber it on this thread.
+        let rc = unsafe { renamex_np(from_c.as_ptr(), to_c.as_ptr(), RENAME_SWAP) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(BackendError::Internal(format!("renamex_np SWAP: {err}")));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Non-Linux, non-macOS Unix: no atomic-swap syscall available
+        // in this codebase; fall back to the two-step residual. Ward
+        // doesn't support any of these targets today, so this branch
+        // exists only to keep the function total.
+        std::fs::remove_dir_all(dest).map_err(BackendError::Io)?;
+        std::fs::rename(staging, dest).map_err(BackendError::Io)
+    }
 }
 
 /// Persist snapshot metadata as JSON alongside its archive.
@@ -1348,5 +1462,86 @@ mod tests {
             .await
             .expect_err("dangling snapshot");
         assert!(matches!(err, BackendError::NotFound(_)));
+    }
+
+    // ----- SEC-017/018: kill_process ownership verification -------------
+
+    #[tokio::test]
+    async fn given_pid_owned_by_sandbox_a_when_kill_with_sandbox_b_then_refused_silently() {
+        // Arrange: insert a process record claiming sandbox A owns this
+        // pid. (Stub-mode exec doesn't populate the map, so the test
+        // bypasses it and writes directly — that's the point: we're
+        // testing the Backend-trait-level guard, not the manager.)
+        let backend = backend_in_tempdir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sandbox-A".to_string(),
+                kill_tx: tx,
+            },
+        );
+
+        // Act: a caller claiming sandbox-B tries to kill pid-1.
+        backend
+            .kill_process("sandbox-B", "pid-1")
+            .await
+            .expect("kill_process should return Ok for the mismatch case");
+
+        // Assert: no kill signal was sent (the receiver should NOT have
+        // a message available immediately) AND the process record is
+        // still in the map (was not removed).
+        assert!(
+            rx.try_recv().is_err(),
+            "cross-sandbox kill leaked a signal — ownership check is broken"
+        );
+        assert!(
+            backend.processes.read().await.contains_key("pid-1"),
+            "cross-sandbox kill removed the process record — ownership check is broken"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_pid_owned_by_sandbox_a_when_kill_with_sandbox_a_then_signal_sent_and_removed() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sandbox-A".to_string(),
+                kill_tx: tx,
+            },
+        );
+
+        // Act: same-sandbox kill — should succeed.
+        backend
+            .kill_process("sandbox-A", "pid-1")
+            .await
+            .expect("kill_process should succeed for owner");
+
+        // Assert: signal received + record gone.
+        assert!(
+            rx.recv().await.is_some(),
+            "kill signal was not sent to the owner"
+        );
+        assert!(
+            !backend.processes.read().await.contains_key("pid-1"),
+            "process record was not removed after successful kill"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_unknown_pid_when_kill_then_ok_noop() {
+        // Arrange: empty processes map (the common case in stub mode).
+        let backend = backend_in_tempdir();
+
+        // Act + Assert: kill returns Ok even when pid is unknown —
+        // matches the pre-SEC-017/018 contract that the manager relies
+        // on for its lifecycle teardown path.
+        backend
+            .kill_process("sandbox-A", "pid-doesnt-exist")
+            .await
+            .expect("kill_process on unknown pid should be Ok no-op");
     }
 }

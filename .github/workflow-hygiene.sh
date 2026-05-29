@@ -41,13 +41,28 @@ done
 # -----------------------------------------------------------------------------
 # Check 2: no mutable major-version tags for third-party actions
 # -----------------------------------------------------------------------------
-# dtolnay/rust-toolchain uses rolling tags by design (per their docs);
-# every other `uses:` line must reference a 40-char commit SHA, with
-# an optional trailing `# v<N>` comment for human readability.
+# Documented exceptions only; every other `uses:` line must reference a
+# 40-char commit SHA with a trailing `# v<N>` comment.
+#
+# Exception 1: dtolnay/rust-toolchain ships rolling tags by design
+# (per their docs at https://github.com/dtolnay/rust-toolchain).
+#
+# Exception 2: slsa-framework/slsa-github-generator REQUIRES tag-form
+# refs and actively rejects commit SHAs at runtime with
+# "Invalid ref: <sha>. Expected ref of the form refs/tags/vX.Y.Z"
+# (exit 2 in `generate-builder.sh`). The tag value gets recorded in
+# the signed provenance as the builder identity, so the project's
+# threat model treats SHA pinning as a downgrade rather than an
+# improvement: an attacker who controlled a specific SHA could mint
+# provenance that looks like a different version. See the SLSA
+# generator README's "Why we do not recommend pinning to a SHA"
+# section.
 
 while IFS= read -r line; do
   # Skip dtolnay's documented rolling tags.
   if [[ "$line" == *"dtolnay/rust-toolchain@"* ]]; then continue; fi
+  # Skip SLSA generator: tag-pinned by upstream design (see comment above).
+  if [[ "$line" == *"slsa-framework/slsa-github-generator/"* ]]; then continue; fi
   # Skip relative path references like `uses: ./.github/actions/foo`.
   if [[ "$line" == *"uses: ./"* ]]; then continue; fi
   emit_error ".github/workflows" "mutable tag ref (must pin to commit SHA): $line"

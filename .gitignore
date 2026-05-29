@@ -2,6 +2,11 @@
 /target/
 **/*.rs.bk
 
+# Python (SDK + ad-hoc scripts)
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+
 # IDE
 .idea/
 .vscode/
