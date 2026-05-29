@@ -62,6 +62,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::new(&cfg.log_level))
         .init();
 
+    // SEC-019: WARD_REGISTRY_ALLOWLIST="" is operator-reachable (e.g.
+    // a malformed unit file `Environment=WARD_REGISTRY_ALLOWLIST=` with
+    // no value). The image-pull path treats empty-after-trim as "unset"
+    // (allow any registry), which is the safer of the two possible
+    // semantics, but operators who set the var expecting an allowlist
+    // deserve a loud signal that they got the opposite. Empty / unset
+    // distinguishes here at startup so the message is delivered once,
+    // not on every pull.
+    if let Ok(raw) = std::env::var("WARD_REGISTRY_ALLOWLIST")
+        && raw.trim().is_empty()
+        && !raw.is_empty()
+    {
+        tracing::warn!(
+            "WARD_REGISTRY_ALLOWLIST is set to an empty / whitespace-only value; \
+             treating as UNSET (all registries allowed). Unset the variable to \
+             silence this warning, or set it to a comma-separated list of \
+             registries (e.g. \"docker.io,ghcr.io\") to enforce an allowlist."
+        );
+    }
+
     tracing::info!(
         socket = %cfg.socket_path.display(),
         data_dir = %cfg.data_dir.display(),
