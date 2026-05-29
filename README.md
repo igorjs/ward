@@ -1,6 +1,12 @@
 # ward
 
 [![CI](https://github.com/igorjs/ward/actions/workflows/ci.yml/badge.svg)](https://github.com/igorjs/ward/actions/workflows/ci.yml)
+<<<<<<< HEAD
+||||||| parent of 53a124c (docs: posture badges + CONTRIBUTING supply-chain section)
+=======
+[![cargo-audit](https://github.com/igorjs/ward/actions/workflows/cargo-audit.yml/badge.svg)](https://github.com/igorjs/ward/actions/workflows/cargo-audit.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/igorjs/ward/badge)](https://scorecard.dev/viewer/?uri=github.com/igorjs/ward)
+>>>>>>> 53a124c (docs: posture badges + CONTRIBUTING supply-chain section)
 [![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](Cargo.toml)

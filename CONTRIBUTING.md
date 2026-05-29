@@ -205,7 +205,39 @@ docs: update installation guide
 test: add egress proxy integration tests
 ```
 
-Always sign commits: `git commit --signoff --gpg-sign`
+**Signed commits are required.** The `main` branch ruleset enforces
+`required_signatures`, so every commit must carry a valid GPG or SSH
+signature:
+
+```bash
+git commit --signoff --gpg-sign
+```
+
+If your local identity isn't set up for signing, see
+[git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work](https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work).
+
+## Supply-chain posture
+
+Ward maintains a tight CI security baseline; PRs that touch
+`.github/workflows/**` are checked automatically by the
+`workflow-hygiene` job:
+
+- Every third-party GitHub Action is pinned to a commit SHA (mutable
+  `@v<N>` tags rejected). Dependabot keeps the SHAs fresh; the
+  `# v<N>` trailing comment lets diffs stay human-readable.
+- Every workflow job runs under `step-security/harden-runner` with
+  an egress allowlist. Build workflows (`ci.yml`, `release.yml`)
+  enforce in `block` mode; API-only workflows allow `api.github.com`
+  only.
+- Release artefacts carry [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
+  via `actions/attest-build-provenance`. End users (and `install.sh`)
+  verify with `gh attestation verify`.
+- Branch ruleset for `main` is managed as code in
+  [`igorjs/repo-config`](https://github.com/igorjs/repo-config) (see
+  `repo-ward.tf`). Policy changes go through a PR there, not the
+  GitHub UI.
+
+The full posture matrix is in [SECURITY.md](SECURITY.md).
 
 ## Pull Request Process
 

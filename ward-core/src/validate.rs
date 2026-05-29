@@ -126,7 +126,16 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
 /// Both must be absolute, and neither may contain a `..` component — a guest
 /// `..` could escape its mount point, and a host `..` could widen what the
 /// caller intended to share.
-pub fn mount(source: &str, target: &str) -> Result<(), ApiError> {
+///
+/// SEC-020: when `allow_host` is false (the safe default), source paths
+/// must fall under one of the allowed roots: `/home/<user>/`, `/tmp/`,
+/// `/var/lib/ward/`. Set `WARD_ALLOW_HOST_MOUNTS=1` at the daemon to
+/// pass `allow_host=true` and lift the restriction (useful for
+/// trusted operator workflows like CI runners with explicit host-FS
+/// access). Even with the opt-in, system-critical roots (`/proc`,
+/// `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/usr`) still require
+/// `readonly: true` so a sandbox can't overwrite host system files.
+pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
     for (label, path) in [("source", source), ("target", target)] {
         if path.is_empty() {
             return Err(ApiError::InvalidRequest(format!(
@@ -144,7 +153,48 @@ pub fn mount(source: &str, target: &str) -> Result<(), ApiError> {
             )));
         }
     }
+
+    // SEC-020: source allowlist (host-side path the sandbox can see).
+    if !allow_host && !is_default_allowed_source(source) {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount source {source} is outside the default allowlist \
+             (/home/, /tmp/, /var/lib/ward/); set WARD_ALLOW_HOST_MOUNTS=1 \
+             on the daemon to permit arbitrary host paths"
+        )));
+    }
+
+    // SEC-020: system-critical paths always require readonly, even with
+    // the host-mounts opt-in. A writable /etc inside a sandbox means
+    // the guest can rewrite host system files via the virtiofs share.
+    if is_sensitive_host_path(source) && !readonly {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount source {source} is a sensitive system path \
+             (/proc, /sys, /dev, /etc, /root, /boot, /usr); \
+             readonly: true is required for these roots"
+        )));
+    }
+
     Ok(())
+}
+
+/// True if `path` falls under one of the default-allowed mount roots.
+/// Match is by prefix on the canonical "/" form so `/home/alice/data`
+/// and `/home/alice` both qualify, but `/homeless` does not.
+fn is_default_allowed_source(path: &str) -> bool {
+    const ALLOWED: &[&str] = &["/home/", "/tmp/", "/var/lib/ward/"];
+    if path == "/tmp" || path == "/var/lib/ward" {
+        return true;
+    }
+    ALLOWED.iter().any(|prefix| path.starts_with(prefix))
+}
+
+/// True if `path` is one of the system roots that must never be
+/// mounted writable into a sandbox.
+fn is_sensitive_host_path(path: &str) -> bool {
+    const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/root", "/boot", "/usr"];
+    SENSITIVE
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
 }
 
 /// Validate a sandbox or volume ID (UUID format).
@@ -293,6 +343,44 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    // ----- SEC-020 mount allowlist + sensitive-path boundaries -------------
+
+    #[test]
+    fn given_homeless_path_when_is_default_allowed_then_rejected() {
+        // Regression guard: the allowlist matches by prefix WITH a
+        // trailing slash, so `/homeless` must NOT match `/home/`.
+        // Without the trailing slash a naive prefix check would let a
+        // sandbox bind-mount the operator's `/homeless` directory.
+        assert!(!is_default_allowed_source("/homeless/secrets"));
+        assert!(!is_default_allowed_source("/homeless"));
+    }
+
+    #[test]
+    fn given_etcetera_path_when_is_sensitive_then_not_flagged() {
+        // Symmetric to the allowlist case: `/etc` must match `/etc` and
+        // `/etc/passwd`, but NOT `/etcetera`. The `format!("{root}/")`
+        // suffix is what enforces the boundary.
+        assert!(!is_sensitive_host_path("/etcetera"));
+        assert!(!is_sensitive_host_path("/etcetera/passwd"));
+    }
+
+    #[test]
+    fn given_etc_root_and_subpath_when_is_sensitive_then_flagged() {
+        // Positive boundary cases: the bare root and any subpath under
+        // it both count as sensitive. Both must require `readonly`.
+        assert!(is_sensitive_host_path("/etc"));
+        assert!(is_sensitive_host_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn given_tmp_and_var_lib_ward_roots_when_is_default_allowed_then_ok() {
+        // Bare root paths (without trailing slash) should match the
+        // allowlist; otherwise mounting `/tmp` itself would inexplicably
+        // fail while mounting `/tmp/subdir` would succeed.
+        assert!(is_default_allowed_source("/tmp"));
+        assert!(is_default_allowed_source("/var/lib/ward"));
+    }
 
     // ----- image_ref ------------------------------------------------------
 
@@ -744,14 +832,64 @@ mod proptests {
     // ----- mount paths ----------------------------------------------------
 
     #[test]
-    fn given_absolute_paths_when_mount_then_ok() {
-        for (source, target) in [("/data", "/mnt/data"), ("/srv/app/cache", "/var/cache")] {
-            assert!(mount(source, target).is_ok(), "{source:?} -> {target:?}");
+    fn given_allowed_source_path_when_mount_then_ok() {
+        // Default allowlist covers /home/, /tmp/, /var/lib/ward/.
+        for (source, target) in [
+            ("/home/alice/data", "/mnt/data"),
+            ("/tmp/build", "/build"),
+            ("/var/lib/ward/cache", "/var/cache"),
+        ] {
+            assert!(
+                mount(source, target, false, false).is_ok(),
+                "{source:?} -> {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_arbitrary_host_path_when_allow_host_false_then_rejected() {
+        // SEC-020: default-deny on sources outside the allowlist.
+        assert!(matches!(
+            mount("/srv/app/cache", "/var/cache", false, false),
+            Err(ApiError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn given_arbitrary_host_path_when_allow_host_true_then_accepted() {
+        // Operator opt-in lifts the source restriction.
+        assert!(mount("/srv/app/cache", "/var/cache", false, true).is_ok());
+    }
+
+    #[test]
+    fn given_sensitive_path_when_writable_then_rejected_even_with_opt_in() {
+        // SEC-020: /etc, /proc, /sys etc. must be readonly even when
+        // WARD_ALLOW_HOST_MOUNTS lifts the source allowlist.
+        for path in ["/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/usr"] {
+            assert!(
+                matches!(
+                    mount(path, "/x", false, true),
+                    Err(ApiError::InvalidRequest(_))
+                ),
+                "expected {path:?} (writable) to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn given_sensitive_path_when_readonly_and_opt_in_then_accepted() {
+        for path in ["/etc", "/etc/passwd", "/proc", "/usr/lib"] {
+            assert!(
+                mount(path, "/x", true, true).is_ok(),
+                "expected {path:?} readonly with opt-in to be accepted"
+            );
         }
     }
 
     #[test]
     fn given_invalid_paths_when_mount_then_invalid_request() {
+        // Structural rules fire before the allowlist; opt-in is true so
+        // these inputs hit the empty/relative/traversal checks alone.
         let cases = [
             ("data", "/mnt/data"),            // relative source
             ("/data", "mnt/data"),            // relative target
@@ -762,7 +900,10 @@ mod proptests {
         ];
         for (source, target) in cases {
             assert!(
-                matches!(mount(source, target), Err(ApiError::InvalidRequest(_))),
+                matches!(
+                    mount(source, target, false, true),
+                    Err(ApiError::InvalidRequest(_))
+                ),
                 "expected rejection for {source:?} -> {target:?}",
             );
         }
