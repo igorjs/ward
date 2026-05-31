@@ -1,12 +1,8 @@
 # ward
 
 [![CI](https://github.com/igorjs/ward/actions/workflows/ci.yml/badge.svg)](https://github.com/igorjs/ward/actions/workflows/ci.yml)
-<<<<<<< HEAD
-||||||| parent of 53a124c (docs: posture badges + CONTRIBUTING supply-chain section)
-=======
 [![cargo-audit](https://github.com/igorjs/ward/actions/workflows/cargo-audit.yml/badge.svg)](https://github.com/igorjs/ward/actions/workflows/cargo-audit.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/igorjs/ward/badge)](https://scorecard.dev/viewer/?uri=github.com/igorjs/ward)
->>>>>>> 53a124c (docs: posture badges + CONTRIBUTING supply-chain section)
 [![SLSA Level 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev/spec/v1.0/levels)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](Cargo.toml)
@@ -185,7 +181,7 @@ ward-core/     Library crate: protocol types, Backend trait, libkrun FFI,
                SandboxManager, broker, image pull/unpack.
 ward-daemon/   wardd binary: gRPC server over Unix socket, hosts the manager.
 ward-cli/      ward binary: thin CLI client over the same gRPC.
-ward-agent/    Guest-side init binary (work-in-progress; see issue #9).
+ward-agent/    Guest-side init binary + vsock RPC protocol (boot integration: #9).
 proto/         ward.proto, ward_agent.proto. Single source of truth for the wire.
 vendor/        Pinned libkrun version + bottle checksums.
 docs/          ADRs and SPEC.md (table of contents).
@@ -209,14 +205,16 @@ host (see ADR-007).
 
 ## Status and roadmap
 
-- Stub backend: complete, 387 tests passing
+- Stub backend: complete, 300+ tests passing
 - libkrun FFI surface: complete (60 symbols, hand-maintained)
 - VM lifecycle wiring (`krun_start_enter` + shutdown signalling): complete
 - OCI image pull + unpack: complete
-- Guest agent (`ward-agent`): in progress, see issue #9
+- Guest agent (`ward-agent`): crate + vsock protocol shipped; boot-path integration tracked by issue #9
 - Cross-sandbox pub/sub broker: complete (deny default + group routing)
-- Snapshots / volumes: API defined, backend implementation pending
-- First signed release (v0.1.0): blocked on CI smoke test (issue #3)
+- Egress: forward proxy + `GetEgressLog` shipped; in-VM TAP routing gated
+- Volumes: fixed-size ext4 images shipped; block-attach blocked on libkrun built with `--enable-blk` (#43)
+- Snapshots: disk-level archive/restore + `from_snapshot` shipped; live checkpoint/restore tracked by #29
+- First signed release (v0.1.0): release smoke-test (#4), then cut v0.1.0 (#5)
 
 Live status, tickets, and priorities live on the
 [Ward project board](https://github.com/users/igorjs/projects/2).
@@ -234,8 +232,10 @@ Live status, tickets, and priorities live on the
 - [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds): builds the
   libkrun + libkrunfw bottles that release artefacts bundle. Independent
   versioning, manual `workflow_dispatch`.
-- `igorjs/ward-sdk-*` (planned): Apache-2.0 client libraries in Python,
-  TypeScript, Go, Rust. Thin wrappers over the gRPC surface.
+
+The SDKs are in-tree under [`sdks/`](sdks/) (Python, TypeScript, Go, Rust),
+generated from `proto/ward.proto` and released under Apache-2.0. They are
+thin wrappers over the gRPC surface.
 
 ## License
 
