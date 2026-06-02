@@ -32,7 +32,7 @@ metrics = "0.24"
 # metrics-exporter-prometheus: spawns a tiny HTTP listener for
 # `/metrics` scrapes. Installed only when WARD_METRICS_ADDR is set
 # so the daemon's default surface stays Unix-socket-only.
-metrics-exporter-prometheus = { version = "0.17", default-features = false, features = [
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = [
     "http-listener",
 ] }
 
