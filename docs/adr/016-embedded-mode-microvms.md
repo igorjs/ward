@@ -173,6 +173,13 @@ ADR is silent on MCP — it's a separate ADR (017) and a separate crate (`ward-m
 - **smoltcp is a new dependency we have to learn.** It is well-maintained but more complex than `ip tuntap`. Risk concentrated in one crate.
 - **Embedded mode means per-process libkrun.** Two processes that each want a sandbox cannot share libkrun state. For most agentic / scripting use cases this is fine; for "fleet" use cases users must use daemon mode (which is correct).
 - **`install.sh` rewrites.** SLSA L3 release flow assumes a single artifact; embedded vs daemon may mean two install paths. (Probably one binary with subcommands, but worth verifying.)
+- **License boundary blocks the obvious SDK embedding path.** `ward-core` and `ward-runtime` are AGPL-3.0; `sdks/rust/ward-client` is Apache-2.0 by design (so library users aren't infected). A `path = "../ward-runtime"` dep from the SDK would transitively pull AGPL code into an Apache-2.0 crate, which silently relicenses it. Resolution paths, in order of preference:
+  1. **Helper-binary embedded mode** — SDK spawns a small AGPL helper (`ward-embed-helper`) that hosts a Runtime + an in-stdio gRPC server. SDK talks to its own helper. AGPL boundary stays clean. Matches microsandbox's "ship the runtime, talk over a private channel" pattern.
+  2. **`ward-proto` crate (Apache-2.0)** — extract the protobuf-generated types into a standalone Apache-2.0 crate so SDKs and tooling can depend on the wire surface without AGPL linkage. Already foreshadowed in `sdks/rust/ward-client/Cargo.toml`.
+  3. **Relicense `ward-core` / `ward-runtime`** — separate ADR (017). Not in scope here.
+- **CLI cannot meaningfully run embedded for stateful commands.** `ward create alpine` followed by `ward exec <id> -- ...` requires the sandbox to outlive the first CLI process. Embedded means the libkrun thread dies with the CLI. So:
+  - SDK and `ward-mcp`: embedded is the right default.
+  - CLI: stays daemon-only for stateful commands (create, exec, list, snapshot, volume). A future `ward run --embedded <image> -- <cmd>` one-shot mode is a reasonable follow-up but is *not* a default flip. **The "CLI default flips to embedded" claim earlier in this ADR is wrong** and is corrected here. The Docker analogy doesn't apply — `docker run` is using a daemon, not running embedded.
 
 ### Neutral
 
@@ -181,15 +188,19 @@ ADR is silent on MCP — it's a separate ADR (017) and a separate crate (`ward-m
 
 ## Implementation order
 
-1. Land `ward-runtime` crate by extracting daemon `main.rs` init.
-2. Rust SDK gains `Sandbox::builder(...)` over `ward-runtime`.
-3. CLI grows `--daemon-addr` flag; default behaviour switches to embedded.
-4. smoltcp networking spike (replaces #32).
-5. macOS Hypervisor entitlement + Linux KVM group documentation; `install.sh` updated.
-6. `ward-mcp` crate (separate ADR).
-7. Python / TS / Go SDKs gain native-helper embedded mode.
+Revised after surfacing the license constraint and the CLI/stateful-sandbox
+mismatch above:
 
-Steps 1–3 are the critical path. Steps 4–5 are independent and can run in parallel. Steps 6–7 are post-v0.1.
+1. ✅ **`ward-runtime` crate** — extracted from daemon `main.rs` init; daemon now consumes it.
+2. **Complete Rust SDK gRPC client** — wire up the `unimplemented!` methods in `sdks/rust/ward-client` against the daemon's socket. This is the immediate value-add and ships at v0.1.
+3. **`ward-mcp` crate (AGPL)** — server binary, depends on `ward-runtime` directly. Embedded mode lives here because an MCP server *is* a per-process owner of its sandboxes. Resolves the "first-class agent integration" goal without crossing the license boundary.
+4. **ADR-017: license posture** — decide between (a) helper-binary embedded SDK, (b) `ward-proto` crate extraction, or (c) relicensing. Until then, embedded SDK is parked.
+5. **smoltcp networking spike** (replaces #32) — independent of the above; can run in parallel.
+6. **Rootless install.sh** — macOS Hypervisor entitlement + Linux KVM group documentation.
+7. **README repositioning** — ward is "fleet daemon + thin SDK + MCP for agents", not "microsandbox-clone."
+8. **Python / TS / Go SDKs** — gRPC-only initially; embedded mode awaits ADR-017.
+
+Steps 1–3 + 7 are the v0.1 critical path. Steps 4–6, 8 follow.
 
 ## References
 
