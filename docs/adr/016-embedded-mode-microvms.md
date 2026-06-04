@@ -177,6 +177,8 @@ ADR is silent on MCP — it's a separate ADR (017) and a separate crate (`ward-m
   1. **Helper-binary embedded mode** — SDK spawns a small AGPL helper (`ward-embed-helper`) that hosts a Runtime + an in-stdio gRPC server. SDK talks to its own helper. AGPL boundary stays clean. Matches microsandbox's "ship the runtime, talk over a private channel" pattern.
   2. **`ward-proto` crate (Apache-2.0)** — extract the protobuf-generated types into a standalone Apache-2.0 crate so SDKs and tooling can depend on the wire surface without AGPL linkage. Already foreshadowed in `sdks/rust/ward-client/Cargo.toml`.
   3. **Relicense `ward-core` / `ward-runtime`** — separate ADR (017). Not in scope here.
+
+  > Resolved in [ADR-017](017-license-posture.md): v0.1 adopts option (2) — the SDK stays gRPC-only and a `ward-proto` crate is extracted. Option (3) is queued for re-evaluation when a corporate adoption signal surfaces.
 - **CLI cannot meaningfully run embedded for stateful commands.** `ward create alpine` followed by `ward exec <id> -- ...` requires the sandbox to outlive the first CLI process. Embedded means the libkrun thread dies with the CLI. So:
   - SDK and `ward-mcp`: embedded is the right default.
   - CLI: stays daemon-only for stateful commands (create, exec, list, snapshot, volume). A future `ward run --embedded <image> -- <cmd>` one-shot mode is a reasonable follow-up but is *not* a default flip. **The "CLI default flips to embedded" claim earlier in this ADR is wrong** and is corrected here. The Docker analogy doesn't apply — `docker run` is using a daemon, not running embedded.
