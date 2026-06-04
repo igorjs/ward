@@ -309,3 +309,40 @@ echo "${C_DIM}# Then use the CLI:${C_RESET}"
 echo "  ward info"
 echo "  ward health"
 echo "  ward create alpine"
+echo
+
+# ---------------------------------------------------------------------------
+# Rootless prerequisites hint (post-install, non-fatal)
+# ---------------------------------------------------------------------------
+#
+# ward runs unprivileged — see docs/rootless.md — but each platform
+# has a one-time setup step the user has to do themselves (we won't
+# sudo on their behalf). Print a per-platform pointer so they don't
+# discover this on their first `ward create`.
+
+case "$(uname -s)" in
+  Linux)
+    if [[ -e /dev/kvm ]] && ! [[ -r /dev/kvm && -w /dev/kvm ]]; then
+      echo "${C_DIM}# Linux rootless setup:${C_RESET}"
+      echo "  You're not yet in the 'kvm' group. Run:"
+      echo "    sudo usermod -aG kvm \$USER"
+      echo "  then log out and back in. ward will start failing at"
+      echo "  sandbox creation until this is done."
+      echo "  Optional for network egress: sudo apt install passt"
+      echo "  (or your distro equivalent). See docs/rootless.md."
+      echo
+    fi
+    ;;
+  Darwin)
+    # The Hypervisor entitlement is applied at release-build time by
+    # ward's release.yml. Local builds from source require manual
+    # codesigning — only relevant if the user built from source
+    # rather than running this script. Mention it lightly.
+    echo "${C_DIM}# macOS rootless setup:${C_RESET}"
+    echo "  The installed wardd is signed with the Hypervisor"
+    echo "  entitlement — no further setup needed. If you instead"
+    echo "  built wardd from source, see docs/rootless.md for the"
+    echo "  one-time codesign step."
+    echo
+    ;;
+esac
