@@ -3325,6 +3325,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ward-core",
+ "ward-runtime",
+]
+
+[[package]]
+name = "ward-runtime"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "ward-core",
 ]
 
 [[package]]

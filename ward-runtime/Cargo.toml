@@ -1,0 +1,27 @@
+[package]
+name = "ward-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedded ward runtime: boot libkrun-backed sandboxes in-process, no daemon. See ADR-016."
+
+[features]
+default = []
+# Mirrors ward-core's `krunvm` feature. When off, the runtime uses the
+# stub Backend (synthetic IDs + scripted streams). When on, real
+# libkrun integration is linked through. Embedded SDKs that need real
+# microVMs enable this; tests / dev environments leave it off.
+krunvm = ["ward-core/krunvm"]
+
+[dependencies]
+ward-core = { path = "../ward-core" }
+tokio = { version = "1", features = ["sync"] }
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
