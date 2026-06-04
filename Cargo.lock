@@ -3269,10 +3269,14 @@ dependencies = [
  "hyper-util",
  "pretty_assertions",
  "prost",
+ "prost-types",
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
  "tower",
 ]
 

@@ -14,21 +14,26 @@ rust-version.workspace = true
 
 # This crate is intentionally Apache-2.0 while the workspace is AGPL-3.0-only.
 # That split only holds if `ward-client` has zero `path =` dependency on any
-# AGPL crate (ward-core, ward-daemon, ward-agent). Linking AGPL code at the
-# Cargo level produces a derivative work under AGPL terms, which would silently
-# override the Apache-2.0 declaration here. When the gRPC stub wiring lands,
-# the .proto-generated types must be sourced from one of:
-#   1. a separate `ward-proto` crate published under Apache-2.0, or
-#   2. local codegen vendored into this crate's `src/proto/`,
-# never via `path = "../../../ward-core"`.
+# AGPL crate (ward-core, ward-runtime, ward-daemon, ward-agent). The protobuf
+# types are generated locally from `proto/ward.proto` (CC0, per ADR-004) via
+# this crate's own `build.rs`, not imported from ward-core. Embedded mode is
+# parked behind ADR-017's license-posture decision; see ADR-016 amendment.
 
 [dependencies]
-tokio = { version = "1", features = ["net", "rt", "macros"] }
+tokio = { version = "1", features = ["net", "rt", "macros", "sync"] }
+tokio-stream = "0.1"
 tonic = "0.14"
+# tonic 0.14 split prost integration into a separate crate; the generated
+# code (include_proto!) references it.
+tonic-prost = "0.14"
 prost = "0.14"
+prost-types = "0.14"
 thiserror = "2"
 tower = "0.5"
-hyper-util = "0.1"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
