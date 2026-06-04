@@ -1,0 +1,51 @@
+[package]
+name = "ward-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ward's network backends: passt (default rootless), gvproxy, and a smoltcp research path. See ADR-018."
+
+[features]
+default = ["passt"]
+# Always-available stub: spawns nothing, sandboxes have no network. Useful
+# for tests, dev on platforms without passt, and the stub-backend path.
+none = []
+# Default rootless backend per ADR-018. Probes `passt(1)` on PATH and
+# manages one passt subprocess per sandbox.
+passt = []
+# Opt-in alternative for hosts that already run gvproxy (e.g. via
+# podman-machine). Not implemented yet — feature gates the future surface.
+gvproxy = []
+# Research path: pure-Rust userspace TCP/IP via smoltcp. Not on the v0.1
+# critical path; this feature wires the dep but the implementation is a
+# scaffold marked with `unimplemented!`. See ADR-018 "Future work".
+smoltcp = ["dep:smoltcp"]
+
+[dependencies]
+# async-trait: makes NetworkBackend object-safe by boxing each async fn's
+# future. Mirrors what ward-core does for Backend; same trade-off.
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+# tokio used only via the test rt(macro); kept here so doctests + unit
+# tests can share the same runtime spin-up.
+tokio = { version = "1", features = ["rt", "macros"] }
+# `which` is the simplest portable way to probe for the passt binary on
+# PATH at runtime. Used by PasstBackend::probe.
+which = "8"
+# smoltcp is gated behind the `smoltcp` feature so the default build
+# doesn't pull a large dep for a research-phase backend.
+smoltcp = { version = "0.13", optional = true, default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "log",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -8,6 +8,7 @@ members = [
     "ward-agent",
     "ward-runtime",
     "ward-mcp",
+    "ward-net",
 ]
 
 [workspace.package]
