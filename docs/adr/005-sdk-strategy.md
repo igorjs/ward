@@ -1,6 +1,6 @@
 # ADR-005: SDK Strategy
 
-**Status:** Accepted
+**Status:** Accepted — SDK distribution model amended by [ADR-016](016-embedded-mode-microvms.md) (2026-06-04)
 **Date:** 2026-05-12
 **Authors:** Igor
 
@@ -79,3 +79,17 @@ No SDKs have been implemented yet. The daemon ships with the `ward` CLI (in `war
 - Schema changes propagate automatically to all SDKs via generated code.
 - Third parties can generate clients in any gRPC-supported language from the `.proto` file.
 - The `.proto` file must be maintained carefully: field numbers cannot be reused, fields cannot change type.
+
+## Amendment (ADR-016, 2026-06-04)
+
+ADR-016 introduces an **embedded mode** alongside the daemon. SDKs now ship in two
+flavours per language:
+
+- **Embedded path:** links `ward-runtime` (Rust) or a small native helper (Python /
+  TS / Go) so `Sandbox::builder(...).create()` works with no daemon install.
+- **Daemon path:** generated gRPC client per this ADR — used when the SDK is
+  configured with a daemon address.
+
+The protobuf surface and SDK tiers in this ADR remain authoritative for the
+daemon path. See ADR-016 for the embedded-path rationale and implementation
+order.
