@@ -271,10 +271,39 @@ For every target in `{aarch64-apple-darwin, x86_64-unknown-linux-gnu,
 aarch64-unknown-linux-gnu}`:
 
 - `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`,
-  `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and `lib/libkrunfw.<ext>`
-  if the build is configured to bundle them (see below).
+  `bin/ward-mcp`, `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and
+  `lib/libkrunfw.<ext>` if the build is configured to bundle them
+  (see below).
 - `ward-<version>-<target>.tar.gz.sha256` — checksum for `install.sh`
   verification.
+
+### macOS codesign
+
+The `aarch64-apple-darwin` build path ad-hoc signs `wardd` and
+`ward-mcp` with `entitlements.plist` (at workspace root) before
+staging. The entitlement is `com.apple.security.hypervisor` — required
+by libkrun's Hypervisor framework calls. Without it, `krun_start_enter`
+returns `HV_ERROR_BAD_ARGUMENT` on Apple Silicon.
+
+`ward` (the CLI) is not signed because it never touches libkrun
+directly — it's a thin gRPC client.
+
+Ad-hoc signing satisfies the entitlement requirement locally but does
+*not* pass Gatekeeper for distribution. End users may need
+`xattr -d com.apple.quarantine ~/.ward/bin/wardd` on first run.
+Tier-2 work (Developer ID + notarization) is tracked by
+[#30](https://github.com/igorjs/ward/issues/30).
+
+For local builds from source (skipping the release pipeline), sign
+manually:
+
+```sh
+codesign --sign - \
+  --entitlements entitlements.plist \
+  --options runtime \
+  --force \
+  target/release/wardd target/release/ward-mcp
+```
 
 ### Bundling libkrun in the release
 

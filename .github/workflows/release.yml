@@ -43,7 +43,7 @@ jobs:
       tag: ${{ steps.r.outputs.tag }}
       include_libkrun: ${{ steps.r.outputs.include_libkrun }}
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -73,7 +73,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - id: r
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -112,7 +112,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -142,7 +142,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Install protoc
         run: |
@@ -231,6 +231,49 @@ jobs:
         run: |
           cargo build --release --workspace --target ${{ matrix.target }} --features ward-core/krunvm
 
+      # macOS Hypervisor entitlement. libkrun on Apple Silicon calls
+      # into the Hypervisor framework; without the
+      # com.apple.security.hypervisor entitlement, `krun_start_enter`
+      # returns HV_ERROR_BAD_ARGUMENT and no microVM ever boots. The
+      # release artefact must carry this entitlement BEFORE the tarball
+      # is staged — otherwise install.sh users on macOS get a daemon
+      # that runs but can't create sandboxes.
+      #
+      # Ad-hoc signing (--sign -) is sufficient to apply the
+      # entitlement locally on the user's machine. It does NOT satisfy
+      # Gatekeeper for distribution outside that machine; that's the
+      # Tier 2 work tracked by #30 (Developer ID + notarization).
+      #
+      # We sign both wardd and ward-mcp because both spawn libkrun via
+      # ward-runtime. The ward CLI is a thin gRPC client that never
+      # touches libkrun directly, so it does not need the entitlement.
+      - name: Codesign macOS binaries with Hypervisor entitlement
+        if: matrix.target == 'aarch64-apple-darwin'
+        # The ${{ }} interpolation for matrix.target is workflow-
+        # controlled (defined in the matrix block above, not user
+        # input), but routing it through env: keeps the shell free
+        # of expression-injection foot-guns. See
+        # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${TARGET}/release"
+          for bin in wardd ward-mcp; do
+            codesign --sign - \
+              --entitlements entitlements.plist \
+              --options runtime \
+              --force \
+              "${BIN_DIR}/${bin}"
+            # Verify the entitlement is present before staging — a
+            # missing entitlement here means a silently-unusable
+            # release, so we surface it immediately rather than at
+            # users' first `ward create`.
+            codesign -d --entitlements - "${BIN_DIR}/${bin}" \
+              | grep -q "com.apple.security.hypervisor"
+            echo "OK: ${bin} signed with Hypervisor entitlement"
+          done
+
       - name: Stage archive
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
@@ -239,6 +282,10 @@ jobs:
           mkdir -p "${STAGE}/bin" "${STAGE}/lib"
           cp "target/${TARGET}/release/wardd" "${STAGE}/bin/"
           cp "target/${TARGET}/release/ward" "${STAGE}/bin/"
+          # ward-mcp ships in every release so agents (Claude / Cursor)
+          # can be wired against a stable install path. Same Hypervisor
+          # entitlement applied above on macOS.
+          cp "target/${TARGET}/release/ward-mcp" "${STAGE}/bin/"
           cp LICENSE "${STAGE}/" 2>/dev/null || true
           cp README.md "${STAGE}/" 2>/dev/null || true
           if [[ "${{ needs.resolve.outputs.include_libkrun }}" == "true" ]]; then
@@ -285,7 +332,7 @@ jobs:
     outputs:
       hashes: ${{ steps.combine.outputs.hashes }}
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # GitHub API + artifact storage only; this job has no source
@@ -351,7 +398,7 @@ jobs:
     needs: [resolve, build, slsa_provenance]
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -386,7 +433,7 @@ jobs:
             # fails with "ECONNREFUSED" because harden-runner drops
             # the connection at the network layer.
             uploads.github.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Download all artefacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
