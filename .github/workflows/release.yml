@@ -231,6 +231,49 @@ jobs:
         run: |
           cargo build --release --workspace --target ${{ matrix.target }} --features ward-core/krunvm
 
+      # macOS Hypervisor entitlement. libkrun on Apple Silicon calls
+      # into the Hypervisor framework; without the
+      # com.apple.security.hypervisor entitlement, `krun_start_enter`
+      # returns HV_ERROR_BAD_ARGUMENT and no microVM ever boots. The
+      # release artefact must carry this entitlement BEFORE the tarball
+      # is staged — otherwise install.sh users on macOS get a daemon
+      # that runs but can't create sandboxes.
+      #
+      # Ad-hoc signing (--sign -) is sufficient to apply the
+      # entitlement locally on the user's machine. It does NOT satisfy
+      # Gatekeeper for distribution outside that machine; that's the
+      # Tier 2 work tracked by #30 (Developer ID + notarization).
+      #
+      # We sign both wardd and ward-mcp because both spawn libkrun via
+      # ward-runtime. The ward CLI is a thin gRPC client that never
+      # touches libkrun directly, so it does not need the entitlement.
+      - name: Codesign macOS binaries with Hypervisor entitlement
+        if: matrix.target == 'aarch64-apple-darwin'
+        # The ${{ }} interpolation for matrix.target is workflow-
+        # controlled (defined in the matrix block above, not user
+        # input), but routing it through env: keeps the shell free
+        # of expression-injection foot-guns. See
+        # https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN_DIR="target/${TARGET}/release"
+          for bin in wardd ward-mcp; do
+            codesign --sign - \
+              --entitlements entitlements.plist \
+              --options runtime \
+              --force \
+              "${BIN_DIR}/${bin}"
+            # Verify the entitlement is present before staging — a
+            # missing entitlement here means a silently-unusable
+            # release, so we surface it immediately rather than at
+            # users' first `ward create`.
+            codesign -d --entitlements - "${BIN_DIR}/${bin}" \
+              | grep -q "com.apple.security.hypervisor"
+            echo "OK: ${bin} signed with Hypervisor entitlement"
+          done
+
       - name: Stage archive
         run: |
           VERSION="${{ needs.resolve.outputs.version }}"
@@ -239,6 +282,10 @@ jobs:
           mkdir -p "${STAGE}/bin" "${STAGE}/lib"
           cp "target/${TARGET}/release/wardd" "${STAGE}/bin/"
           cp "target/${TARGET}/release/ward" "${STAGE}/bin/"
+          # ward-mcp ships in every release so agents (Claude / Cursor)
+          # can be wired against a stable install path. Same Hypervisor
+          # entitlement applied above on macOS.
+          cp "target/${TARGET}/release/ward-mcp" "${STAGE}/bin/"
           cp LICENSE "${STAGE}/" 2>/dev/null || true
           cp README.md "${STAGE}/" 2>/dev/null || true
           if [[ "${{ needs.resolve.outputs.include_libkrun }}" == "true" ]]; then
