@@ -75,17 +75,29 @@ jobs:
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - id: r
+        # Workflow-controlled inputs routed through env: per the GHA
+        # expression-injection guidance, even though they aren't
+        # user-tainted. Keeps the shell free of `${{ }}` foot-guns.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          INPUT_INCLUDE_LIBKRUN: ${{ inputs.include_libkrun }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${EVENT_NAME}" == "push" ]]; then
             TAG="${GITHUB_REF##refs/tags/}"
             VERSION="${TAG#v}"
             INCLUDE_LIBKRUN="true"
           else
-            # workflow_dispatch — synthesise a dev tag.
-            SHORT_SHA="$(echo ${{ github.sha }} | cut -c1-7)"
+            # workflow_dispatch — synthesise a dev tag. VERSION must
+            # match TAG (no semver-style "0.0.0-<sha>" rewrite) because
+            # the tarball filename `ward-${VERSION}-${TARGET}.tar.gz`
+            # is what install.sh resolves from WARD_VERSION. A
+            # mismatch makes the smoke-test install.sh path 404 on
+            # download — that's exactly what blocked #4 first time.
+            SHORT_SHA="$(echo ${SHA} | cut -c1-7)"
             TAG="dev-${SHORT_SHA}"
-            VERSION="0.0.0-${SHORT_SHA}"
-            INCLUDE_LIBKRUN="${{ inputs.include_libkrun }}"
+            VERSION="${TAG}"
+            INCLUDE_LIBKRUN="${INPUT_INCLUDE_LIBKRUN}"
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
