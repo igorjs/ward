@@ -70,17 +70,12 @@ fn given_tools_list_request_when_server_responds_then_returns_four_tools() {
 
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 2);
-    let tools = resp["result"]["tools"]
-        .as_array()
-        .expect("tools is array");
+    let tools = resp["result"]["tools"].as_array().expect("tools is array");
     assert_eq!(tools.len(), 4, "expected 4 tools: {resp}");
 
     // Names are the SDK-stable surface; pin the set so adding/removing
     // requires a deliberate test edit.
-    let names: Vec<&str> = tools
-        .iter()
-        .map(|t| t["name"].as_str().unwrap())
-        .collect();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(names.contains(&"ward_create_sandbox"));
     assert!(names.contains(&"ward_list_sandboxes"));
     assert!(names.contains(&"ward_exec"));

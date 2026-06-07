@@ -98,9 +98,7 @@ pub trait NetworkBackend: Send + Sync {
 
 /// Lookup a backend by name. Used by the daemon's startup config so
 /// `WARD_NETWORK_BACKEND=passt` works without compile-time changes.
-pub fn backend_by_name(
-    name: &str,
-) -> Result<Box<dyn NetworkBackend>, Error> {
+pub fn backend_by_name(name: &str) -> Result<Box<dyn NetworkBackend>, Error> {
     match name {
         "none" => Ok(Box::new(null::NullBackend::default())),
         #[cfg(feature = "passt")]

@@ -37,11 +37,7 @@ impl NetworkBackend for SmoltcpBackend {
         Ok(())
     }
 
-    async fn attach(
-        &self,
-        _sandbox_id: &str,
-        _opts: &AttachOptions,
-    ) -> Result<AttachId, Error> {
+    async fn attach(&self, _sandbox_id: &str, _opts: &AttachOptions) -> Result<AttachId, Error> {
         Err(Error::Unimplemented(
             "smoltcp backend: see docs/adr/018-rootless-networking.md \
              'Future work' for the planned implementation. Use \

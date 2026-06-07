@@ -187,9 +187,7 @@ impl Server {
             "ward_exec" => self.tool_exec(call.arguments).await?,
             "ward_remove_sandbox" => self.tool_remove_sandbox(call.arguments).await?,
             other => {
-                return Err(RpcError::invalid_params(format!(
-                    "unknown tool: {other}"
-                )));
+                return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
             }
         };
 
@@ -201,10 +199,7 @@ impl Server {
 
     // ── Tool implementations ─────────────────────────────────────────────
 
-    async fn tool_create_sandbox(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<String, RpcError> {
+    async fn tool_create_sandbox(&self, args: serde_json::Value) -> Result<String, RpcError> {
         #[derive(serde::Deserialize)]
         struct Args {
             image: String,
@@ -303,10 +298,7 @@ impl Server {
         ))
     }
 
-    async fn tool_remove_sandbox(
-        &self,
-        args: serde_json::Value,
-    ) -> Result<String, RpcError> {
+    async fn tool_remove_sandbox(&self, args: serde_json::Value) -> Result<String, RpcError> {
         #[derive(serde::Deserialize)]
         struct Args {
             id: String,

@@ -262,10 +262,7 @@ impl WardClient {
 
     // ── Sandbox lifecycle ───────────────────────────────────────────
 
-    pub async fn create_sandbox(
-        &mut self,
-        opts: CreateOptions,
-    ) -> Result<Sandbox, WardError> {
+    pub async fn create_sandbox(&mut self, opts: CreateOptions) -> Result<Sandbox, WardError> {
         let req = pb::CreateSandboxRequest {
             image: opts.image,
             resources: Some(pb::ResourceLimits {
@@ -450,7 +447,9 @@ pub fn default_socket_path() -> Result<PathBuf, WardError> {
             return Ok(PathBuf::from(xdg).join("ward").join("ward.sock"));
         }
         let user = std::env::var("USER").unwrap_or_else(|_| "ward".into());
-        Ok(PathBuf::from("/tmp").join(format!("ward-{user}")).join("ward.sock"))
+        Ok(PathBuf::from("/tmp")
+            .join(format!("ward-{user}"))
+            .join("ward.sock"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {

@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// RAII guard around a running ward-mcp subprocess wired to a temp
 /// data dir. SIGKILLs on drop. Per-test isolation.
@@ -76,9 +76,7 @@ impl McpServer {
             resp["result"]["isError"], false,
             "isError flag must be false on success: {resp}"
         );
-        let arr = resp["result"]["content"]
-            .as_array()
-            .expect("content array");
+        let arr = resp["result"]["content"].as_array().expect("content array");
         assert!(!arr.is_empty(), "content must be non-empty: {resp}");
         arr[0]["text"]
             .as_str()

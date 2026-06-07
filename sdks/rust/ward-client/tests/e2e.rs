@@ -228,7 +228,10 @@ async fn given_endpoint_when_connected_then_unix_uri_displayed() {
     let d = Daemon::spawn();
     let client = connect(&d).await;
     let ep = client.endpoint();
-    assert!(ep.starts_with("unix://"), "endpoint must use unix scheme: {ep}");
+    assert!(
+        ep.starts_with("unix://"),
+        "endpoint must use unix scheme: {ep}"
+    );
     assert!(
         ep.contains("ward.sock"),
         "endpoint must reference the socket file: {ep}"
