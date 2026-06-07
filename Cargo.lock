@@ -3359,7 +3359,6 @@ dependencies = [
 name = "ward-client"
 version = "0.1.0"
 dependencies = [
- "assert_cmd",
  "hyper-util",
  "pretty_assertions",
  "prost",

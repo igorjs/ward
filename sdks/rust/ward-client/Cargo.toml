@@ -39,8 +39,7 @@ tonic-prost-build = "0.14"
 tokio = { version = "1", features = ["full"] }
 pretty_assertions = "1"
 tempfile = "3"
-# E2E tests spawn `wardd` as a subprocess and drive it via this SDK.
-# assert_cmd resolves cross-package binaries from the workspace target
-# dir (`cargo_bin("wardd")`) without hard-coding paths. Dev-only; does
-# not affect the SDK's Apache-2.0 ↔ AGPL boundary at runtime.
-assert_cmd = "2"
+# E2E tests spawn `wardd` as a subprocess. Binary resolution lives in
+# the test file itself (walks workspace ancestors for target/<profile>/wardd)
+# so we don't need a dev-dep on ward-daemon — that would breach the
+# Apache-2.0 ↔ AGPL boundary documented above.

@@ -13,14 +13,47 @@
 //! daemon binary users will deploy — not to exercise real microVMs
 //! (those need `--features krunvm` + libkrun, see docs/platforms.md).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
 
 use ward_client::{CreateOptions, EgressMode, WardClient, WardError};
+
+/// Resolve the wardd binary path without pulling in ward-daemon as a
+/// dev-dep (which would breach the Apache-2.0 ↔ AGPL boundary
+/// documented in `Cargo.toml`).
+///
+/// Order of attempts:
+///   1. `CARGO_BIN_EXE_wardd` env var. Cargo sets this automatically
+///      for the crate that owns the binary; for cross-crate cases
+///      (this one) it's typically unset.
+///   2. Workspace fallback: walk `CARGO_MANIFEST_DIR` ancestors looking
+///      for `target/{debug,release}/wardd`. Works when the workspace
+///      has already been built (i.e. `cargo test --workspace`).
+///
+/// Returns `None` if neither path resolves — in that case the test
+/// skips with a `return` rather than panicking. Coverage CI excludes
+/// ward-daemon (so wardd isn't built); skipping is correct.
+fn resolve_wardd() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_wardd") {
+        let p = PathBuf::from(p);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for ancestor in manifest.ancestors() {
+        for profile in ["debug", "release"] {
+            let candidate = ancestor.join("target").join(profile).join("wardd");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Harness: spawn wardd against an isolated data dir / socket
@@ -36,11 +69,15 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn spawn() -> Self {
+    /// Spawn wardd. Returns `None` if the wardd binary isn't present
+    /// in the workspace target dir (e.g. under coverage runs that
+    /// exclude ward-daemon) — callers should `return` to skip.
+    fn try_spawn() -> Option<Self> {
+        let wardd = resolve_wardd()?;
         let data_dir = tempfile::tempdir().expect("create temp dir");
         let socket = data_dir.path().join("ward.sock");
 
-        let mut cmd = Command::cargo_bin("wardd").expect("resolve wardd binary in workspace");
+        let mut cmd = Command::new(&wardd);
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())
             .env("WARD_LOG_LEVEL", "warn")
@@ -55,11 +92,11 @@ impl Daemon {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if socket.exists() {
-                return Self {
+                return Some(Self {
                     _data_dir: data_dir,
                     socket,
                     child: Some(child),
-                };
+                });
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -69,6 +106,7 @@ impl Daemon {
         panic!("wardd did not bind socket within 5s: {}", socket.display());
     }
 }
+
 
 impl Drop for Daemon {
     fn drop(&mut self) {
@@ -101,7 +139,16 @@ fn create_opts(image: &str) -> CreateOptions {
 
 #[tokio::test(flavor = "current_thread")]
 async fn given_sdk_when_create_sandbox_then_returns_running() {
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let sb = client
@@ -120,7 +167,16 @@ async fn given_sdk_when_create_sandbox_then_returns_running() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn given_two_sandboxes_when_list_then_both_appear() {
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let a = client
@@ -140,7 +196,16 @@ async fn given_two_sandboxes_when_list_then_both_appear() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn given_sandbox_when_remove_then_list_no_longer_contains() {
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let sb = client
@@ -164,7 +229,16 @@ async fn given_missing_sandbox_when_get_then_not_found_error() {
     // SDK error mapping: tonic NotFound → WardError::NotFound. Without
     // the per-variant mapping, callers can't distinguish "doesn't
     // exist" from "daemon broke", which agentic clients need.
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let err = client
@@ -182,7 +256,16 @@ async fn given_running_sandbox_when_exec_then_pid_returned() {
     // exec returns the synthetic pid the stub backend assigns. Real
     // libkrun backend will substitute a vsock-routed pid; the SDK
     // shape is the same.
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let sb = client
@@ -201,7 +284,16 @@ async fn given_running_sandbox_when_exec_then_pid_returned() {
 async fn given_running_sandbox_when_run_then_captures_stub_output() {
     // The stub backend emits a scripted stdout line + Exit(0). Run
     // drives exec + stream_output to completion and collects both.
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let mut client = connect(&d).await;
 
     let sb = client
@@ -225,7 +317,16 @@ async fn given_running_sandbox_when_run_then_captures_stub_output() {
 async fn given_endpoint_when_connected_then_unix_uri_displayed() {
     // Diagnostic surface — operators inspecting a logged client must
     // see a URI that points at the right transport.
-    let d = Daemon::spawn();
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
     let client = connect(&d).await;
     let ep = client.endpoint();
     assert!(
