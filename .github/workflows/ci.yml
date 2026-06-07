@@ -18,7 +18,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -47,7 +47,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -58,7 +58,7 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -87,7 +87,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -109,7 +109,7 @@ jobs:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -138,7 +138,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
@@ -186,7 +186,7 @@ jobs:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -215,7 +215,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
@@ -261,7 +261,7 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -290,7 +290,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -346,7 +346,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -375,7 +375,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
@@ -394,7 +394,7 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -423,8 +423,8 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
         with:
           tool: cargo-deny
       - name: cargo deny
@@ -443,7 +443,7 @@ jobs:
     needs: [clippy]
     runs-on: ubuntu-latest
     steps:
-      - uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: block
           # Allowlist covers GitHub API + git transport, Rust toolchain
@@ -472,12 +472,12 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - uses: taiki-e/install-action@920ab1831fbf4fb3ef75c8ead83556c918bb7290 # v2
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
         with:
           tool: cargo-llvm-cov
       - name: Install protoc
