@@ -100,11 +100,14 @@ pub trait NetworkBackend: Send + Sync {
 /// `WARD_NETWORK_BACKEND=passt` works without compile-time changes.
 pub fn backend_by_name(name: &str) -> Result<Box<dyn NetworkBackend>, Error> {
     match name {
-        "none" => Ok(Box::new(null::NullBackend::default())),
+        // Unit-struct construction: clippy::default_constructed_unit_structs
+        // forbids `::default()` on unit structs since the value is just
+        // the type name. PasstBackend has fields so it keeps Default.
+        "none" => Ok(Box::new(null::NullBackend)),
         #[cfg(feature = "passt")]
         "passt" => Ok(Box::new(passt::PasstBackend::default())),
         #[cfg(feature = "smoltcp")]
-        "smoltcp" => Ok(Box::new(smoltcp_backend::SmoltcpBackend::default())),
+        "smoltcp" => Ok(Box::new(smoltcp_backend::SmoltcpBackend)),
         other => Err(Error::Unimplemented(format!(
             "unknown network backend: {other} (known: none, passt, smoltcp)"
         ))),
