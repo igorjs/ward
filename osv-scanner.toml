@@ -1,0 +1,21 @@
+# OSV-Scanner configuration.
+#
+# Documented vulnerability suppressions. Each entry must carry a
+# justification so the next reviewer (or future-us) can re-evaluate.
+# Re-check on every dependency bump — entries here are tech-debt with
+# a paper trail, not a permanent pass.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+# rsa 0.9.10 — "Marvin Attack: potential key recovery through timing
+# sidechannels". Pulled in transitively via:
+#   ward-core → oci-client → jsonwebtoken → rsa
+# OSV records no fixed version as of 2026-06-07 (upstream `rsa` crate
+# has not shipped a constant-time fix). The crate is reached only on
+# RS256-signed OCI registry tokens during image pull; ward does not
+# itself perform RSA operations.
+# Re-evaluate when:
+#   - the `rsa` crate ships a fix (track at https://rustsec.org/advisories/RUSTSEC-2023-0071)
+#   - oci-client / jsonwebtoken offer a non-RSA-pulling feature flag
+# Issue tracking: file when removing the suppression becomes feasible.
+reason = "Transitive via oci-client → jsonwebtoken; no upstream fix as of 2026-06-07. ward does not execute RSA operations directly; risk is bounded to OCI registry auth."
