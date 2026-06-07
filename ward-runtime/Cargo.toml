@@ -25,3 +25,6 @@ tracing = "0.1"
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
+# Integration tests reach into ward-core's pb module to construct
+# protobuf request shapes — same crate the runtime wires through.
+ward-core = { path = "../ward-core" }
