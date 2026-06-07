@@ -6,6 +6,9 @@ members = [
     "ward-cli",
     "ward-core",
     "ward-agent",
+    "ward-runtime",
+    "ward-mcp",
+    "ward-net",
 ]
 
 [workspace.package]

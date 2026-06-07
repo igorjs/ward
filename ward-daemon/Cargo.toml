@@ -15,6 +15,10 @@ path = "src/main.rs"
 
 [dependencies]
 ward-core = { path = "../ward-core" }
+# ADR-016: the daemon and embedded SDKs share the same Runtime wiring
+# so they can never drift. `wardd` builds a Runtime, then layers gRPC
+# on top; SDKs build a Runtime and call the manager directly.
+ward-runtime = { path = "../ward-runtime" }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.14"
