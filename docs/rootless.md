@@ -32,18 +32,23 @@ with `0700` permissions enforced by umask.
 
 libkrun on macOS uses the Hypervisor framework, which requires a
 binary entitlement. ward's release artefacts ship pre-signed with this
-entitlement; building from source needs:
+entitlement (see `entitlements.plist` at the workspace root and the
+release workflow's "Codesign macOS binaries" step). Building from
+source needs:
 
 1. Xcode command-line tools (`xcode-select --install`).
 2. libkrun installed via `brew install slp/krun/libkrun
    slp/krun/libkrunfw`.
-3. The build sets `com.apple.security.hypervisor` on `wardd` and the
-   embedded `ward-mcp` binary. CI handles this; for local dev, sign
-   manually:
+3. The build sets `com.apple.security.hypervisor` on `wardd` and
+   `ward-mcp` (both spawn libkrun via `ward-runtime`). CI handles this
+   for release tarballs; for local dev:
 
 ```sh
-codesign --sign - --entitlements ward-daemon/entitlements.plist --force \
-  target/release/wardd
+codesign --sign - \
+  --entitlements entitlements.plist \
+  --options runtime \
+  --force \
+  target/release/wardd target/release/ward-mcp
 ```
 
 If the entitlement is missing, libkrun returns
