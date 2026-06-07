@@ -2,20 +2,14 @@
 
 //! Ward daemon – serves the gRPC API over a Unix socket.
 
-use std::sync::Arc;
-
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
-use ward_core::backend::Backend;
-use ward_core::backend::krunvm::KrunvmBackend;
-use ward_core::comms::Broker;
 use ward_core::config::Config;
 use ward_core::grpc::WardGrpcServer;
 use ward_core::pb::ward_server::WardServer;
-use ward_core::sandbox::SandboxManager;
 use ward_core::validate::MAX_PUBLISH_PAYLOAD_BYTES;
-use ward_core::volume::VolumeManager;
+use ward_runtime::Runtime;
 
 // gRPC transport caps. Decode > broker payload cap so an oversize
 // publish surfaces as `InvalidArgument` from the validator, not as a
@@ -117,28 +111,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "ward daemon starting"
     );
 
-    // Ensure required directories exist.
-    cfg.ensure_dirs()?;
-
-    // Remove a stale socket file from a previous run.
+    // Remove a stale socket file from a previous run. Done before
+    // Runtime::from_config so that a failure to remove surfaces here,
+    // not after the (more expensive) manager wiring.
     if cfg.socket_path.exists() {
         std::fs::remove_file(&cfg.socket_path)?;
     }
 
-    // Build the domain managers. The backend is held as Arc<dyn Backend>
-    // so future swaps (Firecracker on Linux, Apple Virtualization.framework
-    // on macOS) plug in by changing this line only.
-    let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(cfg.data_dir.clone()));
-    let broker = Arc::new(Broker::new());
-    let sandbox_mgr = Arc::new(SandboxManager::new(
-        Arc::clone(&backend),
-        Arc::clone(&broker),
-        cfg.max_sandboxes,
-        cfg.allow_host_mounts,
-    ));
-    let volume_mgr = Arc::new(VolumeManager::new(cfg.data_dir.clone(), cfg.max_volumes));
+    // ADR-016: a Runtime is the shared wiring between embedded SDKs and
+    // the daemon. Building it here ensures the daemon path can never
+    // drift from the SDK path — both call Runtime::from_config and get
+    // the same Backend / Broker / SandboxManager / VolumeManager.
+    // Runtime::from_config also calls cfg.ensure_dirs() internally.
+    let runtime = Runtime::from_config(&cfg).await?;
 
-    let grpc_service = WardGrpcServer::new(Arc::clone(&sandbox_mgr), Arc::clone(&volume_mgr));
+    let grpc_service = WardGrpcServer::new(runtime.sandbox_manager(), runtime.volume_manager());
 
     // SEC-009: cap per-message size on both decode and encode so a
     // hostile (or buggy) client can't force the daemon to allocate

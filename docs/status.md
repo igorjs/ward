@@ -21,3 +21,8 @@ is a periodic snapshot.
 - First signed release (v0.1.0): release smoke-test
   ([#4](https://github.com/igorjs/ward/issues/4)), then cut v0.1.0
   ([#5](https://github.com/igorjs/ward/issues/5))
+- Embedded / daemonless runtime mode: planned per
+  [ADR-016](adr/016-embedded-mode-microvms.md) (daemon stays for fleet use;
+  CLI default flips to embedded). Bundles userspace networking via `smoltcp`
+  (closes [#32](https://github.com/igorjs/ward/issues/32)) and rootless
+  operation on macOS + Linux.
