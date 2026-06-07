@@ -107,7 +107,6 @@ impl Daemon {
     }
 }
 
-
 impl Drop for Daemon {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
