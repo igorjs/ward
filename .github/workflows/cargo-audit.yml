@@ -52,4 +52,13 @@ jobs:
         # Marvin sidechannel is not reachable. No upstream fix
         # available yet; revisit when rsa publishes a constant-time
         # release.
-        run: cargo audit --deny warnings --ignore RUSTSEC-2023-0071
+        #
+        # --ignore RUSTSEC-2026-0173 (proc-macro-error2 unmaintained):
+        # informational advisory, no CVSS, no exploit. Pulled in via
+        # ward-core -> oci-client -> oci-spec -> getset; runs at
+        # compile time only, not linked into the shipped binaries.
+        # Mirrored in deny.toml and osv-scanner.toml.
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0173
