@@ -204,6 +204,7 @@ impl RuntimeBuilder {
             max_cached_images: 64,
             allow_host_mounts: self.allow_host_mounts,
             metrics_addr: None,
+            network_backend: ward_core::config::NetworkBackendChoice::default(),
         };
         cfg.ensure_dirs()?;
 
@@ -259,6 +260,7 @@ mod tests {
             max_cached_images: 8,
             allow_host_mounts: false,
             metrics_addr: None,
+            network_backend: ward_core::config::NetworkBackendChoice::default(),
         };
         let rt = Runtime::from_config(&cfg).await.unwrap();
         assert!(Arc::strong_count(&rt.broker()) >= 2);
