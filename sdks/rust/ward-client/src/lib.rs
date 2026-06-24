@@ -3,10 +3,12 @@
 //! ward-client: a Rust library wrapper over the ward daemon's gRPC API.
 //!
 //! Idiomatic surface over a generated tonic client. The generated code
-//! lives in [`pb`] and is produced from `proto/ward.proto` at build
-//! time by this crate's own `build.rs` — no `path` dependency on
-//! ward-core, so the Apache-2.0 / AGPL-3.0 boundary documented in
-//! `Cargo.toml` stays clean.
+//! lives in [`pb`] and is re-exported from the [`ward-proto`] crate
+//! (Apache-2.0). Both this SDK and the AGPL server-side workspace
+//! depend on `ward-proto` so the wire types stay byte-identical on
+//! both sides without crossing the licence boundary. See ADR-017.
+//!
+//! [`ward-proto`]: https://docs.rs/ward-proto
 //!
 //! # Example
 //!
@@ -41,12 +43,11 @@ use tower::service_fn;
 
 /// Generated protobuf types and the tonic-built gRPC client stub.
 ///
-/// Compiled from `proto/ward.proto` at build time. Stable surface as
-/// long as protobuf field numbers and message names stay backwards
-/// compatible — see ADR-004 on versioning.
-pub mod pb {
-    tonic::include_proto!("ward.v1");
-}
+/// Re-exported from the [`ward-proto`](https://docs.rs/ward-proto) crate
+/// so the SDK and the server side share a single codegen output. Stable
+/// surface as long as protobuf field numbers and message names stay
+/// backwards compatible — see ADR-004 on versioning.
+pub use ward_proto::pb;
 
 use pb::ward_client::WardClient as PbClient;
 

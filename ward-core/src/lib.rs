@@ -11,6 +11,12 @@ pub mod validate;
 pub mod volume;
 
 /// Generated protobuf types and gRPC service traits.
-pub mod pb {
-    tonic::include_proto!("ward.v1");
-}
+///
+/// Re-exported from the standalone `ward-proto` crate so the AGPL
+/// workspace (this crate + ward-daemon + ward-runtime + ward-mcp) and
+/// the Apache-2.0 SDK side (`sdks/rust/ward-client`) share a single
+/// codegen output without crossing the license boundary. The wire
+/// types stay reachable through the historical `crate::pb::*` path so
+/// existing call sites do not move. See ADR-017 for the rationale and
+/// the `ward-proto` crate docs for the boundary contract.
+pub use ward_proto::pb;
