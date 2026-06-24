@@ -13,8 +13,10 @@ use tokio::sync::RwLock;
 
 use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::protocol::{
-    CreateOpts, EgressMode, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo,
+    CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo,
 };
+#[cfg(feature = "krunvm")]
+use crate::protocol::EgressMode;
 
 /// vsock port the guest agent listens on; must match `ward-agent`.
 /// Only referenced by the krunvm-gated FFI wrappers.
@@ -93,6 +95,10 @@ struct SandboxState {
     /// `Some` in `--features krunvm` after `create_sandbox` returns Ok.
     #[cfg(feature = "krunvm")]
     vm: Option<VmRuntime>,
+    /// Live passt subprocess. `None` when egress mode is Deny or when
+    /// the `krunvm` feature is disabled (stub builds do not spawn passt).
+    #[cfg(feature = "krunvm")]
+    passt: Option<ward_net::passt::PasstHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +181,19 @@ impl Backend for KrunvmBackend {
 
         self.krun_set_root(ctx_id, &rootfs)?;
 
-        if opts.egress.mode != EgressMode::Deny {
-            // TODO: configure virtio-net and attach egress proxy TAP.
-        }
+        #[cfg(feature = "krunvm")]
+        let passt_handle = if opts.egress.mode != EgressMode::Deny {
+            use super::krun_ffi;
+            let handle =
+                ward_net::passt::spawn_for_sandbox(&id, &ward_net::AttachOptions::default())
+                    .await
+                    .map_err(|e| BackendError::Internal(format!("passt spawn: {e}")))?;
+            krun_ffi::set_passt_fd(ctx_id, handle.guest_fd)
+                .map_err(|e| BackendError::Internal(e))?;
+            Some(handle)
+        } else {
+            None
+        };
 
         // Bind mounts → virtiofs shares; volumes → raw block devices. The
         // mapping/validation is host-side; the attach FFI is gated and
@@ -227,6 +243,8 @@ impl Backend for KrunvmBackend {
             ctx_id,
             #[cfg(feature = "krunvm")]
             vm,
+            #[cfg(feature = "krunvm")]
+            passt: passt_handle,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -277,6 +295,16 @@ impl Backend for KrunvmBackend {
             // surface them because the sandbox is being torn down and
             // any further failure on krun_free_ctx is the actionable one.
             let _ = self.krun_signal_and_join(id, vm).await;
+        }
+
+        // SIGTERM + reap the passt child before freeing the libkrun context.
+        // Ordering: passt must be gone before krun_free_ctx so there is no
+        // dangling virtio-net peer after the context is freed.
+        #[cfg(feature = "krunvm")]
+        if let Some(mut passt) = state.passt.take() {
+            if let Err(e) = passt.kill().await {
+                tracing::warn!(sandbox_id = %id, "passt teardown error: {e}");
+            }
         }
 
         if state.ctx_id != 0 {
