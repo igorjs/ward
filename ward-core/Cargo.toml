@@ -56,6 +56,10 @@ uuid = { version = "1", features = ["v4"] }
 # Already a transitive dep via tempfile -> native-tls; promoted to a
 # direct dep so the rustix usage is explicit in this crate's manifest.
 rustix = { version = "1", features = ["fs"] }
+# ward-net: network backend for the krunvm boot path. The passt feature
+# gates spawn_for_sandbox which creates the AF_UNIX socketpair and spawns
+# the passt child. Only needed at runtime when using rootless networking.
+ward-net = { path = "../ward-net", features = ["passt"] }
 # metrics: zero-overhead recorder façade. Daemon installs the
 # prometheus exporter; this crate emits the counters/gauges/histograms
 # the daemon scrapes. No-op if no exporter is installed (i.e. when
