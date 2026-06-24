@@ -2,6 +2,48 @@
 
 use std::path::PathBuf;
 
+/// Selects which network backend the daemon uses per ADR-018.
+///
+/// Parsed from `WARD_NETWORK_BACKEND` at daemon startup. Invalid values
+/// panic at startup with a clear message listing the valid set so typos
+/// surface immediately rather than silently falling back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkBackendChoice {
+    /// passt(1) — rootless userspace TCP/IP translator. Requires `passt`
+    /// on `$PATH` at sandbox-create time. Default per ADR-018.
+    #[default]
+    Passt,
+    /// No network egress. Sandbox is isolated from the network entirely.
+    None,
+    /// gvproxy — alternative for hosts that already run podman-machine.
+    /// Not implemented in v0.1; config parsing accepts the value so the
+    /// env var can be set ahead of the implementation landing.
+    Gvproxy,
+    /// smoltcp — pure-Rust userspace stack (research path). Not on the
+    /// v0.1 critical path; accepted for forward compatibility.
+    Smoltcp,
+}
+
+/// Parse `WARD_NETWORK_BACKEND` value into a [`NetworkBackendChoice`].
+///
+/// Valid values: `passt` (default), `none`, `gvproxy`, `smoltcp`.
+/// Returns an error string on invalid input, listing the valid set.
+///
+/// Free function (not a method) so it's testable without constructing
+/// a full `Config`.
+pub fn parse_network_backend(s: &str) -> Result<NetworkBackendChoice, String> {
+    match s {
+        "passt" => Ok(NetworkBackendChoice::Passt),
+        "none" => Ok(NetworkBackendChoice::None),
+        "gvproxy" => Ok(NetworkBackendChoice::Gvproxy),
+        "smoltcp" => Ok(NetworkBackendChoice::Smoltcp),
+        other => Err(format!(
+            "invalid WARD_NETWORK_BACKEND value {other:?}: valid values are \
+             passt, none, gvproxy, smoltcp"
+        )),
+    }
+}
+
 /// Daemon configuration, sourced from environment variables with sensible defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -29,6 +71,9 @@ pub struct Config {
     /// Unix-socket-only. Set `WARD_METRICS_ADDR=127.0.0.1:9100` (or any
     /// SocketAddr) to opt in to scraping.
     pub metrics_addr: Option<std::net::SocketAddr>,
+    /// Which network backend to use for sandbox egress. Parsed from
+    /// `WARD_NETWORK_BACKEND`; defaults to `passt` per ADR-018.
+    pub network_backend: NetworkBackendChoice,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -44,6 +89,7 @@ pub struct ConfigEnv {
     pub ward_max_cached_images: Option<String>,
     pub ward_allow_host_mounts: Option<String>,
     pub ward_metrics_addr: Option<String>,
+    pub ward_network_backend: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -61,6 +107,7 @@ impl Config {
             ward_max_cached_images: std::env::var("WARD_MAX_CACHED_IMAGES").ok(),
             ward_allow_host_mounts: std::env::var("WARD_ALLOW_HOST_MOUNTS").ok(),
             ward_metrics_addr: std::env::var("WARD_METRICS_ADDR").ok(),
+            ward_network_backend: std::env::var("WARD_NETWORK_BACKEND").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -129,6 +176,17 @@ impl Config {
             .as_deref()
             .and_then(|v| v.parse::<std::net::SocketAddr>().ok());
 
+        // WARD_NETWORK_BACKEND: invalid values panic at startup with a clear
+        // message listing the valid set. This is intentional — a typo like
+        // "wireguard" should surface immediately rather than silently falling
+        // back to passt and leaving the operator confused about which backend
+        // is actually running.
+        let network_backend = env
+            .ward_network_backend
+            .as_deref()
+            .map(|v| parse_network_backend(v).unwrap_or_else(|e| panic!("{e}")))
+            .unwrap_or_default();
+
         Self {
             socket_path,
             data_dir,
@@ -138,6 +196,7 @@ impl Config {
             max_cached_images,
             allow_host_mounts,
             metrics_addr,
+            network_backend,
         }
     }
 
@@ -560,5 +619,44 @@ mod tests {
         // Assert
         assert_eq!(cfg.socket_path, PathBuf::from("/custom/ward.sock"));
         assert_eq!(cfg.data_dir, PathBuf::from("/custom/data"));
+    }
+
+    // ----- WARD_NETWORK_BACKEND ------------------------------------------
+
+    #[test]
+    fn given_no_network_backend_when_from_values_then_defaults_to_passt() {
+        let env = env_with_home();
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.network_backend, NetworkBackendChoice::Passt);
+    }
+
+    #[test]
+    fn given_network_backend_none_when_from_values_then_none() {
+        let env = ConfigEnv {
+            ward_network_backend: Some("none".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.network_backend, NetworkBackendChoice::None);
+    }
+
+    #[test]
+    fn given_network_backend_passt_when_from_values_then_passt() {
+        let env = ConfigEnv {
+            ward_network_backend: Some("passt".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.network_backend, NetworkBackendChoice::Passt);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid WARD_NETWORK_BACKEND value")]
+    fn given_invalid_network_backend_when_from_values_then_panics() {
+        let env = ConfigEnv {
+            ward_network_backend: Some("wireguard".into()),
+            ..env_with_home()
+        };
+        Config::from_values(env);
     }
 }
