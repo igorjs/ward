@@ -259,3 +259,32 @@ unsafe extern "C" {
 
     pub fn krun_start_enter(ctx_id: u32) -> i32;
 }
+
+/// Safe wrapper around [`krun_set_passt_fd`].
+///
+/// Hands the host-side FD of an `AF_UNIX SOCK_STREAM` socketpair to
+/// libkrun so the VM's virtio-net device routes through passt.
+///
+/// # Errors
+///
+/// Returns an error string containing the libkrun errno (negated return
+/// value) if the call fails. The caller in `krunvm.rs` maps this to
+/// `BackendError::Internal`.
+///
+/// # Safety (caller obligations)
+///
+/// - `ctx_id` must have been returned by `krun_create_ctx()` and must
+///   not have been freed.
+/// - `fd` must be an open, valid file descriptor for the lifetime of
+///   this call. libkrun duplicates the fd internally; the caller may
+///   close its copy afterward.
+#[cfg(feature = "krunvm")]
+pub fn set_passt_fd(ctx_id: u32, fd: c_int) -> Result<(), String> {
+    // SAFETY: ctx_id contract documented above; fd is caller-guaranteed open.
+    let ret = unsafe { krun_set_passt_fd(ctx_id, fd) };
+    if ret < 0 {
+        Err(format!("krun_set_passt_fd failed: errno {}", -ret))
+    } else {
+        Ok(())
+    }
+}
