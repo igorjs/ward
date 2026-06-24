@@ -1,0 +1,32 @@
+[package]
+name = "ward-proto"
+description = "Protobuf types + tonic gRPC stubs for the ward sandbox daemon's public wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Apache-2.0, not workspace-default AGPL. ward-proto is the SDK-facing
+# crate: both the AGPL workspace (ward-core, ward-daemon, ward-runtime,
+# ward-mcp) and the Apache-2.0 SDKs (sdks/rust/ward-client) depend on it.
+# The .proto file itself is CC0 per ADR-004; this crate's generated
+# Rust output is the Apache-2.0 boundary. See ADR-017 for the license
+# posture and why the boundary lives at the proto layer, not the
+# transport layer.
+license = "Apache-2.0"
+homepage = "https://github.com/igorjs/ward"
+documentation = "https://docs.rs/ward-proto"
+keywords = ["ward", "sandbox", "microvm", "grpc", "protobuf"]
+categories = ["api-bindings", "virtualization"]
+
+[dependencies]
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+# tonic 0.14 split prost integration into a separate crate; the generated
+# code (include_proto!) references it.
+tonic-prost = "0.14"
+
+[build-dependencies]
+# tonic 0.14 moved prost codegen out of tonic-build into tonic-prost-build.
+tonic-prost-build = "0.14"

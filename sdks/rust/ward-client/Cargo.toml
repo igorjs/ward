@@ -12,28 +12,29 @@ categories = ["api-bindings", "virtualization"]
 edition.workspace = true
 rust-version.workspace = true
 
-# This crate is intentionally Apache-2.0 while the workspace is AGPL-3.0-only.
-# That split only holds if `ward-client` has zero `path =` dependency on any
-# AGPL crate (ward-core, ward-runtime, ward-daemon, ward-agent). The protobuf
-# types are generated locally from `proto/ward.proto` (CC0, per ADR-004) via
-# this crate's own `build.rs`, not imported from ward-core. Embedded mode is
-# parked behind ADR-017's license-posture decision; see ADR-016 amendment.
+# This crate is intentionally Apache-2.0 while most of the workspace is
+# AGPL-3.0-only. That split only holds if `ward-client` has zero `path =`
+# dependency on any AGPL crate (ward-core, ward-runtime, ward-daemon,
+# ward-agent, ward-mcp). The only allowed in-tree path dep is
+# `ward-proto` (Apache-2.0) — generated wire types live there per
+# ADR-017 so server-side AGPL crates and Apache-2.0 SDKs share one
+# codegen output without crossing the licence boundary. Embedded mode is
+# parked behind ADR-017's license-posture decision; see ADR-016
+# amendment.
 
 [dependencies]
+# ward-proto: Apache-2.0, generated protobuf + tonic stubs for ward.v1.
+# Re-exported as `pub use ward_proto::pb` in this crate's lib.rs so the
+# `WardClient::<method>` signatures stay shaped exactly as before — no
+# downstream-facing API change from the extraction.
+ward-proto = { path = "../../../ward-proto" }
 tokio = { version = "1", features = ["net", "rt", "macros", "sync"] }
 tokio-stream = "0.1"
 tonic = "0.14"
-# tonic 0.14 split prost integration into a separate crate; the generated
-# code (include_proto!) references it.
-tonic-prost = "0.14"
 prost = "0.14"
-prost-types = "0.14"
 thiserror = "2"
 tower = "0.5"
 hyper-util = { version = "0.1", features = ["tokio"] }
-
-[build-dependencies]
-tonic-prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
