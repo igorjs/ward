@@ -17,6 +17,11 @@ default = []
 krunvm = []
 
 [dependencies]
+# Generated protobuf types + tonic gRPC stubs for the ward.v1 wire
+# protocol. ward-proto is Apache-2.0; ward-core re-exports its `pb`
+# module so call sites stay `crate::pb::...`-shaped. See ADR-017 for
+# the SDK ↔ server boundary that pinned this split.
+ward-proto = { path = "../ward-proto" }
 # async-trait: makes Backend trait object-safe by boxing each async fn's
 # future. Used to hold `Arc<dyn Backend>` in SandboxManager so backends
 # (libkrun today, Firecracker/Virtualization.framework tomorrow) can be

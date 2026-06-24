@@ -93,3 +93,21 @@ flavours per language:
 The protobuf surface and SDK tiers in this ADR remain authoritative for the
 daemon path. See ADR-016 for the embedded-path rationale and implementation
 order.
+
+## Amendment (ward-proto crate, 2026-06-25)
+
+Per ADR-017 the generated Rust bindings live in a standalone `ward-proto`
+crate (Apache-2.0, `ward-proto/` at the workspace root). Both
+`sdks/rust/ward-client` (Apache-2.0) and the AGPL workspace
+(`ward-core`, `ward-daemon`, `ward-runtime`, `ward-mcp`) depend on
+`ward-proto` and re-export its `pb` module so the wire types stay
+byte-identical on both sides. Server-side call sites continue to use
+the historical `crate::pb::*` path via `pub use ward_proto::pb;` in
+`ward-core/src/lib.rs`. `proto/ward_agent.proto` (the in-VM vsock
+protocol, AGPL-only) is **not** in `ward-proto`; it stays generated
+inside `ward-core/build.rs` so SDK consumers never pull AGPL surface.
+
+The "Build pipeline" section above (regenerate generated code on every
+`ward.proto` change) is now handled by Cargo's normal rebuild graph for
+the Rust SDK — `ward-client` rebuilds when `ward-proto` does. Other
+languages still follow the cross-repo PR pattern.
