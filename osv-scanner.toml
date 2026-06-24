@@ -19,3 +19,23 @@ id = "RUSTSEC-2023-0071"
 #   - oci-client / jsonwebtoken offer a non-RSA-pulling feature flag
 # Issue tracking: file when removing the suppression becomes feasible.
 reason = "Transitive via oci-client → jsonwebtoken; no upstream fix as of 2026-06-07. ward does not execute RSA operations directly; risk is bounded to OCI registry auth."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0173"
+# proc-macro-error2 2.0.1 — "unmaintained" informational advisory
+# (no CVSS, no exploit). Author confirmed deprecation on
+# 2026-06-07. Pulled in transitively via:
+#   ward-core → oci-client → oci-spec → getset → proc-macro-error2
+# proc-macro-error2 is a *proc-macro* crate — it runs at compile
+# time to expand the `getset` derive macros, and is not linked
+# into the shipped `wardd` / `ward` / `ward-mcp` binaries. Even
+# if a real vulnerability existed, the blast radius would be a
+# build-host supply-chain concern during `cargo build`, not a
+# runtime threat in the released artefact. The informational
+# advisory by itself is not exploitable.
+# Re-evaluate when:
+#   - `oci-spec` migrates off `getset` (or `getset` switches to
+#     `manyhow` / `proc-macro2-diagnostics`)
+#   - a `cargo update -p oci-spec` picks up a release that drops it
+# Issue tracking: file when removing the suppression becomes feasible.
+reason = "Informational (unmaintained) advisory, no CVSS / no exploit. Transitive proc-macro via oci-spec → getset; compile-time only, not present in shipped binary."

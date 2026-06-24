@@ -13,6 +13,12 @@ ignore = [
     # anonymous pulls of public images and never holds an RSA private key,
     # so the key-recovery vector does not apply.
     "RUSTSEC-2023-0071",
+    # proc-macro-error2 — "unmaintained" informational advisory (no CVSS,
+    # no exploit). Pulled in transitively via oci-client -> oci-spec ->
+    # getset, and used ONLY at compile time to expand derive macros. Not
+    # linked into the shipped wardd / ward / ward-mcp binaries. Mirror of
+    # the entry in osv-scanner.toml — both scanners need their own ignore.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]
