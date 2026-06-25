@@ -6,6 +6,7 @@ members = [
     "ward-cli",
     "ward-core",
     "ward-agent",
+    "ward-proto",
     "ward-runtime",
     "ward-mcp",
     "ward-net",
