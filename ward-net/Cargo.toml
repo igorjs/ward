@@ -46,6 +46,11 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     "socket-udp",
     "log",
 ] }
+# libc: used in spawn_for_sandbox to call socketpair(2) directly.
+# rustix's net feature isn't enabled here; pulling libc for a single
+# syscall is cheaper than widening the rustix feature set.
+libc = "0.2"
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3"

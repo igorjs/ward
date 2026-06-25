@@ -19,12 +19,115 @@
 //!    krun_ctx_id), so this crate exposes a `spawn_for_attach` that
 //!    returns the FD; the caller injects it into libkrun.
 
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::RwLock;
 
 use crate::{AttachId, AttachOptions, Error, NetworkBackend, Protocol};
 
 /// Name of the passt binary we probe for.
 const PASST_BIN: &str = "passt";
+
+/// Live passt subprocess for one sandbox.
+///
+/// Created by [`spawn_for_sandbox`]. The caller (ward-core) extracts
+/// `guest_fd` and hands it to `krun_set_passt_fd`; this struct retains
+/// ownership of `host_fd` (the other end of the socketpair) so it stays
+/// open until the sandbox is torn down.
+#[derive(Debug)]
+pub struct PasstHandle {
+    /// FD to hand to libkrun via `krun_set_passt_fd`. This is the
+    /// passt-side FD of the AF_UNIX socketpair (passt's `--fd N`
+    /// argument points here, and libkrun communicates through it).
+    pub guest_fd: RawFd,
+    /// Host-side FD of the socketpair. Kept alive so the pair stays
+    /// open while the sandbox is running. Dropped on teardown.
+    _host_fd: OwnedFd,
+    /// The live passt child process. Use [`PasstHandle::kill`] to SIGTERM
+    /// and reap it during sandbox teardown.
+    pub child: tokio::process::Child,
+}
+
+impl PasstHandle {
+    /// SIGTERM the passt child and await its exit. Idempotent: a
+    /// process that has already exited will have `try_wait` return
+    /// `Ok(Some(_))`, and we return `Ok(())` without sending SIGTERM.
+    pub async fn kill(&mut self) -> Result<(), Error> {
+        // If already exited, reap and return.
+        match self.child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("passt try_wait error: {e}");
+            }
+        }
+        if let Err(e) = self.child.start_kill() {
+            // ESRCH = already gone; treat as success.
+            tracing::debug!("passt start_kill: {e}");
+        }
+        let _ = self.child.wait().await;
+        Ok(())
+    }
+}
+
+/// Create an `AF_UNIX SOCK_STREAM` pair, spawn `passt` with the
+/// guest-side FD passed via `--fd <N>`, and return a [`PasstHandle`]
+/// holding the host-side FD + the live child.
+///
+/// The socketpair and spawn are synchronous/blocking at the OS level
+/// but we return an async function so callers in tokio don't need to
+/// `spawn_blocking`.
+///
+/// # Errors
+///
+/// Returns [`Error::DependencyMissing`] if `passt` is not on `$PATH`.
+/// Returns [`Error::Process`] if the socketpair syscall fails or
+/// if `Command::spawn` fails.
+pub async fn spawn_for_sandbox(
+    sandbox_id: &str,
+    opts: &AttachOptions,
+) -> Result<PasstHandle, Error> {
+    // Probe first so error message is actionable.
+    PasstBackend::default().probe().await?;
+
+    // socketpair(AF_UNIX, SOCK_STREAM, 0) → [host_fd, guest_fd]
+    // We use the raw libc call because rustix::net::socketpair on macOS
+    // requires the `net` feature of rustix which ward-net doesn't pull.
+    // SAFETY: socketpair is a pure syscall with no preconditions beyond
+    // valid `sv` pointer; both fds are closed on error via OwnedFd/drop.
+    let mut sv: [std::ffi::c_int; 2] = [-1, -1];
+    // AF_UNIX = 1 on both Linux and macOS.
+    // SOCK_STREAM = 1 on both.
+    let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(Error::Process(format!(
+            "socketpair(AF_UNIX, SOCK_STREAM) failed: errno {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: socketpair succeeded; sv[0] and sv[1] are valid open fds.
+    let host_fd = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+    let guest_fd: RawFd = sv[1];
+
+    // Build argv (includes -f, --pid, port flags)
+    let mut argv = build_command_line(sandbox_id, opts);
+    // Remove the leading "passt" element; Command takes it as the binary.
+    argv.remove(0);
+    // Append --fd <guest_fd> so passt uses our socketpair instead of a
+    // tun/tap device.
+    argv.push("--fd".to_string());
+    argv.push(guest_fd.to_string());
+
+    let child = tokio::process::Command::new(PASST_BIN)
+        .args(&argv)
+        .spawn()
+        .map_err(|e| Error::Process(format!("failed to spawn passt: {e}")))?;
+
+    Ok(PasstHandle {
+        guest_fd,
+        _host_fd: host_fd,
+        child,
+    })
+}
 
 #[derive(Debug, Default)]
 pub struct PasstBackend {
