@@ -27,17 +27,21 @@ See [`docs/why.md`](docs/why.md) for the Docker / SaaS comparison, and
 [`docs/positioning.md`](docs/positioning.md) for how ward differs from
 other libkrun-based projects.
 
-> **Pre-release.** v0.1.0 hasn't been cut yet. Build from source today;
-> live status on the [project board](https://github.com/users/igorjs/projects/2).
+> **Pre-release.** v0.1.0 is the first signed semver release; see the
+> [project board](https://github.com/users/igorjs/projects/2) for live status.
 
-## Quick start
+## Install
 
 ```sh
-git clone https://github.com/igorjs/ward.git
-cd ward
-cargo build --release   # default stub backend, any platform
-cargo test
+curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
 ```
+
+Installs `ward`, `wardd`, and `ward-mcp` to `~/.ward/bin`. Tarballs are
+SHA-256 pinned and SLSA Build L3 attested; if `slsa-verifier` is on `PATH`
+the installer checks the provenance chain before extracting. On macOS the
+daemon ships codesigned with the Hypervisor entitlement; on Linux you'll
+need to be in the `kvm` group (`sudo usermod -aG kvm $USER`). See
+[`docs/platforms.md`](docs/platforms.md) for the full per-platform setup.
 
 Workspace binaries:
 
@@ -45,16 +49,36 @@ Workspace binaries:
 |--------------|------------------------------------------------------------------|
 | `wardd`      | Long-running daemon (gRPC over Unix socket)                       |
 | `ward`       | CLI for the daemon                                                |
-| `ward-mcp`   | MCP stdio server for LLM agents                                   |
+| `ward-mcp`   | MCP stdio server for LLM agents (embedded; no daemon required)    |
 
-Real microVMs need `--features krunvm` plus libkrun installed — see
-[`docs/platforms.md`](docs/platforms.md).
+## Build from source
+
+```sh
+git clone https://github.com/igorjs/ward.git
+cd ward
+
+# macOS (Apple Silicon)
+brew install slp/krun/libkrun slp/krun/libkrunfw
+# Linux (Debian/Ubuntu)
+sudo apt-get install -y libkrun-dev libkrunfw-dev
+
+cargo build --release --features krunvm
+cargo test --features krunvm
+```
+
+Release binaries always ship with `--features krunvm` and a bundled
+libkrun bottle from [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds);
+the installer above does this for you. The default `cargo build`
+(no features) compiles against a stub backend on any platform — useful
+for contributors hacking on broker/CLI/MCP code without libkrun
+installed, not for actually running sandboxes. See
+[`docs/platforms.md`](docs/platforms.md) for the full setup matrix.
 
 ## Hello world (daemon + CLI)
 
 ```sh
-./target/release/wardd &                       # start the daemon
-ward create alpine                             # → sandbox id
+wardd &                                  # start the daemon
+ward create alpine                       # → sandbox id
 ward exec <id> -- echo "hello from inside"
 ward logs <id> <pid>
 ward remove <id>
