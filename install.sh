@@ -18,7 +18,8 @@
 #                     $WARD_INSTALL_DIR/bin/; dylibs in $WARD_INSTALL_DIR/lib/.
 #                     Default: $HOME/.ward
 #   WARD_NO_MODIFY_PATH
-#                     If set to any non-empty value, skip the PATH update hint.
+#                     If set to any non-empty value, skip modifying shell rc
+#                     files; print PATH instructions instead.
 #
 # Exit codes:
 #   0   Success.
@@ -178,7 +179,7 @@ log "Verifying SHA-256"
 EXPECTED_SHA="$(awk '{print $1}' "${TMP_DIR}/${ARCHIVE}.sha256")"
 ACTUAL_SHA="$(${SHA256_CMD} "${TMP_DIR}/${ARCHIVE}" | awk '{print $1}')"
 if [[ "$EXPECTED_SHA" != "$ACTUAL_SHA" ]]; then
-  err "SHA-256 mismatch — refusing to install"
+  err "SHA-256 mismatch; refusing to install"
   err "expected: $EXPECTED_SHA"
   err "got:      $ACTUAL_SHA"
   exit 4
@@ -249,7 +250,7 @@ fi
 
 EXTRACTED_DIR="${TMP_DIR}/ward-${VERSION}-${TARGET}"
 if [[ ! -d "$EXTRACTED_DIR" ]]; then
-  err "unexpected archive layout — no ${EXTRACTED_DIR} after extract"
+  err "unexpected archive layout; no ${EXTRACTED_DIR} after extract"
   exit 5
 fi
 
@@ -286,19 +287,111 @@ echo
 ok "Installed ward ${VERSION} to ${WARD_INSTALL_DIR}"
 echo
 
+# ---------------------------------------------------------------------------
+# Shell rc modification
+# ---------------------------------------------------------------------------
+#
+# Append the export line to the user's shell rc file so future shells
+# pick up ward on PATH. Idempotent: skipped entirely if the install dir
+# is already on PATH, or if the rc file already references it.
+#
+# Hard limit of pipe-to-bash installers: we cannot modify the parent
+# shell's environment, so the user still needs to `source` their rc
+# file or open a new terminal for `ward` to resolve in this session.
+# We print the source command to make that obvious.
+
+print_path_hint() {
+  echo "${C_DIM}# Add ward to your shell PATH:${C_RESET}"
+  echo "  export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\""
+  echo
+  echo "${C_DIM}# Permanently (bash):${C_RESET}"
+  echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.bashrc"
+  echo "${C_DIM}# Permanently (zsh):${C_RESET}"
+  echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.zshrc"
+  echo
+}
+
+modify_path() {
+  local install_bin="${WARD_INSTALL_DIR}/bin"
+
+  # Already on PATH? Nothing to do.
+  case ":$PATH:" in
+    *":${install_bin}:"*)
+      return 0
+      ;;
+  esac
+
+  local shell_name
+  shell_name="$(basename "${SHELL:-/bin/sh}")"
+
+  local rc_file="" line_to_add=""
+  case "$shell_name" in
+    zsh)
+      rc_file="${HOME}/.zshrc"
+      line_to_add="export PATH=\"${install_bin}:\$PATH\""
+      ;;
+    bash)
+      # macOS login shells source .bash_profile, not .bashrc; honour
+      # whichever the user already has.
+      if [[ "$(uname -s)" == "Darwin" && -f "${HOME}/.bash_profile" ]]; then
+        rc_file="${HOME}/.bash_profile"
+      else
+        rc_file="${HOME}/.bashrc"
+      fi
+      line_to_add="export PATH=\"${install_bin}:\$PATH\""
+      ;;
+    fish)
+      rc_file="${HOME}/.config/fish/config.fish"
+      line_to_add="set -gx PATH ${install_bin} \$PATH"
+      mkdir -p "$(dirname "$rc_file")"
+      ;;
+    *)
+      warn "unrecognised shell '$shell_name'; skipping rc modification"
+      print_path_hint
+      return 0
+      ;;
+  esac
+
+  # Idempotent: skip if the install dir is already referenced.
+  if [[ -f "$rc_file" ]] && grep -Fq "$install_bin" "$rc_file"; then
+    ok "PATH already configured in $rc_file"
+    return 0
+  fi
+
+  # Append. touch first so the redirect doesn't fail on missing parent
+  # for shells like fish where we just created the dir above.
+  if ! touch "$rc_file" 2> /dev/null; then
+    warn "could not write to $rc_file; falling back to hint"
+    print_path_hint
+    return 0
+  fi
+  {
+    echo ""
+    echo "# Added by ward installer ($(uname -s) $(date -u +%Y-%m-%d))"
+    echo "$line_to_add"
+  } >> "$rc_file"
+
+  ok "Updated PATH in $rc_file"
+  echo
+  echo "${C_DIM}# To use ward in this shell session, run:${C_RESET}"
+  case "$shell_name" in
+    fish)
+      echo "  source $rc_file"
+      ;;
+    *)
+      echo "  . $rc_file"
+      ;;
+  esac
+  echo "${C_DIM}# Or open a new terminal.${C_RESET}"
+  echo
+}
+
 if [[ -z "${WARD_NO_MODIFY_PATH:-}" ]]; then
+  modify_path
+else
   case ":$PATH:" in
     *":${WARD_INSTALL_DIR}/bin:"*) ;;
-    *)
-      echo "${C_DIM}# Add ward to your shell PATH:${C_RESET}"
-      echo "  export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\""
-      echo
-      echo "${C_DIM}# Permanently (bash):${C_RESET}"
-      echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.bashrc"
-      echo "${C_DIM}# Permanently (zsh):${C_RESET}"
-      echo "  echo 'export PATH=\"${WARD_INSTALL_DIR}/bin:\$PATH\"' >> ~/.zshrc"
-      echo
-      ;;
+    *) print_path_hint ;;
   esac
 fi
 
@@ -315,7 +408,7 @@ echo
 # Rootless prerequisites hint (post-install, non-fatal)
 # ---------------------------------------------------------------------------
 #
-# ward runs unprivileged — see docs/rootless.md — but each platform
+# ward runs unprivileged; see docs/rootless.md; but each platform
 # has a one-time setup step the user has to do themselves (we won't
 # sudo on their behalf). Print a per-platform pointer so they don't
 # discover this on their first `ward create`.
@@ -336,11 +429,11 @@ case "$(uname -s)" in
   Darwin)
     # The Hypervisor entitlement is applied at release-build time by
     # ward's release.yml. Local builds from source require manual
-    # codesigning — only relevant if the user built from source
+    # codesigning; only relevant if the user built from source
     # rather than running this script. Mention it lightly.
     echo "${C_DIM}# macOS rootless setup:${C_RESET}"
     echo "  The installed wardd is signed with the Hypervisor"
-    echo "  entitlement — no further setup needed. If you instead"
+    echo "  entitlement; no further setup needed. If you instead"
     echo "  built wardd from source, see docs/rootless.md for the"
     echo "  one-time codesign step."
     echo
