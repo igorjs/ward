@@ -16,6 +16,11 @@
 # https://github.com/igorjs/libkrun-builds/releases/tag/libkrun-v1.19.1
 # Bumped from 1.18.0 to pick up `krun_set_passt_fd` and
 # `krun_set_gvproxy_path` (required by rootless networking; see ADR-018).
-395899357a858bdfff93a6d2b523a9268b69c1a7daf978eb39a18621a7dc927a  libkrun-1.19.1-aarch64-apple-darwin.tar.gz
-43bb57792abdfb25e5f70ddfaa3cc2a50e6a09613a27b22186f1f52095d83c37  libkrun-1.19.1-x86_64-unknown-linux-gnu.tar.gz
-30a626617725a14459d04bd50983f32bd2ecb9729fef128df6198b9e6e14184b  libkrun-1.19.1-aarch64-unknown-linux-gnu.tar.gz
+# Rebuilt 2026-06-26 with NET=1 BLK=1 in upstream Makefile so the
+# rootless networking and block-device FFI symbols actually export.
+# Earlier 1.19.1 bottle declared them in the header but omitted at
+# link time; verified via `nm -gU libkrun.1.19.1.dylib | grep
+# _krun_set_passt_fd` against the new bottle.
+b1d8e5e81d7bdc1248101b648cfd4913125fa2f46ea4123da827582a58389ded  libkrun-1.19.1-aarch64-apple-darwin.tar.gz
+27122587587ec37a32c8c95d76e634786aef17025f004a6f2b1ca3f1a2b79fe7  libkrun-1.19.1-x86_64-unknown-linux-gnu.tar.gz
+832b68a263682603402a4f3de1d04a2ae091416cd4b8e3af4aefa9ba2b1300fb  libkrun-1.19.1-aarch64-unknown-linux-gnu.tar.gz
