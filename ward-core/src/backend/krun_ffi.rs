@@ -288,3 +288,41 @@ pub fn set_passt_fd(ctx_id: u32, fd: c_int) -> Result<(), String> {
         Ok(())
     }
 }
+
+/// Safe wrapper around [`krun_set_gvproxy_path`].
+///
+/// Hands the path of a gvproxy Unix datagram socket to libkrun so the
+/// VM's virtio-net device connects to gvproxy instead of passt. gvproxy
+/// must already be listening on this path (via `-listen-vfkit unixgram://`)
+/// before calling this function.
+///
+/// # Errors
+///
+/// Returns an error string if the path contains a NUL byte (invalid for
+/// C strings) or if libkrun returns a negative errno-style code.
+/// The caller in `krunvm.rs` maps this to `BackendError::Internal`.
+///
+/// # Safety (caller obligations)
+///
+/// - `ctx_id` must have been returned by `krun_create_ctx()` and must
+///   not have been freed.
+/// - `path` must be a valid filesystem path without embedded NUL bytes.
+///   libkrun copies the path string internally.
+#[cfg(feature = "krunvm")]
+pub fn set_gvproxy_path(ctx_id: u32, path: &std::path::Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cstr = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| format!("gvproxy path {:?} contains a NUL byte", path))?;
+
+    // SAFETY: ctx_id contract documented above; cstr is a valid NUL-terminated
+    // C string. krun_set_gvproxy_path takes a *mut c_char but does not
+    // mutate through it; the signature is a libkrun API wart.
+    let ret = unsafe { krun_set_gvproxy_path(ctx_id, cstr.as_ptr() as *mut c_char) };
+    if ret < 0 {
+        Err(format!("krun_set_gvproxy_path failed: errno {}", -ret))
+    } else {
+        Ok(())
+    }
+}

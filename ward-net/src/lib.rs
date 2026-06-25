@@ -25,6 +25,9 @@ pub mod null;
 #[cfg(feature = "passt")]
 pub mod passt;
 
+#[cfg(feature = "gvproxy")]
+pub mod gvproxy;
+
 #[cfg(feature = "smoltcp")]
 pub mod smoltcp_backend;
 
@@ -106,10 +109,12 @@ pub fn backend_by_name(name: &str) -> Result<Box<dyn NetworkBackend>, Error> {
         "none" => Ok(Box::new(null::NullBackend)),
         #[cfg(feature = "passt")]
         "passt" => Ok(Box::new(passt::PasstBackend::default())),
+        #[cfg(feature = "gvproxy")]
+        "gvproxy" => Ok(Box::new(gvproxy::GvproxyBackend::default())),
         #[cfg(feature = "smoltcp")]
         "smoltcp" => Ok(Box::new(smoltcp_backend::SmoltcpBackend)),
         other => Err(Error::Unimplemented(format!(
-            "unknown network backend: {other} (known: none, passt, smoltcp)"
+            "unknown network backend: {other} (known: none, passt, gvproxy, smoltcp)"
         ))),
     }
 }
