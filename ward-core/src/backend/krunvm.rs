@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::{Backend, BackendError, ProcessHandle, Result};
+use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
 use crate::protocol::EgressMode;
 use crate::protocol::{CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo};
@@ -97,6 +98,11 @@ struct SandboxState {
     /// the `krunvm` feature is disabled (stub builds do not spawn passt).
     #[cfg(feature = "krunvm")]
     passt: Option<ward_net::passt::PasstHandle>,
+    /// Live gvproxy subprocess. `None` when egress mode is Deny, when
+    /// the network backend is not gvproxy, or when the `krunvm` feature
+    /// is disabled.
+    #[cfg(feature = "krunvm")]
+    gvproxy: Option<ward_net::gvproxy::GvproxyHandle>,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,15 +142,31 @@ pub struct KrunvmBackend {
     /// manager's ownership check) could signal a pid belonging to a
     /// different sandbox.
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    /// Which network backend to use when spawning sandboxes. Defaults to
+    /// `Passt` (ADR-018). Set to `Gvproxy` via `WARD_NETWORK_BACKEND=gvproxy`.
+    /// Only read under `--features krunvm`; in stub builds the field is
+    /// stored for symmetry but never branched on.
+    #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
+    network_backend: NetworkBackendChoice,
 }
 
 impl KrunvmBackend {
     pub fn new(data_dir: std::path::PathBuf) -> Self {
+        Self::new_with_network(data_dir, NetworkBackendChoice::default())
+    }
+
+    /// Construct with an explicit network backend choice. Used by the
+    /// daemon's startup path when `WARD_NETWORK_BACKEND` is set.
+    pub fn new_with_network(
+        data_dir: std::path::PathBuf,
+        network_backend: NetworkBackendChoice,
+    ) -> Self {
         Self {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             data_dir,
             processes: Arc::new(RwLock::new(HashMap::new())),
+            network_backend,
         }
     }
 }
@@ -180,16 +202,36 @@ impl Backend for KrunvmBackend {
         self.krun_set_root(ctx_id, &rootfs)?;
 
         #[cfg(feature = "krunvm")]
-        let passt_handle = if opts.egress.mode != EgressMode::Deny {
+        let (passt_handle, gvproxy_handle) = if opts.egress.mode != EgressMode::Deny {
             use super::krun_ffi;
-            let handle =
-                ward_net::passt::spawn_for_sandbox(&id, &ward_net::AttachOptions::default())
+            match self.network_backend {
+                NetworkBackendChoice::Passt => {
+                    let handle = ward_net::passt::spawn_for_sandbox(
+                        &id,
+                        &ward_net::AttachOptions::default(),
+                    )
                     .await
                     .map_err(|e| BackendError::Internal(format!("passt spawn: {e}")))?;
-            krun_ffi::set_passt_fd(ctx_id, handle.guest_fd).map_err(BackendError::Internal)?;
-            Some(handle)
+                    krun_ffi::set_passt_fd(ctx_id, handle.guest_fd)
+                        .map_err(BackendError::Internal)?;
+                    (Some(handle), None)
+                }
+                NetworkBackendChoice::Gvproxy => {
+                    let handle = ward_net::gvproxy::spawn_for_sandbox(
+                        &id,
+                        &ward_net::AttachOptions::default(),
+                    )
+                    .await
+                    .map_err(|e| BackendError::Internal(format!("gvproxy spawn: {e}")))?;
+                    krun_ffi::set_gvproxy_path(ctx_id, &handle.socket_path)
+                        .map_err(BackendError::Internal)?;
+                    (None, Some(handle))
+                }
+                // None / Smoltcp: no external process; libkrun uses loopback or nothing.
+                _ => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         // Bind mounts → virtiofs shares; volumes → raw block devices. The
@@ -242,6 +284,8 @@ impl Backend for KrunvmBackend {
             vm,
             #[cfg(feature = "krunvm")]
             passt: passt_handle,
+            #[cfg(feature = "krunvm")]
+            gvproxy: gvproxy_handle,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -302,6 +346,16 @@ impl Backend for KrunvmBackend {
             && let Err(e) = passt.kill().await
         {
             tracing::warn!(sandbox_id = %id, "passt teardown error: {e}");
+        }
+
+        // SIGTERM + reap the gvproxy child. Same ordering guarantee as passt:
+        // gvproxy must exit before krun_free_ctx to avoid a dangling
+        // virtio-net peer holding references to the freed context.
+        #[cfg(feature = "krunvm")]
+        if let Some(mut gvproxy) = state.gvproxy.take()
+            && let Err(e) = gvproxy.kill().await
+        {
+            tracing::warn!(sandbox_id = %id, "gvproxy teardown error: {e}");
         }
 
         if state.ctx_id != 0 {

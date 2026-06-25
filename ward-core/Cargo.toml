@@ -59,7 +59,7 @@ rustix = { version = "1", features = ["fs"] }
 # ward-net: network backend for the krunvm boot path. The passt feature
 # gates spawn_for_sandbox which creates the AF_UNIX socketpair and spawns
 # the passt child. Only needed at runtime when using rootless networking.
-ward-net = { path = "../ward-net", features = ["passt"] }
+ward-net = { path = "../ward-net", features = ["passt", "gvproxy"] }
 # metrics: zero-overhead recorder façade. Daemon installs the
 # prometheus exporter; this crate emits the counters/gauges/histograms
 # the daemon scrapes. No-op if no exporter is installed (i.e. when

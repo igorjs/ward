@@ -78,6 +78,7 @@ impl Runtime {
             cfg.max_sandboxes,
             cfg.max_volumes,
             cfg.allow_host_mounts,
+            cfg.network_backend,
         ))
     }
 
@@ -86,8 +87,12 @@ impl Runtime {
         max_sandboxes: usize,
         max_volumes: usize,
         allow_host_mounts: bool,
+        network_backend: ward_core::config::NetworkBackendChoice,
     ) -> Self {
-        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(data_dir.clone()));
+        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new_with_network(
+            data_dir.clone(),
+            network_backend,
+        ));
         let broker = Arc::new(Broker::new());
         let sandbox_manager = Arc::new(SandboxManager::new(
             Arc::clone(&backend),
@@ -213,6 +218,7 @@ impl RuntimeBuilder {
             self.max_sandboxes,
             self.max_volumes,
             self.allow_host_mounts,
+            ward_core::config::NetworkBackendChoice::default(),
         ))
     }
 }
