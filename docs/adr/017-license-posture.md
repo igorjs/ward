@@ -178,6 +178,26 @@ becomes meaningfully more expensive.
 Effort: ~half a day of mechanical refactor. Reversible if Option C
 later fires.
 
+### Implementation log
+
+Landed 2026-06-25 (#94). What actually shipped:
+
+1. `ward-proto/` (Apache-2.0): workspace member, `build.rs` compiles
+   `../proto/ward.proto` via `tonic_prost_build`, `src/lib.rs` exposes
+   `pub mod pb`.
+2. `ward-core` re-exports it as `pub use ward_proto::pb;` so all
+   server-side call sites keep working unchanged
+   (`crate::pb::*` resolves to `ward_proto::pb::*`).
+3. `ward-core/build.rs` no longer compiles `ward.proto`. It still
+   compiles `ward_agent.proto`; that protocol stays AGPL-internal
+   because the only consumers are `ward-core` and `ward-agent`.
+4. `sdks/rust/ward-client` drops its own `build.rs` and
+   `tonic-prost-build` build-dep; depends on `ward-proto` instead and
+   re-exports `pb` identically. Downstream API shape unchanged.
+5. License boundary verified post-merge:
+   `cargo tree -p ward-client --edges=no-dev` shows no path-dep on
+   any AGPL workspace crate (only `ward-proto`).
+
 ## References
 
 - ADR-005: SDK strategy (amended by this ADR's scope clarification)
