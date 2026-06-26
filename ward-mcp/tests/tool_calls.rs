@@ -3,9 +3,9 @@
 //! tools/call integration tests for ward-mcp.
 //!
 //! `tests/handshake.rs` covers initialize / tools/list / unknown-method.
-//! This file drives the real tools — each test sends a `tools/call`
+//! This file drives the real tools -- each test sends a `tools/call`
 //! frame and asserts on the response shape, including round-tripping
-//! state across calls (create → list → remove).
+//! state across calls (create -> list -> remove).
 //!
 //! Each test spawns its own `ward-mcp` subprocess against a per-test
 //! WARD_DATA_DIR so they can run in parallel without colliding.
@@ -94,6 +94,8 @@ impl Drop for McpServer {
     }
 }
 
+// ── Original 4 tools ─────────────────────────────────────────────────────────
+
 #[test]
 fn given_create_sandbox_when_called_then_returns_sandbox_id() {
     let mut srv = McpServer::spawn();
@@ -139,7 +141,7 @@ fn given_created_sandbox_when_list_then_appears() {
 #[test]
 fn given_no_sandboxes_when_list_then_explicit_empty_marker() {
     // Explicit "(no sandboxes)" string keeps the LLM from hallucinating
-    // results when the list is empty — silently returning "" would be
+    // results when the list is empty -- silently returning "" would be
     // ambiguous to the agent.
     let mut srv = McpServer::spawn();
     let resp = srv.round_trip(
@@ -229,4 +231,418 @@ fn given_invalid_arguments_when_called_then_invalid_params_error() {
         }),
     );
     assert_eq!(resp["error"]["code"], -32602, "expected -32602: {resp}");
+}
+
+// ── New tools ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn given_sandbox_when_ward_run_then_returns_json_result() {
+    // ward_run calls exec then stream_output and returns a JSON object
+    // with stdout/stderr/exit_code/duration_ms. The stub backend produces
+    // a process that exits immediately; we just verify the envelope shape.
+    let mut srv = McpServer::spawn();
+
+    // Create a sandbox first.
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let create_text = McpServer::tool_text(&cr);
+    let sandbox_id = create_text
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id in create text")
+        .to_string();
+
+    let resp = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_run",
+            "arguments": {
+                "sandbox_id": sandbox_id,
+                "command": ["echo", "hello"]
+            }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    // The text is a JSON object; verify it parses and has the expected keys.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&text).expect("ward_run must return JSON text");
+    assert!(parsed["pid"].is_string(), "result must have pid: {parsed}");
+    assert!(
+        parsed["stdout"].is_string(),
+        "result must have stdout: {parsed}"
+    );
+    assert!(
+        parsed["stderr"].is_string(),
+        "result must have stderr: {parsed}"
+    );
+    assert!(
+        !parsed["duration_ms"].is_null(),
+        "result must have duration_ms: {parsed}"
+    );
+}
+
+#[test]
+fn given_sandbox_exec_when_ward_write_stdin_then_succeeds() {
+    let mut srv = McpServer::spawn();
+
+    // Create sandbox.
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    // Start a process to get a pid.
+    let er = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_exec",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "command": ["cat"] }
+        }),
+    );
+    let exec_text = McpServer::tool_text(&er);
+    // "started pid <pid> in sandbox <id>"
+    let pid = exec_text
+        .split_whitespace()
+        .nth(2)
+        .expect("pid token in exec text")
+        .to_string();
+
+    let resp = srv.round_trip(
+        3,
+        "tools/call",
+        json!({
+            "name": "ward_write_stdin",
+            "arguments": {
+                "sandbox_id": sandbox_id.clone(),
+                "pid": pid.clone(),
+                "data": "hello\n"
+            }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(text.contains(&pid), "response must mention the pid: {text}");
+}
+
+#[test]
+fn given_sandbox_exec_when_ward_kill_process_then_succeeds() {
+    let mut srv = McpServer::spawn();
+
+    // Create sandbox.
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    // Start a process.
+    let er = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_exec",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "command": ["sleep", "100"] }
+        }),
+    );
+    let exec_text = McpServer::tool_text(&er);
+    let pid = exec_text
+        .split_whitespace()
+        .nth(2)
+        .expect("pid token in exec text")
+        .to_string();
+
+    let resp = srv.round_trip(
+        3,
+        "tools/call",
+        json!({
+            "name": "ward_kill_process",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "pid": pid.clone() }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains(&pid),
+        "kill confirmation must mention the pid: {text}"
+    );
+}
+
+#[test]
+fn given_sandbox_when_ward_create_snapshot_then_returns_snapshot_id() {
+    let mut srv = McpServer::spawn();
+
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    let resp = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_create_snapshot",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "label": "v1" }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("snapshot"),
+        "response must mention snapshot: {text}"
+    );
+    assert!(
+        text.contains(&sandbox_id),
+        "response must mention sandbox id: {text}"
+    );
+}
+
+#[test]
+fn given_snapshot_when_ward_restore_snapshot_then_succeeds() {
+    let mut srv = McpServer::spawn();
+
+    // Create sandbox.
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    // Take a snapshot.
+    let sr = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_create_snapshot",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "label": "checkpoint" }
+        }),
+    );
+    let snap_text = McpServer::tool_text(&sr);
+    // "snapshot <snapshot_id> created for sandbox <sandbox_id> (label: checkpoint)"
+    let snapshot_id = snap_text
+        .split_whitespace()
+        .nth(1)
+        .expect("snapshot_id in snapshot text")
+        .to_string();
+
+    let resp = srv.round_trip(
+        3,
+        "tools/call",
+        json!({
+            "name": "ward_restore_snapshot",
+            "arguments": {
+                "sandbox_id": sandbox_id.clone(),
+                "snapshot_id": snapshot_id.clone()
+            }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains(&sandbox_id),
+        "restore confirmation must mention sandbox: {text}"
+    );
+    assert!(
+        text.contains(&snapshot_id),
+        "restore confirmation must mention snapshot: {text}"
+    );
+}
+
+#[test]
+fn given_sandbox_with_snapshot_when_ward_list_snapshots_then_appears() {
+    let mut srv = McpServer::spawn();
+
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    // Take a snapshot so there is something to list.
+    srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_create_snapshot",
+            "arguments": { "sandbox_id": sandbox_id.clone(), "label": "snap1" }
+        }),
+    );
+
+    let resp = srv.round_trip(
+        3,
+        "tools/call",
+        json!({
+            "name": "ward_list_snapshots",
+            "arguments": { "sandbox_id": sandbox_id.clone() }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("snap1"),
+        "list_snapshots must include the label: {text}"
+    );
+}
+
+#[test]
+fn given_sandbox_no_snapshots_when_ward_list_snapshots_then_explicit_empty_marker() {
+    let mut srv = McpServer::spawn();
+
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_create_sandbox", "arguments": { "image": "alpine" } }),
+    );
+    let sandbox_id = McpServer::tool_text(&cr)
+        .split_whitespace()
+        .nth(1)
+        .expect("sandbox id")
+        .to_string();
+
+    let resp = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_list_snapshots",
+            "arguments": { "sandbox_id": sandbox_id.clone() }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("no snapshots"),
+        "empty snapshot list must emit explicit marker: {text}"
+    );
+}
+
+#[test]
+fn given_ward_create_volume_when_called_then_returns_volume_id() {
+    let mut srv = McpServer::spawn();
+
+    let resp = srv.round_trip(
+        1,
+        "tools/call",
+        json!({
+            "name": "ward_create_volume",
+            "arguments": { "name": "my-vol", "size_mb": 64 }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("volume") && text.contains("my-vol"),
+        "create_volume response must mention volume and name: {text}"
+    );
+}
+
+#[test]
+fn given_no_volumes_when_ward_list_volumes_then_explicit_empty_marker() {
+    let mut srv = McpServer::spawn();
+
+    let resp = srv.round_trip(
+        1,
+        "tools/call",
+        json!({ "name": "ward_list_volumes", "arguments": {} }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("(no volumes)"),
+        "empty list must emit explicit marker: {text}"
+    );
+}
+
+#[test]
+fn given_created_volume_when_ward_list_volumes_then_appears() {
+    let mut srv = McpServer::spawn();
+
+    srv.round_trip(
+        1,
+        "tools/call",
+        json!({
+            "name": "ward_create_volume",
+            "arguments": { "name": "data-vol", "size_mb": 128 }
+        }),
+    );
+
+    let resp = srv.round_trip(
+        2,
+        "tools/call",
+        json!({ "name": "ward_list_volumes", "arguments": {} }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains("data-vol"),
+        "list_volumes must include the created volume: {text}"
+    );
+}
+
+#[test]
+fn given_created_volume_when_ward_remove_volume_then_gone() {
+    let mut srv = McpServer::spawn();
+
+    let cr = srv.round_trip(
+        1,
+        "tools/call",
+        json!({
+            "name": "ward_create_volume",
+            "arguments": { "name": "tmp-vol", "size_mb": 32 }
+        }),
+    );
+    let create_text = McpServer::tool_text(&cr);
+    // "volume <id> created (name: tmp-vol, size: 32 MB)"
+    let vol_id = create_text
+        .split_whitespace()
+        .nth(1)
+        .expect("volume id in create text")
+        .to_string();
+
+    let resp = srv.round_trip(
+        2,
+        "tools/call",
+        json!({
+            "name": "ward_remove_volume",
+            "arguments": { "id": vol_id.clone() }
+        }),
+    );
+    let text = McpServer::tool_text(&resp);
+    assert!(
+        text.contains(&vol_id),
+        "remove_volume must confirm the id: {text}"
+    );
+
+    // Verify it no longer appears in list.
+    let lr = srv.round_trip(
+        3,
+        "tools/call",
+        json!({ "name": "ward_list_volumes", "arguments": {} }),
+    );
+    let list_text = McpServer::tool_text(&lr);
+    assert!(
+        !list_text.contains(&vol_id),
+        "removed volume must not appear in list: {list_text}"
+    );
 }
