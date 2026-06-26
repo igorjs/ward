@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Smoke tests for ward-sdk.
 
 These confirm the package surface compiles + imports correctly. They
