@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 /**
  * Thin Promise-based wrapper over the ward gRPC API.
  *

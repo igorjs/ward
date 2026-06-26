@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """Thin Pythonic wrapper over the ward gRPC API.
 
 This module intentionally hides the protobuf types from the call site;

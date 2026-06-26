@@ -95,8 +95,9 @@ jobs:
             -not -path "./.git/*" \
             -not -path "./dist/*" \
             -not -path "./build/*" \
+            -not -path "./.remember/*" \
             | while read -r f; do
-                head -1 "$f" | grep -q "SPDX-License-Identifier:" || echo "$f"
+                head -5 "$f" | grep -q "SPDX-License-Identifier:" || echo "$f"
               done)
           if [ -n "$missing" ]; then
             echo "ERROR: missing SPDX-License-Identifier header on:"

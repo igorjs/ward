@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 // Package ward is the Go SDK for the ward sandbox daemon.
 //
 // Wraps the gRPC API in proto/ward.proto with idiomatic Go: context.Context

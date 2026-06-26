@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """ward-sdk: Python client for the ward sandbox daemon.
 
 Top-level imports re-export the surface most callers need:
