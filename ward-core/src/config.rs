@@ -74,6 +74,15 @@ pub struct Config {
     /// Which network backend to use for sandbox egress. Parsed from
     /// `WARD_NETWORK_BACKEND`; defaults to `passt` per ADR-018.
     pub network_backend: NetworkBackendChoice,
+    /// Hard upper bound on graceful-shutdown drain time. After SIGTERM /
+    /// SIGINT the daemon stops accepting new RPCs, drains in-flight
+    /// streams, and tears down every running sandbox. If that whole
+    /// sequence exceeds this many seconds, the daemon hard-exits with
+    /// a loud error so systemd / launchd unblock instead of hanging.
+    /// Default 30s; tune via `WARD_SHUTDOWN_TIMEOUT_SECS`. Floors at 1
+    /// so an operator-supplied `0` cannot wedge the shutdown by
+    /// timing out before the teardown loop even starts.
+    pub shutdown_timeout_secs: u64,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -90,6 +99,7 @@ pub struct ConfigEnv {
     pub ward_allow_host_mounts: Option<String>,
     pub ward_metrics_addr: Option<String>,
     pub ward_network_backend: Option<String>,
+    pub ward_shutdown_timeout_secs: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -108,6 +118,7 @@ impl Config {
             ward_allow_host_mounts: std::env::var("WARD_ALLOW_HOST_MOUNTS").ok(),
             ward_metrics_addr: std::env::var("WARD_METRICS_ADDR").ok(),
             ward_network_backend: std::env::var("WARD_NETWORK_BACKEND").ok(),
+            ward_shutdown_timeout_secs: std::env::var("WARD_SHUTDOWN_TIMEOUT_SECS").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -187,6 +198,19 @@ impl Config {
             .map(|v| parse_network_backend(v).unwrap_or_else(|e| panic!("{e}")))
             .unwrap_or_default();
 
+        // WARD_SHUTDOWN_TIMEOUT_SECS: invalid values fall back to the
+        // 30s default rather than panicking; operators should not lose
+        // a daemon at startup over a misconfigured shutdown timeout.
+        // Floored at 1 so `WARD_SHUTDOWN_TIMEOUT_SECS=0` does not collapse
+        // the teardown loop to "fire timeout before sandbox iteration
+        // starts" (the daemon's exit would beat the cleanup).
+        let shutdown_timeout_secs = env
+            .ward_shutdown_timeout_secs
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1);
+
         Self {
             socket_path,
             data_dir,
@@ -197,6 +221,7 @@ impl Config {
             allow_host_mounts,
             metrics_addr,
             network_backend,
+            shutdown_timeout_secs,
         }
     }
 
@@ -658,5 +683,45 @@ mod tests {
             ..env_with_home()
         };
         Config::from_values(env);
+    }
+
+    #[test]
+    fn given_shutdown_timeout_unset_when_from_values_then_defaults_to_30() {
+        let cfg = Config::from_values(env_with_home());
+        assert_eq!(cfg.shutdown_timeout_secs, 30);
+    }
+
+    #[test]
+    fn given_shutdown_timeout_set_when_from_values_then_uses_value() {
+        let env = ConfigEnv {
+            ward_shutdown_timeout_secs: Some("90".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.shutdown_timeout_secs, 90);
+    }
+
+    #[test]
+    fn given_shutdown_timeout_zero_when_from_values_then_floors_at_1() {
+        // Regression guard: WARD_SHUTDOWN_TIMEOUT_SECS=0 would collapse
+        // the teardown loop to "fire timeout before sandbox iteration
+        // starts". Flooring at 1 keeps the cap semantically "at least
+        // one second to clean up" no matter the operator footgun.
+        let env = ConfigEnv {
+            ward_shutdown_timeout_secs: Some("0".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.shutdown_timeout_secs, 1);
+    }
+
+    #[test]
+    fn given_shutdown_timeout_unparseable_when_from_values_then_falls_back_to_30() {
+        let env = ConfigEnv {
+            ward_shutdown_timeout_secs: Some("forever".into()),
+            ..env_with_home()
+        };
+        let cfg = Config::from_values(env);
+        assert_eq!(cfg.shutdown_timeout_secs, 30);
     }
 }

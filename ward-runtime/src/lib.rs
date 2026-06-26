@@ -210,6 +210,7 @@ impl RuntimeBuilder {
             allow_host_mounts: self.allow_host_mounts,
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
+            shutdown_timeout_secs: 30,
         };
         cfg.ensure_dirs()?;
 
@@ -267,6 +268,7 @@ mod tests {
             allow_host_mounts: false,
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
+            shutdown_timeout_secs: 30,
         };
         let rt = Runtime::from_config(&cfg).await.unwrap();
         assert!(Arc::strong_count(&rt.broker()) >= 2);
