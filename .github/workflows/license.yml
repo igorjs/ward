@@ -97,7 +97,6 @@ jobs:
             -not -path "./.git/*" \
             -not -path "./dist/*" \
             -not -path "./build/*" \
-            -not -path "./.remember/*" \
             | while read -r f; do
                 head -5 "$f" | grep -q "SPDX-License-Identifier:" || echo "$f"
               done)
