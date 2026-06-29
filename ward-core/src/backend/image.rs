@@ -88,8 +88,12 @@ impl ImagePuller for OciPuller {
         // minimal synthetic rootfs (a `bin/` directory). Set by e2e test
         // harnesses that spawn wardd in an egress-blocked environment (e.g.
         // CI with step-security/harden-runner where docker.io is not in the
-        // allowed-endpoints list). Has no effect in production; the env var
-        // is never set there.
+        // allowed-endpoints list).
+        //
+        // Gated to debug builds so the escape hatch is stripped out of
+        // release binaries entirely. Tests run with debug_assertions on,
+        // production `cargo build --release` does not see this branch.
+        #[cfg(debug_assertions)]
         if std::env::var("WARD_OCI_OFFLINE").as_deref() == Ok("1") {
             std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
             // Derive a stable fake digest from the reference so distinct
