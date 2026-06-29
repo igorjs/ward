@@ -543,6 +543,10 @@ fn given_sandbox_no_snapshots_when_ward_list_snapshots_then_explicit_empty_marke
     );
 }
 
+// mkfs.ext4 is Linux-only with no usable macOS port. The three volume tool
+// tests that create a volume need the formatter to succeed, so gate them to
+// Linux. The empty-list and other non-creating tests stay un-gated.
+#[cfg(target_os = "linux")]
 #[test]
 fn given_ward_create_volume_when_called_then_returns_volume_id() {
     let mut srv = McpServer::spawn();
@@ -578,6 +582,7 @@ fn given_no_volumes_when_ward_list_volumes_then_explicit_empty_marker() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_created_volume_when_ward_list_volumes_then_appears() {
     let mut srv = McpServer::spawn();
@@ -603,6 +608,7 @@ fn given_created_volume_when_ward_list_volumes_then_appears() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_created_volume_when_ward_remove_volume_then_gone() {
     let mut srv = McpServer::spawn();

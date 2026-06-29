@@ -35,6 +35,11 @@ fn extract_id(stdout: &str) -> String {
 // Feature: volume create
 // ---------------------------------------------------------------------------
 
+// mkfs.ext4 is Linux-only with no usable macOS port. Tests that go through
+// `ward volume create` need the formatter to succeed, so gate them to Linux.
+// Sibling tests that only exercise list-empty, name validation, or unknown-id
+// remove paths stay un-gated.
+#[cfg(target_os = "linux")]
 #[test]
 fn given_running_daemon_when_user_creates_volume_then_command_succeeds_and_prints_id() {
     // Arrange
@@ -91,6 +96,7 @@ fn given_no_volumes_when_user_runs_list_then_output_is_empty() {
     output.success().stdout(predicate::str::is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_two_created_volumes_when_user_runs_list_then_both_names_appear() {
     // Arrange
@@ -122,6 +128,7 @@ fn given_two_created_volumes_when_user_runs_list_then_both_names_appear() {
 // Feature: volume remove
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_created_volume_when_user_removes_it_then_list_no_longer_shows_it() {
     // Arrange: create one volume, capture its ID.
@@ -174,6 +181,7 @@ fn given_unknown_id_when_user_removes_volume_then_fails_with_not_found() {
 // The daemon defaults to max_volumes = 256, too many for an E2E test.
 // We override via the env var to make the cap exercise practical.
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_message() {
     // Arrange: spawn a daemon configured with a tiny volume cap by setting
@@ -237,6 +245,7 @@ fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_messag
     let _ = wardd.wait();
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn given_volume_cap_reached_when_user_removes_one_then_create_succeeds_again() {
     // Arrange: bespoke spawn with a tiny cap, fill it, then exercise the
