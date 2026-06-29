@@ -81,6 +81,9 @@ impl Daemon {
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())
             .env("WARD_LOG_LEVEL", "warn")
+            // WARD_OCI_OFFLINE=1: skip real registry pulls so SDK e2e
+            // tests stay hermetic on egress-blocked CI runners.
+            .env("WARD_OCI_OFFLINE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

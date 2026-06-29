@@ -41,6 +41,7 @@ fn given_running_daemon_with_sandbox_when_sigterm_then_clean_exit() {
         .env("WARD_DATA_DIR", data_dir.path())
         .env("WARD_LOG_LEVEL", "warn")
         .env("WARD_SHUTDOWN_TIMEOUT_SECS", "5")
+        .env("WARD_OCI_OFFLINE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

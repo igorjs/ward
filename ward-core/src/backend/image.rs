@@ -84,6 +84,22 @@ pub struct OciPuller;
 #[async_trait::async_trait]
 impl ImagePuller for OciPuller {
     async fn pull(&self, reference: &str, dest: &Path) -> Result<String> {
+        // WARD_OCI_OFFLINE=1: skip the real registry pull and materialise a
+        // minimal synthetic rootfs (a `bin/` directory). Set by e2e test
+        // harnesses that spawn wardd in an egress-blocked environment (e.g.
+        // CI with step-security/harden-runner where docker.io is not in the
+        // allowed-endpoints list). Has no effect in production; the env var
+        // is never set there.
+        if std::env::var("WARD_OCI_OFFLINE").as_deref() == Ok("1") {
+            std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
+            // Derive a stable fake digest from the reference so distinct
+            // image refs get distinct cache entries even in offline mode.
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            return Ok(format!("sha256:{hash:016x}"));
+        }
+
         use oci_client::manifest;
         use oci_client::secrets::RegistryAuth;
         use oci_client::{Client, Reference};
