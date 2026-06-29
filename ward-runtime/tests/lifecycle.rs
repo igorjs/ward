@@ -78,7 +78,7 @@ fn create_request(image: &str) -> pb::CreateSandboxRequest {
 async fn given_runtime_when_create_then_list_then_remove_then_clean() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    // ARRANGE — boot the embedded runtime with a FakePuller so the test
+    // ARRANGE: boot the embedded runtime with a FakePuller so the test
     // does not reach out to a real registry.
     let store = fake_image_store(tmp.path().join("cache").join("images"));
     let runtime = Runtime::builder()
