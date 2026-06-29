@@ -156,24 +156,25 @@ pub struct KrunvmBackend {
 }
 
 impl KrunvmBackend {
-    /// Production constructor. Reads `WARD_MAX_CACHED_IMAGES` from the
-    /// environment (same pattern as `OciPuller` reading
-    /// `WARD_REGISTRY_ALLOWLIST`) so the cache bound is configurable without
-    /// threading `Config` through the constructor chain.
+    /// Production constructor. Defaults `max_cached_images` to 64,
+    /// matching `Config`'s default. Daemon callers thread the operator's
+    /// `WARD_MAX_CACHED_IMAGES` value through `new_with_network` instead
+    /// so the env var has a single home (in `Config::from_env`) rather
+    /// than being read in two places that can drift.
     pub fn new(data_dir: std::path::PathBuf) -> Self {
-        Self::new_with_network(data_dir, NetworkBackendChoice::default())
+        Self::new_with_network(data_dir, NetworkBackendChoice::default(), 64)
     }
 
-    /// Construct with an explicit network backend choice. Used by the
-    /// daemon's startup path when `WARD_NETWORK_BACKEND` is set.
+    /// Construct with an explicit network backend choice + cache bound.
+    /// The daemon's startup path calls this with values resolved from
+    /// `Config` (which reads `WARD_NETWORK_BACKEND` and
+    /// `WARD_MAX_CACHED_IMAGES`). Tests and embedded callers that do
+    /// not need either knob can use `new` for the defaults.
     pub fn new_with_network(
         data_dir: std::path::PathBuf,
         network_backend: NetworkBackendChoice,
+        max_cached_images: usize,
     ) -> Self {
-        let max_cached_images = std::env::var("WARD_MAX_CACHED_IMAGES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64usize);
         let cache_dir = data_dir.join("cache").join("images");
         let image_store = Arc::new(ImageStore::new(cache_dir, max_cached_images));
         Self::new_internal(data_dir, network_backend, image_store)

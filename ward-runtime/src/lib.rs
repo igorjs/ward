@@ -78,6 +78,7 @@ impl Runtime {
             cfg.data_dir.clone(),
             cfg.max_sandboxes,
             cfg.max_volumes,
+            cfg.max_cached_images,
             cfg.allow_host_mounts,
             cfg.network_backend,
             None,
@@ -88,6 +89,7 @@ impl Runtime {
         data_dir: PathBuf,
         max_sandboxes: usize,
         max_volumes: usize,
+        max_cached_images: usize,
         allow_host_mounts: bool,
         network_backend: ward_core::config::NetworkBackendChoice,
         image_store_override: Option<Arc<ImageStore>>,
@@ -100,6 +102,7 @@ impl Runtime {
             None => Arc::new(KrunvmBackend::new_with_network(
                 data_dir.clone(),
                 network_backend,
+                max_cached_images,
             )),
         };
         let broker = Arc::new(Broker::new());
@@ -156,6 +159,8 @@ pub struct RuntimeBuilder {
     /// `FakePuller`) so integration tests stay offline. When `None` the
     /// production `OciPuller` is used.
     image_store_override: Option<Arc<ImageStore>>,
+    /// OCI image cache bound (default 64). Mirrors `Config::max_cached_images`.
+    max_cached_images: usize,
 }
 
 impl Default for RuntimeBuilder {
@@ -164,6 +169,7 @@ impl Default for RuntimeBuilder {
             data_dir: None,
             max_sandboxes: 256,
             max_volumes: 256,
+            max_cached_images: 64,
             allow_host_mounts: false,
             image_store_override: None,
         }
@@ -188,6 +194,14 @@ impl RuntimeBuilder {
     /// Cap on persistent volumes (default 256).
     pub fn max_volumes(mut self, n: usize) -> Self {
         self.max_volumes = n;
+        self
+    }
+
+    /// Cap on the OCI image cache entry count before LRU eviction kicks
+    /// in (default 64). Each cache entry is one fully-unpacked rootfs;
+    /// disk usage scales with the largest image in the working set.
+    pub fn max_cached_images(mut self, n: usize) -> Self {
+        self.max_cached_images = n;
         self
     }
 
@@ -229,7 +243,7 @@ impl RuntimeBuilder {
             log_level: String::new(),
             max_sandboxes: self.max_sandboxes,
             max_volumes: self.max_volumes,
-            max_cached_images: 64,
+            max_cached_images: self.max_cached_images,
             allow_host_mounts: self.allow_host_mounts,
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
@@ -241,6 +255,7 @@ impl RuntimeBuilder {
             data_dir,
             self.max_sandboxes,
             self.max_volumes,
+            self.max_cached_images,
             self.allow_host_mounts,
             ward_core::config::NetworkBackendChoice::default(),
             self.image_store_override,
