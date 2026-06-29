@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 #
 # Workflow-hygiene checks. Enforces the supply-chain invariants from
 # the security/hardening-pass PR. Run by .github/workflows/workflow-

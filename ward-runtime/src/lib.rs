@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ward_core::backend::Backend;
+use ward_core::backend::image::ImageStore;
 use ward_core::backend::krunvm::KrunvmBackend;
 use ward_core::comms::Broker;
 use ward_core::config::Config;
@@ -77,8 +78,10 @@ impl Runtime {
             cfg.data_dir.clone(),
             cfg.max_sandboxes,
             cfg.max_volumes,
+            cfg.max_cached_images,
             cfg.allow_host_mounts,
             cfg.network_backend,
+            None,
         ))
     }
 
@@ -86,13 +89,22 @@ impl Runtime {
         data_dir: PathBuf,
         max_sandboxes: usize,
         max_volumes: usize,
+        max_cached_images: usize,
         allow_host_mounts: bool,
         network_backend: ward_core::config::NetworkBackendChoice,
+        image_store_override: Option<Arc<ImageStore>>,
     ) -> Self {
-        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new_with_network(
-            data_dir.clone(),
-            network_backend,
-        ));
+        let backend: Arc<dyn Backend> = match image_store_override {
+            Some(store) => Arc::new(KrunvmBackend::with_image_store_for_test(
+                data_dir.clone(),
+                store,
+            )),
+            None => Arc::new(KrunvmBackend::new_with_network(
+                data_dir.clone(),
+                network_backend,
+                max_cached_images,
+            )),
+        };
         let broker = Arc::new(Broker::new());
         let sandbox_manager = Arc::new(SandboxManager::new(
             Arc::clone(&backend),
@@ -143,6 +155,12 @@ pub struct RuntimeBuilder {
     max_sandboxes: usize,
     max_volumes: usize,
     allow_host_mounts: bool,
+    /// Test-only: inject a pre-built image store (e.g. backed by a
+    /// `FakePuller`) so integration tests stay offline. When `None` the
+    /// production `OciPuller` is used.
+    image_store_override: Option<Arc<ImageStore>>,
+    /// OCI image cache bound (default 64). Mirrors `Config::max_cached_images`.
+    max_cached_images: usize,
 }
 
 impl Default for RuntimeBuilder {
@@ -151,7 +169,9 @@ impl Default for RuntimeBuilder {
             data_dir: None,
             max_sandboxes: 256,
             max_volumes: 256,
+            max_cached_images: 64,
             allow_host_mounts: false,
+            image_store_override: None,
         }
     }
 }
@@ -177,12 +197,29 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Cap on the OCI image cache entry count before LRU eviction kicks
+    /// in (default 64). Each cache entry is one fully-unpacked rootfs;
+    /// disk usage scales with the largest image in the working set.
+    pub fn max_cached_images(mut self, n: usize) -> Self {
+        self.max_cached_images = n;
+        self
+    }
+
     /// When true, bind-mount sources outside the ward-managed prefixes
     /// (`/home`, `/tmp`, `/var/lib/ward/`) are accepted. False by
-    /// default — see SEC-020 / ADR-016. Only flip when the embedding
+    /// default; see SEC-020 / ADR-016. Only flip when the embedding
     /// application owns the entire host.
     pub fn allow_host_mounts(mut self, yes: bool) -> Self {
         self.allow_host_mounts = yes;
+        self
+    }
+
+    /// Override the image store used by the backend. Intended for tests
+    /// that need an offline puller (e.g. `ImageStore::with_puller(...,
+    /// Arc::new(FakePuller))`) so they do not reach out to a registry.
+    /// Production callers should use the default OCI pull path.
+    pub fn with_image_store_for_test(mut self, store: Arc<ImageStore>) -> Self {
+        self.image_store_override = Some(store);
         self
     }
 
@@ -206,10 +243,11 @@ impl RuntimeBuilder {
             log_level: String::new(),
             max_sandboxes: self.max_sandboxes,
             max_volumes: self.max_volumes,
-            max_cached_images: 64,
+            max_cached_images: self.max_cached_images,
             allow_host_mounts: self.allow_host_mounts,
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
+            shutdown_timeout_secs: 30,
         };
         cfg.ensure_dirs()?;
 
@@ -217,8 +255,10 @@ impl RuntimeBuilder {
             data_dir,
             self.max_sandboxes,
             self.max_volumes,
+            self.max_cached_images,
             self.allow_host_mounts,
             ward_core::config::NetworkBackendChoice::default(),
+            self.image_store_override,
         ))
     }
 }
@@ -267,6 +307,7 @@ mod tests {
             allow_host_mounts: false,
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
+            shutdown_timeout_secs: 30,
         };
         let rt = Runtime::from_config(&cfg).await.unwrap();
         assert!(Arc::strong_count(&rt.broker()) >= 2);

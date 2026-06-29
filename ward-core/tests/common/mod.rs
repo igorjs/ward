@@ -16,6 +16,7 @@
 //! calls misses entire classes of bugs (proto field reuse, wrong status
 //! codes, encoding errors).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,6 +25,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Endpoint, Server};
 
 use ward_core::backend::Backend;
+use ward_core::backend::image::{ImagePuller, ImageStore};
 use ward_core::backend::krunvm::KrunvmBackend;
 use ward_core::comms::Broker;
 use ward_core::grpc::WardGrpcServer;
@@ -31,6 +33,26 @@ use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::ward_server::WardServer;
 use ward_core::sandbox::SandboxManager;
 use ward_core::volume::{VolumeFormatter, VolumeManager};
+
+/// Offline image puller for integration tests: creates a minimal rootfs
+/// without touching the network.
+#[derive(Debug)]
+struct FakePuller;
+
+#[async_trait::async_trait]
+impl ImagePuller for FakePuller {
+    async fn pull(
+        &self,
+        reference: &str,
+        dest: &Path,
+    ) -> Result<String, ward_core::backend::BackendError> {
+        std::fs::create_dir_all(dest.join("bin")).map_err(ward_core::backend::BackendError::Io)?;
+        let hash: u64 = reference
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        Ok(format!("sha256:{hash:016x}"))
+    }
+}
 
 /// No-op volume formatter for tests: the gRPC suite exercises volume CRUD
 /// behaviour, not the on-disk ext4 image, so we skip `mkfs.ext4` (Linux-only)
@@ -74,7 +96,12 @@ pub async fn test_server() -> WardClient<Channel> {
     let data_dir = std::env::temp_dir().join(format!("ward-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&data_dir).expect("create temp data dir");
 
-    let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(data_dir.clone()));
+    let cache_dir = data_dir.join("cache").join("images");
+    let image_store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+    let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::with_image_store_for_test(
+        data_dir.clone(),
+        image_store,
+    ));
     let broker = Arc::new(Broker::new());
     let sandbox_mgr = Arc::new(SandboxManager::new(
         Arc::clone(&backend),

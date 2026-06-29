@@ -8,24 +8,35 @@
 //! its sandboxes, so embedded mode is the natural fit.
 //!
 //! Supported MCP methods:
-//!   - `initialize`            — handshake + capability negotiation
-//!   - `tools/list`            — enumerate available tools
-//!   - `tools/call`            — invoke one of the tools
-//!   - `notifications/initialized` — accepted, no-op
+//!   - `initialize`            -- handshake + capability negotiation
+//!   - `tools/list`            -- enumerate available tools
+//!   - `tools/call`            -- invoke one of the tools
+//!   - `notifications/initialized` -- accepted, no-op
 //!
 //! Tools exposed:
-//!   - `ward_create_sandbox`   — boot a microVM from an OCI image
-//!   - `ward_list_sandboxes`   — list current sandboxes
-//!   - `ward_exec`             — run a command (synchronous capture)
-//!   - `ward_remove_sandbox`   — tear a sandbox down
+//!   - `ward_create_sandbox`   -- boot a microVM from an OCI image
+//!   - `ward_list_sandboxes`   -- list current sandboxes
+//!   - `ward_exec`             -- run a command (synchronous capture)
+//!   - `ward_remove_sandbox`   -- tear a sandbox down
+//!   - `ward_run`              -- exec + collect output synchronously
+//!   - `ward_write_stdin`      -- send bytes to a running process
+//!   - `ward_kill_process`     -- terminate a running process
+//!   - `ward_create_snapshot`  -- snapshot a sandbox
+//!   - `ward_restore_snapshot` -- restore a sandbox from snapshot
+//!   - `ward_list_snapshots`   -- list snapshots for a sandbox
+//!   - `ward_create_volume`    -- allocate a persistent volume
+//!   - `ward_list_volumes`     -- list volumes
+//!   - `ward_remove_volume`    -- delete a volume
 //!
 //! See `docs/adr/016-embedded-mode-microvms.md`.
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ward_core::pb;
+use ward_core::protocol::StreamEventKind;
 use ward_runtime::Runtime;
 
 mod rpc;
@@ -36,10 +47,13 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "ward-mcp";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Default timeout for `ward_run` output collection: 30 seconds.
+const RUN_TIMEOUT_SECS: u64 = 30;
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // MCP servers are spawned by clients (Claude / Cursor / ...) which
-    // own the stdio pair. Logs MUST go to stderr — stdout is the wire
+    // own the stdio pair. Logs MUST go to stderr -- stdout is the wire
     // protocol. tracing_subscriber defaults to stderr; lock it in.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -52,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::io::stdin().is_terminal() {
         // The MCP transport is line-delimited JSON over stdio. A human
         // running `ward-mcp` interactively almost certainly meant to do
-        // something else (e.g. `ward` CLI) — print a hint instead of
+        // something else (e.g. `ward` CLI) -- print a hint instead of
         // hanging.
         eprintln!(
             "ward-mcp speaks MCP JSON-RPC over stdio. \
@@ -111,7 +125,7 @@ impl Server {
                 )),
             };
 
-            // Notifications (no `id`) produce no response — skip the write.
+            // Notifications (no `id`) produce no response -- skip the write.
             let Some(response) = response else { continue };
 
             let mut payload = serde_json::to_vec(&response)?;
@@ -186,6 +200,15 @@ impl Server {
             "ward_list_sandboxes" => self.tool_list_sandboxes().await?,
             "ward_exec" => self.tool_exec(call.arguments).await?,
             "ward_remove_sandbox" => self.tool_remove_sandbox(call.arguments).await?,
+            "ward_run" => self.tool_run(call.arguments).await?,
+            "ward_write_stdin" => self.tool_write_stdin(call.arguments).await?,
+            "ward_kill_process" => self.tool_kill_process(call.arguments).await?,
+            "ward_create_snapshot" => self.tool_create_snapshot(call.arguments).await?,
+            "ward_restore_snapshot" => self.tool_restore_snapshot(call.arguments).await?,
+            "ward_list_snapshots" => self.tool_list_snapshots(call.arguments).await?,
+            "ward_create_volume" => self.tool_create_volume(call.arguments).await?,
+            "ward_list_volumes" => self.tool_list_volumes().await?,
+            "ward_remove_volume" => self.tool_remove_volume(call.arguments).await?,
             other => {
                 return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
             }
@@ -312,11 +335,271 @@ impl Server {
             .map_err(|e| RpcError::internal(format!("remove: {e}")))?;
         Ok(format!("sandbox {} removed", args.id))
     }
+
+    /// Run a command inside a sandbox and collect stdout/stderr synchronously.
+    ///
+    /// Calls exec then drains stream_output with a 30 s timeout. Returns a
+    /// JSON object with stdout, stderr, exit_code, and duration_ms so the
+    /// calling agent has structured output without parsing raw text.
+    async fn tool_run(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+            command: Vec<String>,
+            #[serde(default)]
+            working_dir: Option<String>,
+            /// Override the default 30 s output-collection timeout.
+            #[serde(default)]
+            timeout_secs: Option<u64>,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_run: {e}")))?;
+
+        let timeout = Duration::from_secs(args.timeout_secs.unwrap_or(RUN_TIMEOUT_SECS));
+
+        let exec_req = pb::ExecRequest {
+            sandbox_id: args.sandbox_id.clone(),
+            command: args.command,
+            working_dir: args.working_dir.unwrap_or_default(),
+            env: HashMap::new(),
+        };
+        let mgr = self.runtime.sandbox_manager();
+        let proc_info = mgr
+            .exec(exec_req)
+            .await
+            .map_err(|e| RpcError::internal(format!("ward_run exec: {e}")))?;
+
+        let mut rx = mgr
+            .stream_output(&args.sandbox_id, &proc_info.pid)
+            .await
+            .map_err(|e| RpcError::internal(format!("ward_run stream_output: {e}")))?;
+
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
+        let mut exit_code: Option<i32> = None;
+        let mut duration_ms: u64 = 0;
+
+        let collect = async {
+            while let Some(ev) = rx.recv().await {
+                match ev.kind {
+                    StreamEventKind::Stdout => stdout_buf.push_str(&ev.line),
+                    StreamEventKind::Stderr => stderr_buf.push_str(&ev.line),
+                    StreamEventKind::Exit => {
+                        exit_code = ev.exit_code;
+                        duration_ms = ev.duration_ms;
+                    }
+                }
+            }
+        };
+
+        tokio::time::timeout(timeout, collect).await.map_err(|_| {
+            RpcError::internal(format!(
+                "ward_run: output collection timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?;
+
+        let result = serde_json::json!({
+            "pid": proc_info.pid,
+            "stdout": stdout_buf,
+            "stderr": stderr_buf,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
+        });
+        Ok(result.to_string())
+    }
+
+    /// Forward bytes to a running process's stdin.
+    async fn tool_write_stdin(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+            pid: String,
+            /// UTF-8 data to write to stdin.
+            data: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_write_stdin: {e}")))?;
+
+        self.runtime
+            .sandbox_manager()
+            .write_stdin(
+                &args.sandbox_id,
+                &args.pid,
+                bytes::Bytes::from(args.data.into_bytes()),
+            )
+            .await
+            .map_err(|e| RpcError::internal(format!("write_stdin: {e}")))?;
+
+        Ok(format!(
+            "data written to stdin of pid {} in sandbox {}",
+            args.pid, args.sandbox_id
+        ))
+    }
+
+    /// Terminate a running process inside a sandbox.
+    async fn tool_kill_process(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+            pid: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_kill_process: {e}")))?;
+
+        self.runtime
+            .sandbox_manager()
+            .kill_process(&args.sandbox_id, &args.pid)
+            .await
+            .map_err(|e| RpcError::internal(format!("kill_process: {e}")))?;
+
+        Ok(format!(
+            "process {} in sandbox {} killed",
+            args.pid, args.sandbox_id
+        ))
+    }
+
+    /// Take a snapshot of a running sandbox.
+    async fn tool_create_snapshot(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+            label: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_create_snapshot: {e}")))?;
+
+        let info = self
+            .runtime
+            .sandbox_manager()
+            .create_snapshot(&args.sandbox_id, &args.label)
+            .await
+            .map_err(|e| RpcError::internal(format!("create_snapshot: {e}")))?;
+
+        Ok(format!(
+            "snapshot {} created for sandbox {} (label: {})",
+            info.snapshot_id, info.sandbox_id, info.label
+        ))
+    }
+
+    /// Restore a sandbox from a previously-taken snapshot.
+    async fn tool_restore_snapshot(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+            snapshot_id: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_restore_snapshot: {e}")))?;
+
+        self.runtime
+            .sandbox_manager()
+            .restore_snapshot(&args.sandbox_id, &args.snapshot_id)
+            .await
+            .map_err(|e| RpcError::internal(format!("restore_snapshot: {e}")))?;
+
+        Ok(format!(
+            "sandbox {} restored from snapshot {}",
+            args.sandbox_id, args.snapshot_id
+        ))
+    }
+
+    /// List all snapshots taken from a sandbox.
+    async fn tool_list_snapshots(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            sandbox_id: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_list_snapshots: {e}")))?;
+
+        let snapshots = self
+            .runtime
+            .sandbox_manager()
+            .list_snapshots(&args.sandbox_id)
+            .await
+            .map_err(|e| RpcError::internal(format!("list_snapshots: {e}")))?;
+
+        if snapshots.is_empty() {
+            return Ok(format!("(no snapshots for sandbox {})", args.sandbox_id));
+        }
+
+        let lines: Vec<String> = snapshots
+            .iter()
+            .map(|s| format!("{}\t{}\t{}", s.snapshot_id, s.label, s.size_bytes))
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    /// Allocate a new persistent volume.
+    async fn tool_create_volume(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            name: String,
+            size_mb: u32,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_create_volume: {e}")))?;
+
+        let req = pb::CreateVolumeRequest {
+            name: args.name.clone(),
+            size_mb: args.size_mb,
+        };
+        let info = self
+            .runtime
+            .volume_manager()
+            .create(req)
+            .await
+            .map_err(|e| RpcError::internal(format!("create_volume: {e}")))?;
+
+        Ok(format!(
+            "volume {} created (name: {}, size: {} MB)",
+            info.id, info.name, info.size_mb
+        ))
+    }
+
+    /// List all volumes.
+    async fn tool_list_volumes(&self) -> Result<String, RpcError> {
+        let volumes = self
+            .runtime
+            .volume_manager()
+            .list()
+            .await
+            .map_err(|e| RpcError::internal(format!("list_volumes: {e}")))?;
+
+        if volumes.is_empty() {
+            return Ok("(no volumes)".into());
+        }
+
+        let lines: Vec<String> = volumes
+            .iter()
+            .map(|v| format!("{}\t{}\t{} MB", v.id, v.name, v.size_mb))
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    /// Delete a volume and release its backing storage.
+    async fn tool_remove_volume(&self, args: serde_json::Value) -> Result<String, RpcError> {
+        #[derive(serde::Deserialize)]
+        struct Args {
+            id: String,
+        }
+        let args: Args = serde_json::from_value(args)
+            .map_err(|e| RpcError::invalid_params(format!("ward_remove_volume: {e}")))?;
+
+        self.runtime
+            .volume_manager()
+            .remove(&args.id)
+            .await
+            .map_err(|e| RpcError::internal(format!("remove_volume: {e}")))?;
+
+        Ok(format!("volume {} removed", args.id))
+    }
 }
 
-/// Static schema for the four tools we expose. Sent verbatim in
-/// `tools/list`. JSON Schema draft-07 conventions; MCP doesn't require a
-/// specific dialect but clients (Claude / Cursor) understand draft-07.
+/// Static schema for all tools we expose. Sent verbatim in `tools/list`.
+/// JSON Schema draft-07 conventions; MCP doesn't require a specific dialect
+/// but clients (Claude / Cursor) understand draft-07.
 fn tools_descriptors() -> serde_json::Value {
     serde_json::json!([
         {
@@ -366,6 +649,118 @@ fn tools_descriptors() -> serde_json::Value {
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "ward_run",
+            "description": "Execute a command inside a sandbox and collect stdout, stderr, exit_code, and duration_ms synchronously. Waits up to timeout_secs (default 30) for the process to finish.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string", "description": "ID of the target sandbox" },
+                    "command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "Argv array; first element is the executable."
+                    },
+                    "working_dir": { "type": "string", "description": "Optional working directory inside the sandbox" },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 30,
+                        "description": "Max seconds to wait for output collection before returning a timeout error"
+                    }
+                },
+                "required": ["sandbox_id", "command"]
+            }
+        },
+        {
+            "name": "ward_write_stdin",
+            "description": "Send UTF-8 data to the stdin of a running process inside a sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string" },
+                    "pid": { "type": "string", "description": "Process ID returned by ward_exec" },
+                    "data": { "type": "string", "description": "UTF-8 bytes to write to stdin" }
+                },
+                "required": ["sandbox_id", "pid", "data"]
+            }
+        },
+        {
+            "name": "ward_kill_process",
+            "description": "Terminate a running process inside a ward sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string" },
+                    "pid": { "type": "string", "description": "Process ID returned by ward_exec" }
+                },
+                "required": ["sandbox_id", "pid"]
+            }
+        },
+        {
+            "name": "ward_create_snapshot",
+            "description": "Take a snapshot of a running sandbox, capturing its current state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string" },
+                    "label": { "type": "string", "description": "Human-readable label for the snapshot" }
+                },
+                "required": ["sandbox_id", "label"]
+            }
+        },
+        {
+            "name": "ward_restore_snapshot",
+            "description": "Restore a sandbox to a previously-taken snapshot.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string" },
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID returned by ward_create_snapshot" }
+                },
+                "required": ["sandbox_id", "snapshot_id"]
+            }
+        },
+        {
+            "name": "ward_list_snapshots",
+            "description": "List all snapshots taken from a sandbox.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "sandbox_id": { "type": "string" }
+                },
+                "required": ["sandbox_id"]
+            }
+        },
+        {
+            "name": "ward_create_volume",
+            "description": "Allocate a new persistent ext4 volume that can be attached to sandboxes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Human-readable name for the volume" },
+                    "size_mb": { "type": "integer", "minimum": 1, "description": "Volume size in megabytes" }
+                },
+                "required": ["name", "size_mb"]
+            }
+        },
+        {
+            "name": "ward_list_volumes",
+            "description": "List all persistent volumes.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "ward_remove_volume",
+            "description": "Delete a persistent volume and release its backing storage.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Volume ID returned by ward_create_volume" }
+                },
                 "required": ["id"]
             }
         }

@@ -78,9 +78,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "assert_cmd"
@@ -242,6 +242,12 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "byteorder"
@@ -1915,6 +1921,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "papergrid"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0984e668274d34691bc2b262ef0d115de5fa9973bcdee7ae32213f93099153e"
+dependencies = [
+ "bytecount",
+ "fnv",
+ "unicode-width",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2874,6 +2891,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tabled"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5dc662e6da844ad6e428ad16b57967c9d33c82e16bb1c258326c0c078605dff"
+dependencies = [
+ "papergrid",
+ "testing_table",
+]
+
+[[package]]
 name = "tar"
 version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2902,6 +2929,15 @@ name = "termtree"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
+
+[[package]]
+name = "testing_table"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f8daae29995a24f65619e19d8d31dea5b389f3d853d8bf297bbf607cd0014cc"
+dependencies = [
+ "unicode-width",
+]
 
 [[package]]
 name = "thiserror"
@@ -3305,6 +3341,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
 name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3408,10 +3450,12 @@ name = "ward-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "hyper-util",
  "pretty_assertions",
  "serde_json",
+ "tabled",
  "tokio",
  "tonic",
  "tower",
@@ -3477,6 +3521,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "predicates",
  "rustix",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3492,6 +3537,7 @@ dependencies = [
 name = "ward-mcp"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "serde",
  "serde_json",
  "tempfile",
@@ -3532,6 +3578,7 @@ dependencies = [
 name = "ward-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "tempfile",
  "thiserror",
  "tokio",
