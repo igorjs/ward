@@ -22,6 +22,7 @@ use predicates::prelude::*;
 // scenarios need that ID for subsequent commands.
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn extract_id(stdout: &str) -> String {
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("id: ") {
