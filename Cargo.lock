@@ -3578,6 +3578,7 @@ dependencies = [
 name = "ward-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "tempfile",
  "thiserror",
  "tokio",

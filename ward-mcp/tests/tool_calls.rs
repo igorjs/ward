@@ -31,6 +31,9 @@ impl McpServer {
         let mut child = Command::new(bin)
             .env("WARD_DATA_DIR", tmp.path())
             .env("RUST_LOG", "error")
+            // WARD_OCI_OFFLINE=1: skip real registry pulls so MCP tool
+            // tests stay hermetic on egress-blocked CI runners.
+            .env("WARD_OCI_OFFLINE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

@@ -13,9 +13,38 @@
 //! in-process would do — i.e. the use case ADR-016 introduces.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
+use ward_core::backend::image::{ImagePuller, ImageStore};
 use ward_core::pb;
 use ward_runtime::Runtime;
+
+/// Offline image puller for lifecycle tests: materialises a minimal rootfs
+/// without touching the network. Distinct image references get distinct
+/// cache entries (the hash keeps them apart) so multi-image tests work.
+#[derive(Debug)]
+struct FakePuller;
+
+#[async_trait::async_trait]
+impl ImagePuller for FakePuller {
+    async fn pull(
+        &self,
+        reference: &str,
+        dest: &Path,
+    ) -> Result<String, ward_core::backend::BackendError> {
+        std::fs::create_dir_all(dest.join("bin")).map_err(ward_core::backend::BackendError::Io)?;
+        let hash: u64 = reference
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        Ok(format!("sha256:{hash:016x}"))
+    }
+}
+
+/// Build a test-local image store backed by `FakePuller` rooted at `cache_dir`.
+fn fake_image_store(cache_dir: std::path::PathBuf) -> Arc<ImageStore> {
+    Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)))
+}
 
 /// Helper: build a `CreateSandboxRequest` with the minimum fields the
 /// manager requires. Mirrors `ward-cli/src/main.rs::Commands::Create`
@@ -49,11 +78,14 @@ fn create_request(image: &str) -> pb::CreateSandboxRequest {
 async fn given_runtime_when_create_then_list_then_remove_then_clean() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
-    // ARRANGE — boot the embedded runtime exactly like a Rust app would.
+    // ARRANGE: boot the embedded runtime with a FakePuller so the test
+    // does not reach out to a real registry.
+    let store = fake_image_store(tmp.path().join("cache").join("images"));
     let runtime = Runtime::builder()
         .data_dir(tmp.path())
         .max_sandboxes(4)
         .max_volumes(4)
+        .with_image_store_for_test(store)
         .build()
         .await
         .expect("runtime builds with stub backend");
@@ -91,9 +123,11 @@ async fn given_runtime_when_cap_reached_then_next_create_errors() {
     // Regression: max_sandboxes is the runtime's hard cap. The embedded
     // path must enforce it, not just the daemon path.
     let tmp = tempfile::tempdir().expect("tempdir");
+    let store = fake_image_store(tmp.path().join("cache").join("images"));
     let runtime = Runtime::builder()
         .data_dir(tmp.path())
         .max_sandboxes(2)
+        .with_image_store_for_test(store)
         .build()
         .await
         .expect("runtime builds");
@@ -123,8 +157,10 @@ async fn given_runtime_when_clone_then_managers_shared() {
     // underlying state — embedded users that fork the runtime into
     // multiple workers rely on this.
     let tmp = tempfile::tempdir().expect("tempdir");
+    let store = fake_image_store(tmp.path().join("cache").join("images"));
     let runtime = Runtime::builder()
         .data_dir(tmp.path())
+        .with_image_store_for_test(store)
         .build()
         .await
         .expect("runtime");
