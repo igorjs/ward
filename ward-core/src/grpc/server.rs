@@ -71,6 +71,11 @@ impl WardGrpcServer {
 
 #[tonic::async_trait]
 impl Ward for WardGrpcServer {
+    #[tracing::instrument(
+        name = "rpc.create_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), image = %request.get_ref().image)
+    )]
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
@@ -80,6 +85,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
@@ -89,6 +99,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
+    #[tracing::instrument(
+        name = "rpc.list_sandboxes",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4())
+    )]
     async fn list_sandboxes(
         &self,
         _request: Request<()>,
@@ -97,6 +112,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.remove_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
     async fn remove_sandbox(
         &self,
         request: Request<RemoveSandboxRequest>,
@@ -109,12 +129,22 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(
+        name = "rpc.exec",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
         let info = self.sandbox.exec(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
+    #[tracing::instrument(
+        name = "rpc.run",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
         let req = request.into_inner();
         let info = self.sandbox.run(req).await.map_err(api_err_to_status)?;
@@ -123,6 +153,15 @@ impl Ward for WardGrpcServer {
 
     type StreamOutputStream = tokio_stream::wrappers::ReceiverStream<Result<StreamEvent, Status>>;
 
+    #[tracing::instrument(
+        name = "rpc.stream_output",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            pid = %request.get_ref().pid,
+        )
+    )]
     async fn stream_output(
         &self,
         request: Request<StreamOutputRequest>,
@@ -157,6 +196,15 @@ impl Ward for WardGrpcServer {
         )))
     }
 
+    #[tracing::instrument(
+        name = "rpc.write_stdin",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            pid = %request.get_ref().pid,
+        )
+    )]
     async fn write_stdin(
         &self,
         request: Request<WriteStdinRequest>,
@@ -169,6 +217,15 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(
+        name = "rpc.kill_process",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            pid = %request.get_ref().pid,
+        )
+    )]
     async fn kill_process(
         &self,
         request: Request<KillProcessRequest>,
@@ -181,6 +238,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(
+        name = "rpc.create_snapshot",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn create_snapshot(
         &self,
         request: Request<CreateSnapshotRequest>,
@@ -194,6 +256,15 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(snapshot_info_to_pb(info)))
     }
 
+    #[tracing::instrument(
+        name = "rpc.restore_snapshot",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            snapshot_id = %request.get_ref().snapshot_id,
+        )
+    )]
     async fn restore_snapshot(
         &self,
         request: Request<RestoreSnapshotRequest>,
@@ -206,6 +277,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(
+        name = "rpc.list_snapshots",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn list_snapshots(
         &self,
         request: Request<ListSnapshotsRequest>,
@@ -220,6 +296,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(ListSnapshotsResponse { snapshots }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.create_volume",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), name = %request.get_ref().name)
+    )]
     async fn create_volume(
         &self,
         request: Request<CreateVolumeRequest>,
@@ -229,6 +310,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_volume",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), volume_id = %request.get_ref().id)
+    )]
     async fn get_volume(
         &self,
         request: Request<GetVolumeRequest>,
@@ -238,6 +324,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(info))
     }
 
+    #[tracing::instrument(
+        name = "rpc.list_volumes",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4())
+    )]
     async fn list_volumes(
         &self,
         _request: Request<()>,
@@ -246,6 +337,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(ListVolumesResponse { volumes }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.remove_volume",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), volume_id = %request.get_ref().id)
+    )]
     async fn remove_volume(
         &self,
         request: Request<RemoveVolumeRequest>,
@@ -258,6 +354,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_egress_log",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn get_egress_log(
         &self,
         request: Request<GetEgressLogRequest>,
@@ -293,6 +394,15 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(EgressLogResponse { entries }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.publish",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            topic = %request.get_ref().topic,
+        )
+    )]
     async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
@@ -313,6 +423,15 @@ impl Ward for WardGrpcServer {
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
 
+    #[tracing::instrument(
+        name = "rpc.subscribe",
+        skip_all,
+        fields(
+            request_id = %uuid::Uuid::new_v4(),
+            sandbox_id = %request.get_ref().sandbox_id,
+            topic = %request.get_ref().topic,
+        )
+    )]
     async fn subscribe(
         &self,
         request: Request<SubscribeRequest>,
@@ -348,6 +467,11 @@ impl Ward for WardGrpcServer {
         )))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_communication_log",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
     async fn get_communication_log(
         &self,
         request: Request<GetCommunicationLogRequest>,
@@ -362,6 +486,11 @@ impl Ward for WardGrpcServer {
         }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_health",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4())
+    )]
     async fn get_health(&self, _request: Request<()>) -> Result<Response<HealthStatus>, Status> {
         let uptime_seconds = self.started_at.elapsed().as_secs();
         let sandbox_count = self.sandbox.count().await.map_err(api_err_to_status)? as u32;
@@ -380,6 +509,11 @@ impl Ward for WardGrpcServer {
         }))
     }
 
+    #[tracing::instrument(
+        name = "rpc.get_info",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4())
+    )]
     async fn get_info(&self, _request: Request<()>) -> Result<Response<DaemonInfo>, Status> {
         Ok(Response::new(DaemonInfo {
             version: super::VERSION.to_string(),
@@ -467,5 +601,116 @@ fn snapshot_info_to_pb(info: crate::protocol::SnapshotInfo) -> SnapshotInfo {
         label: info.label,
         created_at: system_time_to_pb(info.created_at),
         size_bytes: info.size_bytes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+    use crate::backend::image::{ImagePuller, ImageStore};
+    use crate::backend::krunvm::KrunvmBackend;
+    use crate::comms::Broker;
+    use crate::sandbox::SandboxManager;
+    use crate::volume::VolumeManager;
+    use std::path::Path;
+
+    /// Offline image puller: materialises a minimal bin/ rootfs without
+    /// touching the network. Mirrors the FakePuller pattern in image.rs
+    /// and manager.rs; duplicated here because both are gated
+    /// `#[cfg(test)]` and not visible across module boundaries.
+    #[derive(Debug)]
+    struct FakePuller;
+
+    #[async_trait::async_trait]
+    impl ImagePuller for FakePuller {
+        async fn pull(
+            &self,
+            reference: &str,
+            dest: &Path,
+        ) -> Result<String, crate::backend::BackendError> {
+            std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            Ok(format!("sha256:{hash:016x}"))
+        }
+    }
+
+    fn build_test_server() -> WardGrpcServer {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        std::mem::forget(dir);
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::with_image_store_for_test(
+            path.clone(),
+            store,
+        ));
+        let broker = Arc::new(Broker::new());
+        let sandbox = Arc::new(SandboxManager::new(backend, broker, 8, false));
+        let volume = Arc::new(VolumeManager::new(path, 8));
+        WardGrpcServer::new(sandbox, volume)
+    }
+
+    /// Regression guard: every RPC handler in this file must carry a
+    /// `#[tracing::instrument(...)]` attribute. The instrument pattern is
+    /// the project's contract for request_id propagation + uniform span
+    /// names (`rpc.<method>`). A new handler added without the attribute
+    /// would silently disappear from the request_id surface; this static
+    /// grep over the source catches that.
+    #[test]
+    fn given_grpc_server_source_when_inspected_then_every_handler_is_instrumented() {
+        let src = include_str!("server.rs");
+        // Count `    async fn ` (handlers inside `impl Ward for ...`)
+        // vs `#[tracing::instrument` attributes. The two MUST balance.
+        // Helpers and free functions use 4-space-prefixed `async fn`
+        // only inside the impl block; nothing else in this file matches.
+        let handlers = src.matches("    async fn ").count();
+        let instruments = src.matches("#[tracing::instrument(").count();
+        assert_eq!(
+            handlers, instruments,
+            "every gRPC handler must have a #[tracing::instrument(...)] attribute; \
+             found {handlers} handlers and {instruments} instrument attributes. \
+             A new RPC without the attribute would silently lose request_id propagation."
+        );
+    }
+
+    /// Sanity check that the instrumented handler compiles and runs end
+    /// to end. `get_health` is the cheapest handler (no request fields
+    /// to validate, no backend work) so it doubles as a smoke test for
+    /// the attribute macro expansion.
+    #[tokio::test]
+    async fn given_instrumented_get_health_when_called_then_returns_ok() {
+        let svc = build_test_server();
+        let resp = svc.get_health(Request::new(())).await.expect("get_health");
+        let inner = resp.into_inner();
+        assert_eq!(inner.status, "ok");
+    }
+
+    /// All instrumented handler attributes follow the same shape:
+    /// `name = "rpc.<method>"` so log lines can be filtered with a
+    /// stable prefix. This pins the convention.
+    #[test]
+    fn given_grpc_server_source_when_inspected_then_every_span_uses_rpc_name_prefix() {
+        let src = include_str!("server.rs");
+        let mut bad: Vec<&str> = Vec::new();
+        for line in src.lines() {
+            let trimmed = line.trim();
+            if let Some(after) = trimmed.strip_prefix("name = \"") {
+                // Only inspect `name = "..."` lines inside an instrument
+                // attribute block. Heuristic: those lines sit indented
+                // inside `#[tracing::instrument(...)]` and end with `",`.
+                if let Some(name) = after.split('"').next()
+                    && !name.starts_with("rpc.")
+                {
+                    bad.push(line);
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "every instrumented span must use the `rpc.<method>` name prefix; offenders: {bad:?}"
+        );
     }
 }
