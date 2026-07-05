@@ -50,3 +50,6 @@ predicates = "3"
 # Per-test temp dirs that self-clean on drop. Used for per-test socket
 # paths and data dirs so E2E tests do not share state.
 tempfile = "3"
+# JSON parsing for e2e_output_modes.rs which validates the CLI's
+# --json mode output structure.
+serde_json = "1"

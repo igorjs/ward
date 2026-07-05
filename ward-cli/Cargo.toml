@@ -11,9 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# JSON mode encodes broker payload bytes as base64 so binary publishes
+# survive the round-trip without collapsing through `from_utf8_lossy`.
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
+# Aligned-column rendering for `ward list`, `ward volume list`, and
+# `ward snapshot list` when stdout is a TTY. Piped output stays
+# tab-separated so scripts keep working.
+tabled = { version = "0.21", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.14"
 tower = "0.5"

@@ -678,15 +678,40 @@ mod tests {
     use crate::protocol::StreamEventKind;
     use pretty_assertions::assert_eq;
 
+    /// Offline puller used by test backends so no network calls are made
+    /// when manager tests create sandboxes.
+    #[derive(Debug)]
+    struct FakePuller;
+
+    #[async_trait::async_trait]
+    impl crate::backend::image::ImagePuller for FakePuller {
+        async fn pull(
+            &self,
+            reference: &str,
+            dest: &std::path::Path,
+        ) -> crate::backend::Result<String> {
+            std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            Ok(format!("sha256:{hash:016x}"))
+        }
+    }
+
     /// Build a fresh SandboxManager pointed at a per-test data_dir.
+    /// Injects a `FakePuller` so `create_sandbox` works offline.
     /// Leaks the TempDir intentionally: tokio's async fs API outlives any
     /// test-local scope, and the OS cleans /tmp on its own schedule.
     fn build_manager(max_sandboxes: usize) -> Arc<SandboxManager> {
+        use crate::backend::image::ImageStore;
         use crate::backend::krunvm::KrunvmBackend;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(dir);
-        let backend: Arc<dyn Backend> = Arc::new(KrunvmBackend::new(path));
+        let backend: Arc<dyn Backend> =
+            Arc::new(KrunvmBackend::with_image_store_for_test(path, store));
         let broker = Arc::new(Broker::new());
         // Default to allow_host_mounts=false so the cap path is exercised
         // by the existing test corpus; per-test overrides go through a

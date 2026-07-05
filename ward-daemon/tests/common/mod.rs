@@ -46,6 +46,12 @@ impl Daemon {
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())
             .env("WARD_LOG_LEVEL", "warn") // quiet startup logs in test output
+            // WARD_OCI_OFFLINE=1: skip real registry pulls in e2e tests.
+            // CI runs with egress-policy:block (step-security/harden-runner)
+            // and docker.io is not in the allowed-endpoints list. Setting this
+            // makes OciPuller materialise a minimal synthetic rootfs instead of
+            // hitting the network, keeping e2e tests hermetic on any host.
+            .env("WARD_OCI_OFFLINE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

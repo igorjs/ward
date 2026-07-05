@@ -13,7 +13,7 @@ use serde_json::Value;
 /// Run the compiled `ward-mcp` binary with a per-test data dir, send it
 /// `request`, and return the parsed response object.
 fn send_one(request: &str) -> Value {
-    // tempfile path for WARD_DATA_DIR — the binary will create the
+    // tempfile path for WARD_DATA_DIR -- the binary will create the
     // tree on first use.
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -39,7 +39,7 @@ fn send_one(request: &str) -> Value {
     let mut line = String::new();
     reader.read_line(&mut line).expect("read response");
 
-    // Kill the child so stdin EOF doesn't matter — we have what we need.
+    // Kill the child so stdin EOF doesn't matter -- we have what we need.
     let _ = child.kill();
     let _ = child.wait();
 
@@ -64,22 +64,87 @@ fn given_initialize_request_when_server_responds_then_advertises_tools_capabilit
 }
 
 #[test]
-fn given_tools_list_request_when_server_responds_then_returns_four_tools() {
+fn given_tools_list_request_when_server_responds_then_returns_all_tools() {
     let req = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
     let resp = send_one(req);
 
     assert_eq!(resp["jsonrpc"], "2.0");
     assert_eq!(resp["id"], 2);
     let tools = resp["result"]["tools"].as_array().expect("tools is array");
-    assert_eq!(tools.len(), 4, "expected 4 tools: {resp}");
+    assert_eq!(tools.len(), 13, "expected 13 tools: {resp}");
 
     // Names are the SDK-stable surface; pin the set so adding/removing
     // requires a deliberate test edit.
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"ward_create_sandbox"));
-    assert!(names.contains(&"ward_list_sandboxes"));
-    assert!(names.contains(&"ward_exec"));
-    assert!(names.contains(&"ward_remove_sandbox"));
+
+    // Original 4 tools.
+    assert!(
+        names.contains(&"ward_create_sandbox"),
+        "missing ward_create_sandbox"
+    );
+    assert!(
+        names.contains(&"ward_list_sandboxes"),
+        "missing ward_list_sandboxes"
+    );
+    assert!(names.contains(&"ward_exec"), "missing ward_exec");
+    assert!(
+        names.contains(&"ward_remove_sandbox"),
+        "missing ward_remove_sandbox"
+    );
+
+    // New tools added in this PR.
+    assert!(names.contains(&"ward_run"), "missing ward_run");
+    assert!(
+        names.contains(&"ward_write_stdin"),
+        "missing ward_write_stdin"
+    );
+    assert!(
+        names.contains(&"ward_kill_process"),
+        "missing ward_kill_process"
+    );
+    assert!(
+        names.contains(&"ward_create_snapshot"),
+        "missing ward_create_snapshot"
+    );
+    assert!(
+        names.contains(&"ward_restore_snapshot"),
+        "missing ward_restore_snapshot"
+    );
+    assert!(
+        names.contains(&"ward_list_snapshots"),
+        "missing ward_list_snapshots"
+    );
+    assert!(
+        names.contains(&"ward_create_volume"),
+        "missing ward_create_volume"
+    );
+    assert!(
+        names.contains(&"ward_list_volumes"),
+        "missing ward_list_volumes"
+    );
+    assert!(
+        names.contains(&"ward_remove_volume"),
+        "missing ward_remove_volume"
+    );
+}
+
+#[test]
+fn given_tools_list_request_when_server_responds_then_each_tool_has_complete_schema() {
+    let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#;
+    let resp = send_one(req);
+
+    let tools = resp["result"]["tools"].as_array().expect("tools is array");
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("(unnamed)");
+        assert!(
+            tool["inputSchema"].is_object(),
+            "tool {name} missing inputSchema"
+        );
+        assert_eq!(
+            tool["inputSchema"]["type"], "object",
+            "tool {name} inputSchema must be type:object"
+        );
+    }
 }
 
 #[test]

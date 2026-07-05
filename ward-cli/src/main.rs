@@ -3,9 +3,11 @@
 //! ward – command-line interface to the Ward daemon.
 
 mod client;
+mod output;
 mod socket;
 
 use clap::{Parser, Subcommand};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Top-level CLI
@@ -22,6 +24,21 @@ struct Cli {
     /// Unix socket path of the ward daemon.
     #[arg(long, env = "WARD_SOCKET", global = true)]
     socket: Option<String>,
+
+    /// Emit machine-parseable JSON instead of the default key/value or
+    /// tab-separated output. One JSON object per command; list commands
+    /// emit a JSON array. Stable surface for `jq` pipelines. Also
+    /// honoured via `WARD_JSON=1` (any non-empty value except `0` or
+    /// `false`).
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Force tab-separated output for list commands even when stdout is
+    /// a TTY. Useful when the operator wants to copy the table cleanly
+    /// or pipe through an external pretty-printer. Also honoured via
+    /// `WARD_NO_PRETTY=1`.
+    #[arg(long, global = true)]
+    no_pretty: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -198,9 +215,27 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// `--json` / `--no-pretty` accept either the flag or a truthy env
+/// var. clap's built-in `env` for bool fields only accepts the literal
+/// strings `"true"` / `"false"`, which collides with the Unix idiom of
+/// `WARD_JSON=1`. We resolve both forms here so users can either pass
+/// the flag or set the env var to any non-empty value that is not
+/// `"0"` or `"false"`.
+fn flag_or_env(flag: bool, env_var: &str) -> bool {
+    if flag {
+        return true;
+    }
+    matches!(
+        std::env::var(env_var).as_deref().map(str::trim),
+        Ok(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let json = flag_or_env(cli.json, "WARD_JSON");
+    let no_pretty = flag_or_env(cli.no_pretty, "WARD_NO_PRETTY");
 
     let socket_path = cli.socket.unwrap_or_else(socket::default_socket);
 
@@ -254,23 +289,42 @@ async fn main() -> anyhow::Result<()> {
                 .await?
                 .into_inner();
 
-            // One field per line for grep-friendly E2E assertions.
-            println!("id: {}", resp.id);
-            println!("status: {}", status_name(resp.status));
-            println!("image: {}", resp.image);
-            if !resp.ip_address.is_empty() {
-                println!("ip_address: {}", resp.ip_address);
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "id": resp.id,
+                        "status": status_name(resp.status),
+                        "image": resp.image,
+                        "ip_address": if resp.ip_address.is_empty() { Value::Null } else { Value::String(resp.ip_address) },
+                    })
+                );
+            } else {
+                // One field per line for grep-friendly E2E assertions.
+                println!("id: {}", resp.id);
+                println!("status: {}", status_name(resp.status));
+                println!("image: {}", resp.image);
+                if !resp.ip_address.is_empty() {
+                    println!("ip_address: {}", resp.ip_address);
+                }
             }
         }
 
         Commands::List => {
             let mut c = client::connect(&socket_path).await?;
             let resp = c.list_sandboxes(()).await?.into_inner();
-            // Tab-separated columns: id, status, image. Empty output means
-            // no sandboxes — same convention as `ward volume list`.
-            for s in resp.sandboxes {
-                println!("{}\t{}\t{}", s.id, status_name(s.status), s.image);
-            }
+            let rows: Vec<Vec<Value>> = resp
+                .sandboxes
+                .into_iter()
+                .map(|s| {
+                    vec![
+                        Value::String(s.id),
+                        Value::String(status_name(s.status).to_string()),
+                        Value::String(s.image),
+                    ]
+                })
+                .collect();
+            output::emit_rows(json, no_pretty, &["id", "status", "image"], &rows)?;
         }
 
         Commands::Exec {
@@ -290,8 +344,12 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`
             // to retrieve streamed output once StreamOutput is implemented.
-            println!("pid: {}", resp.pid);
-            println!("status: {}", resp.status);
+            if json {
+                println!("{}", json!({"pid": resp.pid, "status": resp.status}));
+            } else {
+                println!("pid: {}", resp.pid);
+                println!("status: {}", resp.status);
+            }
         }
 
         Commands::Run { id, language, code } => {
@@ -304,8 +362,12 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .await?
                 .into_inner();
-            println!("pid: {}", resp.pid);
-            println!("status: {}", resp.status);
+            if json {
+                println!("{}", json!({"pid": resp.pid, "status": resp.status}));
+            } else {
+                println!("pid: {}", resp.pid);
+                println!("status: {}", resp.status);
+            }
         }
 
         Commands::Logs { id, pid } => {
@@ -331,7 +393,15 @@ async fn main() -> anyhow::Result<()> {
                     ward_core::pb::StreamEventType::Exit => "exit",
                     ward_core::pb::StreamEventType::Unspecified => "unspecified",
                 };
-                if kind == "exit" {
+                if json {
+                    // One JSON object per event (JSON Lines / NDJSON);
+                    // `jq -c .` is the natural consumer for streaming.
+                    if kind == "exit" {
+                        println!("{}", json!({"type": "exit", "exit_code": evt.exit_code}));
+                    } else {
+                        println!("{}", json!({"type": kind, "line": evt.line}));
+                    }
+                } else if kind == "exit" {
                     println!("exit: {}", evt.exit_code);
                 } else {
                     println!("{kind}: {}", evt.line);
@@ -346,7 +416,11 @@ async fn main() -> anyhow::Result<()> {
                 pid: pid.clone(),
             })
             .await?;
-            println!("killed: {pid}");
+            if json {
+                println!("{}", json!({"killed": pid}));
+            } else {
+                println!("killed: {pid}");
+            }
         }
 
         Commands::Stdin { id, pid, data } => {
@@ -367,13 +441,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let mut c = client::connect(&socket_path).await?;
+            let bytes_written = bytes.len();
             c.write_stdin(ward_core::pb::WriteStdinRequest {
                 sandbox_id: id,
                 pid,
                 data: bytes,
             })
             .await?;
-            println!("wrote");
+            if json {
+                println!("{}", json!({"wrote": bytes_written}));
+            } else {
+                println!("wrote");
+            }
         }
 
         Commands::Snapshot(snap_cmd) => match snap_cmd {
@@ -383,13 +462,22 @@ async fn main() -> anyhow::Result<()> {
                     .create_snapshot(ward_core::pb::CreateSnapshotRequest { sandbox_id, label })
                     .await?
                     .into_inner();
-                // One field per line so scripts can grep without parsing
-                // structured output. Same convention as `ward info` and
-                // `ward volume create`.
-                println!("snapshot_id: {}", resp.snapshot_id);
-                println!("sandbox_id: {}", resp.sandbox_id);
-                println!("label: {}", resp.label);
-                println!("size_bytes: {}", resp.size_bytes);
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "snapshot_id": resp.snapshot_id,
+                            "sandbox_id": resp.sandbox_id,
+                            "label": resp.label,
+                            "size_bytes": resp.size_bytes,
+                        })
+                    );
+                } else {
+                    println!("snapshot_id: {}", resp.snapshot_id);
+                    println!("sandbox_id: {}", resp.sandbox_id);
+                    println!("label: {}", resp.label);
+                    println!("size_bytes: {}", resp.size_bytes);
+                }
             }
             SnapshotCommands::Restore {
                 sandbox_id,
@@ -401,7 +489,14 @@ async fn main() -> anyhow::Result<()> {
                     snapshot_id: snapshot_id.clone(),
                 })
                 .await?;
-                println!("restored: {sandbox_id} from {snapshot_id}");
+                if json {
+                    println!(
+                        "{}",
+                        json!({"restored": sandbox_id, "from_snapshot": snapshot_id})
+                    );
+                } else {
+                    println!("restored: {sandbox_id} from {snapshot_id}");
+                }
             }
             SnapshotCommands::List { sandbox_id } => {
                 let mut c = client::connect(&socket_path).await?;
@@ -409,15 +504,24 @@ async fn main() -> anyhow::Result<()> {
                     .list_snapshots(ward_core::pb::ListSnapshotsRequest { sandbox_id })
                     .await?
                     .into_inner();
-                // Tab-separated columns: snapshot_id, sandbox_id, label,
-                // size_bytes. Stable for `awk` / `cut`. Empty output means
-                // no snapshots for this sandbox.
-                for s in resp.snapshots {
-                    println!(
-                        "{}\t{}\t{}\t{}B",
-                        s.snapshot_id, s.sandbox_id, s.label, s.size_bytes,
-                    );
-                }
+                let rows: Vec<Vec<Value>> = resp
+                    .snapshots
+                    .into_iter()
+                    .map(|s| {
+                        vec![
+                            Value::String(s.snapshot_id),
+                            Value::String(s.sandbox_id),
+                            Value::String(s.label),
+                            Value::from(s.size_bytes),
+                        ]
+                    })
+                    .collect();
+                output::emit_rows(
+                    json,
+                    no_pretty,
+                    &["snapshot_id", "sandbox_id", "label", "size_bytes"],
+                    &rows,
+                )?;
             }
         },
 
@@ -425,7 +529,11 @@ async fn main() -> anyhow::Result<()> {
             let mut c = client::connect(&socket_path).await?;
             c.remove_sandbox(ward_core::pb::RemoveSandboxRequest { id: id.clone() })
                 .await?;
-            println!("removed: {id}");
+            if json {
+                println!("{}", json!({"removed": id}));
+            } else {
+                println!("removed: {id}");
+            }
         }
 
         Commands::Volume(vol_cmd) => match vol_cmd {
@@ -438,29 +546,48 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .await?
                     .into_inner();
-                // One field per line so E2E tests can grep without parsing
-                // structured output. Same convention as `ward info`.
-                println!("id: {}", resp.id);
-                println!("name: {}", resp.name);
-                println!("size_mb: {}", resp.size_mb);
-                println!("mount_path: {}", resp.mount_path);
+                if json {
+                    println!(
+                        "{}",
+                        json!({
+                            "id": resp.id,
+                            "name": resp.name,
+                            "size_mb": resp.size_mb,
+                            "mount_path": resp.mount_path,
+                        })
+                    );
+                } else {
+                    println!("id: {}", resp.id);
+                    println!("name: {}", resp.name);
+                    println!("size_mb: {}", resp.size_mb);
+                    println!("mount_path: {}", resp.mount_path);
+                }
             }
             VolumeCommands::List => {
                 let mut c = client::connect(&socket_path).await?;
                 let resp = c.list_volumes(()).await?.into_inner();
-                // Tab-separated columns: stable for `awk` / `cut` in scripts.
-                // Empty output (no volumes) is the convention for "list found
-                // nothing"; users distinguish "no volumes" from "command failed"
-                // via the exit code, not by parsing stdout text.
-                for v in resp.volumes {
-                    println!("{}\t{}\t{}MiB", v.id, v.name, v.size_mb);
-                }
+                let rows: Vec<Vec<Value>> = resp
+                    .volumes
+                    .into_iter()
+                    .map(|v| {
+                        vec![
+                            Value::String(v.id),
+                            Value::String(v.name),
+                            Value::from(v.size_mb),
+                        ]
+                    })
+                    .collect();
+                output::emit_rows(json, no_pretty, &["id", "name", "size_mb"], &rows)?;
             }
             VolumeCommands::Remove { id } => {
                 let mut c = client::connect(&socket_path).await?;
                 c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
                     .await?;
-                println!("removed: {id}");
+                if json {
+                    println!("{}", json!({"removed": id}));
+                } else {
+                    println!("removed: {id}");
+                }
             }
         },
 
@@ -476,7 +603,11 @@ async fn main() -> anyhow::Result<()> {
                 payload: payload.into_bytes(),
             })
             .await?;
-            println!("published");
+            if json {
+                println!("{}", json!({"published": true}));
+            } else {
+                println!("published");
+            }
         }
 
         Commands::Subscribe { sandbox_id, topic } => {
@@ -491,31 +622,69 @@ async fn main() -> anyhow::Result<()> {
                 .into_inner();
 
             while let Some(msg) = stream.message().await? {
-                // One message per block, fields prefixed for grep-ability.
-                println!("topic: {}", msg.topic);
-                println!("from_sandbox: {}", msg.from_sandbox);
-                println!("payload: {}", String::from_utf8_lossy(&msg.payload));
-                println!("---");
+                if json {
+                    // One JSON object per message (NDJSON). Payload is
+                    // base64-encoded so binary payloads survive the
+                    // round-trip; consumers `jq -r .payload | base64 -d`
+                    // to recover bytes.
+                    use base64::Engine;
+                    let payload_b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&msg.payload);
+                    println!(
+                        "{}",
+                        json!({
+                            "topic": msg.topic,
+                            "from_sandbox": msg.from_sandbox,
+                            "payload_b64": payload_b64,
+                        })
+                    );
+                } else {
+                    println!("topic: {}", msg.topic);
+                    println!("from_sandbox: {}", msg.from_sandbox);
+                    println!("payload: {}", String::from_utf8_lossy(&msg.payload));
+                    println!("---");
+                }
             }
         }
 
         Commands::Health => {
-            // Connect, call GetHealth, render plain-text output so E2E
-            // tests can grep simple fields without parsing structured output.
             let mut c = client::connect(&socket_path).await?;
             let resp = c.get_health(()).await?.into_inner();
-            println!("status: {}", resp.status);
-            println!("uptime_seconds: {}", resp.uptime_seconds);
-            println!("sandbox_count: {}", resp.sandbox_count);
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "status": resp.status,
+                        "uptime_seconds": resp.uptime_seconds,
+                        "sandbox_count": resp.sandbox_count,
+                    })
+                );
+            } else {
+                println!("status: {}", resp.status);
+                println!("uptime_seconds: {}", resp.uptime_seconds);
+                println!("sandbox_count: {}", resp.sandbox_count);
+            }
         }
 
         Commands::Info => {
             let mut c = client::connect(&socket_path).await?;
             let resp = c.get_info(()).await?.into_inner();
-            println!("version: {}", resp.version);
-            println!("platform: {}", resp.platform);
-            println!("arch: {}", resp.arch);
-            println!("backend: {}", resp.backend);
+            if json {
+                println!(
+                    "{}",
+                    json!({
+                        "version": resp.version,
+                        "platform": resp.platform,
+                        "arch": resp.arch,
+                        "backend": resp.backend,
+                    })
+                );
+            } else {
+                println!("version: {}", resp.version);
+                println!("platform: {}", resp.platform);
+                println!("arch: {}", resp.arch);
+                println!("backend: {}", resp.backend);
+            }
         }
     }
 

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use super::image::ImageStore;
 use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
@@ -148,18 +149,43 @@ pub struct KrunvmBackend {
     /// stored for symmetry but never branched on.
     #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
     network_backend: NetworkBackendChoice,
+    /// Content-addressable OCI image cache. Populated on first pull of a
+    /// given manifest digest; subsequent sandboxes for the same image skip
+    /// the registry pull and hardlink from the cached rootfs instead.
+    image_store: Arc<ImageStore>,
 }
 
 impl KrunvmBackend {
+    /// Production constructor. Defaults `max_cached_images` to 64,
+    /// matching `Config`'s default. Daemon callers thread the operator's
+    /// `WARD_MAX_CACHED_IMAGES` value through `new_with_network` instead
+    /// so the env var has a single home (in `Config::from_env`) rather
+    /// than being read in two places that can drift.
     pub fn new(data_dir: std::path::PathBuf) -> Self {
-        Self::new_with_network(data_dir, NetworkBackendChoice::default())
+        Self::new_with_network(data_dir, NetworkBackendChoice::default(), 64)
     }
 
-    /// Construct with an explicit network backend choice. Used by the
-    /// daemon's startup path when `WARD_NETWORK_BACKEND` is set.
+    /// Construct with an explicit network backend choice + cache bound.
+    /// The daemon's startup path calls this with values resolved from
+    /// `Config` (which reads `WARD_NETWORK_BACKEND` and
+    /// `WARD_MAX_CACHED_IMAGES`). Tests and embedded callers that do
+    /// not need either knob can use `new` for the defaults.
     pub fn new_with_network(
         data_dir: std::path::PathBuf,
         network_backend: NetworkBackendChoice,
+        max_cached_images: usize,
+    ) -> Self {
+        let cache_dir = data_dir.join("cache").join("images");
+        let image_store = Arc::new(ImageStore::new(cache_dir, max_cached_images));
+        Self::new_internal(data_dir, network_backend, image_store)
+    }
+
+    /// Internal constructor used by the public constructors and by tests that
+    /// need to inject a fake image store (offline puller).
+    fn new_internal(
+        data_dir: std::path::PathBuf,
+        network_backend: NetworkBackendChoice,
+        image_store: Arc<ImageStore>,
     ) -> Self {
         Self {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
@@ -167,7 +193,20 @@ impl KrunvmBackend {
             data_dir,
             processes: Arc::new(RwLock::new(HashMap::new())),
             network_backend,
+            image_store,
         }
+    }
+
+    /// Constructor for tests that need to inject a custom `ImageStore`
+    /// (e.g. an offline `FakePuller`). Available in all builds so
+    /// integration-test harnesses in `tests/` can use it without a
+    /// `#[cfg(test)]` restriction; production callers should prefer
+    /// `new` or `new_with_network`.
+    pub fn with_image_store_for_test(
+        data_dir: std::path::PathBuf,
+        image_store: Arc<ImageStore>,
+    ) -> Self {
+        Self::new_internal(data_dir, NetworkBackendChoice::default(), image_store)
     }
 }
 
@@ -185,10 +224,10 @@ impl Backend for KrunvmBackend {
 
         let rootfs = self.sandbox_rootfs(&id);
 
-        // Seed the rootfs from a snapshot if requested. The snapshot must
-        // exist; its archived filesystem becomes this sandbox's starting
-        // state (host-side; the VM then boots from it).
         if let Some(snapshot_id) = &opts.from_snapshot {
+            // Seed the rootfs from a snapshot if requested. The snapshot must
+            // exist; its archived filesystem becomes this sandbox's starting
+            // state (host-side; the VM then boots from it).
             if !self.snapshots.read().await.contains_key(snapshot_id) {
                 return Err(BackendError::NotFound(snapshot_id.clone()));
             }
@@ -197,6 +236,13 @@ impl Backend for KrunvmBackend {
             tokio::task::spawn_blocking(move || extract_rootfs(&archive, &dest))
                 .await
                 .map_err(|e| BackendError::Internal(format!("from_snapshot task: {e}")))??;
+        } else if !opts.image.is_empty() {
+            // Pull the image from the content-addressable cache (or the
+            // registry on cache miss) and hardlink it into the sandbox rootfs.
+            // This is the standard path for every `ward create` invocation.
+            self.image_store
+                .prepare_sandbox_rootfs(&opts.image, &rootfs)
+                .await?;
         }
 
         self.krun_set_root(ctx_id, &rootfs)?;
@@ -1224,17 +1270,39 @@ fn write_snapshot_metadata(path: &std::path::Path, info: &SnapshotInfo) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::image::{ImagePuller, ImageStore};
     use crate::protocol::{CommunicationPolicy, CreateOpts, EgressPolicy};
     use pretty_assertions::assert_eq;
+    use std::path::Path;
 
-    /// Build a fresh backend rooted in a tempdir. Leaks the TempDir
-    /// intentionally so the data_dir survives the lifetime of the
-    /// returned backend across async boundaries.
+    /// Offline image puller for tests: creates a minimal rootfs without
+    /// touching the network. Returns a digest derived from the reference
+    /// so distinct image refs get distinct cache entries.
+    #[derive(Debug)]
+    struct FakePuller;
+
+    #[async_trait::async_trait]
+    impl ImagePuller for FakePuller {
+        async fn pull(&self, reference: &str, dest: &Path) -> crate::backend::Result<String> {
+            std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            Ok(format!("sha256:{hash:016x}"))
+        }
+    }
+
+    /// Build a fresh backend rooted in a tempdir. Injects a FakePuller so
+    /// `create_sandbox` populates the sandbox rootfs without network access.
+    /// Leaks the TempDir intentionally so the data_dir survives the lifetime
+    /// of the returned backend across async boundaries.
     fn backend_in_tempdir() -> KrunvmBackend {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().to_path_buf();
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(tmp);
-        KrunvmBackend::new(path)
+        KrunvmBackend::with_image_store_for_test(path, store)
     }
 
     fn create_opts() -> CreateOpts {

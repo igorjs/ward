@@ -9,9 +9,11 @@ on:
     types: [created]
 
 # Minimal top-level grant: job-level permissions override below.
-# SAFETY: pull_request_target runs with base-branch write context.
-# This workflow must NEVER check out or exec code from the PR head.
-# The actions/checkout step always uses `ref: main` for this reason.
+# SAFETY: pull_request_target AND issue_comment both run with base-branch write
+# context. This workflow must NEVER check out or exec code from the PR head, and
+# must NEVER interpolate untrusted event data (comment.body, PR title/body) into
+# a run: step. The actions/checkout step always uses `ref: main`, and event data
+# is read via the API / github-script context, never shell interpolation.
 permissions: {}
 
 concurrency:
@@ -19,7 +21,10 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
+  # Unique job key on purpose: clanker-filter.yml used to share `check`,
+  # and duplicate check-run names make any ruleset context named `check`
+  # ambiguous. Keep this key unique across the workflow set.
+  cla-dco:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -65,6 +70,14 @@ jobs:
               // DCO behaviour. Check both author and committer
               // because merge commits have a separate committer.
               if (c.author?.type === 'Bot' || c.committer?.type === 'Bot') {
+                continue;
+              }
+              // Skip merge commits. A merge made through the GitHub UI
+              // (or `git merge` locally) cannot carry a Signed-off-by
+              // trailer, and it only combines commits that were already
+              // signed off on their own PRs, so gating on it would block
+              // any PR that merges the base branch back in.
+              if ((c.parents?.length || 0) >= 2) {
                 continue;
               }
               const msg = c.commit.message || '';

@@ -23,8 +23,10 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 # Integration tests reach into ward-core's pb module to construct
-# protobuf request shapes — same crate the runtime wires through.
+# protobuf request shapes, and implement ImagePuller for the FakePuller
+# used to keep lifecycle tests offline.
 ward-core = { path = "../ward-core" }

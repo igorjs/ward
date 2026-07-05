@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 #
 # Run an untrusted command in a fresh ward sandbox, then clean up.
 #

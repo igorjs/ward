@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
 # Diff libkrun.h between two upstream tags so a maintainer can see
 # which function signatures need translating into
 # `ward-core/src/backend/krun_ffi.rs` when bumping the pinned version.

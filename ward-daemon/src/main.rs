@@ -186,6 +186,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_incoming_shutdown(uds_stream, shutdown)
         .await?;
 
+    // serve_with_incoming_shutdown has returned, which means the signal
+    // fired and tonic drained in-flight RPCs. Now tear down every
+    // running sandbox so we do not leak passt / gvproxy children, vsock
+    // sockets, or libkrun contexts. Wrapped in a hard timeout so a
+    // sandbox whose Backend::remove hangs cannot prevent the daemon
+    // from exiting; systemd / launchd then unblock and restart cleanly.
+    let teardown = async {
+        let manager = runtime.sandbox_manager();
+        let sandboxes = match manager.list().await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "list sandboxes during shutdown failed; skipping teardown");
+                Vec::new()
+            }
+        };
+        let total = sandboxes.len();
+        if total > 0 {
+            tracing::info!(count = total, "tearing down sandboxes before exit");
+        }
+        for sb in sandboxes {
+            if let Err(e) = manager.remove(&sb.id).await {
+                tracing::warn!(
+                    sandbox_id = %sb.id,
+                    error = %e,
+                    "remove failed during shutdown; continuing teardown"
+                );
+            }
+        }
+        if total > 0 {
+            tracing::info!(count = total, "all sandboxes torn down");
+        }
+    };
+    let timeout = std::time::Duration::from_secs(cfg.shutdown_timeout_secs);
+    if tokio::time::timeout(timeout, teardown).await.is_err() {
+        tracing::error!(
+            timeout_secs = cfg.shutdown_timeout_secs,
+            "shutdown drain exceeded WARD_SHUTDOWN_TIMEOUT_SECS; hard-exiting (set the env var higher to extend the deadline)"
+        );
+        // Best-effort socket cleanup before the abrupt exit so a restarted
+        // daemon does not immediately see a stale socket file.
+        let _ = std::fs::remove_file(&cfg.socket_path);
+        std::process::exit(1);
+    }
+
     // Clean up the socket file on exit.
     let _ = std::fs::remove_file(&cfg.socket_path);
     tracing::info!("ward daemon stopped");
