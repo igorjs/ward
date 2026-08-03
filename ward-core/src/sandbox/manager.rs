@@ -169,6 +169,16 @@ impl SandboxManager {
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
 
+        // SEC-ALLOWLIST: EgressProxy::serve() is not wired into the production
+        // network path. Allowlist mode would silently fall back to an unrestricted
+        // NIC. Reject until TAP/smoltcp wiring lands.
+        if egress_policy.mode == crate::protocol::EgressMode::Allowlist {
+            return Err(ApiError::InvalidRequest(
+                "egress mode Allowlist is not yet available; \
+                 use Deny (no outbound) or Open (unrestricted outbound)".to_string(),
+            ));
+        }
+
         let resources = req
             .resources
             .map(pb_resources_to_protocol)
@@ -545,32 +555,13 @@ impl SandboxManager {
 
     /// Run a language snippet inside a sandbox.
     pub async fn run(&self, req: RunRequest) -> Result<ProcessInfo> {
-        crate::validate::entity_id(&req.sandbox_id, "sandbox")?;
-        crate::validate::language_name(&req.language)?;
-        use crate::protocol::default_runtimes;
-
-        let runtime = default_runtimes()
-            .into_iter()
-            .find(|r| r.name.eq_ignore_ascii_case(&req.language))
-            .ok_or_else(|| {
-                ApiError::InvalidRequest(format!("unsupported language: {}", req.language))
-            })?;
-
-        // Write code to a temp file inside the sandbox via exec.
-        // TODO: implement file-write channel; for now stub the exec.
-        let command = vec![
-            runtime.entrypoint.to_string(),
-            format!("/tmp/ward_run.{}", runtime.file_ext),
-        ];
-
-        let exec_req = ExecRequest {
-            sandbox_id: req.sandbox_id.clone(),
-            command,
-            working_dir: "/tmp".to_string(),
-            env: HashMap::new(),
-        };
-
-        self.exec(exec_req).await
+        // TODO(run-rpc): writing req.code into the guest via the vsock agent
+        // channel is tracked in issue #9. Return Unimplemented so callers get
+        // an honest error instead of a silent fake success.
+        let _ = req;
+        Err(ApiError::InvalidRequest(
+            "Run RPC is not yet implemented; use Exec to run commands inside the sandbox".to_string(),
+        ))
     }
 }
 
@@ -1221,96 +1212,30 @@ mod tests {
     // ----- run -----------------------------------------------------------
 
     #[tokio::test]
-    async fn given_existing_sandbox_when_run_python_then_returns_process_info() {
-        // Arrange
+    async fn given_run_rpc_when_called_then_returns_unimplemented() {
+        // Run is stubbed until the vsock agent channel is wired (issue #9).
+        // Every call returns InvalidRequest regardless of language or input.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("python:3.12-slim")).await.unwrap();
+        let s = mgr.create(create_req("alpine")).await.unwrap();
 
-        // Act
-        let resp = mgr
+        let err = mgr
             .run(crate::pb::RunRequest {
-                sandbox_id: s.id.clone(),
+                sandbox_id: s.id,
                 language: "python".into(),
                 code: "print('hi')".into(),
             })
             .await
-            .expect("run");
+            .expect_err("run should return unimplemented");
 
-        // Assert: same contract as exec — pid + status from the stub.
-        assert_eq!(resp.pid.len(), 36);
-        assert_eq!(resp.sandbox_id, s.id);
-        assert_eq!(resp.status, "running");
-    }
-
-    #[tokio::test]
-    async fn given_unsupported_language_when_run_then_returns_invalid_request() {
-        // Arrange
-        let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
-
-        // Act: "cobol" is not in default_runtimes(); the runtime lookup
-        // returns InvalidRequest before the backend is ever called.
-        let err = mgr
-            .run(crate::pb::RunRequest {
-                sandbox_id: s.id,
-                language: "cobol".into(),
-                code: "DISPLAY 'hello'".into(),
-            })
-            .await
-            .expect_err("unsupported language");
-
-        // Assert
         match err {
             ApiError::InvalidRequest(msg) => {
                 assert!(
-                    msg.contains("unsupported language"),
-                    "expected message to mention 'unsupported language': {msg}",
+                    msg.contains("not yet implemented"),
+                    "unexpected error message: {msg}",
                 );
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn given_invalid_language_name_when_run_then_returns_invalid_request() {
-        // Arrange: dash in the language name fails the language_name
-        // validator before the runtime lookup even runs.
-        let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
-
-        // Act
-        let err = mgr
-            .run(crate::pb::RunRequest {
-                sandbox_id: s.id,
-                language: "py-thon".into(),
-                code: "print('hi')".into(),
-            })
-            .await
-            .expect_err("invalid language name");
-
-        // Assert
-        assert!(matches!(err, ApiError::InvalidRequest(_)));
-    }
-
-    #[tokio::test]
-    async fn given_run_case_insensitive_language_when_lookup_then_matches() {
-        // Arrange: regression for `eq_ignore_ascii_case` matching against
-        // the runtime table. Users may type "Python" or "PYTHON" — both
-        // should resolve.
-        let mgr = build_manager(4);
-        let s = mgr.create(create_req("python:3.12")).await.unwrap();
-
-        // Act
-        let resp = mgr
-            .run(crate::pb::RunRequest {
-                sandbox_id: s.id,
-                language: "PYTHON".into(),
-                code: "print(1)".into(),
-            })
-            .await;
-
-        // Assert
-        assert!(resp.is_ok());
     }
 
     // ----- stream_output -------------------------------------------------
