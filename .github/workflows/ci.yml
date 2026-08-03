@@ -95,7 +95,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
       - name: clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
   # ── Unit + integration tests ────────────────────────────────────────
   # Fast tier: ward-core unit tests (inline #[cfg(test)] modules) and

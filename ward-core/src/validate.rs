@@ -13,7 +13,6 @@ const MAX_CPUS: u32 = 64;
 const MAX_MEMORY_MB: u32 = 65_536; // 64 GiB
 const MAX_PIDS: u32 = 65_536;
 const MAX_TIMEOUT_SECONDS: u64 = 2_592_000; // 30 days
-#[allow(dead_code)]
 const MAX_VOLUME_SIZE_MB: u32 = 1_048_576; // 1 TiB
 
 /// Maximum sizes for cross-sandbox communication primitives.
@@ -117,6 +116,24 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
         return Err(ApiError::InvalidRequest(
             "volume name must contain only alphanumeric characters, dashes, and underscores".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a volume size request.
+///
+/// Rejects zero (no backing image possible) and sizes above `MAX_VOLUME_SIZE_MB`
+/// (prevents multi-TiB sparse file allocation from a single malformed request).
+pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
+    if size_mb == 0 {
+        return Err(ApiError::InvalidRequest(
+            "volume size_mb must be greater than 0".to_string(),
+        ));
+    }
+    if size_mb > MAX_VOLUME_SIZE_MB {
+        return Err(ApiError::InvalidRequest(format!(
+            "volume size_mb {size_mb} exceeds maximum {MAX_VOLUME_SIZE_MB} MiB (1 TiB)",
+        )));
     }
     Ok(())
 }

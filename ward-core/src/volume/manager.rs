@@ -150,13 +150,7 @@ impl VolumeManager {
     /// Create a new volume, allocating backing storage on disk.
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
-
-        // A volume needs a concrete size to allocate its backing image.
-        if req.size_mb == 0 {
-            return Err(ApiError::InvalidRequest(
-                "volume size_mb must be greater than 0".to_string(),
-            ));
-        }
+        crate::validate::volume_size(req.size_mb)?;
 
         // Enforce volume cap to prevent resource exhaustion.
         let current = self.volumes.read().await.len();
