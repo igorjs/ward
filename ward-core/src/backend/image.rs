@@ -166,7 +166,13 @@ impl ImagePuller for OciPuller {
         // Layers are applied bottom-up in manifest order; each is a tar
         // diff over the accumulated filesystem.
         for layer in &image.layers {
-            unpack_layer(&layer.data, &layer.media_type, dest)?;
+            let data = layer.data.clone();
+            let media_type = layer.media_type.clone();
+            let dest = dest.to_path_buf();
+            tokio::task::spawn_blocking(move || unpack_layer(&data, &media_type, &dest))
+                .await
+                .map_err(|e| BackendError::Internal(format!("unpack thread panicked: {e}")))?
+                ?;
         }
 
         let _ = layer_count; // available for future meta.json enrichment
@@ -227,11 +233,49 @@ fn normalise_registry(s: &str) -> String {
 /// ways: the `tar` crate refuses to write outside `dest`, and whiteout
 /// targets are resolved through [`safe_join`], which rejects `..` and
 /// absolute components.
+/// Maximum decompressed bytes per OCI layer. Prevents zip-bomb attacks where
+/// a small compressed layer expands to an arbitrarily large amount of data.
+/// 10 GiB is well above any realistic layer; real base images are < 1 GiB.
+const MAX_DECOMPRESSED_LAYER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Wraps a `Read` and errors if the cumulative bytes read exceed `limit`.
+struct BoundedReader<R> {
+    inner: R,
+    limit: u64,
+    total: u64,
+}
+
+impl<R: Read> BoundedReader<R> {
+    fn new(inner: R, limit: u64) -> Self {
+        Self { inner, limit, total: 0 }
+    }
+}
+
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.total += n as u64;
+        if self.total > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "decompressed layer exceeds {} GiB limit; refusing to unpack",
+                    self.limit / (1024 * 1024 * 1024),
+                ),
+            ));
+        }
+        Ok(n)
+    }
+}
+
 fn unpack_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<()> {
     let reader: Box<dyn Read> = if media_type.ends_with("gzip") {
-        Box::new(GzDecoder::new(Cursor::new(data)))
+        Box::new(BoundedReader::new(
+            GzDecoder::new(Cursor::new(data)),
+            MAX_DECOMPRESSED_LAYER_BYTES,
+        ))
     } else {
-        Box::new(Cursor::new(data))
+        Box::new(BoundedReader::new(Cursor::new(data), MAX_DECOMPRESSED_LAYER_BYTES))
     };
 
     let mut archive = tar::Archive::new(reader);
