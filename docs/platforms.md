@@ -9,9 +9,7 @@
 | Windows (native) | any           | n/a                  | not supported       |
 | Windows (WSL2)   | x86_64        | KVM via WSL2         | community-supported |
 
-The default `cargo build` (stub backend) compiles on any platform Rust
-supports. Real VM boot needs `--features krunvm` and a supported host
-(see [ADR-007](adr/007-platform-support.md)).
+The default `cargo build` (stub backend) compiles on any platform Rust supports. Real VM boot needs `--features krunvm` and a supported host (see [ADR-007](adr/007-platform-support.md)).
 
 ## Real microVMs (`--features krunvm`)
 
@@ -33,14 +31,11 @@ sudo apt-get install -y libkrun-dev libkrunfw-dev
 cargo build --release --features krunvm
 ```
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full setup matrix and
-build-time gotchas.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full setup matrix and build-time gotchas.
 
 ## End-user install (post-v0.1.0)
 
-Once v0.1.0 is published, the one-line installer resolves the latest
-release tarball, verifies the SHA-256, and installs binaries under
-`~/.ward/bin/`:
+Once v0.1.0 is published, the one-line installer resolves the latest release tarball, verifies the SHA-256, and installs binaries under `~/.ward/bin/`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
