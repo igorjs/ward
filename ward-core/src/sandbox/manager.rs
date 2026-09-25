@@ -47,14 +47,16 @@ struct SandboxEntry {
 // ---------------------------------------------------------------------------
 
 /// State held for each process spawned via exec/run. The output receiver is
-/// wrapped in `Mutex<Option<...>>` so the first `stream_output` call can take
-/// it; a second call sees `None` and returns InvalidRequest. The stdin
-/// sender is plain `Option<Sender>` because Sender is Clone — many concurrent
-/// WriteStdin calls can share it. `None` represents a process that doesn't
-/// accept stdin at all (real backend may produce these).
+/// wrapped in `Arc<Mutex<Option<...>>>` so the first `stream_output` call can
+/// take it (a second call sees `None` and returns InvalidRequest) while the
+/// Arc lets callers clone the handle out from under the `processes` RwLock
+/// read guard before awaiting the inner lock. The stdin sender is plain
+/// `Option<Sender>` because Sender is Clone — many concurrent WriteStdin
+/// calls can share it. `None` represents a process that doesn't accept
+/// stdin at all (real backend may produce these).
 struct ProcessRecord {
     sandbox_id: String,
-    output_rx: Mutex<Option<mpsc::Receiver<StreamEvent>>>,
+    output_rx: Arc<Mutex<Option<mpsc::Receiver<StreamEvent>>>>,
     stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
 }
 
@@ -439,7 +441,7 @@ impl SandboxManager {
         let pid = handle.pid.clone();
         let record = ProcessRecord {
             sandbox_id: req.sandbox_id.clone(),
-            output_rx: Mutex::new(handle.output_rx),
+            output_rx: Arc::new(Mutex::new(handle.output_rx)),
             stdin_tx: handle.stdin_tx,
         };
         self.processes.write().await.insert(pid.clone(), record);
@@ -463,20 +465,28 @@ impl SandboxManager {
         crate::validate::entity_id(sandbox_id, "sandbox")?;
         crate::validate::entity_id(pid, "process")?;
 
-        let guard = self.processes.read().await;
-        let record = guard
-            .get(pid)
-            .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
+        // Extract the output handle inside a short scope and drop the
+        // `processes` read guard before the inner `Mutex` await below.
+        // Holding a RwLock read guard across that await would block any
+        // writer (exec, kill_process) for as long as the inner lock takes
+        // to become available.
+        let output_rx = {
+            let guard = self.processes.read().await;
+            let record = guard
+                .get(pid)
+                .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
 
-        // Defence in depth: a caller must address the process by the
-        // sandbox that owns it. Hiding pids across sandboxes prevents
-        // cross-tenant log harvesting if pids are guessed or leaked.
-        if record.sandbox_id != sandbox_id {
-            return Err(ApiError::ProcessNotFound(pid.to_string()));
-        }
+            // Defence in depth: a caller must address the process by the
+            // sandbox that owns it. Hiding pids across sandboxes prevents
+            // cross-tenant log harvesting if pids are guessed or leaked.
+            if record.sandbox_id != sandbox_id {
+                return Err(ApiError::ProcessNotFound(pid.to_string()));
+            }
 
-        record
-            .output_rx
+            Arc::clone(&record.output_rx)
+        };
+
+        output_rx
             .lock()
             .await
             .take()
@@ -529,18 +539,25 @@ impl SandboxManager {
         crate::validate::entity_id(sandbox_id, "sandbox")?;
         crate::validate::entity_id(pid, "process")?;
 
-        let guard = self.processes.read().await;
-        let record = guard
-            .get(pid)
-            .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
-        if record.sandbox_id != sandbox_id {
-            return Err(ApiError::ProcessNotFound(pid.to_string()));
-        }
+        // Clone the sender inside a short scope and drop the `processes`
+        // read guard before the inner `send` await below. Sender is Clone,
+        // so this doesn't change who the channel talks to; it just avoids
+        // holding the RwLock guard across an await that could block on the
+        // receiving end for an unbounded time.
+        let tx = {
+            let guard = self.processes.read().await;
+            let record = guard
+                .get(pid)
+                .ok_or_else(|| ApiError::ProcessNotFound(pid.to_string()))?;
+            if record.sandbox_id != sandbox_id {
+                return Err(ApiError::ProcessNotFound(pid.to_string()));
+            }
 
-        let tx = record
-            .stdin_tx
-            .as_ref()
-            .ok_or_else(|| ApiError::InvalidRequest("process does not accept stdin".into()))?;
+            record
+                .stdin_tx
+                .clone()
+                .ok_or_else(|| ApiError::InvalidRequest("process does not accept stdin".into()))?
+        };
 
         // Send failure means the consumer side dropped — the process is
         // effectively gone from the user's perspective. Surfacing as
@@ -1380,6 +1397,54 @@ mod tests {
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 
+    #[tokio::test]
+    async fn given_stream_output_inner_lock_contended_when_called_then_processes_guard_not_held() {
+        // Arrange: seed a process record whose inner `output_rx` mutex is
+        // held by this task, standing in for a slow consumer on that lock.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let pid = "abc123".to_string();
+        let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
+        let output_rx = Arc::new(Mutex::new(Some(rx)));
+        mgr.processes.write().await.insert(
+            pid.clone(),
+            ProcessRecord {
+                sandbox_id: s.id.clone(),
+                output_rx: Arc::clone(&output_rx),
+                stdin_tx: None,
+            },
+        );
+        let inner_guard = output_rx.lock().await;
+
+        // Act: call stream_output while the inner mutex is held elsewhere.
+        // If the outer `processes` read guard were still held while
+        // awaiting the inner lock, a concurrent writer on `processes`
+        // would be blocked for as long as this inner lock stays held.
+        let mgr_task = Arc::clone(&mgr);
+        let sandbox_id = s.id.clone();
+        let pid_task = pid.clone();
+        let stream_task =
+            tokio::spawn(async move { mgr_task.stream_output(&sandbox_id, &pid_task).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Assert: a concurrent write-lock acquisition on `processes` (what
+        // exec/kill_process need) is not blocked.
+        let write_attempt =
+            tokio::time::timeout(std::time::Duration::from_millis(200), mgr.processes.write())
+                .await;
+        assert!(
+            write_attempt.is_ok(),
+            "processes write lock was blocked by stream_output's in-flight inner lock wait"
+        );
+        drop(write_attempt);
+
+        drop(inner_guard);
+        stream_task
+            .await
+            .expect("task should not panic")
+            .expect("stream_output should succeed once the inner lock is free");
+    }
+
     // ----- write_stdin ---------------------------------------------------
 
     #[tokio::test]
@@ -1489,6 +1554,62 @@ mod tests {
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn given_write_stdin_send_blocked_when_called_then_processes_guard_not_held() {
+        // Arrange: seed a process record whose stdin channel already holds
+        // one buffered message, so the next send blocks until this task
+        // drains it, standing in for a slow-to-consume backend.
+        let mgr = build_manager(4);
+        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let pid = "def456".to_string();
+        let (stdin_tx, mut stdin_rx) = mpsc::channel::<bytes::Bytes>(1);
+        stdin_tx
+            .send(bytes::Bytes::from_static(b"seed"))
+            .await
+            .expect("seed send");
+        mgr.processes.write().await.insert(
+            pid.clone(),
+            ProcessRecord {
+                sandbox_id: s.id.clone(),
+                output_rx: Arc::new(Mutex::new(None)),
+                stdin_tx: Some(stdin_tx),
+            },
+        );
+
+        // Act: write_stdin's inner send now blocks on the full channel
+        // until this task drains `stdin_rx`. If the outer `processes` read
+        // guard were still held while awaiting that send, a concurrent
+        // writer on `processes` would be blocked for as long as the send
+        // stays pending.
+        let mgr_task = Arc::clone(&mgr);
+        let sandbox_id = s.id.clone();
+        let pid_task = pid.clone();
+        let write_task = tokio::spawn(async move {
+            mgr_task
+                .write_stdin(&sandbox_id, &pid_task, bytes::Bytes::from_static(b"data"))
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Assert: a concurrent write-lock acquisition on `processes` is not
+        // blocked by write_stdin's in-flight, still-pending send.
+        let write_attempt =
+            tokio::time::timeout(std::time::Duration::from_millis(200), mgr.processes.write())
+                .await;
+        assert!(
+            write_attempt.is_ok(),
+            "processes write lock was blocked by write_stdin's in-flight send"
+        );
+        drop(write_attempt);
+
+        // Cleanup: drain the channel so write_stdin's send can complete.
+        stdin_rx.recv().await;
+        write_task
+            .await
+            .expect("task should not panic")
+            .expect("write_stdin should succeed once the channel drains");
     }
 
     // ----- kill_process --------------------------------------------------
