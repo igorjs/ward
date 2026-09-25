@@ -690,7 +690,17 @@ impl ImageStore {
         entries.sort_by_key(|(_, meta)| meta.last_used_at);
         let to_evict = entries.len() - self.max_cached_images;
         for (entry_dir, _) in entries.into_iter().take(to_evict) {
-            let _ = std::fs::remove_dir_all(&entry_dir);
+            // Best-effort: a failed eviction must not fail the pull that
+            // triggered it, but a silent failure lets the cache grow past
+            // max_cached_images with no way to notice, so log and count it.
+            if let Err(e) = std::fs::remove_dir_all(&entry_dir) {
+                tracing::warn!(
+                    path = %entry_dir.display(),
+                    error = %e,
+                    "failed to remove cache entry during LRU eviction"
+                );
+                metrics::counter!("wardd_image_cache_eviction_failure_total").increment(1);
+            }
         }
         Ok(())
     }
@@ -896,6 +906,68 @@ mod tests {
         assert!(
             !remaining.contains(&"image-b".to_string()),
             "image-b should have been evicted (LRU), remaining: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_eviction_removal_fails_when_lru_runs_then_failure_is_counted_and_eviction_stays_best_effort()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        // Generous bound: pulling two images must not trigger the
+        // automatic eviction that `ensure()` runs after every pull, or the
+        // manual eviction below would find nothing left to remove.
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 64, Arc::new(FakePuller));
+        store.ensure("image-a").await.expect("a");
+        store.ensure("image-b").await.expect("b");
+
+        // Removing a directory entry needs write permission on its parent.
+        // Stripping write from cache_dir makes the final rmdir of the
+        // evicted entry fail deterministically, without touching the entry
+        // itself (its contents are still removed before that last step).
+        let original_perms = std::fs::metadata(tmp.path())
+            .expect("stat cache_dir")
+            .permissions();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("make cache_dir read-only");
+
+        // A separate handle over the same cache_dir with a bound of 1, used
+        // only to drive eviction directly so it has exactly one candidate.
+        let evictor = ImageStore::with_puller(tmp.path().to_path_buf(), 1, Arc::new(FakePuller));
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let result = metrics::with_local_recorder(&recorder, || evictor.run_lru_eviction());
+
+        // Restore permissions before any assertion can panic, so the
+        // tempdir can still clean itself up on drop.
+        std::fs::set_permissions(tmp.path(), original_perms).expect("restore cache_dir perms");
+
+        result.expect("eviction failure must stay best-effort and not propagate");
+
+        let counted = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .any(|(key, _, _, value)| {
+                key.key().name() == "wardd_image_cache_eviction_failure_total"
+                    && matches!(value, metrics_util::debugging::DebugValue::Counter(n) if n >= 1)
+            });
+        assert!(counted, "expected eviction failure counter to be incremented");
+
+        // remove_dir_all clears an entry's contents before the final rmdir
+        // of the entry itself, so a failed rmdir still leaves an (empty)
+        // directory behind on disk. Counting directories directly (rather
+        // than through `list()`, which depends on a meta.json that's
+        // already gone) proves that final removal step really failed.
+        let remaining_dirs = std::fs::read_dir(tmp.path())
+            .expect("read cache_dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .count();
+        assert_eq!(
+            remaining_dirs, 2,
+            "the entry directory must still exist on disk when rmdir fails"
         );
     }
 
