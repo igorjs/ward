@@ -28,6 +28,16 @@ const AGENT_VSOCK_PORT: u32 = 1024;
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
 
+/// Delay before the stub exec path's scripted process signals completion.
+/// A real caller's follow-up RPCs (kill_process, write_stdin, a second
+/// stream_output call) need a realistic window to reach the manager before
+/// the process "exits" and its bookkeeping is eligible for reaping; this
+/// mirrors how an actual process takes measurable wall-clock time to run,
+/// rather than completing before the exec response has even been handled.
+/// Only referenced by the stub (non-krunvm) exec path.
+#[cfg(not(feature = "krunvm"))]
+const STUB_EXIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Timeout for connecting to the guest agent over its vsock-bridged Unix
 /// socket. The socket exists once the microVM has finished booting, so a
 /// healthy connect resolves almost instantly; this bounds it in case the
@@ -689,6 +699,7 @@ impl Backend for KrunvmBackend {
                         duration_ms: 0,
                     })
                     .await;
+                tokio::time::sleep(STUB_EXIT_DELAY).await;
                 let _ = output_tx
                     .send(StreamEvent {
                         kind: StreamEventKind::Exit,

@@ -15,7 +15,7 @@ use crate::pb::{
 };
 use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, ResourceLimits,
-    StreamEvent,
+    StreamEvent, StreamEventKind,
 };
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -50,6 +50,11 @@ struct SandboxEntry {
 // ---------------------------------------------------------------------------
 // Per-process tracking entry
 // ---------------------------------------------------------------------------
+
+/// Number of buffered `StreamEvent`s the exit-reaping bridge (see
+/// `SandboxManager::reap_on_exit`) will hold before backpressuring the
+/// backend. Matches the stub backend's own scripted-output channel size.
+const OUTPUT_BRIDGE_CAPACITY: usize = 16;
 
 /// State held for each process spawned via exec/run. The output receiver is
 /// wrapped in `Arc<Mutex<Option<...>>>` so the first `stream_output` call can
@@ -475,10 +480,49 @@ impl SandboxManager {
         })
     }
 
+    /// Forward backend output events to `stream_output`'s caller, and reap
+    /// the `ProcessRecord` once the process signals completion. Runs
+    /// detached from the `stream_output` call that spawned it, since a
+    /// process that finishes on its own (without `kill_process` ever being
+    /// called) otherwise has no path back to `self.processes` being
+    /// cleaned up once its output has been consumed.
+    async fn reap_on_exit(
+        mut backend_rx: mpsc::Receiver<StreamEvent>,
+        tx: mpsc::Sender<StreamEvent>,
+        processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+        pid: String,
+    ) {
+        while let Some(event) = backend_rx.recv().await {
+            let is_exit = event.kind == StreamEventKind::Exit;
+            if tx.send(event).await.is_err() {
+                // The receiving end (the stream_output caller) is gone;
+                // nothing left to forward to.
+                break;
+            }
+            if is_exit {
+                break;
+            }
+        }
+        // Reached on Exit, on the backend channel closing without an Exit
+        // event, or on the forward failing above. `remove` is a no-op if
+        // `kill_process` already dropped this record, so this is safe to
+        // run unconditionally.
+        processes.write().await.remove(&pid);
+    }
+
     /// Take the output receiver for a previously-started process. Single-
     /// consumer: a second call returns InvalidRequest. The caller is
     /// expected to drain the channel and translate events into whatever
     /// stream type the transport needs.
+    ///
+    /// The backend's receiver is bridged through a manager-owned channel
+    /// rather than handed back directly: `reap_on_exit` drains the backend
+    /// side, forwards each event to the caller, and removes the
+    /// `ProcessRecord` once it sees the Exit event (or the backend channel
+    /// just closes). Bridging only starts here, once a caller has actually
+    /// asked for output, rather than at `exec` time, so a process nobody
+    /// has asked about yet stays fully addressable by write_stdin and
+    /// kill_process.
     pub async fn stream_output(
         &self,
         sandbox_id: &str,
@@ -490,8 +534,8 @@ impl SandboxManager {
         // Extract the output handle inside a short scope and drop the
         // `processes` read guard before the inner `Mutex` await below.
         // Holding a RwLock read guard across that await would block any
-        // writer (exec, kill_process) for as long as the inner lock takes
-        // to become available.
+        // writer (exec, kill_process, the reaper above) for as long as the
+        // inner lock takes to become available.
         let output_rx = {
             let guard = self.processes.read().await;
             let record = guard
@@ -508,11 +552,20 @@ impl SandboxManager {
             Arc::clone(&record.output_rx)
         };
 
-        output_rx
+        let backend_rx = output_rx
             .lock()
             .await
             .take()
-            .ok_or_else(|| ApiError::InvalidRequest("output stream already consumed".into()))
+            .ok_or_else(|| ApiError::InvalidRequest("output stream already consumed".into()))?;
+
+        let (tx, rx) = mpsc::channel::<StreamEvent>(OUTPUT_BRIDGE_CAPACITY);
+        tokio::spawn(Self::reap_on_exit(
+            backend_rx,
+            tx,
+            Arc::clone(&self.processes),
+            pid.to_string(),
+        ));
+        Ok(rx)
     }
 
     /// Signal a process to terminate and drop its bookkeeping.
@@ -705,7 +758,6 @@ mod tests {
         CreateSandboxRequest, EgressMode as PbEgressMode, EgressPolicy as PbEgressPolicy,
         ResourceLimits as PbResourceLimits,
     };
-    use crate::protocol::StreamEventKind;
     use pretty_assertions::assert_eq;
 
     /// Offline puller used by test backends so no network calls are made
@@ -1327,7 +1379,8 @@ mod tests {
             .await
             .expect("exec");
 
-        // Act
+        // Act: drain to completion without ever calling kill_process, so
+        // the only way the ProcessRecord is reaped is via the Exit event.
         let mut rx = mgr
             .stream_output(&s.id, &proc.pid)
             .await
@@ -1343,6 +1396,16 @@ mod tests {
         assert_eq!(second.kind, StreamEventKind::Exit);
         assert_eq!(second.exit_code, Some(0));
         assert!(after_close.is_none(), "channel must close after Exit");
+
+        // Assert: a process that completes naturally, with kill_process
+        // never called, is reaped from `processes` rather than left
+        // behind. The bridging task drops its sender only after removing
+        // the record, so observing the channel close (`after_close`) above
+        // already guarantees this has happened.
+        assert!(
+            !mgr.processes.read().await.contains_key(&proc.pid),
+            "ProcessRecord for a naturally-completed process must be reaped"
+        );
     }
 
     #[tokio::test]
