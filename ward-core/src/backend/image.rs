@@ -164,10 +164,13 @@ impl ImagePuller for OciPuller {
         let layer_count = image.layers.len();
 
         // Layers are applied bottom-up in manifest order; each is a tar
-        // diff over the accumulated filesystem.
-        for layer in &image.layers {
-            let data = layer.data.clone();
-            let media_type = layer.media_type.clone();
+        // diff over the accumulated filesystem. Consuming `image.layers`
+        // here lets each layer's owned fields move directly into the
+        // blocking task instead of being cloned to satisfy
+        // spawn_blocking's 'static bound.
+        for layer in image.layers {
+            let data = layer.data;
+            let media_type = layer.media_type;
             let dest = dest.to_path_buf();
             tokio::task::spawn_blocking(move || unpack_layer(&data, &media_type, &dest))
                 .await
