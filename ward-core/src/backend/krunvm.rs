@@ -28,6 +28,45 @@ const AGENT_VSOCK_PORT: u32 = 1024;
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
 
+/// Timeout for connecting to the guest agent over its vsock-bridged Unix
+/// socket. The socket exists once the microVM has finished booting, so a
+/// healthy connect resolves almost instantly; this bounds it in case the
+/// guest agent is wedged and never accepts.
+/// Only referenced by the krunvm-gated exec path; exercised directly by
+/// the tests below.
+#[allow(dead_code)]
+const AGENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wrap a guest-agent socket connect attempt in `AGENT_CONNECT_TIMEOUT`,
+/// mapping either failure mode to `BackendError::Exec`. Accepts the connect
+/// as a future rather than performing it directly so tests can substitute
+/// one that never resolves: unlike a TCP handshake, a Unix-domain connect
+/// either succeeds immediately or is refused outright once its listener's
+/// backlog is full, so a genuine OS-level hang isn't reproducible here.
+/// Only referenced by the krunvm-gated exec path; exercised directly by
+/// the tests below.
+#[allow(dead_code)]
+async fn connect_agent_socket_with_timeout<F>(
+    connect: F,
+    sock: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<tokio::net::UnixStream>
+where
+    F: std::future::Future<Output = std::io::Result<tokio::net::UnixStream>>,
+{
+    match tokio::time::timeout(timeout, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(BackendError::Exec(format!(
+            "connect to guest agent at {}: {e}",
+            sock.display()
+        ))),
+        Err(_) => Err(BackendError::Exec(format!(
+            "connect to guest agent at {}: timed out after {timeout:?}",
+            sock.display()
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // libc bindings used only by the krunvm boot path
 // ---------------------------------------------------------------------------
@@ -603,9 +642,12 @@ impl Backend for KrunvmBackend {
         #[cfg(feature = "krunvm")]
         let handle = {
             let sock = self.agent_socket_path(sandbox_id);
-            let stream = tokio::net::UnixStream::connect(&sock).await.map_err(|e| {
-                BackendError::Exec(format!("connect to guest agent at {}: {e}", sock.display()))
-            })?;
+            let stream = connect_agent_socket_with_timeout(
+                tokio::net::UnixStream::connect(&sock),
+                &sock,
+                AGENT_CONNECT_TIMEOUT,
+            )
+            .await?;
             let (handle, kill_tx) = super::agent::drive_exec(
                 stream,
                 pid,
@@ -1690,5 +1732,59 @@ mod tests {
             .kill_process("sandbox-A", "pid-doesnt-exist")
             .await
             .expect("kill_process on unknown pid should be Ok no-op");
+    }
+
+    // ----- connect_agent_socket_with_timeout (audit fix) -------------------
+
+    #[tokio::test]
+    async fn given_listening_socket_when_connect_agent_socket_then_returns_stream() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        // Act
+        let result = connect_agent_socket_with_timeout(
+            tokio::net::UnixStream::connect(&sock_path),
+            &sock_path,
+            AGENT_CONNECT_TIMEOUT,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok(), "expected a live agent socket to connect");
+    }
+
+    #[tokio::test]
+    async fn given_connect_that_never_resolves_when_connect_agent_socket_then_times_out() {
+        // Arrange: a connect future that never completes, standing in for a
+        // wedged guest agent. connect_agent_socket_with_timeout's doc
+        // comment explains why a Unix-domain connect can't be made to hang
+        // deterministically at the OS level, so this exercises the timeout
+        // wrapper directly instead.
+        let sock_path = std::path::PathBuf::from("/nonexistent/agent.sock");
+        let never_connects = std::future::pending::<std::io::Result<tokio::net::UnixStream>>();
+        let timeout = std::time::Duration::from_millis(50);
+        tokio::time::pause();
+
+        // Act
+        let fut = connect_agent_socket_with_timeout(never_connects, &sock_path, timeout);
+        tokio::pin!(fut);
+        tokio::time::advance(timeout + std::time::Duration::from_millis(1)).await;
+        let result = fut.await;
+
+        // Assert
+        match result {
+            Err(BackendError::Exec(msg)) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected a timeout message, got {msg:?}"
+                );
+            }
+            other => panic!("expected BackendError::Exec on timeout, got {other:?}"),
+        }
     }
 }
