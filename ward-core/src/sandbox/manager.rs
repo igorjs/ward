@@ -40,6 +40,11 @@ fn backend_err(e: BackendError) -> ApiError {
 struct SandboxEntry {
     egress: EgressProxy,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Held for the sandbox's whole lifetime. Dropping it (on removal)
+    /// returns the slot to `create_semaphore` so a concurrent `create`
+    /// waiting on the cap can proceed. Never read directly; the field
+    /// exists for its `Drop` side effect.
+    _creation_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,6 +79,12 @@ pub struct SandboxManager {
     entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
     /// Maximum concurrent sandboxes. Prevents resource exhaustion from unbounded creation.
     max_sandboxes: usize,
+    /// Gates `create` so the cap in `max_sandboxes` holds even under
+    /// concurrent calls. A permit is acquired before the backend creates
+    /// the sandbox and held in the resulting `SandboxEntry` for its whole
+    /// lifetime; checking `entries.len()` alone left a window between the
+    /// check and the insert where concurrent creates could all pass.
+    create_semaphore: Arc<tokio::sync::Semaphore>,
     /// SEC-020: snapshot of `Config::allow_host_mounts` taken at daemon
     /// startup. Stored on the manager so the security posture is read
     /// once and cannot mutate mid-process (in particular, a sandbox
@@ -98,6 +109,7 @@ impl SandboxManager {
             broker,
             entries: Arc::new(RwLock::new(HashMap::new())),
             max_sandboxes,
+            create_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sandboxes)),
             allow_host_mounts,
             processes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -131,15 +143,6 @@ impl SandboxManager {
             if mode == crate::pb::CommunicationMode::Group {
                 crate::validate::group_name(&c.group)?;
             }
-        }
-
-        // Enforce sandbox cap to prevent resource exhaustion.
-        let current = self.entries.read().await.len();
-        if current >= self.max_sandboxes {
-            return Err(ApiError::InvalidRequest(format!(
-                "sandbox limit reached ({}/{})",
-                current, self.max_sandboxes,
-            )));
         }
 
         // Validate and convert bind mounts; the backend attaches them to the
@@ -203,6 +206,24 @@ impl SandboxManager {
             comms: comms.clone(),
         };
 
+        // Enforce the sandbox cap via a semaphore acquired up front, rather
+        // than a check-then-insert on `entries.len()`. The old check and the
+        // eventual `entries.write().await.insert(...)` were separated by the
+        // `backend.create_sandbox` await, so concurrent calls could all pass
+        // the check before any of them inserted, letting the count exceed
+        // `max_sandboxes`. The permit is acquired before the backend call
+        // and held for the sandbox's lifetime (see `SandboxEntry`), so the
+        // cap holds under concurrency without serializing sandbox creation.
+        let current = self.entries.read().await.len();
+        let permit = Arc::clone(&self.create_semaphore)
+            .try_acquire_owned()
+            .map_err(|_| {
+                ApiError::InvalidRequest(format!(
+                    "sandbox limit reached ({}/{})",
+                    current, self.max_sandboxes,
+                ))
+            })?;
+
         let info = self
             .backend
             .create_sandbox(id.clone(), &opts)
@@ -255,6 +276,7 @@ impl SandboxManager {
             SandboxEntry {
                 egress,
                 timeout_handle,
+                _creation_permit: permit,
             },
         );
 
@@ -851,6 +873,38 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn given_manager_at_capacity_when_concurrent_creates_race_then_cap_never_exceeded() {
+        // Arrange: cap of 2, more concurrent attempts than the cap allows so
+        // they interleave around the `backend.create_sandbox` await that
+        // separates the old check from the old insert.
+        let mgr = build_manager(2);
+
+        // Act: fire five creates at once from separate tasks.
+        let mut handles = Vec::with_capacity(5);
+        for i in 0..5 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(tokio::spawn(async move {
+                mgr.create(create_req(&format!("alpine:{i}"))).await
+            }));
+        }
+        let mut successes = 0;
+        for handle in handles {
+            if handle.await.expect("task should not panic").is_ok() {
+                successes += 1;
+            }
+        }
+
+        // Assert: the cap held under concurrency, and the manager's live
+        // sandbox count matches the successes exactly (no orphaned entries).
+        assert!(
+            successes <= 2,
+            "expected at most 2 successful creates, got {successes}"
+        );
+        let live = mgr.list().await.expect("list").len();
+        assert_eq!(live, successes, "live sandbox count must match successes");
     }
 
     // ----- get -----------------------------------------------------------
