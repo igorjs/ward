@@ -160,8 +160,13 @@ async fn given_exec_with_working_dir_when_request_succeeds_then_does_not_leak() 
 // Run
 // ---------------------------------------------------------------------------
 
+// Run is an intentional stub pending issue #9: it rejects every call up
+// front instead of performing the real language/sandbox checks.
+const RUN_STUB_MESSAGE: &str =
+    "Run RPC is not yet implemented; use Exec to run commands inside the sandbox";
+
 #[tokio::test]
-async fn given_existing_sandbox_when_run_python_then_returns_pid() {
+async fn given_existing_sandbox_when_run_then_stub_rejects_with_invalid_argument() {
     // Arrange
     let mut client = common::test_server().await;
     let s = client
@@ -174,24 +179,22 @@ async fn given_existing_sandbox_when_run_python_then_returns_pid() {
         .into_inner();
 
     // Act
-    let resp = client
+    let err = client
         .run(RunRequest {
-            sandbox_id: s.id.clone(),
+            sandbox_id: s.id,
             language: "python".into(),
             code: "print('hi')".into(),
         })
         .await
-        .expect("run");
-    let info = resp.into_inner();
+        .expect_err("run");
 
-    // Assert
-    assert_eq!(info.pid.len(), 36);
-    assert_eq!(info.sandbox_id, s.id);
-    assert_eq!(info.status, "running");
+    // Assert: regression guard for issue #9, remove once Run is implemented.
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.message(), RUN_STUB_MESSAGE);
 }
 
 #[tokio::test]
-async fn given_unsupported_language_when_run_then_invalid_argument() {
+async fn given_unsupported_language_when_run_then_stub_rejects_with_invalid_argument() {
     // Arrange
     let mut client = common::test_server().await;
     let s = client
@@ -213,13 +216,11 @@ async fn given_unsupported_language_when_run_then_invalid_argument() {
         .await
         .expect_err("unsupported language");
 
-    // Assert: surfaces as InvalidArgument from the runtime-table lookup.
+    // Assert: the stub short-circuits before the runtime-table lookup, so
+    // even an unsupported language gets the generic stub message rather
+    // than a language-specific one. Regression guard for issue #9.
     assert_eq!(err.code(), Code::InvalidArgument);
-    assert!(
-        err.message().contains("unsupported language"),
-        "got: {}",
-        err.message(),
-    );
+    assert_eq!(err.message(), RUN_STUB_MESSAGE);
 }
 
 #[tokio::test]
@@ -252,7 +253,7 @@ async fn given_invalid_language_name_when_run_then_invalid_argument() {
 }
 
 #[tokio::test]
-async fn given_unknown_sandbox_when_run_then_not_found() {
+async fn given_unknown_sandbox_when_run_then_stub_rejects_with_invalid_argument() {
     // Arrange
     let mut client = common::test_server().await;
 
@@ -266,8 +267,11 @@ async fn given_unknown_sandbox_when_run_then_not_found() {
         .await
         .expect_err("unknown sandbox");
 
-    // Assert
-    assert_eq!(err.code(), Code::NotFound);
+    // Assert: the stub rejects before looking up the sandbox, so even an
+    // unknown id gets InvalidArgument, not NotFound. Regression guard for
+    // issue #9.
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.message(), RUN_STUB_MESSAGE);
 }
 
 // ---------------------------------------------------------------------------
