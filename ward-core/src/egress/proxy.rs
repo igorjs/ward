@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
@@ -15,6 +15,25 @@ use crate::protocol::EgressPolicy;
 /// Cap on the CONNECT request header we'll read before giving up, and on the
 /// number of header lines, to bound work from a hostile client.
 const MAX_HEADER_LINES: usize = 100;
+
+/// Timeout for resolving a CONNECT target host via DNS. Lookups normally
+/// return in well under a second; this bounds a stalled or unresponsive
+/// resolver so one bad hostname can't tie up a proxy task indefinitely.
+const DNS_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Timeout for a single upstream TCP connect attempt. A reachable target
+/// completes its handshake in milliseconds; this bounds an attempt against
+/// a target whose handshake never completes (e.g. a saturated or
+/// black-holed listener) so the proxy can fail over to the next resolved
+/// address, or give up, promptly instead of blocking the task forever.
+const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle timeout for an established egress tunnel. A flat timeout on the
+/// whole transfer would kill a long but legitimate download, so this
+/// bounds inactivity instead: the deadline resets whenever either
+/// direction reads a byte, and the tunnel is only torn down once BOTH
+/// directions have been silent for the full window.
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Log entry
@@ -174,16 +193,17 @@ impl EgressProxy {
         // string). A hostile resolver that returns a public IP first and
         // a private IP second would otherwise bypass the check between
         // resolve and connect.
-        let resolved: Vec<std::net::SocketAddr> =
-            match tokio::net::lookup_host((host.as_str(), port)).await {
-                Ok(addrs) => addrs.collect(),
-                Err(_) => {
-                    client
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        .await?;
-                    return Ok(());
-                }
-            };
+        let Some(resolved) = resolve_target(
+            tokio::net::lookup_host((host.as_str(), port)),
+            DNS_LOOKUP_TIMEOUT,
+        )
+        .await
+        else {
+            client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
+            return Ok(());
+        };
         if resolved.iter().any(|sa| is_private_or_local(&sa.ip())) {
             tracing::warn!(
                 sandbox = %self.sandbox_id,
@@ -197,28 +217,116 @@ impl EgressProxy {
         // Try each resolved SocketAddr in order. Connecting to a concrete
         // address skips the second DNS lookup tokio does for (host, port)
         // tuples, closing the rebinding window.
-        let mut upstream_opt = None;
-        for sa in &resolved {
-            if let Ok(s) = TcpStream::connect(sa).await {
-                upstream_opt = Some(s);
-                break;
-            }
-        }
-        let mut upstream = match upstream_opt {
-            Some(s) => s,
-            None => {
-                client
-                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    .await?;
-                return Ok(());
-            }
+        let Some(mut upstream) = connect_first_reachable(&resolved, UPSTREAM_CONNECT_TIMEOUT).await
+        else {
+            client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                .await?;
+            return Ok(());
         };
 
         client
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
-        tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+        copy_bidirectional_with_idle_timeout(&mut client, &mut upstream, TUNNEL_IDLE_TIMEOUT)
+            .await?;
         Ok(())
+    }
+}
+
+/// Resolve a CONNECT target, bounded by `timeout` so a stalled or
+/// unresponsive resolver can't tie up a proxy task indefinitely. Accepts
+/// the lookup as a future (rather than performing it directly) so tests can
+/// substitute one that never resolves without needing control over the
+/// host's actual DNS resolver. Returns `None` on either a resolution
+/// failure or a timeout; callers can't distinguish the two today because a
+/// CONNECT client gets the same 502 response either way.
+async fn resolve_target<F, I>(lookup: F, timeout: Duration) -> Option<Vec<std::net::SocketAddr>>
+where
+    F: std::future::Future<Output = std::io::Result<I>>,
+    I: Iterator<Item = std::net::SocketAddr>,
+{
+    match tokio::time::timeout(timeout, lookup).await {
+        Ok(Ok(addrs)) => Some(addrs.collect()),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// Attempt each of `addrs` in order, giving each connect up to `timeout`
+/// before moving to the next. Returns the first successful connection, or
+/// `None` if every address failed or timed out.
+async fn connect_first_reachable(
+    addrs: &[std::net::SocketAddr],
+    timeout: Duration,
+) -> Option<TcpStream> {
+    for sa in addrs {
+        if let Ok(Ok(s)) = tokio::time::timeout(timeout, TcpStream::connect(sa)).await {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Pump bytes bidirectionally between `client` and `upstream` until either
+/// side closes, tearing the tunnel down once BOTH directions have gone
+/// quiet for `idle_timeout`. See `TUNNEL_IDLE_TIMEOUT` for why this bounds
+/// inactivity rather than the whole transfer's duration.
+async fn copy_bidirectional_with_idle_timeout(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    idle_timeout: Duration,
+) -> std::io::Result<()> {
+    let last_activity = std::sync::Mutex::new(tokio::time::Instant::now());
+    let (mut client_r, mut client_w) = client.split();
+    let (mut upstream_r, mut upstream_w) = upstream.split();
+
+    tokio::try_join!(
+        pump(&mut client_r, &mut upstream_w, idle_timeout, &last_activity),
+        pump(&mut upstream_r, &mut client_w, idle_timeout, &last_activity),
+    )?;
+    Ok(())
+}
+
+/// Copy from `src` to `dst` until EOF, failing with `ErrorKind::TimedOut`
+/// if `idle_timeout` elapses since the last byte read on EITHER direction.
+/// `last_activity` is shared with the opposite-direction pump so a busy
+/// download doesn't get killed just because the client isn't sending
+/// anything back upstream: each time this pump's own wait lapses, it
+/// rechecks the shared deadline before giving up, in case the other
+/// direction refreshed it in the meantime.
+async fn pump<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    idle_timeout: Duration,
+    last_activity: &std::sync::Mutex<tokio::time::Instant>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        let deadline = *last_activity.lock().unwrap() + idle_timeout;
+        match tokio::time::timeout_at(deadline, src.read(&mut buf)).await {
+            Err(_) => {
+                if *last_activity.lock().unwrap() + idle_timeout > tokio::time::Instant::now() {
+                    continue; // the other direction refreshed activity; keep waiting
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "egress tunnel idle timeout",
+                ));
+            }
+            Ok(Ok(0)) => {
+                let _ = dst.shutdown().await;
+                return Ok(());
+            }
+            Ok(Ok(n)) => {
+                *last_activity.lock().unwrap() = tokio::time::Instant::now();
+                dst.write_all(&buf[..n]).await?;
+            }
+            Ok(Err(e)) => return Err(e),
+        }
     }
 }
 
@@ -780,5 +888,175 @@ mod tests {
 
         // Assert
         assert!(status.contains("403"), "expected 403, got {status:?}");
+    }
+
+    // ----- timeout enforcement (resolve / connect / idle tunnel) ----------
+    //
+    // Coverage targets:
+    //   - resolve_target: happy path and a resolver that never returns
+    //   - connect_first_reachable: happy path and a target whose connect
+    //     backlog is saturated so the handshake never completes
+    //   - copy_bidirectional_with_idle_timeout: happy path and both
+    //     directions silent past the idle window
+    //
+    // A real DNS resolver can't be made to hang deterministically in a
+    // test (it isn't under our control), so resolve_target's timeout test
+    // substitutes a future that never resolves. connect_first_reachable
+    // and the idle-tunnel pump use genuine loopback sockets, matching the
+    // rest of this module's test style. All timeout assertions use
+    // `tokio::time::pause`/`advance` so no test waits on real wall time.
+
+    /// Bind a listener and open connections to it, without ever accepting,
+    /// until one genuinely blocks: the kernel's connect backlog is full.
+    /// Returns the listener and the prior connections (both kept alive so
+    /// the backlog stays saturated) plus the address a further connect
+    /// will hang against.
+    async fn saturate_backlog() -> (TcpListener, std::net::SocketAddr, Vec<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut conns = Vec::new();
+        // Stops as soon as an attempt doesn't complete in time: that's the
+        // signal the backlog is full.
+        while let Ok(Ok(s)) =
+            tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await
+        {
+            conns.push(s);
+        }
+        (listener, addr, conns)
+    }
+
+    /// Bind a loopback listener, connect to it, and accept that connection,
+    /// returning both ends. Stands in for the two legs (client-facing and
+    /// upstream-facing) a real tunnel pumps between.
+    async fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (a, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        (a.unwrap(), accepted.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn given_lookup_resolves_when_resolve_target_then_returns_addrs() {
+        // Arrange
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 443));
+        let lookup = std::future::ready(Ok::<_, std::io::Error>(vec![addr].into_iter()));
+
+        // Act
+        let result = resolve_target(lookup, Duration::from_secs(5)).await;
+
+        // Assert
+        assert_eq!(result, Some(vec![addr]));
+    }
+
+    #[tokio::test]
+    async fn given_lookup_never_resolves_when_resolve_target_then_times_out_and_returns_none() {
+        // Arrange: a resolver future that never completes, standing in for
+        // a stalled DNS server.
+        let never_resolves =
+            std::future::pending::<std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>>();
+        let timeout = Duration::from_millis(50);
+        tokio::time::pause();
+
+        // Act
+        let fut = resolve_target(never_resolves, timeout);
+        tokio::pin!(fut);
+        tokio::time::advance(timeout + Duration::from_millis(1)).await;
+        let result = fut.await;
+
+        // Assert
+        assert!(result.is_none(), "expected a stalled resolver to time out");
+    }
+
+    #[tokio::test]
+    async fn given_reachable_target_when_connect_first_reachable_then_returns_connection() {
+        // Arrange
+        let echo_port = spawn_echo_server().await;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], echo_port));
+
+        // Act
+        let result = connect_first_reachable(&[addr], Duration::from_secs(5)).await;
+
+        // Assert
+        assert!(result.is_some(), "expected a live target to connect");
+    }
+
+    #[tokio::test]
+    async fn given_target_backlog_saturated_when_connect_first_reachable_then_times_out_and_returns_none()
+     {
+        // Arrange: fill the target's connect backlog so its handshake
+        // never completes.
+        let (listener, addr, _conns) = saturate_backlog().await;
+        let addrs = [addr];
+        tokio::time::pause();
+
+        // Act
+        let fut = connect_first_reachable(&addrs, UPSTREAM_CONNECT_TIMEOUT);
+        tokio::pin!(fut);
+        tokio::time::advance(UPSTREAM_CONNECT_TIMEOUT + Duration::from_millis(1)).await;
+        let result = fut.await;
+
+        // Assert
+        assert!(
+            result.is_none(),
+            "expected a hung handshake to time out and be treated as unreachable"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn given_active_traffic_when_within_idle_timeout_then_bytes_are_copied_end_to_end() {
+        // Arrange
+        let (mut client_side, mut client_peer) = connected_pair().await;
+        let (mut upstream_side, mut upstream_peer) = connected_pair().await;
+        let idle_timeout = Duration::from_secs(5);
+
+        // Act: run the pump concurrently while driving traffic through it.
+        let pump_task = tokio::spawn(async move {
+            copy_bidirectional_with_idle_timeout(&mut client_side, &mut upstream_side, idle_timeout)
+                .await
+        });
+
+        client_peer.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        upstream_peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        upstream_peer.write_all(b"pong!").await.unwrap();
+        let mut buf2 = [0u8; 5];
+        client_peer.read_exact(&mut buf2).await.unwrap();
+        assert_eq!(&buf2, b"pong!");
+
+        // Closing both peers surfaces EOF on both directions so the pump
+        // finishes cleanly instead of running for the life of the test.
+        drop(client_peer);
+        drop(upstream_peer);
+        let result = pump_task.await.unwrap();
+
+        // Assert
+        assert!(result.is_ok(), "expected a clean shutdown, got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn given_both_directions_silent_when_idle_timeout_elapses_then_returns_timed_out_error() {
+        // Arrange: two connected pairs with peers kept open but silent, so
+        // neither direction ever produces a byte.
+        let (mut client_side, _client_peer) = connected_pair().await;
+        let (mut upstream_side, _upstream_peer) = connected_pair().await;
+        let idle_timeout = Duration::from_millis(50);
+        tokio::time::pause();
+
+        // Act
+        let fut = copy_bidirectional_with_idle_timeout(
+            &mut client_side,
+            &mut upstream_side,
+            idle_timeout,
+        );
+        tokio::pin!(fut);
+        tokio::time::advance(idle_timeout + Duration::from_millis(1)).await;
+        let result = fut.await;
+
+        // Assert
+        let err = result.expect_err("expected the idle tunnel to time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 }
