@@ -1,12 +1,11 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! SSRF/DNS-rebinding guard tests for `Stack`.
+//! Egress-allowlist wiring tests for `Stack`.
 //!
 //! Drives a guest-side DNS query and a guest-side TCP SYN through the raw
-//! socketpair harness and asserts `Stack` rejects a flow whose actual
-//! destination is a private, loopback, or link-local address, even when
-//! `resolved` associates that address with a domain label an allowlist
-//! would otherwise trust.
+//! socketpair harness and asserts `Stack` consults an injected egress-check
+//! callback with the flow's resolved domain label and port before dialing
+//! out via `Connector`.
 
 #![cfg(feature = "smoltcp")]
 
@@ -44,92 +43,96 @@ const GUEST_DNS_SRC_PORT: u16 = 54321;
 const GUEST_TCP_SRC_PORT: u16 = 55555;
 const DNS_SERVER_PORT: u16 = 53;
 const QUERY_TRANSACTION_ID: u16 = 0xbeef;
-/// A domain name that looks like it could be on an allowlist; the attack
-/// this scenario pins is a DNS answer for a plausible-looking domain that
-/// actually points at the cloud metadata address below.
-const EVIL_DOMAIN: &str = "evil.allowed.example";
-/// The common cloud metadata service address, a link-local address that
-/// must never be reachable from a guest regardless of what domain label,
-/// if any, resolved to it.
-const METADATA_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 169, 254);
-const METADATA_PORT: u16 = 80;
-/// Destination port for the loopback/RFC1918 scenario below; the guard
-/// classifies by destination IP only, so any port works here.
-const PRIVATE_DEST_PORT: u16 = 80;
+/// Domain this scenario's allowlist permits; the fake egress-check callback
+/// answers `true` for it, standing in for an allowlist entry that matches.
+const ALLOWED_DOMAIN: &str = "allowed.example.com";
 /// A real but unrelated public IP used only as an address label, never
 /// actually dialed since the fake `Connector` intercepts every connect
-/// attempt. Mirrors `smoltcp_flow.rs`'s `DEST_ADDR`; the guard under test
-/// must let this destination through rather than block it.
-const PUBLIC_DEST_ADDR: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
-const PUBLIC_DEST_PORT: u16 = 80;
+/// attempt. Mirrors `smoltcp_flow.rs`'s `DEST_ADDR`.
+const ALLOWED_ADDR: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
+const ALLOWED_PORT: u16 = 443;
+/// Domain this scenario's allowlist denies; the fake egress-check callback
+/// answers `false` for it, standing in for a domain no allowlist entry
+/// matches.
+const DENIED_DOMAIN: &str = "denied.example.com";
+/// A real but unrelated public IP used only as an address label; never
+/// actually dialed, since this scenario asserts the fake `Connector` is
+/// never even called.
+const DENIED_ADDR: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 35);
+const DENIED_PORT: u16 = 443;
+/// A public IP the guest connects to directly, with no preceding DNS query
+/// through this scenario's `Stack`, so `resolved` never learns a domain
+/// label for it.
+const UNRESOLVED_ADDR: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 36);
+const UNRESOLVED_PORT: u16 = 443;
 
-/// Fake `Resolver` answering `EVIL_DOMAIN` with the metadata address,
-/// standing in for an attacker who controls DNS answers for a
-/// plausible-looking domain and points it at an address the guest should
-/// never be allowed to reach.
-struct MetadataAnsweringResolver;
+/// Future type an egress-check callback returns; boxed and pinned since the
+/// callback is stored behind a trait object and must be `Send` to cross
+/// into the poll loop's spawned tasks.
+type EgressCheckFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// Callback type `Stack::new`'s fourth argument expects, aliased so the
+/// call site below doesn't repeat this trait object inline.
+type EgressCheckFn = Box<dyn Fn(&str, u16) -> EgressCheckFuture + Send + Sync>;
+
+/// Fake `Resolver` answering `ALLOWED_DOMAIN` with a public address,
+/// standing in for a real DNS lookup so the guest's SYN below has a domain
+/// label recorded in `resolved` for the egress check to consult.
+struct AllowedDomainResolver;
 
 #[async_trait::async_trait]
-impl Resolver for MetadataAnsweringResolver {
+impl Resolver for AllowedDomainResolver {
     async fn resolve(&self, name: &str) -> Vec<IpAddr> {
-        if name == EVIL_DOMAIN {
-            vec![IpAddr::V4(METADATA_ADDR)]
+        if name == ALLOWED_DOMAIN {
+            vec![IpAddr::V4(ALLOWED_ADDR)]
         } else {
             Vec::new()
         }
     }
 }
 
-/// `Stack::new` requires a `Resolver`, but the loopback/RFC1918 scenario
-/// below never sends a DNS query, so this always answers empty rather than
-/// standing in for a real lookup.
-struct NullResolver;
+/// Fake `Connector` that counts how many times it was invoked, so a test
+/// can assert an allowed flow reaches the connect stage exactly once.
+struct CountingConnector {
+    call_count: Arc<Mutex<u32>>,
+}
 
 #[async_trait::async_trait]
-impl Resolver for NullResolver {
+impl Connector for CountingConnector {
+    async fn connect(&self, _addr: SocketAddr) -> io::Result<TcpStream> {
+        *self.call_count.lock().unwrap() += 1;
+        Err(io::Error::other(
+            "CountingConnector never dials out; this scenario only proves it was called",
+        ))
+    }
+}
+
+/// Fake `Resolver` answering `DENIED_DOMAIN` with a public address,
+/// standing in for a real DNS lookup so the guest's SYN below has a domain
+/// label recorded in `resolved` for the egress check to consult.
+struct DeniedDomainResolver;
+
+#[async_trait::async_trait]
+impl Resolver for DeniedDomainResolver {
+    async fn resolve(&self, name: &str) -> Vec<IpAddr> {
+        if name == DENIED_DOMAIN {
+            vec![IpAddr::V4(DENIED_ADDR)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Fake `Resolver` that never resolves anything, standing in for a guest
+/// that connects to a literal IP without this `Stack` ever having relayed a
+/// DNS query for it.
+struct NeverResolvingResolver;
+
+#[async_trait::async_trait]
+impl Resolver for NeverResolvingResolver {
     async fn resolve(&self, _name: &str) -> Vec<IpAddr> {
         Vec::new()
     }
-}
-
-/// Fake `Connector` that records whether it was ever invoked, so a test can
-/// assert a rejected flow never reached the connect stage at all.
-struct RecordingConnector {
-    called: Arc<Mutex<bool>>,
-}
-
-#[async_trait::async_trait]
-impl Connector for RecordingConnector {
-    async fn connect(&self, _addr: SocketAddr) -> io::Result<TcpStream> {
-        *self.called.lock().unwrap() = true;
-        Err(io::Error::other(
-            "RecordingConnector should never be dialed for a flow to the metadata address",
-        ))
-    }
-}
-
-/// Fake `Connector` that records the address it was called with, so this
-/// scenario can prove the guard let the flow through to the connect stage
-/// rather than merely failing to error.
-struct AddressRecordingConnector {
-    called_with: Arc<Mutex<Option<SocketAddr>>>,
-}
-
-#[async_trait::async_trait]
-impl Connector for AddressRecordingConnector {
-    async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
-        *self.called_with.lock().unwrap() = Some(addr);
-        Err(io::Error::other(
-            "AddressRecordingConnector never dials out; this scenario only proves it was called",
-        ))
-    }
-}
-
-/// `Stack::new` requires an egress-check callback; no scenario in this file
-/// exercises rejection by that callback (only by the private-IP guard that
-/// runs before it), so this always allows.
-fn always_allow_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
-    Box::pin(async { true })
 }
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
@@ -237,7 +240,7 @@ fn encode_dns_name(name: &str) -> Vec<u8> {
 /// Builds a complete Ethernet+IPv4+UDP+DNS query frame a guest would send
 /// to look up `domain`, with correctly computed IPv4/UDP checksums so the
 /// checksum validation smoltcp runs by default on ingress accepts it.
-/// Mirrors `smoltcp_dns.rs`'s helper of the same shape.
+/// Mirrors `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 fn build_dns_query_frame(domain: &str) -> Vec<u8> {
     let raw_name = encode_dns_name(domain);
     let dns_repr = DnsRepr {
@@ -296,7 +299,7 @@ fn build_dns_query_frame(domain: &str) -> Vec<u8> {
 /// Builds a complete Ethernet+IPv4+TCP SYN frame a guest would send to open
 /// a connection to `dst_addr:dst_port`, picking that destination directly
 /// rather than through any domain resolution of its own. Mirrors
-/// `smoltcp_flow.rs`'s helper of the same shape.
+/// `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 fn build_tcp_syn_frame_to(dst_addr: Ipv4Addr, dst_port: u16) -> Vec<u8> {
     let tcp_repr = TcpRepr {
         src_port: GUEST_TCP_SRC_PORT,
@@ -348,16 +351,36 @@ fn build_tcp_syn_frame_to(dst_addr: Ipv4Addr, dst_port: u16) -> Vec<u8> {
     buf
 }
 
+/// Polls `stack` and checks `guest_fd` for a relayed response, retrying on
+/// a short cadence until `budget` elapses, to tolerate a relay that
+/// resolves the query asynchronously across more than one poll tick.
+/// Mirrors `smoltcp_ssrf_guard.rs`'s helper of the same shape.
+async fn poll_until_response(
+    stack: &mut Stack,
+    guest_fd: &OwnedFd,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        stack.poll();
+        if let Some(frame) = try_read_frame(guest_fd) {
+            return Some(frame);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
 /// TCP header fields parsed out of a reply frame the stack sent back to the
 /// guest, the minimum this scenario needs to tell an RST apart from a
-/// SYN-ACK. Mirrors `smoltcp_flow.rs`'s helper of the same shape.
+/// SYN-ACK. Mirrors `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 struct ParsedTcpSegment {
     control: TcpControl,
 }
 
 /// Parses `frame` as an Ethernet+IPv4+TCP frame, panicking if it isn't one:
 /// a malformed frame here is a test bug, not something worth handling
-/// gracefully.
+/// gracefully. Mirrors `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 fn parse_tcp_segment(frame: &[u8]) -> ParsedTcpSegment {
     let eth_frame = EthernetFrame::new_checked(frame).expect("valid ethernet frame");
     let ip_packet = Ipv4Packet::new_checked(eth_frame.payload()).expect("valid ipv4 packet");
@@ -376,29 +399,9 @@ fn parse_tcp_segment(frame: &[u8]) -> ParsedTcpSegment {
     }
 }
 
-/// Polls `stack` and checks `guest_fd` for a relayed response, retrying on
-/// a short cadence until `budget` elapses, to tolerate a relay that
-/// resolves the query asynchronously across more than one poll tick.
-/// Mirrors `smoltcp_dns.rs`'s helper of the same shape.
-async fn poll_until_response(
-    stack: &mut Stack,
-    guest_fd: &OwnedFd,
-    budget: Duration,
-) -> Option<Vec<u8>> {
-    let deadline = std::time::Instant::now() + budget;
-    while std::time::Instant::now() < deadline {
-        stack.poll();
-        if let Some(frame) = try_read_frame(guest_fd) {
-            return Some(frame);
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    None
-}
-
 /// Polls `stack` until a reply frame carrying the RST control flag appears
 /// on `guest_fd`, or `budget` (real wall-clock time) elapses. Mirrors
-/// `smoltcp_flow.rs`'s helper of the same shape.
+/// `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 async fn poll_until_rst(
     stack: &mut Stack,
     guest_fd: &OwnedFd,
@@ -418,152 +421,183 @@ async fn poll_until_rst(
     None
 }
 
-/// Polls `stack` on a short cadence until `called_with` records an address
-/// or `budget` elapses, to tolerate the connector being invoked from a task
-/// spawned on a later poll tick rather than synchronously. Mirrors
-/// `smoltcp_flow.rs`'s helper of the same shape.
+/// Polls `stack` on a short cadence until `call_count` reaches at least one
+/// call or `budget` elapses, to tolerate the connector being invoked from a
+/// task spawned on a later poll tick rather than synchronously.
 async fn poll_until_connector_called(
     stack: &mut Stack,
-    called_with: &Arc<Mutex<Option<SocketAddr>>>,
+    call_count: &Arc<Mutex<u32>>,
     budget: Duration,
-) -> Option<SocketAddr> {
+) -> u32 {
     let deadline = std::time::Instant::now() + budget;
     while std::time::Instant::now() < deadline {
         stack.poll();
-        if let Some(addr) = *called_with.lock().unwrap() {
-            return Some(addr);
+        let count = *call_count.lock().unwrap();
+        if count > 0 {
+            return count;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    None
+    *call_count.lock().unwrap()
 }
 
 #[tokio::test]
-async fn given_flow_to_metadata_address_when_polled_then_rejected_regardless_of_resolved_label() {
-    // Arrange: a Stack backed by a fake Resolver that answers an
-    // allowed-looking domain with the cloud metadata address, and a fake
-    // Connector that records whether it was ever called.
+async fn given_allowlist_policy_when_flow_to_allowed_domain_then_fake_connector_called_once() {
+    // Arrange: a Stack backed by a fake Resolver that resolves
+    // ALLOWED_DOMAIN to a public address, a fake egress-check callback
+    // standing in for an allowlist that permits ALLOWED_DOMAIN on any port
+    // it is asked about, and a fake Connector that counts how many times
+    // it was dialed.
     let (guest_fd, host_fd) = socketpair_dgram();
-    let resolver: Box<dyn Resolver> = Box::new(MetadataAnsweringResolver);
-    let called = Arc::new(Mutex::new(false));
-    let connector: Box<dyn Connector> = Box::new(RecordingConnector {
-        called: Arc::clone(&called),
+    let resolver: Box<dyn Resolver> = Box::new(AllowedDomainResolver);
+    let call_count = Arc::new(Mutex::new(0u32));
+    let connector: Box<dyn Connector> = Box::new(CountingConnector {
+        call_count: Arc::clone(&call_count),
     });
-    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
+    let egress_calls: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+    let egress_calls_for_closure = Arc::clone(&egress_calls);
+    let egress_check: EgressCheckFn = Box::new(move |domain: &str, port: u16| {
+        egress_calls_for_closure
+            .lock()
+            .unwrap()
+            .push((domain.to_string(), port));
+        Box::pin(async { true })
+    });
+    let mut stack = Stack::new(host_fd, resolver, connector, egress_check);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
-    // The guest first resolves an allowed-looking domain that an attacker
-    // controlling DNS has pointed at the metadata address, so `resolved`
-    // ends up recording `169.254.169.254 -> "evil.allowed.example"`.
-    write_frame(&guest_fd, &build_dns_query_frame(EVIL_DOMAIN));
+    // The guest first resolves the allowed domain, so `resolved` ends up
+    // recording `ALLOWED_ADDR -> ALLOWED_DOMAIN`.
+    write_frame(&guest_fd, &build_dns_query_frame(ALLOWED_DOMAIN));
     poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
         .await
         .expect("stack should relay a DNS response back to the guest within the poll budget");
     assert_eq!(
-        stack.resolved_domain_for(IpAddr::V4(METADATA_ADDR)),
-        Some(EVIL_DOMAIN),
-        "resolved map should attribute the metadata address to the allowed-looking domain"
+        stack.resolved_domain_for(IpAddr::V4(ALLOWED_ADDR)),
+        Some(ALLOWED_DOMAIN),
+        "resolved map should attribute the allowed address to the allowed domain"
     );
 
-    // Act: the guest picks the destination IP directly for its SYN, the
-    // same metadata address the DNS answer above just resolved to.
+    // Act: the guest opens a SYN to the resolved address.
     write_frame(
         &guest_fd,
-        &build_tcp_syn_frame_to(METADATA_ADDR, METADATA_PORT),
+        &build_tcp_syn_frame_to(ALLOWED_ADDR, ALLOWED_PORT),
     );
 
-    // Assert: the guest receives an RST rather than a SYN-ACK or silence,
-    // and the connector was never dispatched for this destination.
+    // Assert: the connector was dispatched exactly once, and the
+    // egress-check callback was consulted with the resolved domain label
+    // and the flow's destination port.
+    let count = poll_until_connector_called(&mut stack, &call_count, Duration::from_secs(2)).await;
+    assert_eq!(
+        count, 1,
+        "fake connector should be called exactly once for a flow to an allowed domain"
+    );
+    assert_eq!(
+        *egress_calls.lock().unwrap(),
+        vec![(ALLOWED_DOMAIN.to_string(), ALLOWED_PORT)],
+        "egress-check callback should be called once with the resolved domain and destination port"
+    );
+}
+
+#[tokio::test]
+async fn given_allowlist_policy_when_flow_to_denied_domain_then_rst_and_fake_connector_never_called()
+ {
+    // Arrange: same shape as the allowed-domain scenario, but the fake
+    // egress-check callback answers `false` for every domain it is asked
+    // about, standing in for an allowlist that denies DENIED_DOMAIN.
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let resolver: Box<dyn Resolver> = Box::new(DeniedDomainResolver);
+    let call_count = Arc::new(Mutex::new(0u32));
+    let connector: Box<dyn Connector> = Box::new(CountingConnector {
+        call_count: Arc::clone(&call_count),
+    });
+    let egress_check: EgressCheckFn =
+        Box::new(|_domain: &str, _port: u16| Box::pin(async { false }));
+    let mut stack = Stack::new(host_fd, resolver, connector, egress_check);
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // The guest first resolves the denied domain, so `resolved` ends up
+    // recording `DENIED_ADDR -> DENIED_DOMAIN`.
+    write_frame(&guest_fd, &build_dns_query_frame(DENIED_DOMAIN));
+    poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("stack should relay a DNS response back to the guest within the poll budget");
+    assert_eq!(
+        stack.resolved_domain_for(IpAddr::V4(DENIED_ADDR)),
+        Some(DENIED_DOMAIN),
+        "resolved map should attribute the denied address to the denied domain"
+    );
+
+    // Act: the guest opens a SYN to the resolved (denied) address.
+    write_frame(&guest_fd, &build_tcp_syn_frame_to(DENIED_ADDR, DENIED_PORT));
+
+    // Assert: the guest receives an RST rather than a SYN-ACK, and the fake
+    // connector is never called since the egress check rejected the flow
+    // before any connect attempt was made.
     let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
     assert!(
         rst.is_some(),
-        "guest should receive an RST for a SYN to the metadata address, \
-         regardless of the domain label resolved records for it"
+        "guest should receive an RST for a SYN to a denied domain"
     );
-    assert!(
-        !*called.lock().unwrap(),
-        "connector should never be dispatched for a flow to the metadata address"
+    assert_eq!(
+        *call_count.lock().unwrap(),
+        0,
+        "fake connector should never be called for a flow to a denied domain"
     );
 }
 
 #[tokio::test]
-async fn given_flow_to_loopback_or_rfc1918_address_when_polled_then_rejected() {
-    // Table-driven: loopback and RFC1918 destinations exercise the same
-    // arrange/act/assert shape, so check each in one function rather than
-    // duplicating the scenario per address.
-    let private_destinations = [
-        Ipv4Addr::new(127, 0, 0, 1),   // loopback
-        Ipv4Addr::new(192, 168, 1, 1), // RFC1918
-        Ipv4Addr::new(10, 0, 0, 5),    // RFC1918
-    ];
-
-    for dst in private_destinations {
-        // Arrange: a Stack backed by a resolver that is never consulted
-        // (the guest picks this destination directly, with no DNS lookup
-        // involved) and a fake Connector that records whether it was ever
-        // called.
-        let (guest_fd, host_fd) = socketpair_dgram();
-        let resolver: Box<dyn Resolver> = Box::new(NullResolver);
-        let called = Arc::new(Mutex::new(false));
-        let connector: Box<dyn Connector> = Box::new(RecordingConnector {
-            called: Arc::clone(&called),
-        });
-        let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
-        perform_arp_handshake(&mut stack, &guest_fd).await;
-
-        // Act: the guest picks the loopback or RFC1918 destination
-        // directly for its SYN.
-        write_frame(&guest_fd, &build_tcp_syn_frame_to(dst, PRIVATE_DEST_PORT));
-
-        // Assert: the guest receives an RST rather than a SYN-ACK or
-        // silence, and the connector was never dispatched for this
-        // destination.
-        let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
-        assert!(
-            rst.is_some(),
-            "guest should receive an RST for a SYN to {dst}, a loopback or RFC1918 address"
-        );
-        assert!(
-            !*called.lock().unwrap(),
-            "connector should never be dispatched for a flow to {dst}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn given_flow_to_public_address_when_polled_then_reaches_egress_check() {
-    // Arrange: a Stack backed by a resolver that is never consulted (the
-    // guest picks this destination directly, with no DNS lookup involved)
-    // and a fake Connector that records the address it is asked to dial,
-    // the negative case proving the guard does not over-block a
-    // genuinely public destination.
+async fn given_unresolved_destination_ip_when_checked_then_denied() {
+    // Arrange: a Stack backed by a fake Resolver that never resolves
+    // anything (this scenario never drives a DNS query), and a fake
+    // egress-check callback that records every domain string it is asked
+    // about and denies anything IP-shaped, standing in for a real
+    // EgressProxy's pattern-based allowlist naturally failing to match a
+    // bare IP address against its domain patterns.
     let (guest_fd, host_fd) = socketpair_dgram();
-    let resolver: Box<dyn Resolver> = Box::new(NullResolver);
-    let called_with = Arc::new(Mutex::new(None));
-    let connector: Box<dyn Connector> = Box::new(AddressRecordingConnector {
-        called_with: Arc::clone(&called_with),
+    let resolver: Box<dyn Resolver> = Box::new(NeverResolvingResolver);
+    let call_count = Arc::new(Mutex::new(0u32));
+    let connector: Box<dyn Connector> = Box::new(CountingConnector {
+        call_count: Arc::clone(&call_count),
     });
-    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
+    let egress_calls: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+    let egress_calls_for_closure = Arc::clone(&egress_calls);
+    let egress_check: EgressCheckFn = Box::new(move |domain: &str, port: u16| {
+        egress_calls_for_closure
+            .lock()
+            .unwrap()
+            .push((domain.to_string(), port));
+        let is_bare_ip = domain.parse::<IpAddr>().is_ok();
+        Box::pin(async move { !is_bare_ip })
+    });
+    let mut stack = Stack::new(host_fd, resolver, connector, egress_check);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
-    // Act: the guest picks a genuinely public destination directly for its
-    // SYN.
+    // Act: the guest opens a SYN straight to a public IP it never looked up
+    // through this Stack's DNS relay.
     write_frame(
         &guest_fd,
-        &build_tcp_syn_frame_to(PUBLIC_DEST_ADDR, PUBLIC_DEST_PORT),
+        &build_tcp_syn_frame_to(UNRESOLVED_ADDR, UNRESOLVED_PORT),
     );
 
-    // Assert: the connector is dispatched with the exact destination the
-    // guest's SYN carried, proving the flow reached the egress check
-    // instead of being rejected by the private/loopback/link-local guard.
-    let addr = poll_until_connector_called(&mut stack, &called_with, Duration::from_secs(2))
-        .await
-        .expect(
-            "stack should call the connector for a SYN to a public address within the poll budget",
-        );
+    // Assert: the guest receives an RST, the egress-check callback was
+    // consulted with the bare IP as the domain string (the fallback the
+    // Goal describes for an unresolved destination), and the fake
+    // connector is never called.
+    let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert!(
+        rst.is_some(),
+        "guest should receive an RST for a SYN to an address that was never resolved"
+    );
     assert_eq!(
-        addr,
-        SocketAddr::new(IpAddr::V4(PUBLIC_DEST_ADDR), PUBLIC_DEST_PORT),
-        "connector should be called with the exact public destination address the guest's SYN carried"
+        *egress_calls.lock().unwrap(),
+        vec![(UNRESOLVED_ADDR.to_string(), UNRESOLVED_PORT)],
+        "egress-check callback should be called with the bare IP as the domain string \
+         when the destination was never resolved via DNS"
+    );
+    assert_eq!(
+        *call_count.lock().unwrap(),
+        0,
+        "fake connector should never be called for a flow to an unresolved destination"
     );
 }

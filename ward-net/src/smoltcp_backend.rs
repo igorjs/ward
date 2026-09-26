@@ -18,8 +18,10 @@
 //!   ADR-018's "Future work" section.
 
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,6 +94,19 @@ impl Connector for TokioConnector {
         TcpStream::connect(addr).await
     }
 }
+
+/// Future an [`EgressCheckFn`] returns; boxed and pinned since the callback
+/// is stored as a trait object and awaited from inside a spawned task.
+pub type EgressCheckFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// Consulted once a flow's destination has cleared the private-IP guard
+/// (`is_flow_destination_safe`), given the flow's resolved domain label
+/// (or the bare destination IP if unresolved) and destination port.
+/// Returns `true` if the flow may proceed to the [`Connector`]. In
+/// production this is `ward-core`'s `EgressProxy::check`, wired in by
+/// `ward-core`'s krunvm backend since this crate cannot depend on
+/// `ward-core`; tests inject a fake standing in for an allowlist policy.
+pub type EgressCheckFn = dyn Fn(&str, u16) -> EgressCheckFuture + Send + Sync;
 
 /// Largest Ethernet frame `RawFdDevice` will read or write: the standard
 /// 1500-octet IP MTU plus the 14-octet Ethernet header.
@@ -673,6 +688,7 @@ pub struct Stack {
     sockets: SocketSet<'static>,
     resolver: Arc<dyn Resolver>,
     connector: Arc<dyn Connector>,
+    egress_check: Arc<EgressCheckFn>,
     /// Guest-initiated TCP flows, keyed by the (guest, destination)
     /// endpoint pair parsed from the guest's own SYN. Populated by
     /// `register_new_tcp_flow` the first time a destination is seen, so a
@@ -708,7 +724,12 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(fd: OwnedFd, resolver: Box<dyn Resolver>, connector: Box<dyn Connector>) -> Stack {
+    pub fn new(
+        fd: OwnedFd,
+        resolver: Box<dyn Resolver>,
+        connector: Box<dyn Connector>,
+        egress_check: Box<EgressCheckFn>,
+    ) -> Stack {
         let mut device = RawFdDevice::new(fd);
         let config = Config::new(HardwareAddress::Ethernet(INTERFACE_HARDWARE_ADDR));
         let mut interface = Interface::new(config, &mut device, Instant::now());
@@ -762,6 +783,7 @@ impl Stack {
             sockets,
             resolver: Arc::from(resolver),
             connector: Arc::from(connector),
+            egress_check: Arc::from(egress_check),
             flows: HashMap::new(),
             sockets_pending_removal: Vec::new(),
             dns_socket_handle,
@@ -920,6 +942,17 @@ impl Stack {
             );
             return;
         }
+        // The resolved map only ever attributes a domain to an address a
+        // relayed DNS answer actually produced, so a destination reached by
+        // a literal SYN (never looked up) falls back to the bare IP. That
+        // bare-IP label intentionally never matches a domain-pattern
+        // allowlist rule, which is the fail-closed behaviour a caller
+        // wiring `ward-core`'s `EgressProxy::check` in as the egress-check
+        // callback relies on.
+        let domain = self
+            .resolved_domain_for(dst_ip)
+            .map(str::to_string)
+            .unwrap_or_else(|| dst_ip.to_string());
 
         let socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
@@ -946,6 +979,7 @@ impl Stack {
             },
         );
         let connector = Arc::clone(&self.connector);
+        let egress_check = Arc::clone(&self.egress_check);
         let addr = SocketAddr::from(dst);
         // The deadline is anchored to now, when the flow was registered,
         // rather than to whenever the spawned task happens to get its first
@@ -954,16 +988,27 @@ impl Stack {
         // to.
         let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         tokio::task::spawn(async move {
-            // A timed-out connect is reported through the same channel as a
-            // connector error, so pump_flows tears the flow down (removes
-            // it from the flow table, aborts its socket to trigger an RST)
-            // exactly as it already does for any other connect failure.
-            let result = match tokio::time::timeout_at(deadline, connector.connect(addr)).await {
-                Ok(result) => result,
-                Err(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "connect attempt timed out",
-                )),
+            // A rejected egress check, or a timed-out connect, is reported
+            // through the same channel as a connector error, so pump_flows
+            // tears the flow down (removes it from the flow table, aborts
+            // its socket to trigger an RST) exactly as it already does for
+            // any other connect failure.
+            let result = if egress_check(&domain, addr.port()).await {
+                match tokio::time::timeout_at(deadline, connector.connect(addr)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connect attempt timed out",
+                    )),
+                }
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "egress policy rejected destination {domain}:{}",
+                        addr.port()
+                    ),
+                ))
             };
             // The receiver may already be gone if pump_flows gave up on
             // this flow (e.g. the guest reset it) before the connect
@@ -1413,12 +1458,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// per-sandbox identification is wired up); they are accepted now to
 /// match the shape callers will need once that lands.
 ///
+/// `egress_check` is consulted for every flow that clears the private-IP
+/// guard; see [`EgressCheckFn`] for its contract.
+///
 /// # Errors
 ///
 /// Returns [`Error::Process`] if the socketpair syscall fails.
 pub async fn spawn_for_sandbox(
     _sandbox_id: &str,
     _opts: &AttachOptions,
+    egress_check: Box<EgressCheckFn>,
 ) -> Result<SmoltcpHandle, Error> {
     // socketpair(AF_UNIX, SOCK_DGRAM, 0) → [host_fd, guest_fd]. SOCK_DGRAM
     // (unlike passt's SOCK_STREAM) preserves datagram boundaries, matching
@@ -1442,7 +1491,12 @@ pub async fn spawn_for_sandbox(
         // Stack (device + Interface + SocketSet) lives only inside this
         // task, so the host-side fd is never shared or locked from
         // outside it.
-        let mut stack = Stack::new(host_fd, Box::new(SystemResolver), Box::new(TokioConnector));
+        let mut stack = Stack::new(
+            host_fd,
+            Box::new(SystemResolver),
+            Box::new(TokioConnector),
+            egress_check,
+        );
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
@@ -1499,6 +1553,12 @@ impl NetworkBackend for SmoltcpBackend {
 mod tests {
     use super::*;
 
+    /// Stand-in [`EgressCheckFn`] for tests exercising `spawn_for_sandbox`'s
+    /// task lifecycle, not its egress decisions: always allows.
+    fn always_allow_egress(_domain: &str, _port: u16) -> EgressCheckFuture {
+        Box::pin(async { true })
+    }
+
     #[tokio::test]
     async fn given_scaffold_when_probe_then_ok() {
         SmoltcpBackend.probe().await.unwrap();
@@ -1518,7 +1578,12 @@ mod tests {
 
     #[tokio::test]
     async fn given_spawn_for_sandbox_when_called_then_returns_valid_guest_fd() {
-        let result = spawn_for_sandbox("test-sandbox-id", &AttachOptions::default()).await;
+        let result = spawn_for_sandbox(
+            "test-sandbox-id",
+            &AttachOptions::default(),
+            Box::new(always_allow_egress),
+        )
+        .await;
         match result {
             Ok(SmoltcpHandle { guest_fd, .. }) => assert!(guest_fd >= 0),
             Err(err) => panic!("expected Ok(SmoltcpHandle), got Err({err:?})"),
@@ -1527,9 +1592,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_spawned_task_when_shutdown_sent_then_task_joins_cleanly() {
-        let handle = spawn_for_sandbox("test-sandbox-id", &AttachOptions::default())
-            .await
-            .expect("spawn_for_sandbox should succeed");
+        let handle = spawn_for_sandbox(
+            "test-sandbox-id",
+            &AttachOptions::default(),
+            Box::new(always_allow_egress),
+        )
+        .await
+        .expect("spawn_for_sandbox should succeed");
         // Send Shutdown immediately, before any POLL_INTERVAL tick could
         // have elapsed, so a prompt join here can only be explained by
         // the task's select! racing cmd_rx.recv() rather than waiting for
@@ -1555,9 +1624,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_spawned_task_when_stack_polls_then_shuts_down_cleanly() {
-        let handle = spawn_for_sandbox("test-sandbox-id", &AttachOptions::default())
-            .await
-            .expect("spawn_for_sandbox should succeed");
+        let handle = spawn_for_sandbox(
+            "test-sandbox-id",
+            &AttachOptions::default(),
+            Box::new(always_allow_egress),
+        )
+        .await
+        .expect("spawn_for_sandbox should succeed");
         // Outlive at least one POLL_INTERVAL tick so the task's loop
         // drives Stack::poll before shutdown; a panic there would fail
         // the join below instead of this sleep.
@@ -1575,9 +1648,13 @@ mod tests {
 
     #[tokio::test]
     async fn given_spawn_then_detach_when_detach_again_then_idempotent() {
-        let mut handle = spawn_for_sandbox("test-sandbox-id", &AttachOptions::default())
-            .await
-            .expect("spawn_for_sandbox should succeed");
+        let mut handle = spawn_for_sandbox(
+            "test-sandbox-id",
+            &AttachOptions::default(),
+            Box::new(always_allow_egress),
+        )
+        .await
+        .expect("spawn_for_sandbox should succeed");
         handle.detach().await.expect("first detach should succeed");
         handle
             .detach()

@@ -179,17 +179,6 @@ impl SandboxManager {
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
 
-        // SEC-ALLOWLIST: EgressProxy::serve() is not wired into the production
-        // network path. Allowlist mode would silently fall back to an unrestricted
-        // NIC. Reject until TAP/smoltcp wiring lands.
-        if egress_policy.mode == crate::protocol::EgressMode::Allowlist {
-            return Err(ApiError::InvalidRequest(
-                "egress mode Allowlist is not yet available; \
-                 use Deny (no outbound) or Open (unrestricted outbound)"
-                    .to_string(),
-            ));
-        }
-
         let resources = req
             .resources
             .map(pb_resources_to_protocol)
@@ -959,6 +948,30 @@ mod tests {
         );
         let live = mgr.list().await.expect("list").len();
         assert_eq!(live, successes, "live sandbox count must match successes");
+    }
+
+    #[tokio::test]
+    async fn given_egress_mode_allowlist_when_create_sandbox_then_no_longer_rejected() {
+        // Arrange: Allowlist mode used to be hard-rejected at creation
+        // because no datapath enforced it; the smoltcp backend now does.
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            egress: Some(PbEgressPolicy {
+                mode: PbEgressMode::Allowlist as i32,
+                domains: vec!["api.example.com".into()],
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        let result = mgr.create(req).await;
+
+        // Assert
+        assert!(
+            result.is_ok(),
+            "Allowlist mode must no longer be rejected at creation: {result:?}"
+        );
     }
 
     // ----- get -----------------------------------------------------------
