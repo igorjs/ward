@@ -458,10 +458,7 @@ mod tests {
         let mut handle = spawn_for_sandbox("test-sandbox-id", &AttachOptions::default())
             .await
             .expect("spawn_for_sandbox should succeed");
-        handle
-            .detach()
-            .await
-            .expect("first detach should succeed");
+        handle.detach().await.expect("first detach should succeed");
         handle
             .detach()
             .await
