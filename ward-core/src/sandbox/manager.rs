@@ -185,7 +185,8 @@ impl SandboxManager {
         if egress_policy.mode == crate::protocol::EgressMode::Allowlist {
             return Err(ApiError::InvalidRequest(
                 "egress mode Allowlist is not yet available; \
-                 use Deny (no outbound) or Open (unrestricted outbound)".to_string(),
+                 use Deny (no outbound) or Open (unrestricted outbound)"
+                    .to_string(),
             ));
         }
 
@@ -652,7 +653,8 @@ impl SandboxManager {
         // an honest error instead of a silent fake success.
         let _ = req;
         Err(ApiError::InvalidRequest(
-            "Run RPC is not yet implemented; use Exec to run commands inside the sandbox".to_string(),
+            "Run RPC is not yet implemented; use Exec to run commands inside the sandbox"
+                .to_string(),
         ))
     }
 }
