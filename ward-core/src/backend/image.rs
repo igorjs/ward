@@ -962,7 +962,10 @@ mod tests {
                 key.key().name() == "wardd_image_cache_eviction_failure_total"
                     && matches!(value, metrics_util::debugging::DebugValue::Counter(n) if n >= 1)
             });
-        assert!(counted, "expected eviction failure counter to be incremented");
+        assert!(
+            counted,
+            "expected eviction failure counter to be incremented"
+        );
 
         // remove_dir_all clears an entry's contents before the final rmdir
         // of the entry itself, so a failed rmdir still leaves an (empty)
