@@ -17,17 +17,53 @@
 //! - `attach` / `detach` return `Error::Unimplemented` with a pointer at
 //!   ADR-018's "Future work" section.
 
+use std::collections::{HashMap, VecDeque};
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::Duration;
 
-use smoltcp::iface::{Config, Interface, PollResult, SocketSet};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::udp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress};
+use smoltcp::wire::{
+    DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpMessageType, DhcpPacket, DhcpRepr, DnsFlags, DnsPacket,
+    DnsQueryType, DnsQuestion, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
+};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::{AttachId, AttachOptions, Error, NetworkBackend};
+
+/// Resolves a domain name to zero or more addresses on the guest's behalf.
+/// [`Stack`] never resolves names itself: every guest DNS query is handed
+/// to an injected `Resolver` (a real one in production, a scripted one in
+/// tests) so the relay logic never depends on live network access.
+#[async_trait::async_trait]
+pub trait Resolver: Send + Sync {
+    async fn resolve(&self, name: &str) -> Vec<IpAddr>;
+}
+
+/// Production [`Resolver`] backed by the host's own resolver via
+/// `getaddrinfo(3)` (through `tokio::net::lookup_host`, which runs it on a
+/// blocking thread so it never stalls the stack's poll loop).
+#[derive(Debug, Default)]
+pub struct SystemResolver;
+
+#[async_trait::async_trait]
+impl Resolver for SystemResolver {
+    async fn resolve(&self, name: &str) -> Vec<IpAddr> {
+        match tokio::net::lookup_host((name, 0)).await {
+            Ok(addrs) => addrs.map(|socket_addr| socket_addr.ip()).collect(),
+            Err(err) => {
+                tracing::warn!(name, error = %err, "system DNS resolution failed");
+                Vec::new()
+            }
+        }
+    }
+}
 
 /// Largest Ethernet frame `RawFdDevice` will read or write: the standard
 /// 1500-octet IP MTU plus the 14-octet Ethernet header.
@@ -195,6 +231,198 @@ impl TxToken for RawFdTxToken {
 const INTERFACE_HARDWARE_ADDR: EthernetAddress =
     EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
 
+/// The interface's own address, per the libslirp/QEMU user-networking
+/// convention (10.0.2.0/24, gateway low in the range). Guest traffic
+/// addressed here (DNS queries, ICMP echoes, DHCP requests) is accepted;
+/// an interface with no assigned address only accepts broadcast traffic.
+const INTERFACE_ADDR: IpAddress = IpAddress::v4(10, 0, 2, 2);
+const INTERFACE_PREFIX_LEN: u8 = 24;
+
+/// Port the guest-facing DNS relay socket listens on.
+const DNS_SERVER_PORT: u16 = 53;
+/// Bounds how many DNS datagrams (queries or the responses queued for
+/// them) each direction of the relay socket can hold at once.
+const DNS_SOCKET_BUFFER_PACKETS: usize = 8;
+/// Bytes of payload storage in each direction of the relay socket, well
+/// over the largest DNS-over-UDP message (512 bytes without EDNS0).
+const DNS_SOCKET_BUFFER_BYTES: usize = 4096;
+
+/// A DNS query relayed to the injected `Resolver`, awaiting its answer so
+/// [`Stack::poll`] can send a response once it arrives.
+struct PendingDnsQuery {
+    transaction_id: u16,
+    /// The query's own question section (name, type, class), copied
+    /// verbatim into the response so the guest sees the question it asked.
+    question: Vec<u8>,
+    /// Domain name this query asked to resolve, kept so a resolved answer
+    /// can be recorded against it in `Stack::resolved`.
+    domain: String,
+    remote: udp::UdpMetadata,
+    answer: oneshot::Receiver<Vec<IpAddr>>,
+}
+
+/// A parsed guest DNS query, ready to be relayed to a [`Resolver`].
+struct ParsedDnsQuery {
+    transaction_id: u16,
+    domain: String,
+    question: Vec<u8>,
+}
+
+/// Parses `payload` (a UDP datagram's contents) as a DNS query, returning
+/// its transaction ID, dotted-form queried name, and raw question section.
+/// `None` for anything smoltcp's wire types can't parse as a question.
+fn parse_dns_query(payload: &[u8]) -> Option<ParsedDnsQuery> {
+    let packet = DnsPacket::new_checked(payload).ok()?;
+    let (_, question) = DnsQuestion::parse(packet.payload()).ok()?;
+    let domain = decode_dns_name(question.name)?;
+    let question = packet.payload().get(..question.buffer_len())?.to_vec();
+    Some(ParsedDnsQuery {
+        transaction_id: packet.transaction_id(),
+        domain,
+        question,
+    })
+}
+
+/// Decodes wire-format DNS labels (length-prefixed, zero-terminated) into
+/// a dotted domain name.
+fn decode_dns_name(raw: &[u8]) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut offset = 0;
+    while offset < raw.len() {
+        let len = raw[offset] as usize;
+        if len == 0 {
+            break;
+        }
+        offset += 1;
+        let label = raw.get(offset..offset + len)?;
+        labels.push(std::str::from_utf8(label).ok()?);
+        offset += len;
+    }
+    Some(labels.join("."))
+}
+
+/// Compression pointer to offset 12 (0x000C), where the response's own
+/// echoed question section starts, per RFC 1035 section 4.1.4.
+const NAME_POINTER_TO_QUESTION: [u8; 2] = [0xC0, 0x0C];
+/// TTL smoltcp's wire types have no opinion on; any positive value is
+/// valid, so this picks a modest one rather than caching indefinitely.
+const DNS_ANSWER_TTL_SECS: u32 = 60;
+
+/// Upper bound on `Stack::resolved` entries. Guests can query arbitrarily
+/// many names, so this caps memory use; the oldest entry is evicted (FIFO)
+/// to make room for a new one once the cap is reached.
+const MAX_RESOLVED_ENTRIES: usize = 4096;
+
+/// Upper bound on `Stack::pending_dns_queries` entries. A guest can send
+/// queries faster than the resolver answers them, so this caps memory use
+/// the same way `MAX_RESOLVED_ENTRIES` caps `resolved`: the oldest
+/// outstanding query is evicted (FIFO) to make room for a new one once the
+/// cap is reached, on the assumption that a guest still waiting on a query
+/// this old has likely already given up on it. Eviction just drops the
+/// query's receiver; its paired resolver task will still run to
+/// completion, and its `send` will simply fail with no observable effect.
+const MAX_PENDING_DNS_QUERIES: usize = 4096;
+
+/// Hand-encodes a DNS response: header, the query's own echoed question,
+/// then one `A` record per IPv4 address in `answers` (IPv6 addresses are
+/// dropped; there is no relay-side AAAA support yet). smoltcp's wire types
+/// can parse a DNS response but not emit one, so this builds the bytes
+/// directly per RFC 1035.
+fn build_dns_response(transaction_id: u16, question: &[u8], answers: &[IpAddr]) -> Vec<u8> {
+    let ipv4_answers: Vec<Ipv4Addr> = answers
+        .iter()
+        .filter_map(|addr| match addr {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+
+    let mut response = Vec::with_capacity(12 + question.len() + ipv4_answers.len() * 16);
+    response.extend_from_slice(&transaction_id.to_be_bytes());
+    let flags = DnsFlags::RESPONSE | DnsFlags::RECURSION_DESIRED | DnsFlags::RECURSION_AVAILABLE;
+    response.extend_from_slice(&flags.bits().to_be_bytes());
+    response.extend_from_slice(&1u16.to_be_bytes()); // question count
+    response.extend_from_slice(&(ipv4_answers.len() as u16).to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes()); // authority count
+    response.extend_from_slice(&0u16.to_be_bytes()); // additional count
+    response.extend_from_slice(question);
+
+    for addr in ipv4_answers {
+        response.extend_from_slice(&NAME_POINTER_TO_QUESTION);
+        response.extend_from_slice(&u16::from(DnsQueryType::A).to_be_bytes());
+        response.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        response.extend_from_slice(&DNS_ANSWER_TTL_SECS.to_be_bytes());
+        response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        response.extend_from_slice(&addr.octets());
+    }
+
+    response
+}
+
+/// Address this `Stack` hands guests as the DHCP server identifier and
+/// default gateway. Matches `INTERFACE_ADDR`'s octets, kept as a separate
+/// `Ipv4Addr` constant since `wire::dhcpv4::Repr`'s fields need that
+/// concrete type rather than the `IpAddress` enum.
+const GATEWAY_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+/// Subnet mask matching `INTERFACE_PREFIX_LEN`'s /24.
+const DHCP_SUBNET_MASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+/// First address the DHCP lease pool hands out, one above the gateway per
+/// the libslirp/QEMU user-networking convention.
+const DHCP_POOL_START: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+/// Number of addresses in the lease pool before it would wrap back to
+/// `DHCP_POOL_START`; ample for the handful of guests one sandbox's
+/// virtual NIC ever serves.
+const DHCP_POOL_SIZE: u8 = 32;
+/// Lease lifetime handed out in every OFFER, in seconds.
+const DHCP_LEASE_DURATION_SECS: u32 = 3600;
+/// Bounds how many DHCP datagrams the guest-facing DHCP server socket can
+/// hold at once in each direction.
+const DHCP_SOCKET_BUFFER_PACKETS: usize = 8;
+/// Bytes of payload storage in each direction of the DHCP socket, well
+/// over a DHCP message's fixed 236-byte header plus its options.
+const DHCP_SOCKET_BUFFER_BYTES: usize = 1024;
+
+/// Builds a DHCP OFFER answering `discover`: leases `your_ip` to the
+/// requesting client and advertises this `Stack`'s own address as both the
+/// DHCP server identifier and the default gateway. Unlike
+/// `build_dns_response`, this reuses smoltcp's own `wire::dhcpv4::Repr::emit`
+/// rather than a manual byte layout, since that wire type already covers
+/// building a server reply and not just parsing one.
+fn build_dhcp_offer(discover: &DhcpRepr, your_ip: Ipv4Addr) -> Vec<u8> {
+    let dns_servers = heapless::Vec::from_slice(&[GATEWAY_ADDR])
+        .expect("one DNS server address is well within the dns_servers option's fixed capacity");
+    let offer = DhcpRepr {
+        message_type: DhcpMessageType::Offer,
+        transaction_id: discover.transaction_id,
+        secs: 0,
+        client_hardware_address: discover.client_hardware_address,
+        client_ip: Ipv4Addr::UNSPECIFIED,
+        your_ip,
+        server_ip: GATEWAY_ADDR,
+        router: Some(GATEWAY_ADDR),
+        subnet_mask: Some(DHCP_SUBNET_MASK),
+        relay_agent_ip: Ipv4Addr::UNSPECIFIED,
+        broadcast: discover.broadcast,
+        requested_ip: None,
+        client_identifier: discover.client_identifier,
+        server_identifier: Some(GATEWAY_ADDR),
+        parameter_request_list: None,
+        dns_servers: Some(dns_servers),
+        max_size: None,
+        lease_duration: Some(DHCP_LEASE_DURATION_SECS),
+        renew_duration: None,
+        rebind_duration: None,
+        additional_options: &[],
+    };
+
+    let mut buf = vec![0u8; offer.buffer_len()];
+    let mut packet = DhcpPacket::new_unchecked(&mut buf[..]);
+    offer
+        .emit(&mut packet)
+        .expect("offer repr should fit exactly in a buffer sized from its own buffer_len");
+    buf
+}
+
 /// Owns a smoltcp `Interface`, the `SocketSet` it drives, and the
 /// `RawFdDevice` backing both. `Interface::poll` takes the device by
 /// `&mut` on every call, so `Stack` holds all three together instead of
@@ -203,29 +431,291 @@ pub struct Stack {
     device: RawFdDevice,
     interface: Interface,
     sockets: SocketSet<'static>,
+    resolver: Arc<dyn Resolver>,
+    dns_socket_handle: SocketHandle,
+    /// Queries relayed to the resolver, awaiting an answer. Capped at
+    /// `MAX_PENDING_DNS_QUERIES` via `push_pending_dns_query`, oldest
+    /// entry evicted first, since these arrive directly from
+    /// guest-initiated queries with no other backpressure.
+    pending_dns_queries: VecDeque<PendingDnsQuery>,
+    dhcp_socket_handle: SocketHandle,
+    /// Addresses leased so far, keyed by the requesting client's MAC, so a
+    /// client that DISCOVERs again gets the same address back instead of
+    /// consuming another slot in the pool.
+    dhcp_leases: HashMap<EthernetAddress, Ipv4Addr>,
+    /// IP addresses this `Stack` has seen resolved, keyed by the address a
+    /// relayed DNS response answered with, mapped to the domain name that
+    /// was queried for it. Populated as responses are relayed to the guest
+    /// in `deliver_dns_answers`; see `resolved_domain_for`.
+    resolved: HashMap<IpAddr, String>,
+    /// Insertion order of `resolved`'s keys, oldest first, so the cap in
+    /// `record_resolved` can evict FIFO instead of tracking recency.
+    resolved_order: VecDeque<IpAddr>,
 }
 
 impl Stack {
-    pub fn new(fd: OwnedFd) -> Stack {
+    pub fn new(fd: OwnedFd, resolver: Box<dyn Resolver>) -> Stack {
         let mut device = RawFdDevice::new(fd);
         let config = Config::new(HardwareAddress::Ethernet(INTERFACE_HARDWARE_ADDR));
-        let interface = Interface::new(config, &mut device, Instant::now());
+        let mut interface = Interface::new(config, &mut device, Instant::now());
+        interface.update_ip_addrs(|ip_addrs| {
+            ip_addrs
+                .push(IpCidr::new(INTERFACE_ADDR, INTERFACE_PREFIX_LEN))
+                .expect("a freshly created interface has room for its one static address");
+        });
+
         // Vec-backed storage gives a SocketSet with no borrowed lifetime,
         // per smoltcp's own SocketSet doc comment.
-        let sockets = SocketSet::new(Vec::new());
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut dns_socket = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; DNS_SOCKET_BUFFER_PACKETS],
+                vec![0u8; DNS_SOCKET_BUFFER_BYTES],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; DNS_SOCKET_BUFFER_PACKETS],
+                vec![0u8; DNS_SOCKET_BUFFER_BYTES],
+            ),
+        );
+        dns_socket
+            .bind(DNS_SERVER_PORT)
+            .expect("binding a freshly created UDP socket cannot fail");
+        let dns_socket_handle = sockets.add(dns_socket);
+
+        let mut dhcp_socket = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; DHCP_SOCKET_BUFFER_PACKETS],
+                vec![0u8; DHCP_SOCKET_BUFFER_BYTES],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; DHCP_SOCKET_BUFFER_PACKETS],
+                vec![0u8; DHCP_SOCKET_BUFFER_BYTES],
+            ),
+        );
+        dhcp_socket
+            .bind(DHCP_SERVER_PORT)
+            .expect("binding a freshly created UDP socket cannot fail");
+        let dhcp_socket_handle = sockets.add(dhcp_socket);
+
         Stack {
             device,
             interface,
             sockets,
+            resolver: Arc::from(resolver),
+            dns_socket_handle,
+            pending_dns_queries: VecDeque::new(),
+            dhcp_socket_handle,
+            dhcp_leases: HashMap::new(),
+            resolved: HashMap::new(),
+            resolved_order: VecDeque::new(),
         }
+    }
+
+    /// Domain name a relayed DNS response most recently resolved `ip` to,
+    /// or `None` if this `Stack` has not recorded such a response.
+    pub fn resolved_domain_for(&self, ip: IpAddr) -> Option<&str> {
+        self.resolved.get(&ip).map(String::as_str)
+    }
+
+    /// Records that `domain` resolved to `ip` in a response just relayed to
+    /// the guest. Evicts the oldest entry first once `MAX_RESOLVED_ENTRIES`
+    /// is reached; re-recording an address already present updates its
+    /// domain in place without changing its eviction order.
+    fn record_resolved(&mut self, ip: IpAddr, domain: String) {
+        if !self.resolved.contains_key(&ip) {
+            if self.resolved_order.len() >= MAX_RESOLVED_ENTRIES
+                && let Some(oldest) = self.resolved_order.pop_front()
+            {
+                self.resolved.remove(&oldest);
+            }
+            self.resolved_order.push_back(ip);
+        }
+        self.resolved.insert(ip, domain);
+    }
+
+    /// Test-only entry point into the resolved-map eviction logic. Available
+    /// in all builds so integration-test harnesses in `tests/` can use it
+    /// without a `#[cfg(test)]` restriction; production callers reach
+    /// `record_resolved` only via a relayed DNS response.
+    pub fn record_resolved_for_test(&mut self, ip: IpAddr, domain: &str) {
+        self.record_resolved(ip, domain.to_string());
+    }
+
+    /// Queues `query` as awaiting a resolver answer. Evicts the oldest
+    /// outstanding query first once `MAX_PENDING_DNS_QUERIES` is reached;
+    /// see that constant for why eviction (rather than rejecting the new
+    /// query) is the right tradeoff here.
+    fn push_pending_dns_query(&mut self, query: PendingDnsQuery) {
+        if self.pending_dns_queries.len() >= MAX_PENDING_DNS_QUERIES {
+            self.pending_dns_queries.pop_front();
+        }
+        self.pending_dns_queries.push_back(query);
+    }
+
+    /// Test-only entry point into the pending-query-table eviction logic,
+    /// constructing a query whose answer never arrives (mirroring a guest
+    /// that floods queries and never gets a response) without driving a
+    /// real frame through the socketpair. The paired sender is leaked
+    /// rather than dropped, so the receiver never reports closed for the
+    /// duration of the test.
+    pub fn push_pending_dns_query_for_test(&mut self, transaction_id: u16, domain: &str) {
+        let (answer_tx, answer_rx) = oneshot::channel();
+        std::mem::forget(answer_tx);
+        self.push_pending_dns_query(PendingDnsQuery {
+            transaction_id,
+            question: Vec::new(),
+            domain: domain.to_string(),
+            remote: udp::UdpMetadata::from(IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Addr::UNSPECIFIED),
+                0,
+            )),
+            answer: answer_rx,
+        });
+    }
+
+    /// Number of DNS queries currently awaiting a resolver answer.
+    pub fn pending_dns_query_count_for_test(&self) -> usize {
+        self.pending_dns_queries.len()
     }
 
     /// Processes pending ingress on the device and flushes queued
     /// egress. Returns smoltcp's own `PollResult`: `SocketStateChanged`
     /// when a caller should recheck socket state, `None` otherwise.
     pub fn poll(&mut self) -> PollResult {
-        self.interface
-            .poll(Instant::now(), &mut self.device, &mut self.sockets)
+        let result = self
+            .interface
+            .poll(Instant::now(), &mut self.device, &mut self.sockets);
+        self.relay_dns_queries();
+        self.deliver_dns_answers();
+        self.serve_dhcp();
+        result
+    }
+
+    /// Returns the address leased to `mac`, assigning the next free
+    /// address from the pool on a client's first DISCOVER and returning
+    /// that same address on every later one instead of consuming another
+    /// slot.
+    fn lease_for(&mut self, mac: EthernetAddress) -> Ipv4Addr {
+        if let Some(addr) = self.dhcp_leases.get(&mac) {
+            return *addr;
+        }
+        let offset = (self.dhcp_leases.len() as u8) % DHCP_POOL_SIZE;
+        let [a, b, c, d] = DHCP_POOL_START.octets();
+        let addr = Ipv4Addr::new(a, b, c, d + offset);
+        self.dhcp_leases.insert(mac, addr);
+        addr
+    }
+
+    /// Drains every guest datagram waiting on the DHCP server socket,
+    /// answering each DISCOVER with an OFFER. smoltcp's `socket::dhcpv4`
+    /// is a DHCP client only, so this hand-rolls the server side on top of
+    /// a plain UDP socket bound to port 67.
+    fn serve_dhcp(&mut self) {
+        loop {
+            let payload = {
+                let socket = self.sockets.get_mut::<udp::Socket>(self.dhcp_socket_handle);
+                match socket.recv() {
+                    Ok((data, _meta)) => data.to_vec(),
+                    Err(_) => break,
+                }
+            };
+            let Ok(packet) = DhcpPacket::new_checked(payload.as_slice()) else {
+                tracing::warn!("dropping malformed guest DHCP datagram on UDP:67");
+                continue;
+            };
+            let Ok(discover) = DhcpRepr::parse(&packet) else {
+                tracing::warn!("dropping unparseable guest DHCP datagram on UDP:67");
+                continue;
+            };
+            if discover.message_type != DhcpMessageType::Discover {
+                // REQUEST/ACK handling is not implemented yet.
+                continue;
+            }
+            let offered_ip = self.lease_for(discover.client_hardware_address);
+            let offer = build_dhcp_offer(&discover, offered_ip);
+            // The client has no address yet, so the offer is broadcast
+            // back rather than sent to the (still unspecified) source
+            // address the DISCOVER arrived from.
+            let reply_to = udp::UdpMetadata::from(IpEndpoint::new(
+                IpAddress::Ipv4(Ipv4Addr::BROADCAST),
+                DHCP_CLIENT_PORT,
+            ));
+            let socket = self.sockets.get_mut::<udp::Socket>(self.dhcp_socket_handle);
+            if let Err(err) = socket.send_slice(&offer, reply_to) {
+                tracing::warn!(error = %err, "failed to queue guest DHCP offer");
+            }
+        }
+    }
+
+    /// Drains every guest datagram waiting on the DNS relay socket,
+    /// spawning a resolver call for each one it can parse as a query.
+    fn relay_dns_queries(&mut self) {
+        loop {
+            let (payload, remote) = {
+                let socket = self.sockets.get_mut::<udp::Socket>(self.dns_socket_handle);
+                match socket.recv() {
+                    Ok((data, meta)) => (data.to_vec(), meta),
+                    Err(_) => break,
+                }
+            };
+            let Some(ParsedDnsQuery {
+                transaction_id,
+                domain,
+                question,
+            }) = parse_dns_query(&payload)
+            else {
+                tracing::warn!("dropping malformed guest DNS query on UDP:53");
+                continue;
+            };
+            let (answer_tx, answer_rx) = oneshot::channel();
+            let resolver = Arc::clone(&self.resolver);
+            let domain_for_resolve = domain.clone();
+            tokio::task::spawn(async move {
+                let answers = resolver.resolve(&domain_for_resolve).await;
+                // Best-effort: a dropped receiver means this Stack (and
+                // its pending-query list) has already gone away.
+                let _ = answer_tx.send(answers);
+            });
+            self.push_pending_dns_query(PendingDnsQuery {
+                transaction_id,
+                question,
+                domain,
+                remote,
+                answer: answer_rx,
+            });
+        }
+    }
+
+    /// Checks every in-flight resolver call and queues a response for each
+    /// one that has answered, leaving the rest pending for a later tick.
+    fn deliver_dns_answers(&mut self) {
+        let mut still_pending = VecDeque::new();
+        for mut query in std::mem::take(&mut self.pending_dns_queries) {
+            match query.answer.try_recv() {
+                Ok(answers) => {
+                    let response =
+                        build_dns_response(query.transaction_id, &query.question, &answers);
+                    // Only IPv4 answers are ever sent to the guest (see
+                    // build_dns_response), so only those are recorded as
+                    // resolved; an IPv6 answer the guest never saw would be
+                    // a false entry in the map.
+                    for addr in answers.iter().filter(|addr| matches!(addr, IpAddr::V4(_))) {
+                        self.record_resolved(*addr, query.domain.clone());
+                    }
+                    let socket = self.sockets.get_mut::<udp::Socket>(self.dns_socket_handle);
+                    if let Err(err) = socket.send_slice(&response, query.remote) {
+                        tracing::warn!(error = %err, "failed to queue guest DNS response");
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => still_pending.push_back(query),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    tracing::warn!(
+                        "DNS resolver task ended without answering a guest query; dropping it"
+                    );
+                }
+            }
+        }
+        self.pending_dns_queries = still_pending;
     }
 }
 
@@ -322,7 +812,7 @@ pub async fn spawn_for_sandbox(
         // Stack (device + Interface + SocketSet) lives only inside this
         // task, so the host-side fd is never shared or locked from
         // outside it.
-        let mut stack = Stack::new(host_fd);
+        let mut stack = Stack::new(host_fd, Box::new(SystemResolver));
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
