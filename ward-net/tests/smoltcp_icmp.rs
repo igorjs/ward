@@ -8,7 +8,7 @@
 
 #![cfg(feature = "smoltcp")]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, Icmpv4Packet, Icmpv4Repr, IpProtocol, Ipv4Packet, Ipv4Repr,
 };
-use ward_net::smoltcp_backend::{Resolver, Stack};
+use ward_net::smoltcp_backend::{Connector, Resolver, Stack};
 
 /// MAC `Stack`'s interface already answers on (mirrors the private
 /// `INTERFACE_HARDWARE_ADDR` constant in `smoltcp_backend`), so a guest
@@ -47,6 +47,19 @@ struct NullResolver;
 impl Resolver for NullResolver {
     async fn resolve(&self, _name: &str) -> Vec<IpAddr> {
         Vec::new()
+    }
+}
+
+/// `Stack::new` requires a `Connector`, but this scenario never sends a TCP
+/// SYN, so this always fails rather than standing in for a real dialer.
+struct NullConnector;
+
+#[async_trait::async_trait]
+impl Connector for NullConnector {
+    async fn connect(&self, _addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+        Err(std::io::Error::other(
+            "NullConnector never dials out; this scenario never opens a TCP flow",
+        ))
     }
 }
 
@@ -243,7 +256,8 @@ async fn given_guest_icmp_echo_request_when_polled_then_echo_reply_returned_with
     // sufficient to satisfy Stack::new's constructor injection.
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let echo_request = build_icmp_echo_request_frame();

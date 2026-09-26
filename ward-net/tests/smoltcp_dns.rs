@@ -8,7 +8,7 @@
 
 #![cfg(feature = "smoltcp")]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use smoltcp::wire::{
     DnsRecord, DnsRecordData, DnsRepr, EthernetAddress, EthernetFrame, EthernetProtocol,
     EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, UdpPacket, UdpRepr,
 };
-use ward_net::smoltcp_backend::{Resolver, Stack};
+use ward_net::smoltcp_backend::{Connector, Resolver, Stack};
 
 /// MAC `Stack`'s interface already answers on (mirrors the private
 /// `INTERFACE_HARDWARE_ADDR` constant in `smoltcp_backend`), so a guest
@@ -63,6 +63,19 @@ impl Resolver for FakeResolver {
         } else {
             Vec::new()
         }
+    }
+}
+
+/// `Stack::new` requires a `Connector`, but this scenario never sends a TCP
+/// SYN, so this always fails rather than standing in for a real dialer.
+struct NullConnector;
+
+#[async_trait::async_trait]
+impl Connector for NullConnector {
+    async fn connect(&self, _addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+        Err(std::io::Error::other(
+            "NullConnector never dials out; this scenario never opens a TCP flow",
+        ))
     }
 }
 
@@ -310,7 +323,8 @@ async fn given_guest_dns_query_when_relayed_then_fake_resolver_answer_returned()
         domain: CANNED_DOMAIN,
         answer: CANNED_ANSWER,
     });
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let query = build_dns_query_frame(CANNED_DOMAIN);
@@ -342,7 +356,8 @@ async fn given_dns_response_when_relayed_then_resolved_map_records_ip_to_domain(
         domain: CANNED_DOMAIN,
         answer: CANNED_ANSWER,
     });
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let query = build_dns_query_frame(CANNED_DOMAIN);
@@ -371,7 +386,8 @@ async fn given_resolved_map_at_capacity_when_new_entry_then_oldest_evicted() {
         domain: CANNED_DOMAIN,
         answer: CANNED_ANSWER,
     });
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
 
     // Act: insert far more synthetic entries than the map's cap, each with
     // a distinct IP and domain so eviction order is unambiguous.
@@ -471,7 +487,8 @@ async fn given_spoofed_dns_response_wrong_transaction_id_when_relayed_then_resol
             ),
         ],
     });
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: fire both queries before either resolves, then drain both
@@ -523,7 +540,8 @@ async fn given_outstanding_query_table_at_capacity_when_new_query_then_oldest_ev
         domain: CANNED_DOMAIN,
         answer: CANNED_ANSWER,
     });
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
 
     // Act: push far more synthetic outstanding queries than the table's
     // expected cap, each for a distinct domain, none of which ever
