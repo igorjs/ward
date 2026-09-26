@@ -1,12 +1,8 @@
 # Ward Daemon: Specification
 
-This document is the table of contents for the Ward daemon's architecture
-decision records (ADRs). Each ADR captures a single design decision, its
-context, and its consequences.
+This document is the table of contents for the Ward daemon's architecture decision records (ADRs). Each ADR captures a single design decision, its context, and its consequences.
 
-The **canonical source code is the repository itself.** Don't read the ADRs
-expecting line-accurate code; read them to understand *why* the code is
-shaped the way it is.
+The **canonical source code is the repository itself.** Don't read the ADRs expecting line-accurate code; read them to understand *why* the code is shaped the way it is.
 
 ## Table of Contents
 
@@ -58,6 +54,4 @@ The Ward ecosystem spans more than this repo. References:
 
 ## Protobuf schema
 
-The wire protocol is defined in [`proto/ward.proto`](../proto/ward.proto)
-and released under CC0 1.0 (public domain). The `.proto` file is the
-single source of truth for the API. All SDKs are generated from it.
+The wire protocol is defined in [`proto/ward.proto`](../proto/ward.proto) and released under CC0 1.0 (public domain). The `.proto` file is the single source of truth for the API. All SDKs are generated from it.

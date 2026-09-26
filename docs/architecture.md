@@ -30,8 +30,7 @@
                               +------------------+
 ```
 
-Per-layer rationale lives in the ADRs under [`adr/`](adr/). [`SPEC.md`](SPEC.md)
-is the table of contents. Good starting points:
+Per-layer rationale lives in the ADRs under [`adr/`](adr/). [`SPEC.md`](SPEC.md) is the table of contents. Good starting points:
 
 - [ADR-001](adr/001-project-scope.md): what's in and out of scope
 - [ADR-003](adr/003-isolation-backend.md): libkrun + the `krunvm` flag

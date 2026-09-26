@@ -1,36 +1,21 @@
 # Session 2026-05-29: SLSA L3 rollout + 13-branch consolidation
 
-This document captures the state of `main` after the SLSA L3
-attestation work and the 13-branch consolidation campaign that ran on
-2026-05-29, plus what's still required before a real v0.1.0 release.
-Filed under `docs/sessions/` as a session log; future sessions can
-reference it by date.
+This document captures the state of `main` after the SLSA L3 attestation work and the 13-branch consolidation campaign that ran on 2026-05-29, plus what's still required before a real v0.1.0 release. Filed under `docs/sessions/` as a session log; future sessions can reference it by date.
 
 ## Current state of `main`
 
-All work that existed as local-only branches at the start of the
-session is now on `origin/main`. The 13 PRs landed in this session
-(#66-#78), plus the SLSA L3 saga (#59-#65), brings ward to:
+All work that existed as local-only branches at the start of the session is now on `origin/main`. The 13 PRs landed in this session (#66-#78), plus the SLSA L3 saga (#59-#65), brings ward to:
 
 ### Supply-chain posture (complete)
 
-- Release pipeline produces SLSA Build L3 attestation via the
-  `slsa-framework/slsa-github-generator/.../generator_generic_slsa3.yml@v2.1.0`
-  reusable workflow.
-- `install.sh` verifies via `slsa-verifier verify-artifact ...` (the
-  canonical SLSA-framework tool, not `gh attestation verify` which
-  queries GitHub's separate first-party Attestations API).
-- README shows SLSA Level 3 badge alongside CI, cargo-audit, OpenSSF
-  Scorecard, License, Rust, Status.
-- `workflow-hygiene.sh` SHA-pin rule has a documented exemption for
-  `slsa-framework/slsa-github-generator` (the generator rejects SHA
-  pins at runtime; the exemption matches the existing
-  `dtolnay/rust-toolchain` pattern).
+- Release pipeline produces SLSA Build L3 attestation via the `slsa-framework/slsa-github-generator/.../generator_generic_slsa3.yml@v2.1.0` reusable workflow.
+- `install.sh` verifies via `slsa-verifier verify-artifact ...` (the canonical SLSA-framework tool, not `gh attestation verify` which queries GitHub's separate first-party Attestations API).
+- README shows SLSA Level 3 badge alongside CI, cargo-audit, OpenSSF Scorecard, License, Rust, Status.
+- `workflow-hygiene.sh` SHA-pin rule has a documented exemption for `slsa-framework/slsa-github-generator` (the generator rejects SHA pins at runtime; the exemption matches the existing `dtolnay/rust-toolchain` pattern).
 
 ### Security hardening (complete)
 
-All 22 SEC-* findings from the May 2026 audit have remediation on
-`main`:
+All 22 SEC-* findings from the May 2026 audit have remediation on `main`:
 
 - SEC-002/003/004: umask + secure dir creation (PR #38)
 - SEC-005: server-side egress resolve + private-range deny (PR #38)
@@ -49,15 +34,12 @@ All 22 SEC-* findings from the May 2026 audit have remediation on
 ### Observability (complete)
 
 - Opt-in Prometheus metrics via `WARD_METRICS_ADDR` (PR #77)
-- Sandbox lifecycle metrics + broker pub/sub counters + egress
-  decision counters
-- Timeout-driven cleanup routes through the same path as user-initiated
-  remove (no gauge leak)
+- Sandbox lifecycle metrics + broker pub/sub counters + egress decision counters
+- Timeout-driven cleanup routes through the same path as user-initiated remove (no gauge leak)
 
 ### Documentation (complete for current surface)
 
-- 3 deferred ADRs (013 multi-tenant authn/authz, 014 WASM backend,
-  015 live migration) in `docs/adr/` (PR #70)
+- 3 deferred ADRs (013 multi-tenant authn/authz, 014 WASM backend, 015 live migration) in `docs/adr/` (PR #70)
 - AI-agent sandbox example with reusable shell wrapper (PR #71)
 - README posture badges + CONTRIBUTING supply-chain section (PR #74)
 
@@ -66,18 +48,13 @@ All 22 SEC-* findings from the May 2026 audit have remediation on
 - Python (`sdks/python/`): pyproject + WardClient + 8 smoke tests (PR #72)
 - TypeScript (`sdks/typescript/`): package.json + Promise-based client (PR #73)
 - Go (`sdks/go/`): module + option-pattern client (PR #73)
-- Rust (`sdks/rust/ward-client/`): in-workspace crate with NO path-dep
-  on AGPL `ward-core` (proto types come from a future ward-proto
-  crate or local codegen) (PR #73)
+- Rust (`sdks/rust/ward-client/`): in-workspace crate with NO path-dep on AGPL `ward-core` (proto types come from a future ward-proto crate or local codegen) (PR #73)
 
-All four are NotImplementedError-bodied; the gRPC wire-up is gated on
-the agent + real exec path landing.
+All four are NotImplementedError-bodied; the gRPC wire-up is gated on the agent + real exec path landing.
 
 ## What still blocks v0.1.0
 
-A v0.1.0 release would be misleading without the lead feature
-("run untrusted code in hardware-isolated microVMs") actually working
-under `--features krunvm`. Today that path stubs the exec channel.
+A v0.1.0 release would be misleading without the lead feature ("run untrusted code in hardware-isolated microVMs") actually working under `--features krunvm`. Today that path stubs the exec channel.
 
 ### Critical (lead feature)
 
@@ -90,8 +67,7 @@ under `--features krunvm`. Today that path stubs the exec channel.
 | #13 | feat(backend): real stream_output via vsock pipe |
 | #14 | feat(backend): real write_stdin via vsock pipe |
 
-Without #9 + #10 specifically, `ward exec` is decorative under
-`--features krunvm`. #12-#14 follow naturally from #10.
+Without #9 + #10 specifically, `ward exec` is decorative under `--features krunvm`. #12-#14 follow naturally from #10.
 
 ### Important (release ergonomics)
 
@@ -126,41 +102,19 @@ Without #9 + #10 specifically, `ward exec` is decorative under
 
 ## Recommended sequencing
 
-1. **`v0.0.1-alpha.1` prerelease NOW** (cheap, validates production
-   path): `gh release create v0.0.1-alpha.1 --prerelease --target main
-   --generate-notes`. Triggers release.yml, builds three target
-   tarballs with libkrun bundled, attaches SLSA L3 attestation,
-   validates `install.sh` end-to-end against real users. Doesn't
-   become "Latest" because of `--prerelease`. Distinguishes clearly
-   that this is not v0.1.0.
-2. **#9 (agent) + #10 (real exec via vsock)** as the first real
-   feature work. Estimated 1-2 weeks; this is the boundary between
-   "demo" and "real".
+1. **`v0.0.1-alpha.1` prerelease NOW** (cheap, validates production path): `gh release create v0.0.1-alpha.1 --prerelease --target main --generate-notes`. Triggers release.yml, builds three target tarballs with libkrun bundled, attaches SLSA L3 attestation, validates `install.sh` end-to-end against real users. Doesn't become "Latest" because of `--prerelease`. Distinguishes clearly that this is not v0.1.0.
+2. **#9 (agent) + #10 (real exec via vsock)** as the first real feature work. Estimated 1-2 weeks; this is the boundary between "demo" and "real".
 3. **#12, #13, #14 (kill/stream/stdin)** follow naturally from #10.
-4. **#7 (real OCI image pull)** could land in parallel with the
-   agent work since it touches a different module.
-5. **#24 (CI lint with --features krunvm on Linux)** lands when #9-#14
-   land; CI then exercises the real backend path on every PR.
-6. **`v0.1.0` proper**, after #7 + #9 + #10 + #12 + #13 + #14 + #24
-   are all on `main`. Drop the "Status: pre-release" badge from
-   README at the same time.
-7. Distribution (#21 Homebrew, #22 .deb, #23 systemd/launchd) can
-   land between v0.1.0 and v0.2.0.
+4. **#7 (real OCI image pull)** could land in parallel with the agent work since it touches a different module.
+5. **#24 (CI lint with --features krunvm on Linux)** lands when #9-#14 land; CI then exercises the real backend path on every PR.
+6. **`v0.1.0` proper**, after #7 + #9 + #10 + #12 + #13 + #14 + #24 are all on `main`. Drop the "Status: pre-release" badge from README at the same time.
+7. Distribution (#21 Homebrew, #22 .deb, #23 systemd/launchd) can land between v0.1.0 and v0.2.0.
 
 ## Known caveats / loose ends
 
-- `e2e_volume` fails on macOS local test runs because `mkfs.ext4`
-  isn't available. Pre-existing, unrelated to recent work. Either
-  gate the test on `#[cfg(target_os = "linux")]` or ship a stub
-  formatter for macOS.
-- Dependabot PR open (`dependabot/go_modules/sdks/go/google.golang.org/grpc-1.79.3`)
-  bumping go.mod grpc dep. Routine.
-- One commit (`fix(release): add libprotobuf-dev for well-known proto
-  includes on Linux`) was accidentally direct-pushed to `main` during
-  the SLSA L3 saga because `git checkout -b X origin/main` made the
-  local branch track `origin/main`. The change is signed + correct +
-  what we'd have merged via PR. Process fix: use `git switch -c X`
-  for new branches (no tracking inherited from base).
+- `e2e_volume` fails on macOS local test runs because `mkfs.ext4` isn't available. Pre-existing, unrelated to recent work. Either gate the test on `#[cfg(target_os = "linux")]` or ship a stub formatter for macOS.
+- Dependabot PR open (`dependabot/go_modules/sdks/go/google.golang.org/grpc-1.79.3`) bumping go.mod grpc dep. Routine.
+- One commit (`fix(release): add libprotobuf-dev for well-known proto includes on Linux`) was accidentally direct-pushed to `main` during the SLSA L3 saga because `git checkout -b X origin/main` made the local branch track `origin/main`. The change is signed + correct + what we'd have merged via PR. Process fix: use `git switch -c X` for new branches (no tracking inherited from base).
 
 ## Verification commands
 
@@ -183,16 +137,5 @@ If `slsa-verifier` isn't on PATH: `brew install slsa-verifier`.
 
 ## Open questions
 
-- Should `repo-config`'s `repo-ward.tf` add the SLSA generator's
-  status check (e.g. `slsa_provenance / final`) to
-  `required_status_check_contexts`? Answer: no, because release.yml
-  only runs on tag-push events, never on PRs; adding it as a
-  required PR check would block every PR forever. The L3 gate is
-  already enforced in-workflow: `publish` needs `slsa_provenance`,
-  so a failed attestation skips the release entirely. The branch
-  protection ruleset doesn't need a separate signal.
-- Should `install.sh` fall back to anything when `slsa-verifier` is
-  missing? Current behaviour: WARN + continue with SHA-256-only.
-  Alternative: hard-require the verifier (refuse to install).
-  Current default is more user-friendly and consistent with the
-  prior `gh CLI` fallback shape.
+- Should `repo-config`'s `repo-ward.tf` add the SLSA generator's status check (e.g. `slsa_provenance / final`) to `required_status_check_contexts`? Answer: no, because release.yml only runs on tag-push events, never on PRs; adding it as a required PR check would block every PR forever. The L3 gate is already enforced in-workflow: `publish` needs `slsa_provenance`, so a failed attestation skips the release entirely. The branch protection ruleset doesn't need a separate signal.
+- Should `install.sh` fall back to anything when `slsa-verifier` is missing? Current behaviour: WARN + continue with SHA-256-only. Alternative: hard-require the verifier (refuse to install). Current default is more user-friendly and consistent with the prior `gh CLI` fallback shape.
