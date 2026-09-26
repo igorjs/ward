@@ -190,8 +190,7 @@ ADR is silent on MCP — it's a separate ADR (017) and a separate crate (`ward-m
 
 ## Implementation order
 
-Revised after surfacing the license constraint and the CLI/stateful-sandbox
-mismatch above:
+Revised after surfacing the license constraint and the CLI/stateful-sandbox mismatch above:
 
 1. ✅ **`ward-runtime` crate** — extracted from daemon `main.rs` init; daemon now consumes it.
 2. **Complete Rust SDK gRPC client** — wire up the `unimplemented!` methods in `sdks/rust/ward-client` against the daemon's socket. This is the immediate value-add and ships at v0.1.

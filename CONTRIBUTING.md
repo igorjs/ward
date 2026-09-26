@@ -44,11 +44,7 @@ The CLA bot will record your signature automatically. You only need to do this o
 
 ## Architecture
 
-Before making non-trivial changes, skim the ADRs under
-[`docs/adr/`](docs/adr/). [`docs/SPEC.md`](docs/SPEC.md) is the table of
-contents. Each ADR is short (~50–100 lines) and explains *why* a piece
-of the system is shaped the way it is. Particularly useful starting
-points:
+Before making non-trivial changes, skim the ADRs under [`docs/adr/`](docs/adr/). [`docs/SPEC.md`](docs/SPEC.md) is the table of contents. Each ADR is short (~50–100 lines) and explains *why* a piece of the system is shaped the way it is. Particularly useful starting points:
 
 - [ADR-001](docs/adr/001-project-scope.md) — what's in/out of scope
 - [ADR-003](docs/adr/003-isolation-backend.md) — libkrun and the `krunvm` feature flag
@@ -61,13 +57,11 @@ points:
 ### Prerequisites
 
 - **Rust** (latest stable, install via [rustup](https://rustup.rs/))
-- **macOS arm64** or **Linux** (x86_64 / arm64). Intel Macs aren't currently
-  supported because libkrun's hypervisor backend uses Apple Silicon's HVF.
+- **macOS arm64** or **Linux** (x86_64 / arm64). Intel Macs aren't currently supported because libkrun's hypervisor backend uses Apple Silicon's HVF.
 
 ### Setup
 
-The default build works with no extra setup — the backend ships a
-stub mode that exercises the full code path without a real microVM:
+The default build works with no extra setup — the backend ships a stub mode that exercises the full code path without a real microVM:
 
 ```bash
 git clone https://github.com/igorjs/ward.git
@@ -78,12 +72,7 @@ cargo test
 
 ### Setup with real microVMs (libkrun)
 
-If you want `wardd` to boot actual microVMs (i.e. build with
-`--features krunvm`), you need libkrun and libkrunfw on the system.
-The release artefacts we publish to end users bundle these dylibs
-inside the binary's rpath — bottle production lives in the separate
-[`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) repo —
-but developer builds rely on the system package manager:
+If you want `wardd` to boot actual microVMs (i.e. build with `--features krunvm`), you need libkrun and libkrunfw on the system. The release artefacts we publish to end users bundle these dylibs inside the binary's rpath — bottle production lives in the separate [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) repo — but developer builds rely on the system package manager:
 
 **macOS Apple Silicon**
 
@@ -102,21 +91,11 @@ sudo apt-get install -y libkrun-dev libkrunfw-dev
 cargo build --features krunvm
 ```
 
-Why this isn't bundled at `cargo build` time: the "users install
-nothing but ward" promise is satisfied by *end-user release artefacts*
-(`.pkg`, `.deb`, install.sh) that bundle the dylibs, not by per-build
-downloads. Bottles are produced by [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds)
-and consumed by `release.yml` in this repo. FFI declarations live in
-`ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys`
-crate, no bindgen, no libclang build-dep).
+Why this isn't bundled at `cargo build` time: the "users install nothing but ward" promise is satisfied by *end-user release artefacts* (`.pkg`, `.deb`, install.sh) that bundle the dylibs, not by per-build downloads. Bottles are produced by [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) and consumed by `release.yml` in this repo. FFI declarations live in `ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys` crate, no bindgen, no libclang build-dep).
 
 ### Bumping libkrun
 
-Ward pins a specific libkrun version in `vendor/libkrun-version.txt`
-and declares the C ABI by hand in `ward-core/src/backend/krun_ffi.rs`.
-When upstream releases a new version that ward should adopt, follow
-this procedure end-to-end. The same convention lives in
-[ADR-003 Update section](docs/adr/003-isolation-backend.md#update--2026-05-18).
+Ward pins a specific libkrun version in `vendor/libkrun-version.txt` and declares the C ABI by hand in `ward-core/src/backend/krun_ffi.rs`. When upstream releases a new version that ward should adopt, follow this procedure end-to-end. The same convention lives in [ADR-003 Update section](docs/adr/003-isolation-backend.md#update--2026-05-18).
 
 **1. Diff the header.** Run the helper script with the target version:
 
@@ -125,45 +104,19 @@ scripts/diff-libkrun.sh <new-version>
 # e.g. scripts/diff-libkrun.sh 1.19.0
 ```
 
-It fetches `include/libkrun.h` for the currently-pinned version (from
-`vendor/libkrun-version.txt`) and the new version, and prints a unified
-diff. To list only added function declarations:
+It fetches `include/libkrun.h` for the currently-pinned version (from `vendor/libkrun-version.txt`) and the new version, and prints a unified diff. To list only added function declarations:
 
 ```bash
 scripts/diff-libkrun.sh 1.19.0 | grep -E '^\+(int32_t|uint32_t|void) krun_'
 ```
 
-**2. Translate new signatures.** For each added declaration in the
-diff, add a matching `unsafe extern "C"` line in
-`ward-core/src/backend/krun_ffi.rs`. Group by the existing section
-comments (Context lifecycle, VM config, Networking, GPU/display,
-Audio, Resource limits, Exec config, Firmware/kernel, TEE, vsock,
-Console/serial, Virt features, Logging, Shutdown signalling, Boot).
-Use the smallest correct Rust types: `int32_t` -> `i32`, `uint8_t` ->
-`u8`, `const char *` -> `*const c_char`, NUL-terminated `char **` ->
-`*const *const c_char`. Watch for `uint8_t` masquerading as a count
-field (silent truncation if Rust callers pass a larger type; surface
-as an error per the `krun_set_vm_config` precedent).
+**2. Translate new signatures.** For each added declaration in the diff, add a matching `unsafe extern "C"` line in `ward-core/src/backend/krun_ffi.rs`. Group by the existing section comments (Context lifecycle, VM config, Networking, GPU/display, Audio, Resource limits, Exec config, Firmware/kernel, TEE, vsock, Console/serial, Virt features, Logging, Shutdown signalling, Boot). Use the smallest correct Rust types: `int32_t` -> `i32`, `uint8_t` -> `u8`, `const char *` -> `*const c_char`, NUL-terminated `char **` -> `*const *const c_char`. Watch for `uint8_t` masquerading as a count field (silent truncation if Rust callers pass a larger type; surface as an error per the `krun_set_vm_config` precedent).
 
-**3. Remove deletions.** If any function disappeared upstream, remove
-its declaration here. Check libkrun's `ABI_VERSION` constant in
-upstream `Makefile` is unchanged across the bump; if it incremented,
-the SO version changed and we need a coordinated release rather than a
-drop-in bump.
+**3. Remove deletions.** If any function disappeared upstream, remove its declaration here. Check libkrun's `ABI_VERSION` constant in upstream `Makefile` is unchanged across the bump; if it incremented, the SO version changed and we need a coordinated release rather than a drop-in bump.
 
-**4. Bump the pin and trigger a rebuild.** Edit
-`vendor/libkrun-version.txt` to the new version. If libkrunfw is also
-bumping, edit `vendor/libkrun-checksums.txt` (the comment block
-documents the format) and the matching files at
-[`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds):
-`version.txt` and `libkrunfw-version.txt`. Trigger the `build`
-workflow at libkrun-builds manually via `workflow_dispatch`.
+**4. Bump the pin and trigger a rebuild.** Edit `vendor/libkrun-version.txt` to the new version. If libkrunfw is also bumping, edit `vendor/libkrun-checksums.txt` (the comment block documents the format) and the matching files at [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds): `version.txt` and `libkrunfw-version.txt`. Trigger the `build` workflow at libkrun-builds manually via `workflow_dispatch`.
 
-**5. Update local checksums.** Once the libkrun-builds build publishes,
-copy each per-target SHA-256 from the release into
-`vendor/libkrun-checksums.txt`. The release packaging workflow
-refuses to use any downloaded bottle whose hash isn't listed there,
-so this is the supply-chain pin.
+**5. Update local checksums.** Once the libkrun-builds build publishes, copy each per-target SHA-256 from the release into `vendor/libkrun-checksums.txt`. The release packaging workflow refuses to use any downloaded bottle whose hash isn't listed there, so this is the supply-chain pin.
 
 **6. Verify locally.** Run both build modes:
 
@@ -173,9 +126,7 @@ cargo check --features krunvm        # FFI path, requires libkrun installed
 cargo test --workspace
 ```
 
-**7. Commit as one PR.** Title: `chore(libkrun): bump to v<NEW>`.
-Include the diff summary in the PR body so reviewers can see what
-changed in the surface without re-running the script.
+**7. Commit as one PR.** Title: `chore(libkrun): bump to v<NEW>`. Include the diff summary in the PR body so reviewers can see what changed in the surface without re-running the script.
 
 ### Workflow
 
@@ -205,37 +156,22 @@ docs: update installation guide
 test: add egress proxy integration tests
 ```
 
-**Signed commits are required.** The `main` branch ruleset enforces
-`required_signatures`, so every commit must carry a valid GPG or SSH
-signature:
+**Signed commits are required.** The `main` branch ruleset enforces `required_signatures`, so every commit must carry a valid GPG or SSH signature:
 
 ```bash
 git commit --signoff --gpg-sign
 ```
 
-If your local identity isn't set up for signing, see
-[git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work](https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work).
+If your local identity isn't set up for signing, see [git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work](https://git-scm.com/book/en/v2/Git-Tools-Signing-Your-Work).
 
 ## Supply-chain posture
 
-Ward maintains a tight CI security baseline; PRs that touch
-`.github/workflows/**` are checked automatically by the
-`workflow-hygiene` job:
+Ward maintains a tight CI security baseline; PRs that touch `.github/workflows/**` are checked automatically by the `workflow-hygiene` job:
 
-- Every third-party GitHub Action is pinned to a commit SHA (mutable
-  `@v<N>` tags rejected). Dependabot keeps the SHAs fresh; the
-  `# v<N>` trailing comment lets diffs stay human-readable.
-- Every workflow job runs under `step-security/harden-runner` with
-  an egress allowlist. Build workflows (`ci.yml`, `release.yml`)
-  enforce in `block` mode; API-only workflows allow `api.github.com`
-  only.
-- Release artefacts carry [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance)
-  via `actions/attest-build-provenance`. End users (and `install.sh`)
-  verify with `gh attestation verify`.
-- Branch ruleset for `main` is managed as code in
-  [`igorjs/repo-config`](https://github.com/igorjs/repo-config) (see
-  `repo-ward.tf`). Policy changes go through a PR there, not the
-  GitHub UI.
+- Every third-party GitHub Action is pinned to a commit SHA (mutable `@v<N>` tags rejected). Dependabot keeps the SHAs fresh; the `# v<N>` trailing comment lets diffs stay human-readable.
+- Every workflow job runs under `step-security/harden-runner` with an egress allowlist. Build workflows (`ci.yml`, `release.yml`) enforce in `block` mode; API-only workflows allow `api.github.com` only.
+- Release artefacts carry [SLSA build provenance](https://slsa.dev/spec/v1.0/provenance) via `actions/attest-build-provenance`. End users (and `install.sh`) verify with `gh attestation verify`.
+- Branch ruleset for `main` is managed as code in [`igorjs/repo-config`](https://github.com/igorjs/repo-config) (see `repo-ward.tf`). Policy changes go through a PR there, not the GitHub UI.
 
 The full posture matrix is in [SECURITY.md](SECURITY.md).
 
@@ -250,9 +186,7 @@ The full posture matrix is in [SECURITY.md](SECURITY.md).
 
 ## Releasing
 
-ward releases are cut by pushing a semver-tagged commit. CI produces
-pre-built archives for every supported target and publishes them to a
-GitHub Release; `install.sh` then resolves and downloads from that release.
+ward releases are cut by pushing a semver-tagged commit. CI produces pre-built archives for every supported target and publishes them to a GitHub Release; `install.sh` then resolves and downloads from that release.
 
 ### Cutting a release
 
@@ -267,35 +201,20 @@ git push origin v0.2.0
 
 ### What the release workflow produces
 
-For every target in `{aarch64-apple-darwin, x86_64-unknown-linux-gnu,
-aarch64-unknown-linux-gnu}`:
+For every target in `{aarch64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu}`:
 
-- `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`,
-  `bin/ward-mcp`, `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and
-  `lib/libkrunfw.<ext>` if the build is configured to bundle them
-  (see below).
-- `ward-<version>-<target>.tar.gz.sha256` — checksum for `install.sh`
-  verification.
+- `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`, `bin/ward-mcp`, `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and `lib/libkrunfw.<ext>` if the build is configured to bundle them (see below).
+- `ward-<version>-<target>.tar.gz.sha256` — checksum for `install.sh` verification.
 
 ### macOS codesign
 
-The `aarch64-apple-darwin` build path ad-hoc signs `wardd` and
-`ward-mcp` with `entitlements.plist` (at workspace root) before
-staging. The entitlement is `com.apple.security.hypervisor` — required
-by libkrun's Hypervisor framework calls. Without it, `krun_start_enter`
-returns `HV_ERROR_BAD_ARGUMENT` on Apple Silicon.
+The `aarch64-apple-darwin` build path ad-hoc signs `wardd` and `ward-mcp` with `entitlements.plist` (at workspace root) before staging. The entitlement is `com.apple.security.hypervisor` — required by libkrun's Hypervisor framework calls. Without it, `krun_start_enter` returns `HV_ERROR_BAD_ARGUMENT` on Apple Silicon.
 
-`ward` (the CLI) is not signed because it never touches libkrun
-directly — it's a thin gRPC client.
+`ward` (the CLI) is not signed because it never touches libkrun directly — it's a thin gRPC client.
 
-Ad-hoc signing satisfies the entitlement requirement locally but does
-*not* pass Gatekeeper for distribution. End users may need
-`xattr -d com.apple.quarantine ~/.ward/bin/wardd` on first run.
-Tier-2 work (Developer ID + notarization) is tracked by
-[#30](https://github.com/igorjs/ward/issues/30).
+Ad-hoc signing satisfies the entitlement requirement locally but does *not* pass Gatekeeper for distribution. End users may need `xattr -d com.apple.quarantine ~/.ward/bin/wardd` on first run. Tier-2 work (Developer ID + notarization) is tracked by [#30](https://github.com/igorjs/ward/issues/30).
 
-For local builds from source (skipping the release pipeline), sign
-manually:
+For local builds from source (skipping the release pipeline), sign manually:
 
 ```sh
 codesign --sign - \
@@ -309,17 +228,8 @@ codesign --sign - \
 
 The release workflow has two modes:
 
-- **Stub mode** (default for tag pushes): builds without the `krunvm`
-  feature. Binaries ship without microVM support — useful for the very
-  first release and for demoing the CLI surface without provisioning
-  hypervisor entitlements.
-- **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`):
-  builds with `--features ward-core/krunvm` and copies the matching
-  `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/libkrun-builds`
-  GitHub Release into the archive next to the binaries. Requires the
-  `build` workflow at `libkrun-builds` to have run for the pinned version
-  AND the resulting SHA-256s to be committed here in
-  `vendor/libkrun-checksums.txt`.
+- **Stub mode** (default for tag pushes): builds without the `krunvm` feature. Binaries ship without microVM support — useful for the very first release and for demoing the CLI surface without provisioning hypervisor entitlements.
+- **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`): builds with `--features ward-core/krunvm` and copies the matching `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/libkrun-builds` GitHub Release into the archive next to the binaries. Requires the `build` workflow at `libkrun-builds` to have run for the pinned version AND the resulting SHA-256s to be committed here in `vendor/libkrun-checksums.txt`.
 
 ### One-line install for users
 
@@ -327,9 +237,7 @@ The release workflow has two modes:
 curl -fsSL https://raw.githubusercontent.com/igorjs/ward/main/install.sh | bash
 ```
 
-The script auto-detects target, downloads the latest tarball, verifies
-its SHA-256 against the published `.sha256` file, and installs binaries
-to `$HOME/.ward/bin/` (overridable via `WARD_INSTALL_DIR`).
+The script auto-detects target, downloads the latest tarball, verifies its SHA-256 against the published `.sha256` file, and installs binaries to `$HOME/.ward/bin/` (overridable via `WARD_INSTALL_DIR`).
 
 ## Reporting Bugs
 
