@@ -14,8 +14,16 @@ name: osv-scan
 
 on:
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
   push:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "LICENSE"
   schedule:
     - cron: "0 4 * * 1"  # weekly Monday 04:00 UTC
   workflow_dispatch:
