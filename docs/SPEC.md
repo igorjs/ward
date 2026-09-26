@@ -20,6 +20,13 @@ The **canonical source code is the repository itself.** Don't read the ADRs expe
 - [ADR-010: Shared Volumes](adr/010-shared-volumes.md)
 - [ADR-011: Cross-Sandbox Communication (pub/sub broker)](adr/011-cross-sandbox-comms.md)
 - [ADR-012: Backend Trait Abstraction](adr/012-backend-trait.md)
+- [ADR-013: Multi-Tenant Authentication and Authorisation](adr/013-multi-tenant-auth.md)
+- [ADR-014: WASM Backend Alongside libkrun](adr/014-wasm-backend.md)
+- [ADR-015: Live Migration and Sandbox Hot-Swap](adr/015-live-migration.md)
+- [ADR-016: Embedded-Mode microVMs (Daemonless + Rootless + Userspace Networking)](adr/016-embedded-mode-microvms.md)
+- [ADR-017: License Posture for Embedded SDK Distribution](adr/017-license-posture.md)
+- [ADR-018: Rootless Networking Architecture](adr/018-rootless-networking.md)
+- [ADR-019: In-Process smoltcp Networking as Default](adr/019-inprocess-smoltcp-networking.md)
 
 ### How to read
 

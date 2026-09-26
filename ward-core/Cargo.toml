@@ -96,3 +96,9 @@ tempfile = "3"
 # not enumerate. Targeted at validators and other pure-function boundaries.
 proptest = "1"
 
+# metrics-util: already pulled transitively via metrics-exporter-prometheus
+# (see ward-daemon). Promoted to a direct dev-dependency here for
+# DebuggingRecorder, which lets tests snapshot counter values instead of
+# asserting on side effects the recorder facade doesn't otherwise expose.
+metrics-util = "0.20"
+
