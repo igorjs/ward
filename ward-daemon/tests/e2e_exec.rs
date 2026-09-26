@@ -8,8 +8,8 @@
 //!
 //!   - exec with valid args returns a pid the user can pass to `logs`
 //!   - exec with invalid args returns a clear validation error
-//!   - run for a supported language returns a pid
-//!   - run for cobol (unsupported) returns a clear error
+//!   - run is an intentional stub (issue #9): every call fails with the
+//!     stub's not-yet-implemented error, regardless of language or sandbox
 //!   - logs after exec emits a stdout line and an exit marker
 //!   - logs with an invalid pid surfaces the validation error
 
@@ -80,7 +80,7 @@ fn given_unknown_sandbox_when_user_runs_exec_then_fails_with_not_found() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_existing_sandbox_when_user_runs_python_snippet_then_returns_pid() {
+fn given_existing_sandbox_when_user_runs_python_snippet_then_fails_with_stub_error() {
     // Arrange
     let daemon = common::Daemon::spawn();
     let create_out = daemon
@@ -96,15 +96,15 @@ fn given_existing_sandbox_when_user_runs_python_snippet_then_returns_pid() {
         .args(["run", &id, "--language", "python", "--code", "print('hi')"])
         .assert();
 
-    // Assert
+    // Assert: Run is an intentional stub (issue #9); even a valid request
+    // for a supported language fails with the not-yet-implemented error.
     assertion
-        .success()
-        .stdout(predicate::str::contains("pid:"))
-        .stdout(predicate::str::contains("status: running"));
+        .failure()
+        .stderr(predicate::str::contains("not yet implemented"));
 }
 
 #[test]
-fn given_unsupported_language_when_user_runs_then_fails_with_clear_error() {
+fn given_unsupported_language_when_user_runs_then_fails_with_stub_error() {
     // Arrange
     let daemon = common::Daemon::spawn();
     let create_out = daemon
@@ -114,20 +114,22 @@ fn given_unsupported_language_when_user_runs_then_fails_with_clear_error() {
         .expect("create");
     let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
 
-    // Act: "cobol" is not in the runtime table.
+    // Act: "cobol" is not in the runtime table, but the stub (issue #9)
+    // rejects the call before that table is ever consulted.
     let mut cmd = daemon.cli();
     let assertion = cmd
         .args(["run", &id, "--language", "cobol", "--code", "DISPLAY 'hi'"])
         .assert();
 
-    // Assert: non-zero exit and stderr mentions the offending language.
+    // Assert: non-zero exit with the generic stub error, not a
+    // language-specific one.
     assertion
         .failure()
-        .stderr(predicate::str::contains("cobol"));
+        .stderr(predicate::str::contains("not yet implemented"));
 }
 
 #[test]
-fn given_invalid_language_name_when_user_runs_then_fails() {
+fn given_invalid_language_name_when_user_runs_then_fails_with_stub_error() {
     // Arrange
     let daemon = common::Daemon::spawn();
     let create_out = daemon
@@ -137,7 +139,8 @@ fn given_invalid_language_name_when_user_runs_then_fails() {
         .expect("create");
     let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
 
-    // Act: dashes in language names fail the validator regex.
+    // Act: a dash in the language name would fail the validator regex,
+    // but the stub (issue #9) rejects the call before validation runs.
     let mut cmd = daemon.cli();
     let assertion = cmd
         .args(["run", &id, "--language", "py-thon", "--code", "print(1)"])
@@ -146,7 +149,7 @@ fn given_invalid_language_name_when_user_runs_then_fails() {
     // Assert
     assertion
         .failure()
-        .stderr(predicate::str::contains("language"));
+        .stderr(predicate::str::contains("not yet implemented"));
 }
 
 // ---------------------------------------------------------------------------

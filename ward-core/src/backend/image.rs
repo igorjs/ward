@@ -174,8 +174,7 @@ impl ImagePuller for OciPuller {
             let dest = dest.to_path_buf();
             tokio::task::spawn_blocking(move || unpack_layer(&data, &media_type, &dest))
                 .await
-                .map_err(|e| BackendError::Internal(format!("unpack thread panicked: {e}")))?
-                ?;
+                .map_err(|e| BackendError::Internal(format!("unpack thread panicked: {e}")))??;
         }
 
         let _ = layer_count; // available for future meta.json enrichment
@@ -250,7 +249,11 @@ struct BoundedReader<R> {
 
 impl<R: Read> BoundedReader<R> {
     fn new(inner: R, limit: u64) -> Self {
-        Self { inner, limit, total: 0 }
+        Self {
+            inner,
+            limit,
+            total: 0,
+        }
     }
 }
 
@@ -278,7 +281,10 @@ fn unpack_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<()> {
             MAX_DECOMPRESSED_LAYER_BYTES,
         ))
     } else {
-        Box::new(BoundedReader::new(Cursor::new(data), MAX_DECOMPRESSED_LAYER_BYTES))
+        Box::new(BoundedReader::new(
+            Cursor::new(data),
+            MAX_DECOMPRESSED_LAYER_BYTES,
+        ))
     };
 
     let mut archive = tar::Archive::new(reader);
@@ -956,7 +962,10 @@ mod tests {
                 key.key().name() == "wardd_image_cache_eviction_failure_total"
                     && matches!(value, metrics_util::debugging::DebugValue::Counter(n) if n >= 1)
             });
-        assert!(counted, "expected eviction failure counter to be incremented");
+        assert!(
+            counted,
+            "expected eviction failure counter to be incremented"
+        );
 
         // remove_dir_all clears an entry's contents before the final rmdir
         // of the entry itself, so a failed rmdir still leaves an (empty)
