@@ -14,8 +14,62 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  # ── Path filter: skip Rust build/test/lint on docs-only changes ────────
+  # Every other job in this workflow runs `cargo` against the workspace, so
+  # none of them can be affected by a change that only touches documentation
+  # or an unrelated SDK (sdks/go, sdks/python, sdks/typescript aren't Cargo
+  # workspace members). This job always runs and reports its diff, so the
+  # downstream jobs still produce a check run (skipped, not missing) for
+  # required-status-check purposes; only their own `if:` decides whether the
+  # expensive work happens. Diffs the PR head against its base, or the push
+  # `before` SHA, falling back to running everything when there's no usable
+  # base to diff against (new branch, force-push with no prior ref).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            codeload.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Detect Rust-relevant changes
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+          if [ -z "$BASE_SHA" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            echo "No usable base SHA (got '$BASE_SHA'); running all jobs."
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "Changed files:"
+          echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^deny\.toml$|^vendor/|^\.github/workflows/ci\.yml$'; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # ── Fast fail: formatting ────────────────────────────────────────────
   fmt:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -56,6 +110,8 @@ jobs:
 
   # ── Lint ─────────────────────────────────────────────────────────────
   clippy:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -102,7 +158,8 @@ jobs:
   # ward-core integration tests (tests/grpc_*.rs that spin up an in-process
   # tonic server). No subprocess management, sub-second runtime.
   test:
-    needs: [clippy]
+    needs: [changes, clippy]
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -179,7 +236,8 @@ jobs:
   # Runs on every PR but in its own job so failures here are visibly
   # distinct from cheaper test failures.
   e2e:
-    needs: [clippy]
+    needs: [changes, clippy]
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -248,7 +306,8 @@ jobs:
   # Real boot tests are gated behind WARD_KVM_TESTS for a future self-hosted
   # KVM runner (see ward-core/tests/krun_boot.rs).
   krunvm-build:
-    needs: [clippy]
+    needs: [changes, clippy]
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -344,6 +403,8 @@ jobs:
   # ── MSRV (minimum supported Rust version) ───────────────────────────
   # Reads rust-version from Cargo.toml; no extra tooling needed.
   msrv:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -392,6 +453,8 @@ jobs:
 
   # ── Supply chain audit ───────────────────────────────────────────────
   deny:
+    needs: [changes]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -440,7 +503,8 @@ jobs:
   # coverage delta is visible on every PR without an external service.
   # The lcov report is also uploaded as an artifact for offline analysis.
   coverage:
-    needs: [clippy]
+    needs: [changes, clippy]
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
