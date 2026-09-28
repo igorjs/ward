@@ -46,6 +46,7 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     "socket-dns",
     "socket-dhcpv4",
     "socket-icmp",
+    "auto-icmp-echo-reply",
     "log",
 ] }
 # heapless is the bounded-Vec type wire::dhcpv4::Repr's dns_servers option
