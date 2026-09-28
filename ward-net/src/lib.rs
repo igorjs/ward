@@ -9,9 +9,10 @@
 //!   builds the command line that libkrun's `krun_set_passt_fd` consumes.
 //! - [`null::NullBackend`] — no-op. Sandbox has no network egress; the
 //!   stub-backend tests use this and so does `WARD_NETWORK_BACKEND=none`.
-//! - [`smoltcp_backend::SmoltcpBackend`] — research scaffold (feature
-//!   `smoltcp`). The trait shape is there; the implementation is marked
-//!   `unimplemented!` until ADR-018's "Future work" section is funded.
+//! - [`smoltcp_backend::SmoltcpBackend`] — in-process stack (feature
+//!   `smoltcp`). `RawFdDevice` reads and writes raw Ethernet frames over
+//!   an `OwnedFd` and is tested; `SmoltcpBackend::attach` still returns
+//!   `Error::Unimplemented` until it's wired to a live `Interface`.
 //!
 //! Backend selection in production lives in `ward-core` (or
 //! `ward-runtime`) where the libkrun FD plumbing happens. This crate

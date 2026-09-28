@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! smoltcp backend — research scaffold.
+//! smoltcp backend — research path.
 //!
 //! Per ADR-018, smoltcp is not on the v0.1 critical path. This module
 //! exists so the [`crate::NetworkBackend`] trait shape covers all three
@@ -8,17 +8,180 @@
 //! point (rather than discovering, six months from now, that smoltcp
 //! needs a different trait surface than passt).
 //!
-//! What this scaffold does today:
-//! - Compiles against `smoltcp` so we know the feature flag works.
+//! [`RawFdDevice`] implements smoltcp's `phy::Device` trait over a raw
+//! file descriptor (a `socketpair(2)` end), reading and writing raw
+//! Ethernet frames. [`SmoltcpBackend`] (the [`NetworkBackend`] impl) does
+//! not yet wire a device into a running `Interface`:
 //! - Implements `probe()` (smoltcp is in-process so probing always
 //!   succeeds).
 //! - `attach` / `detach` return `Error::Unimplemented` with a pointer at
 //!   ADR-018's "Future work" section.
-//!
-//! What it does NOT do today: parse virtio-net frames, manage flows,
-//! proxy bytes. All of that is future work.
+
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::time::Instant;
 
 use crate::{AttachId, AttachOptions, Error, NetworkBackend};
+
+/// Largest Ethernet frame `RawFdDevice` will read or write: the standard
+/// 1500-octet IP MTU plus the 14-octet Ethernet header.
+const MAX_FRAME_LEN: usize = 1514;
+
+/// Smallest valid Ethernet frame: 6-byte destination MAC, 6-byte source
+/// MAC, 2-byte ethertype. A datagram shorter than this cannot be parsed
+/// as a frame and is dropped.
+const MIN_ETHERNET_FRAME_LEN: usize = 14;
+
+/// A smoltcp `phy::Device` that reads and writes raw Ethernet frames on
+/// an `OwnedFd` (typically one end of an `AF_UNIX SOCK_DGRAM` pair).
+pub struct RawFdDevice {
+    fd: OwnedFd,
+}
+
+impl RawFdDevice {
+    pub fn new(fd: OwnedFd) -> RawFdDevice {
+        RawFdDevice { fd }
+    }
+}
+
+impl Device for RawFdDevice {
+    type RxToken<'a>
+        = RawFdRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = RawFdTxToken
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Loops past a malformed datagram instead of returning None for
+        // it: the recv below already consumed that datagram, so reporting
+        // None (meaning "queue empty") would make the poll loop stop
+        // early and leave any valid frame queued behind it waiting for
+        // the next tick. Only a genuinely empty queue (EAGAIN, n <= 0)
+        // returns None.
+        loop {
+            // Sized one byte past MAX_FRAME_LEN so an oversized datagram
+            // (the kernel silently truncates SOCK_DGRAM reads to the
+            // buffer size) fills the whole buffer and is distinguishable
+            // from a frame that legitimately fills exactly MAX_FRAME_LEN
+            // bytes.
+            let mut buf = [0u8; MAX_FRAME_LEN + 1];
+            // SAFETY: self.fd is a valid open fd for the device's
+            // lifetime; buf is a valid, initialized buffer of the given
+            // length. MSG_DONTWAIT makes this non-blocking so an empty
+            // socket returns immediately instead of stalling the
+            // caller's poll loop.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            if (n as usize) < MIN_ETHERNET_FRAME_LEN {
+                tracing::warn!(
+                    len = n,
+                    min = MIN_ETHERNET_FRAME_LEN,
+                    "dropping truncated datagram shorter than a minimum Ethernet frame"
+                );
+                continue;
+            }
+            if (n as usize) > MAX_FRAME_LEN {
+                tracing::warn!(
+                    len = n,
+                    max = MAX_FRAME_LEN,
+                    "dropping oversized datagram larger than the maximum Ethernet frame"
+                );
+                continue;
+            }
+            let frame = buf[..n as usize].to_vec();
+            return Some((
+                RawFdRxToken { frame },
+                RawFdTxToken {
+                    fd: self.fd.as_raw_fd(),
+                },
+            ));
+        }
+    }
+
+    fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        Some(RawFdTxToken {
+            fd: self.fd.as_raw_fd(),
+        })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut caps = DeviceCapabilities::default();
+        caps.medium = Medium::Ethernet;
+        caps.max_transmission_unit = MAX_FRAME_LEN;
+        caps
+    }
+}
+
+/// Holds the frame `RawFdDevice::receive` already read off the fd; no
+/// further I/O happens on `consume`.
+pub struct RawFdRxToken {
+    frame: Vec<u8>,
+}
+
+impl RxToken for RawFdRxToken {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        f(&self.frame)
+    }
+}
+
+/// Writes the frame `f` builds straight onto the underlying fd when
+/// consumed.
+pub struct RawFdTxToken {
+    fd: RawFd,
+}
+
+impl TxToken for RawFdTxToken {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let mut buf = vec![0u8; len];
+        let result = f(&mut buf);
+        // SAFETY: self.fd is a valid open fd for the device's lifetime;
+        // buf has exactly `len` initialized bytes to send. MSG_DONTWAIT
+        // makes this non-blocking: without it, a guest that stops
+        // draining its side of the socketpair fills the send buffer and
+        // parks this call, and since it runs inside Stack::poll (a
+        // synchronous call with no await to yield at), that would stall
+        // the sandbox's whole network task rather than just this frame.
+        let sent =
+            unsafe { libc::send(self.fd, buf.as_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        if sent < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                tracing::warn!(error = %err, "failed to write an Ethernet frame to the guest");
+            }
+            // WouldBlock (a full send buffer, i.e. the guest isn't
+            // draining) is dropped silently: TCP retransmits or the
+            // next protocol-level retry covers the loss, matching how
+            // ingress already drops a datagram it can't use rather than
+            // erroring the whole poll loop.
+        } else if (sent as usize) != buf.len() {
+            tracing::warn!(
+                sent,
+                expected = buf.len(),
+                "short write sending an Ethernet frame to the guest"
+            );
+        }
+        result
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct SmoltcpBackend;
