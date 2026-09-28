@@ -228,6 +228,12 @@ jobs:
         run: cargo test --workspace --lib --bins
       - name: Integration tests (ward-core)
         run: cargo test -p ward-core --tests
+      - name: Integration tests (ward-net, smoltcp)
+        # Gated separately from the two steps above: the smoltcp backend
+        # is opt-in and its integration tests are compiled out entirely
+        # under default features, so they need this explicit feature flag
+        # to run at all rather than silently being skipped.
+        run: cargo test -p ward-net --features smoltcp --tests
 
   # ── E2E tests ───────────────────────────────────────────────────────
   # Slow tier: spawns the real wardd binary as a subprocess and runs the
