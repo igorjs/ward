@@ -35,6 +35,9 @@ allow = [
     # Permissive, OSI-approved, FSF-libre. Pulled in via the const_format /
     # konst chain under oci-client (oci-spec).
     "Zlib",
+    # Permissive, OSI-approved. Pulled in via smoltcp and its `managed`
+    # dependency (ADR-019's in-process network stack).
+    "0BSD",
 ]
 confidence-threshold = 0.8
 

@@ -23,6 +23,16 @@ use crate::protocol::{CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, Sn
 #[allow(dead_code)]
 const AGENT_VSOCK_PORT: u32 = 1024;
 
+/// MAC address assigned to the guest's virtio-net device for the smoltcp
+/// backend. Locally administered (0x02 prefix), distinct from
+/// `INTERFACE_HARDWARE_ADDR` on the host side of `ward-net`'s `Stack`.
+/// `krun_add_net_unixgram` requires a real, non-null MAC: confirmed
+/// empirically that a null `c_mac` segfaults inside libkrun rather than
+/// having it assign one itself, despite `libkrun.h` giving no indication
+/// either way. Only referenced by the krunvm-gated FFI wrappers.
+#[cfg(feature = "krunvm")]
+const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
 /// Path of the agent binary inside every sandbox rootfs.
 /// Only referenced by the krunvm-gated FFI wrappers.
 #[allow(dead_code)]
@@ -133,7 +143,6 @@ struct VmRuntime {
     shutdown_fd: std::os::fd::RawFd,
 }
 
-#[derive(Debug)]
 struct SandboxState {
     info: SandboxInfo,
     /// krun context ID returned by krun_create_ctx().
@@ -153,6 +162,27 @@ struct SandboxState {
     /// is disabled.
     #[cfg(feature = "krunvm")]
     gvproxy: Option<ward_net::gvproxy::GvproxyHandle>,
+    /// Live smoltcp stack task. `None` when egress mode is Deny, when the
+    /// network backend is not smoltcp, or when the `krunvm` feature is
+    /// disabled.
+    #[cfg(feature = "krunvm")]
+    smoltcp: Option<ward_net::smoltcp_backend::SmoltcpHandle>,
+}
+
+// Manual impl instead of a derive: SmoltcpHandle wraps a JoinHandle and an
+// mpsc::Sender that don't implement Debug, so smoltcp is reported by
+// presence only, same as the other network handle fields would show.
+impl std::fmt::Debug for SandboxState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = f.debug_struct("SandboxState");
+        s.field("info", &self.info).field("ctx_id", &self.ctx_id);
+        #[cfg(feature = "krunvm")]
+        s.field("vm", &self.vm)
+            .field("passt", &self.passt)
+            .field("gvproxy", &self.gvproxy)
+            .field("smoltcp_active", &self.smoltcp.is_some());
+        s.finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +327,8 @@ impl Backend for KrunvmBackend {
         self.krun_set_root(ctx_id, &rootfs)?;
 
         #[cfg(feature = "krunvm")]
-        let (passt_handle, gvproxy_handle) = if opts.egress.mode != EgressMode::Deny {
+        let (passt_handle, gvproxy_handle, smoltcp_handle) = if opts.egress.mode != EgressMode::Deny
+        {
             use super::krun_ffi;
             match self.network_backend {
                 NetworkBackendChoice::Passt => {
@@ -309,7 +340,7 @@ impl Backend for KrunvmBackend {
                     .map_err(|e| BackendError::Internal(format!("passt spawn: {e}")))?;
                     krun_ffi::set_passt_fd(ctx_id, handle.guest_fd)
                         .map_err(BackendError::Internal)?;
-                    (Some(handle), None)
+                    (Some(handle), None, None)
                 }
                 NetworkBackendChoice::Gvproxy => {
                     let handle = ward_net::gvproxy::spawn_for_sandbox(
@@ -320,13 +351,24 @@ impl Backend for KrunvmBackend {
                     .map_err(|e| BackendError::Internal(format!("gvproxy spawn: {e}")))?;
                     krun_ffi::set_gvproxy_path(ctx_id, &handle.socket_path)
                         .map_err(BackendError::Internal)?;
-                    (None, Some(handle))
+                    (None, Some(handle), None)
                 }
-                // None / Smoltcp: no external process; libkrun uses loopback or nothing.
-                _ => (None, None),
+                NetworkBackendChoice::Smoltcp => {
+                    let handle = ward_net::smoltcp_backend::spawn_for_sandbox(
+                        &id,
+                        &ward_net::AttachOptions::default(),
+                    )
+                    .await
+                    .map_err(|e| BackendError::Internal(format!("smoltcp spawn: {e}")))?;
+                    krun_ffi::set_net_unixgram(ctx_id, handle.guest_fd, SMOLTCP_GUEST_MAC)
+                        .map_err(BackendError::Internal)?;
+                    (None, None, Some(handle))
+                }
+                // None: no external process; libkrun uses loopback or nothing.
+                _ => (None, None, None),
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Bind mounts → virtiofs shares; volumes → raw block devices. The
@@ -381,6 +423,8 @@ impl Backend for KrunvmBackend {
             passt: passt_handle,
             #[cfg(feature = "krunvm")]
             gvproxy: gvproxy_handle,
+            #[cfg(feature = "krunvm")]
+            smoltcp: smoltcp_handle,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -451,6 +495,17 @@ impl Backend for KrunvmBackend {
             && let Err(e) = gvproxy.kill().await
         {
             tracing::warn!(sandbox_id = %id, "gvproxy teardown error: {e}");
+        }
+
+        // Stop the smoltcp stack task before freeing the libkrun context.
+        // Same ordering guarantee as passt/gvproxy: the task must exit
+        // before krun_free_ctx to avoid a dangling virtio-net peer holding
+        // references to the freed context.
+        #[cfg(feature = "krunvm")]
+        if let Some(mut smoltcp) = state.smoltcp.take()
+            && let Err(e) = smoltcp.detach().await
+        {
+            tracing::warn!(sandbox_id = %id, "smoltcp teardown error: {e}");
         }
 
         if state.ctx_id != 0 {
@@ -1358,6 +1413,18 @@ mod tests {
         KrunvmBackend::with_image_store_for_test(path, store)
     }
 
+    /// Same as `backend_in_tempdir`, but lets a test pick which network
+    /// backend `create_sandbox` wires up instead of the default.
+    #[cfg(feature = "krunvm")]
+    fn backend_in_tempdir_with_network(network_backend: NetworkBackendChoice) -> KrunvmBackend {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().to_path_buf();
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+        std::mem::forget(tmp);
+        KrunvmBackend::new_internal(path, network_backend, store)
+    }
+
     fn create_opts() -> CreateOpts {
         CreateOpts {
             image: "alpine:latest".into(),
@@ -1797,5 +1864,37 @@ mod tests {
             }
             other => panic!("expected BackendError::Exec on timeout, got {other:?}"),
         }
+    }
+
+    // ----- network backend selection: smoltcp -----------------------------
+
+    #[cfg(feature = "krunvm")]
+    #[tokio::test]
+    async fn given_network_backend_smoltcp_when_create_sandbox_then_smoltcp_handle_set() {
+        // Arrange: a backend configured for the smoltcp network backend,
+        // with egress open so create_sandbox doesn't skip network setup
+        // (EgressMode::Deny, the default, never wires up a backend).
+        let backend = backend_in_tempdir_with_network(NetworkBackendChoice::Smoltcp);
+        let opts = CreateOpts {
+            egress: EgressPolicy {
+                mode: EgressMode::Open,
+                domains: vec![],
+            },
+            ..create_opts()
+        };
+
+        // Act
+        backend
+            .create_sandbox("sb1".to_string(), &opts)
+            .await
+            .expect("create_sandbox");
+
+        // Assert: the sandbox's smoltcp handle was populated.
+        let sandboxes = backend.sandboxes.read().await;
+        let state = sandboxes.get("sb1").expect("sandbox state recorded");
+        assert!(
+            state.smoltcp.is_some(),
+            "expected smoltcp handle to be set for NetworkBackendChoice::Smoltcp"
+        );
     }
 }
