@@ -10,7 +10,7 @@
 
 #![cfg(feature = "smoltcp")]
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
     UdpPacket, UdpRepr,
 };
-use ward_net::smoltcp_backend::{Resolver, Stack};
+use ward_net::smoltcp_backend::{Connector, Resolver, Stack};
 
 /// Arbitrary "guest" MAC standing in for the sandbox's virtual NIC. A DHCP
 /// DISCOVER needs no destination MAC of its own kind (it broadcasts), but
@@ -40,6 +40,19 @@ struct NullResolver;
 impl Resolver for NullResolver {
     async fn resolve(&self, _name: &str) -> Vec<IpAddr> {
         Vec::new()
+    }
+}
+
+/// `Stack::new` requires a `Connector`, but this scenario never sends a TCP
+/// SYN, so this always fails rather than standing in for a real dialer.
+struct NullConnector;
+
+#[async_trait::async_trait]
+impl Connector for NullConnector {
+    async fn connect(&self, _addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+        Err(std::io::Error::other(
+            "NullConnector never dials out; this scenario never opens a TCP flow",
+        ))
     }
 }
 
@@ -251,7 +264,8 @@ async fn given_dhcp_discover_when_polled_then_guest_gets_offer_with_gateway() {
     // sufficient to satisfy Stack::new's constructor injection.
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
 
     let discover = build_dhcp_discover_frame();
     write_frame(&guest_fd, &discover);
@@ -293,7 +307,8 @@ async fn given_dhcp_request_after_offer_when_polled_then_guest_gets_ack_for_same
     const REQUEST_TRANSACTION_ID: u32 = 0xc0ff_ee43;
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
-    let mut stack = Stack::new(host_fd, resolver);
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let mut stack = Stack::new(host_fd, resolver, connector);
 
     // Act, part 1: DISCOVER, to learn which address the OFFER actually
     // leased (lease_for is keyed on the client MAC and returns the same

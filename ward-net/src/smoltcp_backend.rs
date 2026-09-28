@@ -18,19 +18,25 @@
 //!   ADR-018's "Future work" section.
 
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
 
-use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::udp;
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
+};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpMessageType, DhcpPacket, DhcpRepr, DnsFlags, DnsPacket,
-    DnsQueryType, DnsQuestion, EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint,
+    DnsQueryType, DnsQuestion, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
+    IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
+    TcpRepr,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -62,6 +68,28 @@ impl Resolver for SystemResolver {
                 Vec::new()
             }
         }
+    }
+}
+
+/// Opens an outbound TCP connection to `addr` on the guest's behalf.
+/// [`Stack`] never dials the network itself: every new guest-initiated flow
+/// is handed to an injected `Connector` (a real dialer in production, a
+/// scripted one in tests) so the flow-table logic never depends on live
+/// network access.
+#[async_trait::async_trait]
+pub trait Connector: Send + Sync {
+    async fn connect(&self, addr: SocketAddr) -> std::io::Result<TcpStream>;
+}
+
+/// Production [`Connector`] backed by a real outbound
+/// `tokio::net::TcpStream::connect`.
+#[derive(Debug, Default)]
+pub struct TokioConnector;
+
+#[async_trait::async_trait]
+impl Connector for TokioConnector {
+    async fn connect(&self, addr: SocketAddr) -> std::io::Result<TcpStream> {
+        TcpStream::connect(addr).await
     }
 }
 
@@ -323,6 +351,16 @@ const MAX_RESOLVED_ENTRIES: usize = 4096;
 /// completion, and its `send` will simply fail with no observable effect.
 const MAX_PENDING_DNS_QUERIES: usize = 4096;
 
+/// Upper bound on `Stack::flows` entries. Each flow holds a listening
+/// `tcp::Socket` and, once connected, a spawned host-io task, so unlike the
+/// DNS caps above this bounds real per-connection resources rather than
+/// just a lookup table; a guest SYN arriving once the table is already at
+/// this cap is rejected outright (the guest's own destination is never
+/// even given a listening socket) instead of evicting an existing flow,
+/// since dropping an already-established connection to make room for an
+/// unrelated new one would surprise whichever guest process owns it.
+const MAX_FLOW_ENTRIES: usize = 1024;
+
 /// Hand-encodes a DNS response: header, the query's own echoed question,
 /// then one `A` record per IPv4 address in `answers` (IPv6 addresses are
 /// dropped; there is no relay-side AAAA support yet). smoltcp's wire types
@@ -427,6 +465,140 @@ fn build_dhcp_reply(
     buf
 }
 
+/// Bytes of payload storage in each direction of a flow's TCP socket. A
+/// fresh socket is created lazily per destination the guest opens, so this
+/// only costs memory for flows that are actually in use.
+const TCP_SOCKET_BUFFER_BYTES: usize = 16384;
+
+/// How long a spawned host-io task waits for one write to the connector's
+/// `TcpStream` to complete before giving up on the flow. Every host-side
+/// await in the byte pump is wrapped in a timeout so a stalled peer can
+/// never block the flow indefinitely.
+const HOST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a flow's spawned connect task waits for `Connector::connect` to
+/// resolve before giving up. Without this, an unresponsive remote would
+/// leave the flow `Connecting` forever with no way to notice the guest gave
+/// up waiting.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Pending chunks a host-io task's write channel can hold before
+/// `pump_flows` stops dequeuing the guest's smoltcp receive buffer for that
+/// flow. Small on purpose: backpressure should show up as the guest's own
+/// TCP window shrinking (data left queued in smoltcp), not as unbounded
+/// host-side buffering.
+const HOST_WRITER_CHANNEL_CAPACITY: usize = 16;
+
+/// Pending chunks a host-io task's read channel can hold before it pauses
+/// reading more from the connector's `TcpStream`. Small for the same
+/// reason as `HOST_WRITER_CHANNEL_CAPACITY`: backpressure on data coming
+/// from the host should stall that task's own read, not grow an unbounded
+/// buffer here.
+const HOST_READER_CHANNEL_CAPACITY: usize = 16;
+
+/// Lifecycle of one guest-initiated TCP flow, keyed by its (guest,
+/// destination) endpoint pair in `Stack::flows`.
+enum FlowState {
+    /// The connector has been dispatched for this flow's destination and
+    /// hasn't returned yet, successfully or not.
+    Connecting(oneshot::Receiver<std::io::Result<TcpStream>>),
+    /// The connector resolved successfully. Bytes read from the flow's
+    /// `tcp::Socket` receive buffer are handed to the spawned host-io
+    /// task over `to_host_tx`, which owns the `TcpStream` exclusively and
+    /// performs the actual (timeout-wrapped) writes. Bytes that task reads
+    /// from the host arrive over `from_host_rx`; `pending_from_host` holds
+    /// a chunk `pump_flows` already dequeued but could only partially hand
+    /// to the guest's `tcp::Socket` send buffer, so the remainder isn't
+    /// lost between ticks.
+    Established {
+        to_host_tx: mpsc::Sender<Vec<u8>>,
+        from_host_rx: mpsc::Receiver<Vec<u8>>,
+        pending_from_host: Option<Vec<u8>>,
+    },
+}
+
+/// One guest-initiated TCP flow: the smoltcp socket handle backing it plus
+/// its current lifecycle state. Kept as a pair rather than two parallel
+/// maps since both are always looked up together in `Stack::flows`.
+struct Flow {
+    handle: SocketHandle,
+    state: FlowState,
+}
+
+/// Spawns the task that owns `stream` exclusively for the rest of the
+/// flow's life, relaying bytes in both directions. `stream` and smoltcp's
+/// own `tcp::Socket` are never touched by the same task: `pump_flows`
+/// (running synchronously inside `Stack::poll`) drains the socket's
+/// receive buffer into the returned sender and feeds bytes out of the
+/// returned receiver into the socket's send buffer; this task performs the
+/// actual async, timeout-wrapped reads and writes against `stream`.
+///
+/// `stream` is split into independent halves so the read and write loops
+/// below can run concurrently without two tasks racing on the same
+/// `TcpStream`; each half is only ever touched by its own loop. The two
+/// loops are joined with `select!` rather than run as separate tasks so
+/// that whichever direction fails first (an error, a timeout, or its
+/// channel closing) ends this task and drops both halves together,
+/// tearing down the connection as a unit instead of leaking the other
+/// direction's loop.
+fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+    let (to_host_tx, mut to_host_rx) = mpsc::channel::<Vec<u8>>(HOST_WRITER_CHANNEL_CAPACITY);
+    let (from_host_tx, from_host_rx) = mpsc::channel::<Vec<u8>>(HOST_READER_CHANNEL_CAPACITY);
+    let (mut read_half, mut write_half) = stream.into_split();
+    tokio::task::spawn(async move {
+        let write_loop = async {
+            while let Some(chunk) = to_host_rx.recv().await {
+                match tokio::time::timeout(HOST_WRITE_TIMEOUT, write_half.write_all(&chunk)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            error = %err,
+                            "host write failed for a guest-initiated TCP flow"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!("host write timed out for a guest-initiated TCP flow");
+                        break;
+                    }
+                }
+            }
+        };
+        let read_loop = async {
+            // No timeout on this await, unlike the write side: a read
+            // only returns when the peer sends something, closes, or
+            // errors, so a stuck-peer timeout here would also fire on
+            // every merely idle or slow-to-answer connection (a long
+            // request, a keep-alive) and reset it for no reason. The
+            // flow already tears down on EOF or a real error below.
+            let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
+            loop {
+                match read_half.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if from_host_tx.send(buf[..n].to_vec()).await.is_err() {
+                            // pump_flows already tore this flow down.
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "host read failed for a guest-initiated TCP flow"
+                        );
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            () = write_loop => {}
+            () = read_loop => {}
+        }
+    });
+    (to_host_tx, from_host_rx)
+}
+
 /// Owns a smoltcp `Interface`, the `SocketSet` it drives, and the
 /// `RawFdDevice` backing both. `Interface::poll` takes the device by
 /// `&mut` on every call, so `Stack` holds all three together instead of
@@ -436,6 +608,20 @@ pub struct Stack {
     interface: Interface,
     sockets: SocketSet<'static>,
     resolver: Arc<dyn Resolver>,
+    connector: Arc<dyn Connector>,
+    /// Guest-initiated TCP flows, keyed by the (guest, destination)
+    /// endpoint pair parsed from the guest's own SYN. Populated by
+    /// `register_new_tcp_flow` the first time a destination is seen, so a
+    /// guest that opens the same destination twice only dispatches the
+    /// connector once.
+    flows: HashMap<(IpEndpoint, IpEndpoint), Flow>,
+    /// Sockets a prior `pump_flows` call aborted (to make smoltcp emit a
+    /// final RST for the corresponding flow) but hasn't freed yet. Removal
+    /// is deferred one poll cycle so the egress loop between the abort and
+    /// the removal gets a chance to actually dispatch that RST; freeing the
+    /// socket immediately after aborting it would discard the pending RST
+    /// unsent.
+    sockets_pending_removal: Vec<SocketHandle>,
     dns_socket_handle: SocketHandle,
     /// Queries relayed to the resolver, awaiting an answer. Capped at
     /// `MAX_PENDING_DNS_QUERIES` via `push_pending_dns_query`, oldest
@@ -458,7 +644,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(fd: OwnedFd, resolver: Box<dyn Resolver>) -> Stack {
+    pub fn new(fd: OwnedFd, resolver: Box<dyn Resolver>, connector: Box<dyn Connector>) -> Stack {
         let mut device = RawFdDevice::new(fd);
         let config = Config::new(HardwareAddress::Ethernet(INTERFACE_HARDWARE_ADDR));
         let mut interface = Interface::new(config, &mut device, Instant::now());
@@ -467,6 +653,11 @@ impl Stack {
                 .push(IpCidr::new(INTERFACE_ADDR, INTERFACE_PREFIX_LEN))
                 .expect("a freshly created interface has room for its one static address");
         });
+        // The guest's own TCP SYNs target arbitrary destinations, not this
+        // interface's own address. AnyIP makes the interface accept and
+        // route that traffic, per libslirp/QEMU-style user networking,
+        // instead of silently dropping it as "not addressed to us".
+        interface.set_any_ip(true);
 
         // Vec-backed storage gives a SocketSet with no borrowed lifetime,
         // per smoltcp's own SocketSet doc comment.
@@ -506,6 +697,9 @@ impl Stack {
             interface,
             sockets,
             resolver: Arc::from(resolver),
+            connector: Arc::from(connector),
+            flows: HashMap::new(),
+            sockets_pending_removal: Vec::new(),
             dns_socket_handle,
             pending_dns_queries: VecDeque::new(),
             dhcp_socket_handle,
@@ -582,17 +776,345 @@ impl Stack {
         self.pending_dns_queries.len()
     }
 
-    /// Processes pending ingress on the device and flushes queued
-    /// egress. Returns smoltcp's own `PollResult`: `SocketStateChanged`
-    /// when a caller should recheck socket state, `None` otherwise.
+    /// Processes pending ingress on the device and flushes queued egress.
+    /// Returns smoltcp's own `PollResult`: `SocketStateChanged` when a
+    /// caller should recheck socket state, `None` otherwise.
+    ///
+    /// Drives ingress one packet at a time (rather than the single
+    /// `Interface::poll` call this replaces) so `poll_flows` can inspect
+    /// each queued guest datagram before smoltcp consumes it, and register
+    /// a new TCP flow's listening socket in time to catch its own SYN.
     pub fn poll(&mut self) -> PollResult {
-        let result = self
-            .interface
-            .poll(Instant::now(), &mut self.device, &mut self.sockets);
+        let now = Instant::now();
+        self.interface.poll_maintenance(now);
+
+        let mut result = PollResult::None;
+        loop {
+            self.poll_flows();
+            match self
+                .interface
+                .poll_ingress_single(now, &mut self.device, &mut self.sockets)
+            {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::SocketStateChanged => {
+                    result = PollResult::SocketStateChanged;
+                }
+            }
+        }
+        loop {
+            match self
+                .interface
+                .poll_egress(now, &mut self.device, &mut self.sockets)
+            {
+                PollResult::None => break,
+                PollResult::SocketStateChanged => result = PollResult::SocketStateChanged,
+            }
+        }
+
+        self.pump_flows();
         self.relay_dns_queries();
         self.deliver_dns_answers();
         self.serve_dhcp();
         result
+    }
+
+    /// Registers a listening TCP socket for a newly seen guest SYN, if the
+    /// next queued datagram carries one. See `peek_guest_syn` for how the
+    /// SYN is detected without consuming the datagram smoltcp's own
+    /// ingress is about to process.
+    fn poll_flows(&mut self) {
+        let Some((src, dst)) = self.peek_guest_syn() else {
+            return;
+        };
+        if self.flows.contains_key(&(src, dst)) {
+            return;
+        }
+        if self.flow_table_is_full() {
+            // No listening socket is opened for this destination, so
+            // smoltcp's own ingress processing finds no socket willing to
+            // accept the SYN and replies with an RST on its own, the same
+            // way it already does for any other unmatched TCP segment.
+            tracing::warn!(
+                destination = %dst,
+                cap = MAX_FLOW_ENTRIES,
+                "rejecting a new guest TCP flow: flow table is at capacity"
+            );
+            return;
+        }
+
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
+        );
+        let handle = self.sockets.add(socket);
+        let tcp_socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if let Err(err) = tcp_socket.listen(dst) {
+            tracing::warn!(
+                destination = %dst,
+                error = %err,
+                "failed to open a listening socket for a new guest TCP flow"
+            );
+            self.sockets.remove(handle);
+            return;
+        }
+
+        let (connect_tx, connect_rx) = oneshot::channel();
+        self.flows.insert(
+            (src, dst),
+            Flow {
+                handle,
+                state: FlowState::Connecting(connect_rx),
+            },
+        );
+        let connector = Arc::clone(&self.connector);
+        let addr = SocketAddr::from(dst);
+        // The deadline is anchored to now, when the flow was registered,
+        // rather than to whenever the spawned task happens to get its first
+        // poll: a busy runtime could otherwise delay that first poll long
+        // enough to eat into the budget a caller of `connect` is entitled
+        // to.
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+        tokio::task::spawn(async move {
+            // A timed-out connect is reported through the same channel as a
+            // connector error, so pump_flows tears the flow down (removes
+            // it from the flow table, aborts its socket to trigger an RST)
+            // exactly as it already does for any other connect failure.
+            let result = match tokio::time::timeout_at(deadline, connector.connect(addr)).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "connect attempt timed out",
+                )),
+            };
+            // The receiver may already be gone if pump_flows gave up on
+            // this flow (e.g. the guest reset it) before the connect
+            // resolved; a dropped send is not this task's problem.
+            let _ = connect_tx.send(result);
+        });
+    }
+
+    /// Advances every flow's lifecycle by one step: promotes a `Connecting`
+    /// flow to `Established` once its connector task resolves, and for
+    /// every `Established` flow, pumps bytes in both directions between the
+    /// flow's `tcp::Socket` and its host-io task, guest->host by draining
+    /// the socket's receive buffer into the task's write channel, host->guest
+    /// by feeding the task's read channel into the socket's send buffer. A
+    /// flow whose connector failed or whose host-io task has stopped is
+    /// torn down: its socket aborted (so smoltcp sends the guest a final
+    /// RST) and its entry dropped from `self.flows`; the socket itself is
+    /// freed one call later, via `sockets_pending_removal`, once the poll
+    /// loop's egress pass in between has had a chance to actually dispatch
+    /// that RST.
+    fn pump_flows(&mut self) {
+        for handle in self.sockets_pending_removal.drain(..) {
+            self.sockets.remove(handle);
+        }
+
+        let mut to_remove = Vec::new();
+        for (&key, flow) in self.flows.iter_mut() {
+            match &mut flow.state {
+                FlowState::Connecting(connect_rx) => match connect_rx.try_recv() {
+                    Ok(Ok(stream)) => {
+                        let (to_host_tx, from_host_rx) = spawn_host_io(stream);
+                        flow.state = FlowState::Established {
+                            to_host_tx,
+                            from_host_rx,
+                            pending_from_host: None,
+                        };
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(
+                            destination = %key.1,
+                            error = %err,
+                            "connector failed to open a guest-initiated TCP flow"
+                        );
+                        to_remove.push((key, flow.handle));
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        to_remove.push((key, flow.handle));
+                    }
+                },
+                FlowState::Established {
+                    to_host_tx,
+                    from_host_rx,
+                    pending_from_host,
+                } => {
+                    match to_host_tx.try_reserve() {
+                        Ok(permit) => {
+                            let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+                            if socket.can_recv()
+                                && let Ok(chunk) = socket.recv(|data| (data.len(), data.to_vec()))
+                                && !chunk.is_empty()
+                            {
+                                permit.send(chunk);
+                            }
+                        }
+                        // The host writer's channel is full: leave the bytes
+                        // queued in smoltcp's own receive buffer rather than
+                        // dropping them, so the guest's TCP window naturally
+                        // shrinks until the writer catches up.
+                        Err(mpsc::error::TrySendError::Full(())) => {}
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            to_remove.push((key, flow.handle));
+                        }
+                    }
+
+                    if pending_from_host.is_none() {
+                        match from_host_rx.try_recv() {
+                            Ok(chunk) => *pending_from_host = Some(chunk),
+                            Err(mpsc::error::TryRecvError::Empty) => {}
+                            // The host-io task ended (error, timeout, or the
+                            // stream closed): nothing more will ever arrive.
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                to_remove.push((key, flow.handle));
+                            }
+                        }
+                    }
+                    if let Some(chunk) = pending_from_host {
+                        let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+                        // Leave any unsent remainder in `pending_from_host`
+                        // rather than dropping it: the guest's own send
+                        // buffer being full is this direction's backpressure
+                        // signal, resolved once the guest reads more.
+                        if socket.can_send() {
+                            match socket.send_slice(chunk) {
+                                Ok(sent) if sent == chunk.len() => {
+                                    *pending_from_host = None;
+                                }
+                                Ok(sent) => {
+                                    chunk.drain(0..sent);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        destination = %key.1,
+                                        error = %err,
+                                        "failed to forward host bytes to a guest-initiated TCP flow"
+                                    );
+                                    to_remove.push((key, flow.handle));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A single flow's Established arm above can push the same (key,
+        // handle) twice in one pass (e.g. the write channel closing and
+        // the read channel disconnecting in the same tick, which happens
+        // whenever spawn_host_io's task ends). Dedupe by key here rather
+        // than at each push site, so `sockets_pending_removal` never gets
+        // a handle twice, which would panic the next pump_flows call: the
+        // second SocketSet::remove for an already-removed handle panics.
+        let mut removed = std::collections::HashSet::with_capacity(to_remove.len());
+        for (key, handle) in to_remove {
+            if !removed.insert(key) {
+                continue;
+            }
+            self.sockets.get_mut::<tcp::Socket>(handle).abort();
+            self.sockets_pending_removal.push(handle);
+            self.flows.remove(&key);
+        }
+    }
+
+    /// True once `self.flows` holds `MAX_FLOW_ENTRIES` entries. Shared by
+    /// `poll_flows` and the test-only accessor below so neither path can
+    /// admit a flow past the cap.
+    fn flow_table_is_full(&self) -> bool {
+        self.flows.len() >= MAX_FLOW_ENTRIES
+    }
+
+    /// Test-only entry point into the flow table's capacity check,
+    /// inserting a synthetic entry that never opens a real socket or
+    /// dispatches a connector, so a test can drive the table to its cap
+    /// without sending thousands of real SYN frames through the wire
+    /// harness. Subject to the same cap `poll_flows` enforces for a real
+    /// SYN, so a caller cannot use this to push the table past capacity
+    /// either; a call once the table is already full is a no-op. The
+    /// paired oneshot sender is leaked rather than dropped, mirroring
+    /// `push_pending_dns_query_for_test`, so `pump_flows` finds the
+    /// synthetic entry's receiver still open and leaves it in place for the
+    /// rest of the test instead of tearing it down.
+    pub fn insert_synthetic_flow_for_test(&mut self, src: SocketAddr, dst: SocketAddr) {
+        if self.flow_table_is_full() {
+            return;
+        }
+        // This backend only ever addresses IPv4 guests (see the module-wide
+        // AnyIP / DHCP setup elsewhere in `Stack::new`), so a test passing
+        // an IPv6 address is a test bug, not a case this accessor needs to
+        // handle.
+        let SocketAddr::V4(src) = src else {
+            panic!("insert_synthetic_flow_for_test: only IPv4 addresses are supported");
+        };
+        let SocketAddr::V4(dst) = dst else {
+            panic!("insert_synthetic_flow_for_test: only IPv4 addresses are supported");
+        };
+        let (connect_tx, connect_rx) = oneshot::channel();
+        std::mem::forget(connect_tx);
+        self.flows.insert(
+            (
+                IpEndpoint::new(IpAddress::Ipv4(*src.ip()), src.port()),
+                IpEndpoint::new(IpAddress::Ipv4(*dst.ip()), dst.port()),
+            ),
+            Flow {
+                handle: SocketHandle::default(),
+                state: FlowState::Connecting(connect_rx),
+            },
+        );
+    }
+
+    /// Non-destructively inspects the next queued guest datagram (via
+    /// `MSG_PEEK`, leaving it queued for smoltcp's own ingress right after
+    /// this call) for a fresh TCP SYN, returning its (guest, destination)
+    /// endpoint pair. Anything else queued (ARP, DNS, DHCP, a non-SYN TCP
+    /// segment, or nothing at all) returns `None`.
+    fn peek_guest_syn(&self) -> Option<(IpEndpoint, IpEndpoint)> {
+        let mut buf = [0u8; MAX_FRAME_LEN + 1];
+        // SAFETY: self.device's fd is a valid open fd for the device's
+        // lifetime; buf is a valid, initialized buffer of the given
+        // length. MSG_PEEK leaves the datagram queued so smoltcp's own
+        // ingress can still consume it right after this call returns.
+        let n = unsafe {
+            libc::recv(
+                self.device.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if n <= 0 {
+            return None;
+        }
+        let n = n as usize;
+        if !(MIN_ETHERNET_FRAME_LEN..=MAX_FRAME_LEN).contains(&n) {
+            return None;
+        }
+
+        let eth_frame = EthernetFrame::new_checked(&buf[..n]).ok()?;
+        if eth_frame.ethertype() != EthernetProtocol::Ipv4 {
+            return None;
+        }
+        let ip_packet = Ipv4Packet::new_checked(eth_frame.payload()).ok()?;
+        if ip_packet.next_header() != IpProtocol::Tcp {
+            return None;
+        }
+        let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).ok()?;
+        let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
+        let tcp_repr = TcpRepr::parse(
+            &tcp_packet,
+            &IpAddress::Ipv4(ip_repr.src_addr),
+            &IpAddress::Ipv4(ip_repr.dst_addr),
+            &ChecksumCapabilities::default(),
+        )
+        .ok()?;
+        if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
+            return None;
+        }
+
+        let src = IpEndpoint::new(IpAddress::Ipv4(ip_repr.src_addr), tcp_repr.src_port);
+        let dst = IpEndpoint::new(IpAddress::Ipv4(ip_repr.dst_addr), tcp_repr.dst_port);
+        Some((src, dst))
     }
 
     /// Returns the address leased to `mac`, assigning the next free
@@ -842,7 +1364,7 @@ pub async fn spawn_for_sandbox(
         // Stack (device + Interface + SocketSet) lives only inside this
         // task, so the host-side fd is never shared or locked from
         // outside it.
-        let mut stack = Stack::new(host_fd, Box::new(SystemResolver));
+        let mut stack = Stack::new(host_fd, Box::new(SystemResolver), Box::new(TokioConnector));
         loop {
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
