@@ -382,17 +382,21 @@ const DHCP_SOCKET_BUFFER_PACKETS: usize = 8;
 /// over a DHCP message's fixed 236-byte header plus its options.
 const DHCP_SOCKET_BUFFER_BYTES: usize = 1024;
 
-/// Builds a DHCP OFFER answering `discover`: leases `your_ip` to the
+/// Builds a DHCP OFFER or ACK answering `discover`: leases `your_ip` to the
 /// requesting client and advertises this `Stack`'s own address as both the
 /// DHCP server identifier and the default gateway. Unlike
 /// `build_dns_response`, this reuses smoltcp's own `wire::dhcpv4::Repr::emit`
 /// rather than a manual byte layout, since that wire type already covers
 /// building a server reply and not just parsing one.
-fn build_dhcp_offer(discover: &DhcpRepr, your_ip: Ipv4Addr) -> Vec<u8> {
+fn build_dhcp_reply(
+    discover: &DhcpRepr,
+    your_ip: Ipv4Addr,
+    message_type: DhcpMessageType,
+) -> Vec<u8> {
     let dns_servers = heapless::Vec::from_slice(&[GATEWAY_ADDR])
         .expect("one DNS server address is well within the dns_servers option's fixed capacity");
     let offer = DhcpRepr {
-        message_type: DhcpMessageType::Offer,
+        message_type,
         transaction_id: discover.transaction_id,
         secs: 0,
         client_hardware_address: discover.client_hardware_address,
@@ -595,15 +599,24 @@ impl Stack {
     /// address from the pool on a client's first DISCOVER and returning
     /// that same address on every later one instead of consuming another
     /// slot.
-    fn lease_for(&mut self, mac: EthernetAddress) -> Ipv4Addr {
+    /// Returns `None` once the pool is exhausted (`DHCP_POOL_SIZE`
+    /// distinct MACs already leased) rather than wrapping around and
+    /// handing out an address already leased to another client: this
+    /// map is keyed on the guest-controlled DISCOVER's MAC, so an
+    /// unbounded or wrapping pool is a resource-exhaustion and
+    /// duplicate-address surface a guest fully controls.
+    fn lease_for(&mut self, mac: EthernetAddress) -> Option<Ipv4Addr> {
         if let Some(addr) = self.dhcp_leases.get(&mac) {
-            return *addr;
+            return Some(*addr);
         }
-        let offset = (self.dhcp_leases.len() as u8) % DHCP_POOL_SIZE;
+        let offset = self.dhcp_leases.len();
+        if offset >= DHCP_POOL_SIZE as usize {
+            return None;
+        }
         let [a, b, c, d] = DHCP_POOL_START.octets();
-        let addr = Ipv4Addr::new(a, b, c, d + offset);
+        let addr = Ipv4Addr::new(a, b, c, d + offset as u8);
         self.dhcp_leases.insert(mac, addr);
-        addr
+        Some(addr)
     }
 
     /// Drains every guest datagram waiting on the DHCP server socket,
@@ -627,22 +640,39 @@ impl Stack {
                 tracing::warn!("dropping unparseable guest DHCP datagram on UDP:67");
                 continue;
             };
-            if discover.message_type != DhcpMessageType::Discover {
-                // REQUEST/ACK handling is not implemented yet.
-                continue;
-            }
-            let offered_ip = self.lease_for(discover.client_hardware_address);
-            let offer = build_dhcp_offer(&discover, offered_ip);
-            // The client has no address yet, so the offer is broadcast
+            let reply = match discover.message_type {
+                DhcpMessageType::Discover => {
+                    let Some(offered_ip) = self.lease_for(discover.client_hardware_address) else {
+                        tracing::warn!("dropping guest DHCP DISCOVER: lease pool exhausted");
+                        continue;
+                    };
+                    build_dhcp_reply(&discover, offered_ip, DhcpMessageType::Offer)
+                }
+                DhcpMessageType::Request => {
+                    // The address was already reserved during DISCOVER;
+                    // REQUEST just confirms the client wants it. A client
+                    // that skipped DISCOVER (e.g. renewing a lease this
+                    // Stack instance never granted) gets a fresh lease
+                    // rather than being refused, since this is a single
+                    // trusted guest, not a multi-tenant DHCP server.
+                    let Some(acked_ip) = self.lease_for(discover.client_hardware_address) else {
+                        tracing::warn!("dropping guest DHCP REQUEST: lease pool exhausted");
+                        continue;
+                    };
+                    build_dhcp_reply(&discover, acked_ip, DhcpMessageType::Ack)
+                }
+                _ => continue,
+            };
+            // The client has no address yet, so the reply is broadcast
             // back rather than sent to the (still unspecified) source
-            // address the DISCOVER arrived from.
+            // address the request arrived from.
             let reply_to = udp::UdpMetadata::from(IpEndpoint::new(
                 IpAddress::Ipv4(Ipv4Addr::BROADCAST),
                 DHCP_CLIENT_PORT,
             ));
             let socket = self.sockets.get_mut::<udp::Socket>(self.dhcp_socket_handle);
-            if let Err(err) = socket.send_slice(&offer, reply_to) {
-                tracing::warn!(error = %err, "failed to queue guest DHCP offer");
+            if let Err(err) = socket.send_slice(&reply, reply_to) {
+                tracing::warn!(error = %err, "failed to queue guest DHCP reply");
             }
         }
     }

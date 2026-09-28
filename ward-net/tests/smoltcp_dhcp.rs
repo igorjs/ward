@@ -121,9 +121,24 @@ async fn poll_until_response(
 /// must), with correctly computed IPv4/UDP checksums so the checksum
 /// validation smoltcp runs by default on ingress accepts it.
 fn build_dhcp_discover_frame() -> Vec<u8> {
+    build_dhcp_client_frame(DhcpMessageType::Discover, DISCOVER_TRANSACTION_ID, None)
+}
+
+/// Builds a complete Ethernet+IPv4+UDP+DHCP client-message frame
+/// (DISCOVER or REQUEST), broadcast at both the Ethernet and IP layers, as
+/// a client with no address of its own must, with correctly computed
+/// IPv4/UDP checksums so smoltcp's default ingress checksum validation
+/// accepts it. Shared by `build_dhcp_discover_frame` and the REQUEST
+/// scenario below since only the message type, transaction ID, and
+/// requested address differ.
+fn build_dhcp_client_frame(
+    message_type: DhcpMessageType,
+    transaction_id: u32,
+    requested_ip: Option<Ipv4Addr>,
+) -> Vec<u8> {
     let dhcp_repr = DhcpRepr {
-        message_type: DhcpMessageType::Discover,
-        transaction_id: DISCOVER_TRANSACTION_ID,
+        message_type,
+        transaction_id,
         secs: 0,
         client_hardware_address: GUEST_MAC,
         client_ip: Ipv4Addr::UNSPECIFIED,
@@ -133,7 +148,7 @@ fn build_dhcp_discover_frame() -> Vec<u8> {
         subnet_mask: None,
         relay_agent_ip: Ipv4Addr::UNSPECIFIED,
         broadcast: true,
-        requested_ip: None,
+        requested_ip,
         client_identifier: Some(GUEST_MAC),
         server_identifier: None,
         parameter_request_list: None,
@@ -266,5 +281,60 @@ async fn given_dhcp_discover_when_polled_then_guest_gets_offer_with_gateway() {
         router,
         Some(GATEWAY_ADDR),
         "offer should hand back the stack's own address as the default gateway"
+    );
+}
+
+#[tokio::test]
+async fn given_dhcp_request_after_offer_when_polled_then_guest_gets_ack_for_same_address() {
+    // Arrange: a Stack backed by the socketpair harness. A real DHCP
+    // client's four-way handshake is DISCOVER -> OFFER -> REQUEST -> ACK;
+    // without answering REQUEST, the client never configures its
+    // interface and retries from DISCOVER forever.
+    const REQUEST_TRANSACTION_ID: u32 = 0xc0ff_ee43;
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let resolver: Box<dyn Resolver> = Box::new(NullResolver);
+    let mut stack = Stack::new(host_fd, resolver);
+
+    // Act, part 1: DISCOVER, to learn which address the OFFER actually
+    // leased (lease_for is keyed on the client MAC and returns the same
+    // address every time, but this scenario reads it back rather than
+    // assuming a specific offset, so it stays correct regardless of the
+    // pool's internal allocation order).
+    write_frame(&guest_fd, &build_dhcp_discover_frame());
+    let offer_frame = poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("stack should reply to the DISCOVER within the poll budget");
+    let (_, offer_type, offered_ip, _) = parse_dhcp_reply(&offer_frame);
+    assert_eq!(
+        offer_type,
+        DhcpMessageType::Offer,
+        "setup: expected an OFFER before this scenario can exercise REQUEST"
+    );
+
+    // Act, part 2: REQUEST the offered address.
+    let request = build_dhcp_client_frame(
+        DhcpMessageType::Request,
+        REQUEST_TRANSACTION_ID,
+        Some(offered_ip),
+    );
+    write_frame(&guest_fd, &request);
+    let ack_frame = poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("stack should reply to the guest's DHCP REQUEST within the poll budget");
+    let (transaction_id, message_type, acked_ip, _) = parse_dhcp_reply(&ack_frame);
+
+    // Assert
+    assert_eq!(
+        transaction_id, REQUEST_TRANSACTION_ID,
+        "ACK should carry the REQUEST's own transaction ID, not the DISCOVER's"
+    );
+    assert_eq!(
+        message_type,
+        DhcpMessageType::Ack,
+        "stack should answer a REQUEST with an ACK, completing the four-way handshake"
+    );
+    assert_eq!(
+        acked_ip, offered_ip,
+        "ACK should confirm the same address the OFFER leased"
     );
 }
