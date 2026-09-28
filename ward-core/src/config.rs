@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-/// Selects which network backend the daemon uses per ADR-018.
+/// Selects which network backend the daemon uses per ADR-019.
 ///
 /// Parsed from `WARD_NETWORK_BACKEND` at daemon startup. Invalid values
 /// panic at startup with a clear message listing the valid set so typos
@@ -10,8 +10,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkBackendChoice {
     /// passt(1): rootless userspace TCP/IP translator. Requires `passt`
-    /// on `$PATH` at sandbox-create time. Default per ADR-018.
-    #[default]
+    /// on `$PATH` at sandbox-create time.
     Passt,
     /// No network egress. Sandbox is isolated from the network entirely.
     None,
@@ -19,14 +18,14 @@ pub enum NetworkBackendChoice {
     /// Not implemented in v0.1; config parsing accepts the value so the
     /// env var can be set ahead of the implementation landing.
     Gvproxy,
-    /// smoltcp: pure-Rust userspace stack (research path). Not on the
-    /// v0.1 critical path; accepted for forward compatibility.
+    /// smoltcp: pure-Rust userspace stack. Default per ADR-019.
+    #[default]
     Smoltcp,
 }
 
 /// Parse `WARD_NETWORK_BACKEND` value into a [`NetworkBackendChoice`].
 ///
-/// Valid values: `passt` (default), `none`, `gvproxy`, `smoltcp`.
+/// Valid values: `passt`, `none`, `gvproxy`, `smoltcp` (default).
 /// Returns an error string on invalid input, listing the valid set.
 ///
 /// Free function (not a method) so it's testable without constructing
@@ -649,10 +648,10 @@ mod tests {
     // ----- WARD_NETWORK_BACKEND ------------------------------------------
 
     #[test]
-    fn given_no_network_backend_when_from_values_then_defaults_to_passt() {
+    fn given_no_env_var_when_parse_then_defaults_to_smoltcp() {
         let env = env_with_home();
         let cfg = Config::from_values(env);
-        assert_eq!(cfg.network_backend, NetworkBackendChoice::Passt);
+        assert_eq!(cfg.network_backend, NetworkBackendChoice::Smoltcp);
     }
 
     #[test]

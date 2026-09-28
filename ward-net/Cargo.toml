@@ -9,7 +9,7 @@ repository.workspace = true
 description = "ward's network backends: passt (default rootless), gvproxy, and an in-process smoltcp stack. See ADR-019."
 
 [features]
-default = ["passt"]
+default = ["smoltcp"]
 # Always-available stub: spawns nothing, sandboxes have no network. Useful
 # for tests, dev on platforms without passt, and the stub-backend path.
 none = []
