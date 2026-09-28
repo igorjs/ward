@@ -13,6 +13,16 @@ license.workspace = true
 name = "wardd"
 path = "src/main.rs"
 
+[features]
+default = []
+# Forwards to ward-core: enables the real libkrun backend so the
+# smoltcp_e2e.rs real-hardware test can be selected with
+# `--features krunvm` (it stays `#[ignore]`d; libkrun + KVM/HVF are
+# required to actually run it).
+krunvm = ["ward-core/krunvm"]
+# Forwards to ward-core/ward-net's smoltcp feature.
+smoltcp = ["ward-core/smoltcp"]
+
 [dependencies]
 ward-core = { path = "../ward-core" }
 # ADR-016: the daemon and embedded SDKs share the same Runtime wiring
