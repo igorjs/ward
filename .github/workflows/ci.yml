@@ -151,7 +151,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get install -y protobuf-compiler
       - name: clippy
-        run: cargo clippy --all-targets --features ward-net/smoltcp -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   # ── Unit + integration tests ────────────────────────────────────────
   # Fast tier: ward-core unit tests (inline #[cfg(test)] modules) and
@@ -228,12 +228,10 @@ jobs:
         run: cargo test --workspace --lib --bins
       - name: Integration tests (ward-core)
         run: cargo test -p ward-core --tests
-      - name: Integration tests (ward-net, smoltcp)
-        # Gated separately from the two steps above: the smoltcp backend
-        # is opt-in and its integration tests are compiled out entirely
-        # under default features, so they need this explicit feature flag
-        # to run at all rather than silently being skipped.
-        run: cargo test -p ward-net --features smoltcp --tests
+      - name: Integration tests (ward-net)
+        # Separate step from the two above: ward-core's --tests run
+        # doesn't touch ward-net's own tests/ directory.
+        run: cargo test -p ward-net --tests
 
   # ── E2E tests ───────────────────────────────────────────────────────
   # Slow tier: spawns the real wardd binary as a subprocess and runs the

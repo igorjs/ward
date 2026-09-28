@@ -6,22 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ward's network backends: passt (default rootless), gvproxy, and an in-process smoltcp stack. See ADR-019."
-
-[features]
-default = ["smoltcp"]
-# Always-available stub: spawns nothing, sandboxes have no network. Useful
-# for tests, dev on platforms without passt, and the stub-backend path.
-none = []
-# Default rootless backend per ADR-018. Probes `passt(1)` on PATH and
-# manages one passt subprocess per sandbox.
-passt = []
-# Opt-in alternative for hosts that already run gvproxy (e.g. via
-# podman-machine). Not implemented yet — feature gates the future surface.
-gvproxy = []
-# Pure-Rust userspace TCP/IP via smoltcp, the intended default per
-# ADR-019 (supersedes ADR-018's "research path" framing).
-smoltcp = ["dep:smoltcp", "dep:heapless"]
+description = "ward's network backends: a no-op stub and an in-process smoltcp TCP/IP stack. See ADR-019, ADR-020."
 
 [dependencies]
 # async-trait: makes NetworkBackend object-safe by boxing each async fn's
@@ -32,12 +17,7 @@ tracing = "0.1"
 # tokio used only via the test rt(macro); kept here so doctests + unit
 # tests can share the same runtime spin-up.
 tokio = { version = "1", features = ["rt", "macros", "process", "time", "fs", "sync", "net", "io-util"] }
-# `which` is the simplest portable way to probe for the passt binary on
-# PATH at runtime. Used by PasstBackend::probe.
-which = "8"
-# smoltcp is gated behind the `smoltcp` feature so the default build
-# doesn't pull a large dep for a research-phase backend.
-smoltcp = { version = "0.13", optional = true, default-features = false, features = [
+smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",
@@ -53,7 +33,7 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
 # needs to build a DHCP OFFER; already resolved transitively via smoltcp,
 # declared directly here since Rust requires a direct dependency to name
 # a crate's path.
-heapless = { version = "0.9", optional = true }
+heapless = "0.9"
 # libc: used in spawn_for_sandbox to call socketpair(2) directly.
 # rustix's net feature isn't enabled here; pulling libc for a single
 # syscall is cheaper than widening the rustix feature set.

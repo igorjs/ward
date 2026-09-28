@@ -6,8 +6,6 @@
 //! harness and asserts `Stack` answers with an echo reply carrying the same
 //! identifier and sequence number the request carried.
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

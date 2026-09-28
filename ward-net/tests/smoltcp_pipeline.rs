@@ -12,8 +12,6 @@
 //! and bidirectional payload delivery. Proves the pieces interoperate, not
 //! just that each works alone.
 
-#![cfg(feature = "smoltcp")]
-
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

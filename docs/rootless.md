@@ -67,15 +67,7 @@ That `sudo usermod` is the one-time setup step, and it is unavoidable: systemd r
 
 In CI (including GitHub Actions), GitHub-hosted Linux runners ship `/dev/kvm` but do not add the `runner` user to the `kvm` group by default; a workflow using ward on such a runner needs the same one-time `sudo usermod -aG kvm $USER` (or an equivalent `chmod`) as a setup step, run once per job. This is a GitHub Actions runner-image limitation, not a ward one.
 
-Optional: for rootless networking via `passt` (per [ADR-018](adr/018-rootless-networking.md)), install `passt`:
-
-```sh
-sudo apt install passt        # Debian/Ubuntu
-sudo dnf install passt        # Fedora
-sudo pacman -S passt          # Arch
-```
-
-`passt` is required only when the daemon needs to give sandboxes network egress. Stub-backend tests don't need it.
+Network egress is handled by an in-process smoltcp TCP/IP stack (per [ADR-019](adr/019-inprocess-smoltcp-networking.md) and [ADR-020](adr/020-smoltcp-only-networking.md)), no external binary or extra install step needed.
 
 ## Verifying rootless
 
@@ -100,8 +92,6 @@ If any of these surprise you (e.g. `wardd` started but won't create a sandbox be
 
 - **macOS: "permission denied" opening Hypervisor.** Re-sign the binary with the entitlement (above). Apple revokes ad-hoc signatures across certain system updates.
 - **Linux: `open /dev/kvm: permission denied`.** You're not in the `kvm` group, or you haven't logged out since being added.
-- **Linux: passt missing.** Install via your package manager. ward fails fast with a hint pointing here.
-
 ## Future work
 
 - macOS notarization for the signed `wardd` / `ward-mcp` binaries so Gatekeeper accepts them without `xattr -d com.apple.quarantine`. Tracked as [#30](https://github.com/igorjs/ward/issues/30).

@@ -1,10 +1,10 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! smoltcp backend — the default network backend (ADR-019).
+//! smoltcp backend — Ward's sole network backend (ADR-019, ADR-020).
 //!
-//! An in-process, pure-Rust TCP/IP stack replacing `passt`/`gvproxy`: no
-//! external binary, no `CAP_NET_ADMIN`, and a single process boundary
-//! where the [`Stack`]'s allowlist guard and SSRF/DNS-rebinding checks
+//! An in-process, pure-Rust TCP/IP stack: no external binary, no
+//! `CAP_NET_ADMIN`, and a single process boundary where the [`Stack`]'s
+//! allowlist guard and SSRF/DNS-rebinding checks
 //! ([`is_flow_destination_safe`]) run on every flow.
 //!
 //! [`RawFdDevice`] implements smoltcp's `phy::Device` trait over a raw
@@ -19,11 +19,10 @@
 //! egress check, then bridges the accepted flow to a real
 //! [`tokio::net::TcpStream`] over bounded channels.
 //!
-//! [`spawn_for_sandbox`] is the real per-sandbox lifecycle entry point
-//! (called directly from `krunvm.rs`, matching `passt`/`gvproxy`'s own
-//! free-function pattern); the [`NetworkBackend`] trait's `attach`/
-//! `detach` on [`SmoltcpBackend`] are unused by that path (see their own
-//! doc comments below).
+//! [`spawn_for_sandbox`] is the real per-sandbox lifecycle entry point,
+//! called directly from `krunvm.rs`; the [`NetworkBackend`] trait's
+//! `attach`/`detach` on [`SmoltcpBackend`] are unused by that path (see
+//! their own doc comments below).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -1426,8 +1425,7 @@ impl SmoltcpHandle {
     /// join. Idempotent: a task that has already finished (from a prior
     /// `detach` call) is detected via `is_finished` and this returns
     /// immediately, and a `cmd_tx` send on an already-closed channel is a
-    /// non-error no-op rather than a failure, mirroring
-    /// [`crate::passt::PasstHandle::kill`]'s idempotent shape.
+    /// non-error no-op rather than a failure.
     ///
     /// # Errors
     ///
@@ -1478,8 +1476,8 @@ pub async fn spawn_for_sandbox(
     egress_check: Box<EgressCheckFn>,
 ) -> Result<SmoltcpHandle, Error> {
     // socketpair(AF_UNIX, SOCK_DGRAM, 0) → [host_fd, guest_fd]. SOCK_DGRAM
-    // (unlike passt's SOCK_STREAM) preserves datagram boundaries, matching
-    // RawFdDevice's one-recv-per-frame reads.
+    // preserves datagram boundaries, matching RawFdDevice's one-recv-
+    // per-frame reads.
     // SAFETY: socketpair is a pure syscall with no preconditions beyond a
     // valid `sv` pointer; both fds are closed on error via OwnedFd/drop.
     let mut sv: [std::ffi::c_int; 2] = [-1, -1];

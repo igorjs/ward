@@ -7,8 +7,6 @@
 //! callback with the flow's resolved domain label and port before dialing
 //! out via `Connector`.
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

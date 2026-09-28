@@ -3,16 +3,14 @@
 //! ward network backends.
 //!
 //! [`NetworkBackend`] is the trait every backend implements. Per
-//! `docs/adr/018-rootless-networking.md` ward ships three implementations:
+//! `docs/adr/020-smoltcp-only-networking.md`, ward ships two:
 //!
-//! - [`passt::PasstBackend`] — default. Probes `passt(1)` on `$PATH` and
-//!   builds the command line that libkrun's `krun_set_passt_fd` consumes.
 //! - [`null::NullBackend`] — no-op. Sandbox has no network egress; the
 //!   stub-backend tests use this and so does `WARD_NETWORK_BACKEND=none`.
-//! - [`smoltcp_backend::SmoltcpBackend`] — in-process stack (feature
-//!   `smoltcp`). `RawFdDevice` reads and writes raw Ethernet frames over
-//!   an `OwnedFd` and is tested; `SmoltcpBackend::attach` still returns
-//!   `Error::Unimplemented` until it's wired to a live `Interface`.
+//! - [`smoltcp_backend::SmoltcpBackend`] — in-process TCP/IP stack, the
+//!   sole network-egress backend (`docs/adr/019-inprocess-smoltcp-networking.md`,
+//!   `docs/adr/020-smoltcp-only-networking.md`). `passt` and `gvproxy`
+//!   backends existed here previously; ADR-020 removed both.
 //!
 //! Backend selection in production lives in `ward-core` (or
 //! `ward-runtime`) where the libkrun FD plumbing happens. This crate
@@ -22,24 +20,11 @@
 use std::path::PathBuf;
 
 pub mod null;
-
-#[cfg(feature = "passt")]
-pub mod passt;
-
-#[cfg(feature = "gvproxy")]
-pub mod gvproxy;
-
-#[cfg(feature = "smoltcp")]
 pub mod smoltcp_backend;
 
 /// Errors surfaced by network backends.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The required external binary (passt, gvproxy, ...) wasn't found
-    /// on `$PATH`.
-    #[error("network backend dependency missing: {what} (looked on $PATH)")]
-    DependencyMissing { what: String },
-
     /// The backend's external process failed to spawn or exited non-zero.
     #[error("network backend process error: {0}")]
     Process(String),
@@ -79,17 +64,17 @@ pub struct AttachOptions {
 /// backends use it to look up their own internal state when detaching.
 pub type AttachId = String;
 
-/// Trait every backend implements. Async because passt + gvproxy
-/// involve spawning child processes via tokio; smoltcp is sync but
-/// implementations are free to be async.
+/// Trait every backend implements. Async since a future backend may
+/// spawn a child process via tokio; smoltcp itself is sync but the
+/// trait stays async so it isn't tied to one implementation's shape.
 #[async_trait::async_trait]
 pub trait NetworkBackend: Send + Sync {
-    /// Short, log-friendly name for this backend (e.g. `"passt"`).
+    /// Short, log-friendly name for this backend (e.g. `"smoltcp"`).
     fn name(&self) -> &'static str;
 
-    /// Check that the backend can actually run on this host. For passt
-    /// this means "is the binary on PATH"; for smoltcp this is always
-    /// true (the implementation is in-process).
+    /// Check that the backend can actually run on this host. Always
+    /// true for both current backends (`none` is a no-op, `smoltcp`
+    /// runs in-process).
     async fn probe(&self) -> Result<(), Error>;
 
     /// Attach a sandbox to the network. Returns an opaque ID the caller
@@ -101,21 +86,13 @@ pub trait NetworkBackend: Send + Sync {
 }
 
 /// Lookup a backend by name. Used by the daemon's startup config so
-/// `WARD_NETWORK_BACKEND=passt` works without compile-time changes.
+/// `WARD_NETWORK_BACKEND=smoltcp` works without compile-time changes.
 pub fn backend_by_name(name: &str) -> Result<Box<dyn NetworkBackend>, Error> {
     match name {
-        // Unit-struct construction: clippy::default_constructed_unit_structs
-        // forbids `::default()` on unit structs since the value is just
-        // the type name. PasstBackend has fields so it keeps Default.
         "none" => Ok(Box::new(null::NullBackend)),
-        #[cfg(feature = "passt")]
-        "passt" => Ok(Box::new(passt::PasstBackend::default())),
-        #[cfg(feature = "gvproxy")]
-        "gvproxy" => Ok(Box::new(gvproxy::GvproxyBackend::default())),
-        #[cfg(feature = "smoltcp")]
         "smoltcp" => Ok(Box::new(smoltcp_backend::SmoltcpBackend)),
         other => Err(Error::Unimplemented(format!(
-            "unknown network backend: {other} (known: none, passt, gvproxy, smoltcp)"
+            "unknown network backend: {other} (known: none, smoltcp)"
         ))),
     }
 }

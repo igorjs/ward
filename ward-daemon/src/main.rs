@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // serve_with_incoming_shutdown has returned, which means the signal
     // fired and tonic drained in-flight RPCs. Now tear down every
-    // running sandbox so we do not leak passt / gvproxy children, vsock
+    // running sandbox so we do not leak the smoltcp stack task, vsock
     // sockets, or libkrun contexts. Wrapped in a hard timeout so a
     // sandbox whose Backend::remove hangs cannot prevent the daemon
     // from exiting; systemd / launchd then unblock and restart cleanly.

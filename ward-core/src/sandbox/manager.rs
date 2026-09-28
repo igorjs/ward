@@ -190,9 +190,9 @@ impl SandboxManager {
 
         // SEC-ALLOWLIST: only the smoltcp backend's Stack enforces
         // EgressMode::Allowlist on the datapath (its per-flow guard).
-        // passt and gvproxy have no such enforcement point, so accepting
-        // Allowlist for them would silently degrade to unrestricted
-        // egress: reject up front instead.
+        // NetworkBackendChoice::None has no datapath at all, so accepting
+        // Allowlist for it would silently degrade to "policy set but
+        // never checked": reject up front instead.
         if egress_policy.mode == crate::protocol::EgressMode::Allowlist
             && self.network_backend != crate::config::NetworkBackendChoice::Smoltcp
         {
@@ -1011,11 +1011,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_passt_backend_when_create_sandbox_with_allowlist_then_rejected() {
-        // Arrange: passt has no per-flow enforcement point for Allowlist
-        // (unlike smoltcp's Stack), so accepting it here would silently
-        // degrade to unrestricted egress.
-        let mgr = build_manager_with_backend(4, crate::config::NetworkBackendChoice::Passt);
+    async fn given_none_backend_when_create_sandbox_with_allowlist_then_rejected() {
+        // Arrange: NetworkBackendChoice::None has no datapath at all
+        // (unlike smoltcp's Stack), so accepting an Allowlist policy for
+        // it would silently degrade to "policy set but never checked".
+        let mgr = build_manager_with_backend(4, crate::config::NetworkBackendChoice::None);
         let req = CreateSandboxRequest {
             image: "alpine".into(),
             egress: Some(PbEgressPolicy {
@@ -1029,7 +1029,7 @@ mod tests {
         let err = mgr
             .create(req)
             .await
-            .expect_err("passt cannot enforce Allowlist");
+            .expect_err("the none backend cannot enforce Allowlist");
 
         // Assert
         match err {
