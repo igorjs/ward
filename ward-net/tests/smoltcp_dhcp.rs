@@ -317,7 +317,7 @@ async fn given_dhcp_request_after_offer_when_polled_then_guest_gets_ack_for_same
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
 
     // Act, part 1: DISCOVER, to learn which address the OFFER actually
     // leased (lease_for is keyed on the client MAC and returns the same

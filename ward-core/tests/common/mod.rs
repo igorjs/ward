@@ -108,6 +108,7 @@ pub async fn test_server() -> WardClient<Channel> {
         Arc::clone(&broker),
         4,
         /* allow_host_mounts = */ false,
+        ward_core::config::NetworkBackendChoice::Smoltcp,
     ));
     let volume_mgr = Arc::new(VolumeManager::with_formatter(
         data_dir,

@@ -722,7 +722,7 @@ async fn given_host_closes_connection_when_flow_torn_down_then_second_poll_does_
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: establish the flow, then close the host side immediately so
