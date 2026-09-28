@@ -599,6 +599,70 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
     (to_host_tx, from_host_rx)
 }
 
+/// True if `dst` is safe to open a guest-initiated TCP flow to: neither
+/// private (RFC1918), loopback, link-local (this is what keeps a resolved
+/// or literal 169.254.169.254 cloud metadata address out of reach),
+/// multicast, unspecified, broadcast, CGNAT, nor any of the IETF
+/// TEST-NET/benchmarking/future-use reserved ranges (IPv4), and neither
+/// unique-local, 6to4, NAT64, nor Teredo (IPv6). Checked against the raw
+/// destination address regardless of whether it came from a literal in the
+/// SYN or from a DNS answer, so a guest cannot reach an internal address by
+/// having an attacker-controlled resolver answer an otherwise-allowed
+/// domain with it. This mirrors `ward-core`'s egress-proxy range checks
+/// (SEC-005) natively, since this crate cannot depend on `ward-core`.
+fn is_flow_destination_safe(dst: IpAddr) -> bool {
+    !is_private_or_local(dst)
+}
+
+fn is_private_or_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // 0.0.0.0/8 reserved (Linux routes to loopback in some setups)
+                || oct[0] == 0
+                // 100.64.0.0/10 CGNAT
+                || (oct[0] == 100 && (oct[1] & 0xC0) == 0x40)
+                // 192.0.0.0/24 IETF protocol assignments (incl. 192.0.0.1)
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
+                // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 TEST-NET
+                || (oct[0] == 192 && oct[1] == 0 && oct[2] == 2)
+                || (oct[0] == 198 && oct[1] == 51 && oct[2] == 100)
+                || (oct[0] == 203 && oct[1] == 0 && oct[2] == 113)
+                // 198.18.0.0/15 benchmarking
+                || (oct[0] == 198 && (oct[1] & 0xFE) == 18)
+                // 240.0.0.0/4 future-use (often unfiltered, reaches host)
+                || oct[0] >= 240
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fe80::/10 link-local
+                || (seg[0] & 0xFFC0 == 0xFE80)
+                // fc00::/7 unique local
+                || (seg[0] & 0xFE00 == 0xFC00)
+                // 2002::/16 6to4 anycast, tunnels to arbitrary IPv4
+                || seg[0] == 0x2002
+                // 64:ff9b::/96 NAT64, also tunnels to IPv4
+                || (seg[0] == 0x0064 && seg[1] == 0xFF9B)
+                // 2001::/32 Teredo tunnels
+                || (seg[0] == 0x2001 && seg[1] == 0x0000)
+                // IPv4-mapped IPv6, recurse so the full v4 rule set applies.
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|v4| is_private_or_local(IpAddr::V4(v4)))
+                    .unwrap_or(false)
+        }
+    }
+}
+
 /// Owns a smoltcp `Interface`, the `SocketSet` it drives, and the
 /// `RawFdDevice` backing both. `Interface::poll` takes the device by
 /// `&mut` on every call, so `Stack` holds all three together instead of
@@ -839,6 +903,20 @@ impl Stack {
                 destination = %dst,
                 cap = MAX_FLOW_ENTRIES,
                 "rejecting a new guest TCP flow: flow table is at capacity"
+            );
+            return;
+        }
+        let dst_ip = SocketAddr::from(dst).ip();
+        if !is_flow_destination_safe(dst_ip) {
+            // Same rejection path as the capacity check above: no listening
+            // socket is opened, so smoltcp finds no socket willing to accept
+            // the SYN and sends the RST itself. The check runs on every new
+            // flow unconditionally, so a destination reached via a DNS
+            // answer is screened exactly the same as one given as a literal.
+            tracing::warn!(
+                destination = %dst,
+                "rejecting a new guest TCP flow: destination is a private, \
+                 loopback, link-local, or otherwise reserved address"
             );
             return;
         }
