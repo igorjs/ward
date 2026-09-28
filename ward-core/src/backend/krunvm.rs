@@ -23,6 +23,16 @@ use crate::protocol::{CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, Sn
 #[allow(dead_code)]
 const AGENT_VSOCK_PORT: u32 = 1024;
 
+/// MAC address assigned to the guest's virtio-net device for the smoltcp
+/// backend. Locally administered (0x02 prefix), distinct from
+/// `INTERFACE_HARDWARE_ADDR` on the host side of `ward-net`'s `Stack`.
+/// `krun_add_net_unixgram` requires a real, non-null MAC: confirmed
+/// empirically that a null `c_mac` segfaults inside libkrun rather than
+/// having it assign one itself, despite `libkrun.h` giving no indication
+/// either way. Only referenced by the krunvm-gated FFI wrappers.
+#[cfg(feature = "krunvm")]
+const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+
 /// Path of the agent binary inside every sandbox rootfs.
 /// Only referenced by the krunvm-gated FFI wrappers.
 #[allow(dead_code)]
@@ -350,7 +360,7 @@ impl Backend for KrunvmBackend {
                     )
                     .await
                     .map_err(|e| BackendError::Internal(format!("smoltcp spawn: {e}")))?;
-                    krun_ffi::set_net_unixgram(ctx_id, handle.guest_fd, None)
+                    krun_ffi::set_net_unixgram(ctx_id, handle.guest_fd, SMOLTCP_GUEST_MAC)
                         .map_err(BackendError::Internal)?;
                     (None, None, Some(handle))
                 }

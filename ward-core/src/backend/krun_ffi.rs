@@ -297,6 +297,12 @@ pub fn set_passt_fd(ctx_id: u32, fd: c_int) -> Result<(), String> {
 /// fd-based integrations use this function), not the named-socket
 /// `c_path`/vfkit mode, so `c_path` is always passed as null.
 ///
+/// `mac` is required, not optional: confirmed empirically (real libkrun
+/// 1.19.4, real hardware) that a null `c_mac` makes `krun_add_net_unixgram`
+/// segfault rather than assigning a MAC itself, contrary to an earlier,
+/// never-verified assumption. libkrun's own header only documents `c_mac`
+/// as "MAC address as an array of 6 uint8_t entries", with no null case.
+///
 /// # Errors
 ///
 /// Returns an error string containing the libkrun errno (negated return
@@ -311,24 +317,16 @@ pub fn set_passt_fd(ctx_id: u32, fd: c_int) -> Result<(), String> {
 ///   this call. libkrun duplicates the fd internally; the caller may
 ///   close its copy afterward.
 #[cfg(feature = "krunvm")]
-pub fn set_net_unixgram(
-    ctx_id: u32,
-    fd: std::os::fd::RawFd,
-    mac: Option<[u8; 6]>,
-) -> Result<(), String> {
-    let mut mac_bytes = mac.unwrap_or_default();
-    let c_mac = if mac.is_some() {
-        mac_bytes.as_mut_ptr()
-    } else {
-        std::ptr::null_mut()
-    };
+pub fn set_net_unixgram(ctx_id: u32, fd: std::os::fd::RawFd, mac: [u8; 6]) -> Result<(), String> {
+    let mut mac_bytes = mac;
 
     // SAFETY: ctx_id contract documented above; fd is caller-guaranteed
     // open; c_path is null because this is the fd-based connection mode,
-    // not the named-socket/vfkit mode; c_mac either points at a live
-    // 6-byte local array for the duration of this call or is null (libkrun
-    // assigns a MAC itself in that case).
-    let ret = unsafe { krun_add_net_unixgram(ctx_id, std::ptr::null(), fd, c_mac, 0, 0) };
+    // not the named-socket/vfkit mode; c_mac points at a live 6-byte
+    // local array for the duration of this call.
+    let ret = unsafe {
+        krun_add_net_unixgram(ctx_id, std::ptr::null(), fd, mac_bytes.as_mut_ptr(), 0, 0)
+    };
     if ret < 0 {
         Err(format!("krun_add_net_unixgram failed: errno {}", -ret))
     } else {
