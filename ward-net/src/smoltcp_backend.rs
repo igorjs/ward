@@ -1,21 +1,29 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! smoltcp backend — research path.
+//! smoltcp backend — the default network backend (ADR-019).
 //!
-//! Per ADR-018, smoltcp is not on the v0.1 critical path. This module
-//! exists so the [`crate::NetworkBackend`] trait shape covers all three
-//! candidates uniformly and so future work has a deliberate starting
-//! point (rather than discovering, six months from now, that smoltcp
-//! needs a different trait surface than passt).
+//! An in-process, pure-Rust TCP/IP stack replacing `passt`/`gvproxy`: no
+//! external binary, no `CAP_NET_ADMIN`, and a single process boundary
+//! where the [`Stack`]'s allowlist guard and SSRF/DNS-rebinding checks
+//! ([`is_flow_destination_safe`]) run on every flow.
 //!
 //! [`RawFdDevice`] implements smoltcp's `phy::Device` trait over a raw
-//! file descriptor (a `socketpair(2)` end), reading and writing raw
-//! Ethernet frames. [`SmoltcpBackend`] (the [`NetworkBackend`] impl) does
-//! not yet wire a device into a running `Interface`:
-//! - Implements `probe()` (smoltcp is in-process so probing always
-//!   succeeds).
-//! - `attach` / `detach` return `Error::Unimplemented` with a pointer at
-//!   ADR-018's "Future work" section.
+//! file descriptor (a `socketpair(2)` end carrying bare Ethernet frames
+//! to/from libkrun). [`Stack`] wires a `RawFdDevice` into an `Interface`
+//! and drives it: a hand-rolled DNS relay and DHCP server over raw UDP
+//! sockets (smoltcp's own `dns`/`dhcpv4` sockets are client-only, so
+//! serving queries needs manual wire encoding), ICMP echo via smoltcp's
+//! `auto-icmp-echo-reply` feature, and a capped TCP flow table that
+//! intercepts a guest's SYN via non-destructive `MSG_PEEK`, resolves the
+//! destination against the private/link-local guard and an injected
+//! egress check, then bridges the accepted flow to a real
+//! [`tokio::net::TcpStream`] over bounded channels.
+//!
+//! [`spawn_for_sandbox`] is the real per-sandbox lifecycle entry point
+//! (called directly from `krunvm.rs`, matching `passt`/`gvproxy`'s own
+//! free-function pattern); the [`NetworkBackend`] trait's `attach`/
+//! `detach` on [`SmoltcpBackend`] are unused by that path (see their own
+//! doc comments below).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -1442,10 +1450,10 @@ impl SmoltcpHandle {
     }
 }
 
-/// How long the task waits for a command before polling the device
-/// again when nothing has arrived. Frame processing beyond draining the
-/// socket is future work; this cadence only bounds how promptly a
-/// `Shutdown` not already caught by the `select!` race is noticed.
+/// How long the task waits for a command before running the stack's poll
+/// cycle (DNS, DHCP, ICMP, flow table) again when nothing has arrived.
+/// Also bounds how promptly a `Shutdown` not already caught by the
+/// `select!` race is noticed.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Allocates an `AF_UNIX SOCK_DGRAM` socketpair for `sandbox_id` and
@@ -1535,11 +1543,16 @@ impl NetworkBackend for SmoltcpBackend {
         Ok(())
     }
 
+    /// Unused by the real sandbox lifecycle, which goes through
+    /// [`spawn_for_sandbox`] instead (see the module doc comment).
+    /// Errors rather than silently no-opping so a future caller of this
+    /// trait method (not `spawn_for_sandbox`) fails loudly instead of
+    /// getting a sandbox with no network.
     async fn attach(&self, _sandbox_id: &str, _opts: &AttachOptions) -> Result<AttachId, Error> {
         Err(Error::Unimplemented(
-            "smoltcp backend: see docs/adr/018-rootless-networking.md \
-             'Future work' for the planned implementation. Use \
-             WARD_NETWORK_BACKEND=passt for now."
+            "smoltcp backend: NetworkBackend::attach is not the real \
+             lifecycle path for this backend (ADR-019); sandboxes are \
+             attached via spawn_for_sandbox instead."
                 .into(),
         ))
     }
@@ -1571,7 +1584,7 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            Error::Unimplemented(msg) => assert!(msg.contains("018")),
+            Error::Unimplemented(msg) => assert!(msg.contains("spawn_for_sandbox")),
             other => panic!("expected Unimplemented, got {other:?}"),
         }
     }
