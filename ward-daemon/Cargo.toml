@@ -20,8 +20,6 @@ default = []
 # `--features krunvm` (it stays `#[ignore]`d; libkrun + KVM/HVF are
 # required to actually run it).
 krunvm = ["ward-core/krunvm"]
-# Forwards to ward-core/ward-net's smoltcp feature.
-smoltcp = ["ward-core/smoltcp"]
 
 [dependencies]
 ward-core = { path = "../ward-core" }

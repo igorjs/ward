@@ -124,8 +124,6 @@ unsafe extern "C" {
         features: u32,
         flags: u32,
     ) -> i32;
-    pub fn krun_set_passt_fd(ctx_id: u32, fd: c_int) -> i32;
-    pub fn krun_set_gvproxy_path(ctx_id: u32, c_path: *mut c_char) -> i32;
     pub fn krun_set_net_mac(ctx_id: u32, c_mac: *mut u8) -> i32;
     pub fn krun_set_port_map(ctx_id: u32, port_map: *const *const c_char) -> i32;
 
@@ -260,42 +258,12 @@ unsafe extern "C" {
     pub fn krun_start_enter(ctx_id: u32) -> i32;
 }
 
-/// Safe wrapper around [`krun_set_passt_fd`].
-///
-/// Hands the host-side FD of an `AF_UNIX SOCK_STREAM` socketpair to
-/// libkrun so the VM's virtio-net device routes through passt.
-///
-/// # Errors
-///
-/// Returns an error string containing the libkrun errno (negated return
-/// value) if the call fails. The caller in `krunvm.rs` maps this to
-/// `BackendError::Internal`.
-///
-/// # Safety (caller obligations)
-///
-/// - `ctx_id` must have been returned by `krun_create_ctx()` and must
-///   not have been freed.
-/// - `fd` must be an open, valid file descriptor for the lifetime of
-///   this call. libkrun duplicates the fd internally; the caller may
-///   close its copy afterward.
-#[cfg(feature = "krunvm")]
-pub fn set_passt_fd(ctx_id: u32, fd: c_int) -> Result<(), String> {
-    // SAFETY: ctx_id contract documented above; fd is caller-guaranteed open.
-    let ret = unsafe { krun_set_passt_fd(ctx_id, fd) };
-    if ret < 0 {
-        Err(format!("krun_set_passt_fd failed: errno {}", -ret))
-    } else {
-        Ok(())
-    }
-}
-
 /// Safe wrapper around [`krun_add_net_unixgram`].
 ///
 /// Hands the host-side FD of an `AF_UNIX SOCK_DGRAM` socketpair to libkrun
 /// so the VM's virtio-net device exchanges bare Ethernet frames over it.
-/// This is the fd-based connection mode (mirroring how gvproxy's own
-/// fd-based integrations use this function), not the named-socket
-/// `c_path`/vfkit mode, so `c_path` is always passed as null.
+/// This is the fd-based connection mode, not the named-socket `c_path`/
+/// vfkit mode, so `c_path` is always passed as null.
 ///
 /// `mac` is required, not optional: confirmed empirically (real libkrun
 /// 1.19.4, real hardware) that a null `c_mac` makes `krun_add_net_unixgram`
@@ -329,44 +297,6 @@ pub fn set_net_unixgram(ctx_id: u32, fd: std::os::fd::RawFd, mac: [u8; 6]) -> Re
     };
     if ret < 0 {
         Err(format!("krun_add_net_unixgram failed: errno {}", -ret))
-    } else {
-        Ok(())
-    }
-}
-
-/// Safe wrapper around [`krun_set_gvproxy_path`].
-///
-/// Hands the path of a gvproxy Unix datagram socket to libkrun so the
-/// VM's virtio-net device connects to gvproxy instead of passt. gvproxy
-/// must already be listening on this path (via `-listen-vfkit unixgram://`)
-/// before calling this function.
-///
-/// # Errors
-///
-/// Returns an error string if the path contains a NUL byte (invalid for
-/// C strings) or if libkrun returns a negative errno-style code.
-/// The caller in `krunvm.rs` maps this to `BackendError::Internal`.
-///
-/// # Safety (caller obligations)
-///
-/// - `ctx_id` must have been returned by `krun_create_ctx()` and must
-///   not have been freed.
-/// - `path` must be a valid filesystem path without embedded NUL bytes.
-///   libkrun copies the path string internally.
-#[cfg(feature = "krunvm")]
-pub fn set_gvproxy_path(ctx_id: u32, path: &std::path::Path) -> Result<(), String> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let cstr = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("gvproxy path {:?} contains a NUL byte", path))?;
-
-    // SAFETY: ctx_id contract documented above; cstr is a valid NUL-terminated
-    // C string. krun_set_gvproxy_path takes a *mut c_char but does not
-    // mutate through it; the signature is a libkrun API wart.
-    let ret = unsafe { krun_set_gvproxy_path(ctx_id, cstr.as_ptr() as *mut c_char) };
-    if ret < 0 {
-        Err(format!("krun_set_gvproxy_path failed: errno {}", -ret))
     } else {
         Ok(())
     }

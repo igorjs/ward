@@ -8,8 +8,6 @@
 //! a DHCP client only, so `Stack` must serve DHCP by hand-building the wire
 //! packets via `smoltcp::wire::dhcpv4` (which does cover both directions).
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

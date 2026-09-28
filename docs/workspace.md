@@ -13,8 +13,8 @@ ward-runtime/  Embedded runtime: boots libkrun-backed sandboxes in-process,
                no daemon required.
 ward-mcp/      Model Context Protocol server: exposes sandboxed-execution
                tools to LLM agents over stdio JSON-RPC.
-ward-net/      Network backends: passt (default rootless), gvproxy, and a
-               smoltcp research path.
+ward-net/      Network backend: an in-process smoltcp TCP/IP stack, the
+               sole egress path (ADR-019, ADR-020).
 proto/         ward.proto, ward_agent.proto. Single source of truth for the wire.
 sdks/          Apache-2.0 client libraries (Python, TypeScript, Go, Rust).
 vendor/        Pinned libkrun version + bottle checksums.

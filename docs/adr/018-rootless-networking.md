@@ -1,8 +1,10 @@
 # ADR-018: Rootless Networking Architecture
 
-**Status:** Proposed
+**Status:** Proposed (superseded by [ADR-019](019-inprocess-smoltcp-networking.md) and [ADR-020](020-smoltcp-only-networking.md))
 **Date:** 2026-06-04
 **Authors:** Igor
+
+**Note (ADR-020):** This record chose `passt` and `gvproxy` as Ward's network backends and expected an in-process smoltcp stack to stay deferred. Both decisions were reversed: ADR-019 promoted smoltcp to the default, and ADR-020 removed `passt`/`gvproxy` outright. Kept for historical context.
 
 ## Context
 

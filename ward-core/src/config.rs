@@ -2,43 +2,36 @@
 
 use std::path::PathBuf;
 
-/// Selects which network backend the daemon uses per ADR-019.
+/// Selects whether sandbox egress goes through the smoltcp network
+/// backend or is disabled entirely. Per ADR-019 (smoltcp default) and
+/// ADR-020 (smoltcp is the sole backend; passt and gvproxy were removed).
 ///
 /// Parsed from `WARD_NETWORK_BACKEND` at daemon startup. Invalid values
 /// panic at startup with a clear message listing the valid set so typos
 /// surface immediately rather than silently falling back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkBackendChoice {
-    /// passt(1): rootless userspace TCP/IP translator. Requires `passt`
-    /// on `$PATH` at sandbox-create time.
-    Passt,
     /// No network egress. Sandbox is isolated from the network entirely.
     None,
-    /// gvproxy: alternative for hosts that already run podman-machine.
-    /// Not implemented in v0.1; config parsing accepts the value so the
-    /// env var can be set ahead of the implementation landing.
-    Gvproxy,
-    /// smoltcp: pure-Rust userspace stack. Default per ADR-019.
+    /// smoltcp: pure-Rust in-process userspace TCP/IP stack. The only
+    /// egress-capable backend (ADR-020).
     #[default]
     Smoltcp,
 }
 
 /// Parse `WARD_NETWORK_BACKEND` value into a [`NetworkBackendChoice`].
 ///
-/// Valid values: `passt`, `none`, `gvproxy`, `smoltcp` (default).
+/// Valid values: `none`, `smoltcp` (default).
 /// Returns an error string on invalid input, listing the valid set.
 ///
 /// Free function (not a method) so it's testable without constructing
 /// a full `Config`.
 pub fn parse_network_backend(s: &str) -> Result<NetworkBackendChoice, String> {
     match s {
-        "passt" => Ok(NetworkBackendChoice::Passt),
         "none" => Ok(NetworkBackendChoice::None),
-        "gvproxy" => Ok(NetworkBackendChoice::Gvproxy),
         "smoltcp" => Ok(NetworkBackendChoice::Smoltcp),
         other => Err(format!(
-            "invalid WARD_NETWORK_BACKEND value {other:?}: valid values are \
-             passt, none, gvproxy, smoltcp"
+            "invalid WARD_NETWORK_BACKEND value {other:?}: valid values are none, smoltcp"
         )),
     }
 }
@@ -71,7 +64,7 @@ pub struct Config {
     /// SocketAddr) to opt in to scraping.
     pub metrics_addr: Option<std::net::SocketAddr>,
     /// Which network backend to use for sandbox egress. Parsed from
-    /// `WARD_NETWORK_BACKEND`; defaults to `passt` per ADR-018.
+    /// `WARD_NETWORK_BACKEND`; defaults to `smoltcp` per ADR-019/ADR-020.
     pub network_backend: NetworkBackendChoice,
     /// Hard upper bound on graceful-shutdown drain time. After SIGTERM /
     /// SIGINT the daemon stops accepting new RPCs, drains in-flight
@@ -189,8 +182,8 @@ impl Config {
         // WARD_NETWORK_BACKEND: invalid values panic at startup with a clear
         // message listing the valid set. This is intentional; a typo like
         // "wireguard" should surface immediately rather than silently falling
-        // back to passt and leaving the operator confused about which backend
-        // is actually running.
+        // back to smoltcp and leaving the operator confused about which
+        // backend is actually running.
         let network_backend = env
             .ward_network_backend
             .as_deref()
@@ -662,16 +655,6 @@ mod tests {
         };
         let cfg = Config::from_values(env);
         assert_eq!(cfg.network_backend, NetworkBackendChoice::None);
-    }
-
-    #[test]
-    fn given_network_backend_passt_when_from_values_then_passt() {
-        let env = ConfigEnv {
-            ward_network_backend: Some("passt".into()),
-            ..env_with_home()
-        };
-        let cfg = Config::from_values(env);
-        assert_eq!(cfg.network_backend, NetworkBackendChoice::Passt);
     }
 
     #[test]

@@ -422,8 +422,6 @@ case "$(uname -s)" in
       echo "    sudo usermod -aG kvm \$USER"
       echo "  then log out and back in. ward will start failing at"
       echo "  sandbox creation until this is done."
-      echo "  Optional for network egress: sudo apt install passt"
-      echo "  (or your distro equivalent). See docs/rootless.md."
       echo
     fi
     ;;

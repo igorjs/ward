@@ -8,8 +8,6 @@
 //! `resolved` associates that address with a domain label an allowlist
 //! would otherwise trust.
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

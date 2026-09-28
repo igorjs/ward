@@ -1,8 +1,10 @@
 # ADR-019: In-Process smoltcp Networking as Default
 
-- **Status:** Accepted
+- **Status:** Accepted (partially superseded by [ADR-020](020-smoltcp-only-networking.md))
 - **Date created:** 2026-09-25
 - **Date modified:** 2026-09-25
+
+**Note (ADR-020):** This record kept `passt` and `gvproxy` as opt-in backends (Decision, Follow-up). ADR-020 removed both outright, ahead of the informal "run in production long enough" bar this record set, after real-hardware verification of the smoltcp path during ADR-019's own implementation. The rest of this record (promoting smoltcp to default) stands.
 
 ## Context
 

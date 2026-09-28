@@ -6,8 +6,6 @@
 //! and assert `RawFdDevice::receive` observes them on the other, with no
 //! smoltcp `Interface` involved.
 
-#![cfg(feature = "smoltcp")]
-
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use smoltcp::phy::{Device, RxToken, TxToken};
@@ -16,8 +14,7 @@ use ward_net::smoltcp_backend::RawFdDevice;
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
 ///
-/// Mirrors the raw libc `socketpair` call in `ward_net::passt::spawn_for_sandbox`,
-/// adapted to `SOCK_DGRAM` so each `write` produces one discrete datagram
+/// Uses `SOCK_DGRAM` so each `write` produces one discrete datagram
 /// that a single `receive` call can observe.
 fn socketpair_dgram() -> (OwnedFd, OwnedFd) {
     let mut sv: [std::ffi::c_int; 2] = [-1, -1];

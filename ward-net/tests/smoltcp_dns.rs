@@ -6,8 +6,6 @@
 //! asserts `Stack` relays it to an injected `Resolver` and answers with
 //! the resolver's own result, with no live network access involved.
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

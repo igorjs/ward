@@ -7,8 +7,6 @@
 //! `Connector` rather than dialing the network itself, so a test never
 //! needs live network access to prove the flow table's addressing logic.
 
-#![cfg(feature = "smoltcp")]
-
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

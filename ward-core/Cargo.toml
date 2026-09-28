@@ -15,10 +15,6 @@ default = []
 # `backend::krun_ffi` module declares the FFI surface directly (no
 # bindgen, no krun-sys crate). See adr/003-isolation-backend.md.
 krunvm = []
-# Mirrors ward-net's own `smoltcp` feature name so it can be selected
-# explicitly at this crate's boundary; already forwarded unconditionally
-# via the ward-net dependency below.
-smoltcp = ["ward-net/smoltcp"]
 
 [dependencies]
 # Generated protobuf types + tonic gRPC stubs for the ward.v1 wire
@@ -60,10 +56,8 @@ uuid = { version = "1", features = ["v4"] }
 # Already a transitive dep via tempfile -> native-tls; promoted to a
 # direct dep so the rustix usage is explicit in this crate's manifest.
 rustix = { version = "1", features = ["fs"] }
-# ward-net: network backend for the krunvm boot path. The passt feature
-# gates spawn_for_sandbox which creates the AF_UNIX socketpair and spawns
-# the passt child. Only needed at runtime when using rootless networking.
-ward-net = { path = "../ward-net", features = ["passt", "gvproxy", "smoltcp"] }
+# ward-net: the smoltcp network backend for the krunvm boot path.
+ward-net = { path = "../ward-net" }
 # metrics: zero-overhead recorder façade. Daemon installs the
 # prometheus exporter; this crate emits the counters/gauges/histograms
 # the daemon scrapes. No-op if no exporter is installed (i.e. when
