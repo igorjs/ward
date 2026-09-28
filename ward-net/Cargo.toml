@@ -21,7 +21,7 @@ passt = []
 gvproxy = []
 # Pure-Rust userspace TCP/IP via smoltcp, the intended default per
 # ADR-019 (supersedes ADR-018's "research path" framing).
-smoltcp = ["dep:smoltcp"]
+smoltcp = ["dep:smoltcp", "dep:heapless"]
 
 [dependencies]
 # async-trait: makes NetworkBackend object-safe by boxing each async fn's
@@ -48,6 +48,11 @@ smoltcp = { version = "0.13", optional = true, default-features = false, feature
     "socket-icmp",
     "log",
 ] }
+# heapless is the bounded-Vec type wire::dhcpv4::Repr's dns_servers option
+# needs to build a DHCP OFFER; already resolved transitively via smoltcp,
+# declared directly here since Rust requires a direct dependency to name
+# a crate's path.
+heapless = { version = "0.9", optional = true }
 # libc: used in spawn_for_sandbox to call socketpair(2) directly.
 # rustix's net feature isn't enabled here; pulling libc for a single
 # syscall is cheaper than widening the rustix feature set.
