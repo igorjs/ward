@@ -1003,7 +1003,18 @@ impl Stack {
                 }
             }
         }
+        // A single flow's Established arm above can push the same (key,
+        // handle) twice in one pass (e.g. the write channel closing and
+        // the read channel disconnecting in the same tick, which happens
+        // whenever spawn_host_io's task ends). Dedupe by key here rather
+        // than at each push site, so `sockets_pending_removal` never gets
+        // a handle twice, which would panic the next pump_flows call: the
+        // second SocketSet::remove for an already-removed handle panics.
+        let mut removed = std::collections::HashSet::with_capacity(to_remove.len());
         for (key, handle) in to_remove {
+            if !removed.insert(key) {
+                continue;
+            }
             self.sockets.get_mut::<tcp::Socket>(handle).abort();
             self.sockets_pending_removal.push(handle);
             self.flows.remove(&key);

@@ -700,3 +700,47 @@ async fn given_flow_table_at_capacity_when_new_syn_then_rejected_with_rst() {
          no room to admit"
     );
 }
+
+#[tokio::test]
+async fn given_host_closes_connection_when_flow_torn_down_then_second_poll_does_not_panic() {
+    // Arrange: a Stack backed by a real TcpListener standing in for the
+    // host peer. spawn_host_io's write and read loops race in one
+    // tokio::select!, so whichever ends first drops both channel halves
+    // (to_host_rx and from_host_tx) together; closing the host's end of
+    // the connection makes the read loop see EOF and end the task.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let listener_addr = listener.local_addr().expect("local_addr");
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let resolver: Box<dyn Resolver> = Box::new(NullResolver);
+    let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
+    let mut stack = Stack::new(host_fd, resolver, connector);
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // Act: establish the flow, then close the host side immediately so
+    // its io task ends and both channel halves drop in the same tick.
+    write_frame(&guest_fd, &build_tcp_syn_frame());
+    let syn_ack = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert!(
+        syn_ack.is_some(),
+        "flow must reach Established before this scenario can exercise teardown"
+    );
+    let (host_stream, _) = listener.accept().await.expect("accept");
+    drop(host_stream);
+
+    // poll_until_rst polls in a loop until the flow is actually torn
+    // down (previously queuing the flow for removal twice in that same
+    // pass: the write channel's Closed arm and the read channel's
+    // Disconnected arm both fire once the io task ends). This confirms
+    // teardown happened before the assertion below exercises the panic.
+    let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert!(
+        rst.is_some(),
+        "flow should be torn down (RST to the guest) once the host closes its side"
+    );
+
+    // Assert: one more poll must not panic. This is where
+    // `sockets_pending_removal` gets drained; a duplicate entry from the
+    // pass above previously made the second `SocketSet::remove` for the
+    // same handle panic on an already-removed socket.
+    stack.poll();
+}
