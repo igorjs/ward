@@ -56,49 +56,59 @@ impl Device for RawFdDevice {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        // Sized one byte past MAX_FRAME_LEN so an oversized datagram (the
-        // kernel silently truncates SOCK_DGRAM reads to the buffer size)
-        // fills the whole buffer and is distinguishable from a frame that
-        // legitimately fills exactly MAX_FRAME_LEN bytes.
-        let mut buf = [0u8; MAX_FRAME_LEN + 1];
-        // SAFETY: self.fd is a valid open fd for the device's lifetime;
-        // buf is a valid, initialized buffer of the given length.
-        // MSG_DONTWAIT makes this non-blocking so an empty socket returns
-        // immediately instead of stalling the caller's poll loop.
-        let n = unsafe {
-            libc::recv(
-                self.fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if n <= 0 {
-            return None;
+        // Loops past a malformed datagram instead of returning None for
+        // it: the recv below already consumed that datagram, so reporting
+        // None (meaning "queue empty") would make the poll loop stop
+        // early and leave any valid frame queued behind it waiting for
+        // the next tick. Only a genuinely empty queue (EAGAIN, n <= 0)
+        // returns None.
+        loop {
+            // Sized one byte past MAX_FRAME_LEN so an oversized datagram
+            // (the kernel silently truncates SOCK_DGRAM reads to the
+            // buffer size) fills the whole buffer and is distinguishable
+            // from a frame that legitimately fills exactly MAX_FRAME_LEN
+            // bytes.
+            let mut buf = [0u8; MAX_FRAME_LEN + 1];
+            // SAFETY: self.fd is a valid open fd for the device's
+            // lifetime; buf is a valid, initialized buffer of the given
+            // length. MSG_DONTWAIT makes this non-blocking so an empty
+            // socket returns immediately instead of stalling the
+            // caller's poll loop.
+            let n = unsafe {
+                libc::recv(
+                    self.fd.as_raw_fd(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n <= 0 {
+                return None;
+            }
+            if (n as usize) < MIN_ETHERNET_FRAME_LEN {
+                tracing::warn!(
+                    len = n,
+                    min = MIN_ETHERNET_FRAME_LEN,
+                    "dropping truncated datagram shorter than a minimum Ethernet frame"
+                );
+                continue;
+            }
+            if (n as usize) > MAX_FRAME_LEN {
+                tracing::warn!(
+                    len = n,
+                    max = MAX_FRAME_LEN,
+                    "dropping oversized datagram larger than the maximum Ethernet frame"
+                );
+                continue;
+            }
+            let frame = buf[..n as usize].to_vec();
+            return Some((
+                RawFdRxToken { frame },
+                RawFdTxToken {
+                    fd: self.fd.as_raw_fd(),
+                },
+            ));
         }
-        if (n as usize) < MIN_ETHERNET_FRAME_LEN {
-            tracing::warn!(
-                len = n,
-                min = MIN_ETHERNET_FRAME_LEN,
-                "dropping truncated datagram shorter than a minimum Ethernet frame"
-            );
-            return None;
-        }
-        if (n as usize) > MAX_FRAME_LEN {
-            tracing::warn!(
-                len = n,
-                max = MAX_FRAME_LEN,
-                "dropping oversized datagram larger than the maximum Ethernet frame"
-            );
-            return None;
-        }
-        let frame = buf[..n as usize].to_vec();
-        Some((
-            RawFdRxToken { frame },
-            RawFdTxToken {
-                fd: self.fd.as_raw_fd(),
-            },
-        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -144,9 +154,30 @@ impl TxToken for RawFdTxToken {
         let mut buf = vec![0u8; len];
         let result = f(&mut buf);
         // SAFETY: self.fd is a valid open fd for the device's lifetime;
-        // buf has exactly `len` initialized bytes for f to have written.
-        unsafe {
-            libc::write(self.fd, buf.as_ptr().cast(), buf.len());
+        // buf has exactly `len` initialized bytes to send. MSG_DONTWAIT
+        // makes this non-blocking: without it, a guest that stops
+        // draining its side of the socketpair fills the send buffer and
+        // parks this call, and since it runs inside Stack::poll (a
+        // synchronous call with no await to yield at), that would stall
+        // the sandbox's whole network task rather than just this frame.
+        let sent =
+            unsafe { libc::send(self.fd, buf.as_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+        if sent < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock {
+                tracing::warn!(error = %err, "failed to write an Ethernet frame to the guest");
+            }
+            // WouldBlock (a full send buffer, i.e. the guest isn't
+            // draining) is dropped silently: TCP retransmits or the
+            // next protocol-level retry covers the loss, matching how
+            // ingress already drops a datagram it can't use rather than
+            // erroring the whole poll loop.
+        } else if (sent as usize) != buf.len() {
+            tracing::warn!(
+                sent,
+                expected = buf.len(),
+                "short write sending an Ethernet frame to the guest"
+            );
         }
         result
     }
