@@ -422,8 +422,13 @@ case "$(uname -s)" in
       echo "    sudo usermod -aG kvm \$USER"
       echo "  then log out and back in. ward will start failing at"
       echo "  sandbox creation until this is done."
-      echo "  Optional for network egress: sudo apt install passt"
-      echo "  (or your distro equivalent). See docs/rootless.md."
+      # smoltcp is the default network backend; passt is now opt-in
+      # (WARD_NETWORK_BACKEND=passt), so only hint at installing it
+      # when the user has actually chosen it.
+      if [[ "${WARD_NETWORK_BACKEND:-}" == "passt" ]]; then
+        echo "  Optional for network egress: sudo apt install passt"
+        echo "  (or your distro equivalent). See docs/rootless.md."
+      fi
       echo
     fi
     ;;
