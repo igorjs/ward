@@ -8,8 +8,10 @@
 
 #![cfg(feature = "smoltcp")]
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::pin::Pin;
 use std::time::Duration;
 
 use smoltcp::phy::ChecksumCapabilities;
@@ -77,6 +79,13 @@ impl Connector for NullConnector {
             "NullConnector never dials out; this scenario never opens a TCP flow",
         ))
     }
+}
+
+/// `Stack::new` requires an egress-check callback, but this scenario never
+/// opens a TCP flow, so this always allows rather than standing in for a
+/// real allowlist policy.
+fn always_allow_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async { true })
 }
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
@@ -324,7 +333,7 @@ async fn given_guest_dns_query_when_relayed_then_fake_resolver_answer_returned()
         answer: CANNED_ANSWER,
     });
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let query = build_dns_query_frame(CANNED_DOMAIN);
@@ -357,7 +366,7 @@ async fn given_dns_response_when_relayed_then_resolved_map_records_ip_to_domain(
         answer: CANNED_ANSWER,
     });
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let query = build_dns_query_frame(CANNED_DOMAIN);
@@ -387,7 +396,7 @@ async fn given_resolved_map_at_capacity_when_new_entry_then_oldest_evicted() {
         answer: CANNED_ANSWER,
     });
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
 
     // Act: insert far more synthetic entries than the map's cap, each with
     // a distinct IP and domain so eviction order is unambiguous.
@@ -488,7 +497,7 @@ async fn given_spoofed_dns_response_wrong_transaction_id_when_relayed_then_resol
         ],
     });
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: fire both queries before either resolves, then drain both
@@ -541,7 +550,7 @@ async fn given_outstanding_query_table_at_capacity_when_new_query_then_oldest_ev
         answer: CANNED_ANSWER,
     });
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
 
     // Act: push far more synthetic outstanding queries than the table's
     // expected cap, each for a distinct domain, none of which ever

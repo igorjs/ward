@@ -648,7 +648,13 @@ mod tests {
             store,
         ));
         let broker = Arc::new(Broker::new());
-        let sandbox = Arc::new(SandboxManager::new(backend, broker, 8, false));
+        let sandbox = Arc::new(SandboxManager::new(
+            backend,
+            broker,
+            8,
+            false,
+            crate::config::NetworkBackendChoice::Smoltcp,
+        ));
         let volume = Arc::new(VolumeManager::new(path, 8));
         WardGrpcServer::new(sandbox, volume)
     }

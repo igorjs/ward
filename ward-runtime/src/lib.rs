@@ -111,6 +111,7 @@ impl Runtime {
             Arc::clone(&broker),
             max_sandboxes,
             allow_host_mounts,
+            network_backend,
         ));
         let volume_manager = Arc::new(VolumeManager::new(data_dir, max_volumes));
         Self {

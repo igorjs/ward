@@ -95,6 +95,13 @@ pub struct SandboxManager {
     /// once and cannot mutate mid-process (in particular, a sandbox
     /// escape that touches `/proc/<pid>/environ` cannot widen it).
     allow_host_mounts: bool,
+    /// Snapshot of `Config::network_backend`, same rationale as
+    /// `allow_host_mounts`. Only the smoltcp backend has a datapath that
+    /// enforces `EgressMode::Allowlist` (its per-flow guard in
+    /// `ward-net`'s `Stack`); passt and gvproxy have no such enforcement
+    /// point, so `create` rejects Allowlist up front for those backends
+    /// rather than silently accepting a policy nothing checks.
+    network_backend: crate::config::NetworkBackendChoice,
     /// Process records keyed by pid. Populated by exec/run; drained by
     /// stream_output. Lives for the lifetime of the manager; the leak
     /// is bounded by sandbox lifetime and cleaned up when the sandbox
@@ -108,6 +115,7 @@ impl SandboxManager {
         broker: Arc<Broker>,
         max_sandboxes: usize,
         allow_host_mounts: bool,
+        network_backend: crate::config::NetworkBackendChoice,
     ) -> Self {
         Self {
             backend,
@@ -116,6 +124,7 @@ impl SandboxManager {
             max_sandboxes,
             create_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sandboxes)),
             allow_host_mounts,
+            network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -179,15 +188,20 @@ impl SandboxManager {
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
 
-        // SEC-ALLOWLIST: EgressProxy::serve() is not wired into the production
-        // network path. Allowlist mode would silently fall back to an unrestricted
-        // NIC. Reject until TAP/smoltcp wiring lands.
-        if egress_policy.mode == crate::protocol::EgressMode::Allowlist {
-            return Err(ApiError::InvalidRequest(
-                "egress mode Allowlist is not yet available; \
-                 use Deny (no outbound) or Open (unrestricted outbound)"
-                    .to_string(),
-            ));
+        // SEC-ALLOWLIST: only the smoltcp backend's Stack enforces
+        // EgressMode::Allowlist on the datapath (its per-flow guard).
+        // passt and gvproxy have no such enforcement point, so accepting
+        // Allowlist for them would silently degrade to unrestricted
+        // egress: reject up front instead.
+        if egress_policy.mode == crate::protocol::EgressMode::Allowlist
+            && self.network_backend != crate::config::NetworkBackendChoice::Smoltcp
+        {
+            return Err(ApiError::InvalidRequest(format!(
+                "egress mode Allowlist requires the smoltcp network backend \
+                 (WARD_NETWORK_BACKEND=smoltcp); the configured backend \
+                 ({:?}) has no datapath to enforce it",
+                self.network_backend
+            )));
         }
 
         let resources = req
@@ -786,7 +800,20 @@ mod tests {
     /// Injects a `FakePuller` so `create_sandbox` works offline.
     /// Leaks the TempDir intentionally: tokio's async fs API outlives any
     /// test-local scope, and the OS cleans /tmp on its own schedule.
+    /// Default to allow_host_mounts=false so the cap path is exercised by
+    /// the existing test corpus; per-test overrides go through a
+    /// dedicated builder if they need the opt-in.
     fn build_manager(max_sandboxes: usize) -> Arc<SandboxManager> {
+        build_manager_with_backend(max_sandboxes, crate::config::NetworkBackendChoice::Smoltcp)
+    }
+
+    /// Same as [`build_manager`], but with the network backend snapshot
+    /// under test's control, for scenarios that depend on which backend
+    /// is configured (e.g. the SEC-ALLOWLIST guard).
+    fn build_manager_with_backend(
+        max_sandboxes: usize,
+        network_backend: crate::config::NetworkBackendChoice,
+    ) -> Arc<SandboxManager> {
         use crate::backend::image::ImageStore;
         use crate::backend::krunvm::KrunvmBackend;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -797,14 +824,12 @@ mod tests {
         let backend: Arc<dyn Backend> =
             Arc::new(KrunvmBackend::with_image_store_for_test(path, store));
         let broker = Arc::new(Broker::new());
-        // Default to allow_host_mounts=false so the cap path is exercised
-        // by the existing test corpus; per-test overrides go through a
-        // dedicated builder if they need the opt-in.
         Arc::new(SandboxManager::new(
             backend,
             broker,
             max_sandboxes,
             /* allow_host_mounts = */ false,
+            network_backend,
         ))
     }
 
@@ -959,6 +984,60 @@ mod tests {
         );
         let live = mgr.list().await.expect("list").len();
         assert_eq!(live, successes, "live sandbox count must match successes");
+    }
+
+    #[tokio::test]
+    async fn given_egress_mode_allowlist_when_create_sandbox_then_no_longer_rejected() {
+        // Arrange: Allowlist mode used to be hard-rejected at creation
+        // because no datapath enforced it; the smoltcp backend now does.
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            egress: Some(PbEgressPolicy {
+                mode: PbEgressMode::Allowlist as i32,
+                domains: vec!["api.example.com".into()],
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        let result = mgr.create(req).await;
+
+        // Assert
+        assert!(
+            result.is_ok(),
+            "Allowlist mode must no longer be rejected at creation: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_passt_backend_when_create_sandbox_with_allowlist_then_rejected() {
+        // Arrange: passt has no per-flow enforcement point for Allowlist
+        // (unlike smoltcp's Stack), so accepting it here would silently
+        // degrade to unrestricted egress.
+        let mgr = build_manager_with_backend(4, crate::config::NetworkBackendChoice::Passt);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            egress: Some(PbEgressPolicy {
+                mode: PbEgressMode::Allowlist as i32,
+                domains: vec!["api.example.com".into()],
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        let err = mgr
+            .create(req)
+            .await
+            .expect_err("passt cannot enforce Allowlist");
+
+        // Assert
+        match err {
+            ApiError::InvalidRequest(msg) => {
+                assert!(msg.contains("smoltcp"), "expected 'smoltcp' in: {msg}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     // ----- get -----------------------------------------------------------

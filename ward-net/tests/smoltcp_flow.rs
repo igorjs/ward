@@ -9,9 +9,11 @@
 
 #![cfg(feature = "smoltcp")]
 
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,6 +80,13 @@ impl Connector for RecordingConnector {
             "RecordingConnector never dials out; this scenario only proves it was called",
         ))
     }
+}
+
+/// `Stack::new` requires an egress-check callback; no scenario in this file
+/// exercises rejection, so this always allows rather than standing in for a
+/// real allowlist policy.
+fn always_allow_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async { true })
 }
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
@@ -254,7 +263,7 @@ async fn given_guest_syn_to_open_dest_when_polled_then_fake_connector_called_wit
     let connector: Box<dyn Connector> = Box::new(RecordingConnector {
         called_with: Arc::clone(&called_with),
     });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let syn_frame = build_tcp_syn_frame();
@@ -484,7 +493,7 @@ async fn given_established_flow_when_guest_sends_bytes_then_host_receives_them()
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: drive a full handshake from the guest (SYN, then the ACK that
@@ -549,7 +558,7 @@ async fn given_established_flow_when_host_sends_bytes_then_guest_receives_them()
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: drive a full handshake from the guest (SYN, then the ACK that
@@ -635,7 +644,7 @@ async fn given_fake_connector_future_never_resolves_when_polled_then_flow_times_
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(HangingConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: the guest's SYN starts a connect attempt that will never
@@ -671,7 +680,7 @@ async fn given_flow_table_at_capacity_when_new_syn_then_rejected_with_rst() {
     let connector: Box<dyn Connector> = Box::new(RecordingConnector {
         called_with: Arc::clone(&called_with),
     });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let synthetic_dest = Ipv4Addr::new(198, 51, 100, 1);
@@ -713,7 +722,7 @@ async fn given_host_closes_connection_when_flow_torn_down_then_second_poll_does_
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     // Act: establish the flow, then close the host side immediately so

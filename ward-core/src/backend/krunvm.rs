@@ -15,6 +15,8 @@ use super::image::ImageStore;
 use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
+use crate::egress::EgressProxy;
+#[cfg(feature = "krunvm")]
 use crate::protocol::EgressMode;
 use crate::protocol::{CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo};
 
@@ -167,6 +169,13 @@ struct SandboxState {
     /// disabled.
     #[cfg(feature = "krunvm")]
     smoltcp: Option<ward_net::smoltcp_backend::SmoltcpHandle>,
+    /// Egress policy proxy backing the smoltcp datapath's per-flow
+    /// allow/deny check. Kept alive for the sandbox's lifetime: the
+    /// spawned Stack task holds its own clone of this `Arc` inside the
+    /// egress-check closure. `None` for Passt/Gvproxy backends (which
+    /// don't consult it yet) and for Deny-mode sandboxes.
+    #[cfg(feature = "krunvm")]
+    egress: Option<Arc<EgressProxy>>,
 }
 
 // Manual impl instead of a derive: SmoltcpHandle wraps a JoinHandle and an
@@ -180,7 +189,8 @@ impl std::fmt::Debug for SandboxState {
         s.field("vm", &self.vm)
             .field("passt", &self.passt)
             .field("gvproxy", &self.gvproxy)
-            .field("smoltcp_active", &self.smoltcp.is_some());
+            .field("smoltcp_active", &self.smoltcp.is_some())
+            .field("egress_active", &self.egress.is_some());
         s.finish()
     }
 }
@@ -327,7 +337,8 @@ impl Backend for KrunvmBackend {
         self.krun_set_root(ctx_id, &rootfs)?;
 
         #[cfg(feature = "krunvm")]
-        let (passt_handle, gvproxy_handle, smoltcp_handle) = if opts.egress.mode != EgressMode::Deny
+        let (passt_handle, gvproxy_handle, smoltcp_handle, egress_proxy) = if opts.egress.mode
+            != EgressMode::Deny
         {
             use super::krun_ffi;
             match self.network_backend {
@@ -340,7 +351,7 @@ impl Backend for KrunvmBackend {
                     .map_err(|e| BackendError::Internal(format!("passt spawn: {e}")))?;
                     krun_ffi::set_passt_fd(ctx_id, handle.guest_fd)
                         .map_err(BackendError::Internal)?;
-                    (Some(handle), None, None)
+                    (Some(handle), None, None, None)
                 }
                 NetworkBackendChoice::Gvproxy => {
                     let handle = ward_net::gvproxy::spawn_for_sandbox(
@@ -351,24 +362,36 @@ impl Backend for KrunvmBackend {
                     .map_err(|e| BackendError::Internal(format!("gvproxy spawn: {e}")))?;
                     krun_ffi::set_gvproxy_path(ctx_id, &handle.socket_path)
                         .map_err(BackendError::Internal)?;
-                    (None, Some(handle), None)
+                    (None, Some(handle), None, None)
                 }
                 NetworkBackendChoice::Smoltcp => {
+                    // The proxy is the single source of truth for this
+                    // sandbox's allow/deny decisions; the spawned Stack task
+                    // consults it through the closure below on every flow.
+                    let egress_proxy = Arc::new(EgressProxy::new(id.clone(), opts.egress.clone()));
+                    let egress_for_check = Arc::clone(&egress_proxy);
+                    let egress_check: Box<ward_net::smoltcp_backend::EgressCheckFn> =
+                        Box::new(move |domain: &str, port: u16| {
+                            let proxy = Arc::clone(&egress_for_check);
+                            let domain = domain.to_string();
+                            Box::pin(async move { proxy.check(&domain, port).await })
+                        });
                     let handle = ward_net::smoltcp_backend::spawn_for_sandbox(
                         &id,
                         &ward_net::AttachOptions::default(),
+                        egress_check,
                     )
                     .await
                     .map_err(|e| BackendError::Internal(format!("smoltcp spawn: {e}")))?;
                     krun_ffi::set_net_unixgram(ctx_id, handle.guest_fd, SMOLTCP_GUEST_MAC)
                         .map_err(BackendError::Internal)?;
-                    (None, None, Some(handle))
+                    (None, None, Some(handle), Some(egress_proxy))
                 }
                 // None: no external process; libkrun uses loopback or nothing.
-                _ => (None, None, None),
+                _ => (None, None, None, None),
             }
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         // Bind mounts → virtiofs shares; volumes → raw block devices. The
@@ -425,6 +448,8 @@ impl Backend for KrunvmBackend {
             gvproxy: gvproxy_handle,
             #[cfg(feature = "krunvm")]
             smoltcp: smoltcp_handle,
+            #[cfg(feature = "krunvm")]
+            egress: egress_proxy,
         };
 
         self.sandboxes.write().await.insert(id, state);

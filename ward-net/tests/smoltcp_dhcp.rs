@@ -10,8 +10,10 @@
 
 #![cfg(feature = "smoltcp")]
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::pin::Pin;
 use std::time::Duration;
 
 use smoltcp::phy::ChecksumCapabilities;
@@ -54,6 +56,13 @@ impl Connector for NullConnector {
             "NullConnector never dials out; this scenario never opens a TCP flow",
         ))
     }
+}
+
+/// `Stack::new` requires an egress-check callback, but this scenario never
+/// opens a TCP flow, so this always allows rather than standing in for a
+/// real allowlist policy.
+fn always_allow_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async { true })
 }
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
@@ -265,7 +274,7 @@ async fn given_dhcp_discover_when_polled_then_guest_gets_offer_with_gateway() {
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
 
     let discover = build_dhcp_discover_frame();
     write_frame(&guest_fd, &discover);
@@ -308,7 +317,7 @@ async fn given_dhcp_request_after_offer_when_polled_then_guest_gets_ack_for_same
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
 
     // Act, part 1: DISCOVER, to learn which address the OFFER actually
     // leased (lease_for is keyed on the client MAC and returns the same

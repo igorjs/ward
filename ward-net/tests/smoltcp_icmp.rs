@@ -8,8 +8,10 @@
 
 #![cfg(feature = "smoltcp")]
 
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::pin::Pin;
 use std::time::Duration;
 
 use smoltcp::phy::ChecksumCapabilities;
@@ -61,6 +63,13 @@ impl Connector for NullConnector {
             "NullConnector never dials out; this scenario never opens a TCP flow",
         ))
     }
+}
+
+/// `Stack::new` requires an egress-check callback, but this scenario never
+/// opens a TCP flow, so this always allows rather than standing in for a
+/// real allowlist policy.
+fn always_allow_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async { true })
 }
 
 /// Create an `AF_UNIX SOCK_DGRAM` pair and return both ends as owned fds.
@@ -257,7 +266,7 @@ async fn given_guest_icmp_echo_request_when_polled_then_echo_reply_returned_with
     let (guest_fd, host_fd) = socketpair_dgram();
     let resolver: Box<dyn Resolver> = Box::new(NullResolver);
     let connector: Box<dyn Connector> = Box::new(NullConnector);
-    let mut stack = Stack::new(host_fd, resolver, connector);
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
     let echo_request = build_icmp_echo_request_frame();
