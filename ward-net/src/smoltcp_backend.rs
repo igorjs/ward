@@ -476,11 +476,6 @@ const TCP_SOCKET_BUFFER_BYTES: usize = 16384;
 /// never block the flow indefinitely.
 const HOST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a spawned host-io task waits for one read from the connector's
-/// `TcpStream` to yield a chunk (or EOF) before giving up on the flow.
-/// Mirrors `HOST_WRITE_TIMEOUT`'s convention for the read direction.
-const HOST_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// How long a flow's spawned connect task waits for `Connector::connect` to
 /// resolve before giving up. Without this, an unresponsive remote would
 /// leave the flow `Connecting` forever with no way to notice the guest gave
@@ -570,25 +565,27 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
             }
         };
         let read_loop = async {
+            // No timeout on this await, unlike the write side: a read
+            // only returns when the peer sends something, closes, or
+            // errors, so a stuck-peer timeout here would also fire on
+            // every merely idle or slow-to-answer connection (a long
+            // request, a keep-alive) and reset it for no reason. The
+            // flow already tears down on EOF or a real error below.
             let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
             loop {
-                match tokio::time::timeout(HOST_READ_TIMEOUT, read_half.read(&mut buf)).await {
-                    Ok(Ok(0)) => break,
-                    Ok(Ok(n)) => {
+                match read_half.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
                         if from_host_tx.send(buf[..n].to_vec()).await.is_err() {
                             // pump_flows already tore this flow down.
                             break;
                         }
                     }
-                    Ok(Err(err)) => {
+                    Err(err) => {
                         tracing::warn!(
                             error = %err,
                             "host read failed for a guest-initiated TCP flow"
                         );
-                        break;
-                    }
-                    Err(_) => {
-                        tracing::warn!("host read timed out for a guest-initiated TCP flow");
                         break;
                     }
                 }
