@@ -150,8 +150,9 @@ pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
 /// pass `allow_host=true` and lift the restriction (useful for
 /// trusted operator workflows like CI runners with explicit host-FS
 /// access). Even with the opt-in, system-critical roots (`/proc`,
-/// `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/usr`) still require
-/// `readonly: true` so a sandbox can't overwrite host system files.
+/// `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/usr`, `/run`, `/var/run`,
+/// `/lib`, `/bin`, `/sbin`) still require `readonly: true` so a sandbox
+/// can't overwrite host system files.
 pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
     for (label, path) in [("source", source), ("target", target)] {
         if path.is_empty() {
@@ -186,7 +187,8 @@ pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Re
     if is_sensitive_host_path(source) && !readonly {
         return Err(ApiError::InvalidRequest(format!(
             "mount source {source} is a sensitive system path \
-             (/proc, /sys, /dev, /etc, /root, /boot, /usr); \
+             (/proc, /sys, /dev, /etc, /root, /boot, /usr, /run, \
+             /var/run, /lib, /bin, /sbin); \
              readonly: true is required for these roots"
         )));
     }
@@ -208,7 +210,10 @@ fn is_default_allowed_source(path: &str) -> bool {
 /// True if `path` is one of the system roots that must never be
 /// mounted writable into a sandbox.
 fn is_sensitive_host_path(path: &str) -> bool {
-    const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/root", "/boot", "/usr"];
+    const SENSITIVE: &[&str] = &[
+        "/proc", "/sys", "/dev", "/etc", "/root", "/boot", "/usr", "/run", "/var/run", "/lib",
+        "/bin", "/sbin",
+    ];
     SENSITIVE
         .iter()
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
@@ -882,7 +887,10 @@ mod proptests {
     fn given_sensitive_path_when_writable_then_rejected_even_with_opt_in() {
         // SEC-020: /etc, /proc, /sys etc. must be readonly even when
         // WARD_ALLOW_HOST_MOUNTS lifts the source allowlist.
-        for path in ["/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/usr"] {
+        for path in [
+            "/etc", "/proc", "/sys", "/dev", "/root", "/boot", "/usr", "/run", "/var/run", "/lib",
+            "/bin", "/sbin",
+        ] {
             assert!(
                 matches!(
                     mount(path, "/x", false, true),
@@ -895,7 +903,7 @@ mod proptests {
 
     #[test]
     fn given_sensitive_path_when_readonly_and_opt_in_then_accepted() {
-        for path in ["/etc", "/etc/passwd", "/proc", "/usr/lib"] {
+        for path in ["/etc", "/etc/passwd", "/proc", "/usr/lib", "/var/run/docker.sock"] {
             assert!(
                 mount(path, "/x", true, true).is_ok(),
                 "expected {path:?} readonly with opt-in to be accepted"
