@@ -39,12 +39,15 @@ async fn given_existing_sandbox_when_exec_echo_then_returns_pid_and_running_stat
 
     // Act
     let resp = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["echo".into(), "hello".into()],
-            working_dir: String::new(),
-            env: Default::default(),
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into(), "hello".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            },
+            &s.token,
+        ))
         .await
         .expect("exec");
     let info = resp.into_inner();
@@ -68,14 +71,18 @@ async fn given_empty_command_when_exec_then_invalid_argument() {
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: a real token lets the request reach exec's command validator
+    // rather than being rejected earlier for a missing token.
     let err = client
-        .exec(ExecRequest {
-            sandbox_id: s.id,
-            command: vec![],
-            working_dir: String::new(),
-            env: Default::default(),
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec![],
+                working_dir: String::new(),
+                env: Default::default(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("empty command");
 
@@ -141,12 +148,15 @@ async fn given_exec_with_working_dir_when_request_succeeds_then_does_not_leak() 
 
     // Act
     let resp = client
-        .exec(ExecRequest {
-            sandbox_id: s.id,
-            command: vec!["pwd".into()],
-            working_dir: "/work".into(),
-            env: Default::default(),
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["pwd".into()],
+                working_dir: "/work".into(),
+                env: Default::default(),
+            },
+            &s.token,
+        ))
         .await
         .expect("exec")
         .into_inner();
@@ -178,13 +188,17 @@ async fn given_existing_sandbox_when_run_then_stub_rejects_with_invalid_argument
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: a real token lets the request reach the run stub rather than
+    // being rejected earlier for a missing token.
     let err = client
-        .run(RunRequest {
-            sandbox_id: s.id,
-            language: "python".into(),
-            code: "print('hi')".into(),
-        })
+        .run(common::with_token(
+            RunRequest {
+                sandbox_id: s.id.clone(),
+                language: "python".into(),
+                code: "print('hi')".into(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("run");
 
@@ -206,13 +220,17 @@ async fn given_unsupported_language_when_run_then_stub_rejects_with_invalid_argu
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: a real token lets the request reach the run stub rather than
+    // being rejected earlier for a missing token.
     let err = client
-        .run(RunRequest {
-            sandbox_id: s.id,
-            language: "cobol".into(),
-            code: "DISPLAY 'hi'".into(),
-        })
+        .run(common::with_token(
+            RunRequest {
+                sandbox_id: s.id.clone(),
+                language: "cobol".into(),
+                code: "DISPLAY 'hi'".into(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("unsupported language");
 
@@ -238,13 +256,18 @@ async fn given_invalid_language_name_when_run_then_invalid_argument() {
 
     // Act: dash in the language name fails the language_name validator
     // BEFORE the runtime-table lookup. This catches the validator early
-    // so unknown languages don't reach the routing logic.
+    // so unknown languages don't reach the routing logic. A real token
+    // is attached so the request reaches that validator instead of being
+    // rejected earlier for a missing token.
     let err = client
-        .run(RunRequest {
-            sandbox_id: s.id,
-            language: "py-thon".into(),
-            code: "print('hi')".into(),
-        })
+        .run(common::with_token(
+            RunRequest {
+                sandbox_id: s.id.clone(),
+                language: "py-thon".into(),
+                code: "print('hi')".into(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("invalid language name");
 
@@ -253,23 +276,36 @@ async fn given_invalid_language_name_when_run_then_invalid_argument() {
 }
 
 #[tokio::test]
-async fn given_unknown_sandbox_when_run_then_stub_rejects_with_invalid_argument() {
-    // Arrange
+async fn given_authorized_sandbox_when_run_then_stub_rejects_with_invalid_argument() {
+    // Arrange: a real, token-authorized sandbox. An unauthenticated call
+    // against an unknown sandbox now legitimately gets rejected by the
+    // capability-token check before Run's own stub ever runs, the same as
+    // every other sandbox-scoped RPC; this guards the stub's rejection
+    // once a caller has cleared that gate.
     let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
 
     // Act
     let err = client
-        .run(RunRequest {
-            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
-            language: "python".into(),
-            code: "print('hi')".into(),
-        })
+        .run(common::with_token(
+            RunRequest {
+                sandbox_id: s.id.clone(),
+                language: "python".into(),
+                code: "print('hi')".into(),
+            },
+            &s.token,
+        ))
         .await
-        .expect_err("unknown sandbox");
+        .expect_err("run");
 
-    // Assert: the stub rejects before looking up the sandbox, so even an
-    // unknown id gets InvalidArgument, not NotFound. Regression guard for
-    // issue #9.
+    // Assert: regression guard for issue #9, remove once Run is implemented.
     assert_eq!(err.code(), Code::InvalidArgument);
     assert_eq!(err.message(), RUN_STUB_MESSAGE);
 }
@@ -292,21 +328,27 @@ async fn given_exec_when_stream_output_then_yields_stdout_then_exit_then_closes(
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["echo".into(), "hi".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into(), "hi".into()],
+                ..Default::default()
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
     // Act: open the stream and drain it to completion.
     let mut stream = client
-        .stream_output(StreamOutputRequest {
-            sandbox_id: s.id.clone(),
-            pid: proc.pid.clone(),
-        })
+        .stream_output(common::with_token(
+            StreamOutputRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid.clone(),
+            },
+            &s.token,
+        ))
         .await
         .expect("stream_output")
         .into_inner();
@@ -383,29 +425,38 @@ async fn given_stream_already_consumed_when_called_again_then_invalid_argument()
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["echo".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["echo".into()],
+                ..Default::default()
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
     let _first = client
-        .stream_output(StreamOutputRequest {
-            sandbox_id: s.id.clone(),
-            pid: proc.pid.clone(),
-        })
+        .stream_output(common::with_token(
+            StreamOutputRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid.clone(),
+            },
+            &s.token,
+        ))
         .await
         .expect("first call");
 
     // Act
     let err = client
-        .stream_output(StreamOutputRequest {
-            sandbox_id: s.id,
-            pid: proc.pid,
-        })
+        .stream_output(common::with_token(
+            StreamOutputRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid,
+            },
+            &s.token,
+        ))
         .await
         .expect_err("second call");
 
@@ -430,22 +481,28 @@ async fn given_exec_when_write_stdin_with_valid_bytes_then_returns_empty_ok() {
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["cat".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
     // Act
     let resp = client
-        .write_stdin(WriteStdinRequest {
-            sandbox_id: s.id,
-            pid: proc.pid,
-            data: b"hello\n".to_vec(),
-        })
+        .write_stdin(common::with_token(
+            WriteStdinRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid,
+                data: b"hello\n".to_vec(),
+            },
+            &s.token,
+        ))
         .await
         .expect("write_stdin");
 
@@ -512,22 +569,30 @@ async fn given_pid_from_different_sandbox_when_write_stdin_then_not_found() {
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s1.id,
-            command: vec!["cat".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s1.id,
+                command: vec!["cat".into()],
+                ..Default::default()
+            },
+            &s1.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
-    // Act: address the pid via the WRONG sandbox.
+    // Act: address the pid via the WRONG sandbox, but with that sandbox's
+    // own real token so the request passes authorization and reaches the
+    // cross-sandbox pid ownership check under test.
     let err = client
-        .write_stdin(WriteStdinRequest {
-            sandbox_id: s2.id,
-            pid: proc.pid,
-            data: b"x".to_vec(),
-        })
+        .write_stdin(common::with_token(
+            WriteStdinRequest {
+                sandbox_id: s2.id.clone(),
+                pid: proc.pid,
+                data: b"x".to_vec(),
+            },
+            &s2.token,
+        ))
         .await
         .expect_err("cross-sandbox");
 
@@ -553,21 +618,27 @@ async fn given_exec_when_kill_process_then_returns_empty_ok() {
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["cat".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
     // Act
     let resp = client
-        .kill_process(KillProcessRequest {
-            sandbox_id: s.id,
-            pid: proc.pid,
-        })
+        .kill_process(common::with_token(
+            KillProcessRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid,
+            },
+            &s.token,
+        ))
         .await
         .expect("kill_process");
 
@@ -589,29 +660,38 @@ async fn given_killed_pid_when_write_stdin_then_not_found() {
         .unwrap()
         .into_inner();
     let proc = client
-        .exec(ExecRequest {
-            sandbox_id: s.id.clone(),
-            command: vec!["cat".into()],
-            ..Default::default()
-        })
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: s.id.clone(),
+                command: vec!["cat".into()],
+                ..Default::default()
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
     client
-        .kill_process(KillProcessRequest {
-            sandbox_id: s.id.clone(),
-            pid: proc.pid.clone(),
-        })
+        .kill_process(common::with_token(
+            KillProcessRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid.clone(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap();
 
     // Act
     let err = client
-        .write_stdin(WriteStdinRequest {
-            sandbox_id: s.id,
-            pid: proc.pid,
-            data: b"x".to_vec(),
-        })
+        .write_stdin(common::with_token(
+            WriteStdinRequest {
+                sandbox_id: s.id.clone(),
+                pid: proc.pid,
+                data: b"x".to_vec(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("write after kill");
 

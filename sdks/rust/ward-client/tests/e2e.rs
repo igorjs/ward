@@ -17,9 +17,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use hyper_util::rt::TokioIo;
 use tempfile::TempDir;
+use tokio::net::UnixStream;
+use tonic::Request;
+use tonic::transport::{Channel, Endpoint, Uri};
+use tower::service_fn;
 
-use ward_client::{CreateOptions, EgressMode, WardClient, WardError};
+use ward_client::{CreateOptions, EgressMode, WardClient, WardError, pb};
+use pb::ward_client::WardClient as PbClient;
 
 /// Resolve the wardd binary path without pulling in ward-daemon as a
 /// dev-dep (which would breach the Apache-2.0 ↔ AGPL boundary
@@ -136,6 +142,57 @@ fn create_opts(image: &str) -> CreateOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Raw pb client: the SDK's high-level `WardClient` methods don't yet accept
+// a caller-supplied capability token, so tests that exercise a token-gated
+// RPC connect a second, low-level client and attach the token via gRPC
+// metadata directly, mirroring the pattern ward-core's own token tests use.
+// ---------------------------------------------------------------------------
+
+async fn connect_raw(d: &Daemon) -> PbClient<Channel> {
+    let socket = d.socket.clone();
+    let channel = Endpoint::try_from("http://[::1]:50051")
+        .expect("construct dummy endpoint")
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let socket = socket.clone();
+            async move {
+                let stream = UnixStream::connect(&socket).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("raw pb client connects to wardd over UDS");
+    PbClient::new(channel)
+}
+
+/// Wrap `msg` in a `Request` carrying the sandbox's capability token, the
+/// header every token-gated RPC requires.
+fn with_token<T>(msg: T, token: &str) -> Request<T> {
+    let mut req = Request::new(msg);
+    req.metadata_mut().insert(
+        "x-ward-sandbox-token",
+        token.parse().expect("token is a valid metadata value"),
+    );
+    req
+}
+
+fn raw_create_request(image: &str) -> pb::CreateSandboxRequest {
+    pb::CreateSandboxRequest {
+        image: image.into(),
+        resources: Some(pb::ResourceLimits {
+            cpus: 1,
+            memory_mb: 256,
+            pids_max: 0,
+            timeout_seconds: 0,
+        }),
+        egress: Some(pb::EgressPolicy {
+            mode: pb::EgressMode::Deny as i32,
+            domains: Vec::new(),
+        }),
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -209,19 +266,27 @@ async fn given_sandbox_when_remove_then_list_no_longer_contains() {
         }
     };
     let mut client = connect(&d).await;
+    let mut raw = connect_raw(&d).await;
 
-    let sb = client
-        .create_sandbox(create_opts("alpine"))
+    // remove_sandbox is token-gated; the SDK has no way yet to supply the
+    // token, so creation and removal go through the raw client instead.
+    let created = raw
+        .create_sandbox(raw_create_request("alpine"))
         .await
-        .expect("create");
-    client
-        .remove_sandbox(&sb.id)
-        .await
-        .expect("remove succeeds");
+        .expect("create")
+        .into_inner();
+    raw.remove_sandbox(with_token(
+        pb::RemoveSandboxRequest {
+            id: created.id.clone(),
+        },
+        &created.token,
+    ))
+    .await
+    .expect("remove succeeds with the sandbox's real token");
 
     let listed = client.list_sandboxes().await.expect("list after remove");
     assert!(
-        listed.iter().all(|s| s.id != sb.id),
+        listed.iter().all(|s| s.id != created.id),
         "removed sandbox must not appear: {listed:?}"
     );
 }
@@ -268,18 +333,30 @@ async fn given_running_sandbox_when_exec_then_pid_returned() {
             return;
         }
     };
-    let mut client = connect(&d).await;
+    let mut raw = connect_raw(&d).await;
 
-    let sb = client
-        .create_sandbox(create_opts("alpine"))
+    // exec is token-gated; the SDK has no way yet to supply the token, so
+    // this drives the raw client with the token attached instead.
+    let created = raw
+        .create_sandbox(raw_create_request("alpine"))
         .await
-        .expect("create");
+        .expect("create")
+        .into_inner();
 
-    let pid = client
-        .exec(&sb.id, &["echo", "hello"], None)
+    let exec_resp = raw
+        .exec(with_token(
+            pb::ExecRequest {
+                sandbox_id: created.id,
+                command: vec!["echo".into(), "hello".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            },
+            &created.token,
+        ))
         .await
-        .expect("exec succeeds");
-    assert!(!pid.is_empty(), "pid must be non-empty");
+        .expect("exec succeeds with the sandbox's real token")
+        .into_inner();
+    assert!(!exec_resp.pid.is_empty(), "pid must be non-empty");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -296,22 +373,61 @@ async fn given_running_sandbox_when_run_then_captures_stub_output() {
             return;
         }
     };
-    let mut client = connect(&d).await;
+    let mut raw = connect_raw(&d).await;
 
-    let sb = client
-        .create_sandbox(create_opts("alpine"))
+    // run (exec + stream_output) is token-gated; the SDK has no way yet to
+    // supply the token, so this replicates run's exec-then-drain sequence
+    // against the raw client with the token attached to both calls.
+    let created = raw
+        .create_sandbox(raw_create_request("alpine"))
         .await
-        .expect("create");
+        .expect("create")
+        .into_inner();
 
-    let result = client.run(&sb.id, &["echo", "hello"]).await.expect("run");
+    let exec_resp = raw
+        .exec(with_token(
+            pb::ExecRequest {
+                sandbox_id: created.id.clone(),
+                command: vec!["echo".into(), "hello".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            },
+            &created.token,
+        ))
+        .await
+        .expect("exec succeeds with the sandbox's real token")
+        .into_inner();
+
+    let mut stream = raw
+        .stream_output(with_token(
+            pb::StreamOutputRequest {
+                sandbox_id: created.id,
+                pid: exec_resp.pid,
+            },
+            &created.token,
+        ))
+        .await
+        .expect("stream_output succeeds with the sandbox's real token")
+        .into_inner();
+
+    let mut stdout = String::new();
+    let mut exit_code = None;
+    while let Some(ev) = stream.message().await.expect("stream event") {
+        match pb::StreamEventType::try_from(ev.r#type).unwrap_or_default() {
+            pb::StreamEventType::Stdout => stdout.push_str(&ev.line),
+            pb::StreamEventType::Exit => exit_code = Some(ev.exit_code),
+            _ => {}
+        }
+    }
+
     assert_eq!(
-        result.exit_code,
+        exit_code,
         Some(0),
-        "stub backend must emit Exit(0): {result:?}"
+        "stub backend must emit Exit(0): stdout={stdout:?}"
     );
     assert!(
-        !result.stdout.is_empty(),
-        "stub backend must emit at least one stdout line: {result:?}"
+        !stdout.is_empty(),
+        "stub backend must emit at least one stdout line"
     );
 }
 

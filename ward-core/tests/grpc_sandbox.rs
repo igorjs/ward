@@ -267,7 +267,10 @@ async fn given_existing_sandbox_when_remove_then_subsequent_get_returns_not_foun
 
     // Act
     client
-        .remove_sandbox(RemoveSandboxRequest { id: s.id.clone() })
+        .remove_sandbox(common::with_token(
+            RemoveSandboxRequest { id: s.id.clone() },
+            &s.token,
+        ))
         .await
         .expect("remove");
 
@@ -343,7 +346,7 @@ async fn given_sandboxes_at_cap_when_one_removed_then_create_again_succeeds() {
     // a regression in the sandbox slot accounting would slip past
     // integration and only surface in production.
     let mut client = common::test_server().await;
-    let mut ids = vec![];
+    let mut created = vec![];
     for i in 0..4 {
         let s = client
             .create_sandbox(CreateSandboxRequest {
@@ -353,12 +356,17 @@ async fn given_sandboxes_at_cap_when_one_removed_then_create_again_succeeds() {
             .await
             .expect("under cap")
             .into_inner();
-        ids.push(s.id);
+        created.push(s);
     }
 
     // Remove one to free a slot.
     client
-        .remove_sandbox(RemoveSandboxRequest { id: ids[0].clone() })
+        .remove_sandbox(common::with_token(
+            RemoveSandboxRequest {
+                id: created[0].id.clone(),
+            },
+            &created[0].token,
+        ))
         .await
         .expect("remove first sandbox");
 

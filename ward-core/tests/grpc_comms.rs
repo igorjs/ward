@@ -256,21 +256,27 @@ async fn given_two_same_group_sandboxes_when_publish_then_subscriber_receives_me
         .into_inner();
 
     let mut stream = client
-        .subscribe(SubscribeRequest {
-            sandbox_id: bob.id.clone(),
-            topic: "events".into(),
-        })
+        .subscribe(common::with_token(
+            SubscribeRequest {
+                sandbox_id: bob.id.clone(),
+                topic: "events".into(),
+            },
+            &bob.token,
+        ))
         .await
         .expect("subscribe")
         .into_inner();
 
     // Act
     client
-        .publish(PublishRequest {
-            sandbox_id: alice.id.clone(),
-            topic: "events".into(),
-            payload: b"hello".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id.clone(),
+                topic: "events".into(),
+                payload: b"hello".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .expect("publish");
 
@@ -302,21 +308,27 @@ async fn given_different_group_sandboxes_when_publish_then_subscriber_receives_n
         .into_inner();
 
     let mut stream = client
-        .subscribe(SubscribeRequest {
-            sandbox_id: bob.id,
-            topic: "events".into(),
-        })
+        .subscribe(common::with_token(
+            SubscribeRequest {
+                sandbox_id: bob.id,
+                topic: "events".into(),
+            },
+            &bob.token,
+        ))
         .await
         .expect("subscribe")
         .into_inner();
 
     // Act
     client
-        .publish(PublishRequest {
-            sandbox_id: alice.id,
-            topic: "events".into(),
-            payload: b"hello".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id,
+                topic: "events".into(),
+                payload: b"hello".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .expect("publish");
 
@@ -344,13 +356,17 @@ async fn given_deny_sandbox_when_publish_then_invalid_argument() {
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: the real token lets the request reach the broker's Deny-policy
+    // check rather than being rejected earlier for a missing token.
     let err = client
-        .publish(PublishRequest {
-            sandbox_id: alice.id,
-            topic: "events".into(),
-            payload: b"x".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id,
+                topic: "events".into(),
+                payload: b"x".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .expect_err("Deny publisher");
 
@@ -373,12 +389,16 @@ async fn given_deny_sandbox_when_subscribe_then_invalid_argument() {
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: the real token lets the request reach the broker's Deny-policy
+    // check rather than being rejected earlier for a missing token.
     let err = client
-        .subscribe(SubscribeRequest {
-            sandbox_id: alice.id,
-            topic: "events".into(),
-        })
+        .subscribe(common::with_token(
+            SubscribeRequest {
+                sandbox_id: alice.id,
+                topic: "events".into(),
+            },
+            &alice.token,
+        ))
         .await
         .expect_err("Deny subscriber");
 
@@ -402,27 +422,36 @@ async fn given_publisher_when_get_communication_log_then_records_recent_entries(
         .into_inner();
 
     client
-        .publish(PublishRequest {
-            sandbox_id: alice.id.clone(),
-            topic: "events.a".into(),
-            payload: b"first".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id.clone(),
+                topic: "events.a".into(),
+                payload: b"first".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .unwrap();
     client
-        .publish(PublishRequest {
-            sandbox_id: alice.id.clone(),
-            topic: "events.b".into(),
-            payload: b"second".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id.clone(),
+                topic: "events.b".into(),
+                payload: b"second".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .unwrap();
 
     // Act
     let log = client
-        .get_communication_log(GetCommunicationLogRequest {
-            sandbox_id: alice.id.clone(),
-        })
+        .get_communication_log(common::with_token(
+            GetCommunicationLogRequest {
+                sandbox_id: alice.id.clone(),
+            },
+            &alice.token,
+        ))
         .await
         .expect("get_communication_log")
         .into_inner();
@@ -447,19 +476,25 @@ async fn given_deny_publish_when_get_communication_log_then_records_attempt() {
         .into_inner();
 
     let _ = client
-        .publish(PublishRequest {
-            sandbox_id: alice.id.clone(),
-            topic: "events".into(),
-            payload: b"x".to_vec(),
-        })
+        .publish(common::with_token(
+            PublishRequest {
+                sandbox_id: alice.id.clone(),
+                topic: "events".into(),
+                payload: b"x".to_vec(),
+            },
+            &alice.token,
+        ))
         .await
         .expect_err("Deny");
 
     // Act
     let log = client
-        .get_communication_log(GetCommunicationLogRequest {
-            sandbox_id: alice.id,
-        })
+        .get_communication_log(common::with_token(
+            GetCommunicationLogRequest {
+                sandbox_id: alice.id.clone(),
+            },
+            &alice.token,
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -482,9 +517,12 @@ async fn given_no_activity_when_get_communication_log_then_returns_empty() {
 
     // Act
     let log = client
-        .get_communication_log(GetCommunicationLogRequest {
-            sandbox_id: alice.id,
-        })
+        .get_communication_log(common::with_token(
+            GetCommunicationLogRequest {
+                sandbox_id: alice.id.clone(),
+            },
+            &alice.token,
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -509,9 +547,12 @@ async fn given_sandbox_removed_when_publish_with_old_id_then_not_found() {
         .unwrap()
         .into_inner();
     client
-        .remove_sandbox(RemoveSandboxRequest {
-            id: alice.id.clone(),
-        })
+        .remove_sandbox(common::with_token(
+            RemoveSandboxRequest {
+                id: alice.id.clone(),
+            },
+            &alice.token,
+        ))
         .await
         .unwrap();
 

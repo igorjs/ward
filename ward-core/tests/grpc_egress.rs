@@ -31,9 +31,12 @@ async fn given_existing_sandbox_when_get_egress_log_then_returns_empty_log() {
 
     // Act
     let resp = client
-        .get_egress_log(GetEgressLogRequest {
-            sandbox_id: sandbox.id.clone(),
-        })
+        .get_egress_log(common::with_token(
+            GetEgressLogRequest {
+                sandbox_id: sandbox.id.clone(),
+            },
+            &sandbox.token,
+        ))
         .await
         .expect("get_egress_log should succeed");
 
