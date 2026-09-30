@@ -82,6 +82,8 @@ message SandboxInfo {
   string ip_address = 5;
   ResourceLimits resources = 6;
   google.protobuf.Timestamp expires_at = 7;
+  // Populated only on CreateSandbox's response; empty on GetSandbox/ListSandboxes.
+  string token = 8;
 }
 
 enum SandboxStatus {

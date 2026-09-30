@@ -33,6 +33,15 @@ fn backend_err(e: BackendError) -> ApiError {
     }
 }
 
+/// Same translation as `backend_err`, but for lookups keyed by snapshot id:
+/// a missing entity should surface as SnapshotNotFound, not SandboxNotFound.
+fn snapshot_backend_err(e: BackendError) -> ApiError {
+    match e {
+        BackendError::NotFound(id) => ApiError::SnapshotNotFound(id),
+        other => ApiError::Backend(other.to_string()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-sandbox tracking entry
 // ---------------------------------------------------------------------------
@@ -45,6 +54,9 @@ struct SandboxEntry {
     /// waiting on the cap can proceed. Never read directly; the field
     /// exists for its `Drop` side effect.
     _creation_permit: tokio::sync::OwnedSemaphorePermit,
+    /// The capability token minted for this sandbox at creation. Compared
+    /// by `authorize()`; never returned by `get()`/`list()`.
+    token: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,8 +151,15 @@ impl SandboxManager {
     // Lifecycle
     // -----------------------------------------------------------------------
 
-    /// Create a new sandbox.
-    pub async fn create(&self, req: crate::pb::CreateSandboxRequest) -> Result<PbSandboxInfo> {
+    /// Create a new sandbox. `presented_token` is only consulted when
+    /// `req.from_snapshot` is set: it must match the token of the sandbox
+    /// that owns the snapshot, so cloning a sandbox from its snapshot
+    /// requires proving ownership of the source.
+    pub async fn create(
+        &self,
+        req: crate::pb::CreateSandboxRequest,
+        presented_token: &str,
+    ) -> Result<PbSandboxInfo> {
         // Metrics: time the full create path (validation + backend boot +
         // bookkeeping). Recorded on every call regardless of outcome
         // because the failure rate matters as much as the success rate.
@@ -226,6 +245,18 @@ impl SandboxManager {
             comms: comms.clone(),
         };
 
+        // Cloning a sandbox from a snapshot requires the snapshot owner's
+        // token, otherwise any caller could clone any other sandbox's
+        // state by guessing or observing a snapshot id.
+        if let Some(ref from_id) = opts.from_snapshot {
+            let owner_id = self
+                .backend
+                .snapshot_owner(from_id)
+                .await
+                .map_err(snapshot_backend_err)?;
+            self.authorize(&owner_id, presented_token).await?;
+        }
+
         // Enforce the sandbox cap via a semaphore acquired up front, rather
         // than a check-then-insert on `entries.len()`. The old check and the
         // eventual `entries.write().await.insert(...)` were separated by the
@@ -244,7 +275,7 @@ impl SandboxManager {
                 ))
             })?;
 
-        let info = self
+        let mut info = self
             .backend
             .create_sandbox(id.clone(), &opts)
             .await
@@ -291,12 +322,17 @@ impl SandboxManager {
             None
         };
 
+        // Capability token for this sandbox: a fresh random UUID, checked
+        // by authorize() and never echoed back by get()/list().
+        let token = uuid::Uuid::new_v4().to_string();
+
         self.entries.write().await.insert(
             id.clone(),
             SandboxEntry {
                 egress,
                 timeout_handle,
                 _creation_permit: permit,
+                token: token.clone(),
             },
         );
 
@@ -315,6 +351,12 @@ impl SandboxManager {
             .record(create_start.elapsed().as_secs_f64());
         metrics::gauge!("wardd_sandbox_active").increment(1.0);
 
+        // The real token is returned exactly once, on creation. Set it
+        // explicitly here rather than trusting the backend to have left
+        // it empty, since this is the trust boundary that decides what
+        // the caller sees.
+        info.token = token;
+
         Ok(protocol_info_to_pb(info))
     }
 
@@ -322,13 +364,35 @@ impl SandboxManager {
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
         crate::validate::entity_id(id, "sandbox")?;
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
-        Ok(protocol_info_to_pb(info))
+        Ok(protocol_info_to_pb(redact_token(info)))
     }
 
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;
-        Ok(infos.into_iter().map(protocol_info_to_pb).collect())
+        Ok(infos
+            .into_iter()
+            .map(redact_token)
+            .map(protocol_info_to_pb)
+            .collect())
+    }
+
+    /// Verify a presented capability token matches the one minted for
+    /// `sandbox_id` at creation. Distinguishes an unknown sandbox from a
+    /// wrong token so callers (and the gRPC layer's status mapping) can
+    /// tell the two apart.
+    pub async fn authorize(&self, sandbox_id: &str, token: &str) -> Result<()> {
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(sandbox_id)
+            .ok_or_else(|| ApiError::SandboxNotFound(sandbox_id.to_string()))?;
+        if entry.token == token {
+            Ok(())
+        } else {
+            Err(ApiError::PermissionDenied(format!(
+                "token does not match sandbox {sandbox_id}"
+            )))
+        }
     }
 
     /// Return the egress decision log for a sandbox's proxy.
@@ -436,10 +500,7 @@ impl SandboxManager {
         self.backend
             .restore_snapshot(sandbox_id, snapshot_id)
             .await
-            .map_err(|e| match e {
-                BackendError::NotFound(id) => ApiError::SnapshotNotFound(id),
-                other => ApiError::Backend(other.to_string()),
-            })
+            .map_err(snapshot_backend_err)
     }
 
     /// List all snapshots taken from a given sandbox.
@@ -722,6 +783,15 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
     }
 }
 
+/// Clear the capability token before a sandbox's info is returned by
+/// `get()`/`list()`. Only the `create()` response carries the real token;
+/// echoing it back here would let anyone who can query the API bypass the
+/// check `authorize()` performs.
+fn redact_token(mut info: crate::protocol::SandboxInfo) -> crate::protocol::SandboxInfo {
+    info.token = String::new();
+    info
+}
+
 fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
     use crate::protocol::SandboxStatus as ProtocolStatus;
 
@@ -743,6 +813,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
         ip_address: info.ip_address.unwrap_or_default(),
         resources: None,
         expires_at,
+        token: info.token,
     }
 }
 
@@ -849,7 +920,7 @@ mod tests {
 
         // Act
         let info = mgr
-            .create(create_req("alpine:latest"))
+            .create(create_req("alpine:latest"), "")
             .await
             .expect("create should succeed");
 
@@ -867,7 +938,7 @@ mod tests {
 
         // Act: empty image violates the validator's non-empty rule.
         let err = mgr
-            .create(create_req(""))
+            .create(create_req(""), "")
             .await
             .expect_err("empty image must be rejected");
 
@@ -883,7 +954,7 @@ mod tests {
 
         // Act
         let err = mgr
-            .create(create_req("../../etc/passwd"))
+            .create(create_req("../../etc/passwd"), "")
             .await
             .expect_err("path traversal must be rejected");
 
@@ -905,7 +976,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = mgr.create(req).await.expect_err("over-cap cpus");
+        let err = mgr.create(req, "").await.expect_err("over-cap cpus");
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
@@ -925,7 +996,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let err = mgr.create(req).await.expect_err("group without name");
+        let err = mgr.create(req, "").await.expect_err("group without name");
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
@@ -935,12 +1006,12 @@ mod tests {
     async fn given_manager_at_capacity_when_create_then_returns_invalid_request_with_limit() {
         // Arrange: fill to capacity.
         let mgr = build_manager(2);
-        mgr.create(create_req("alpine:1")).await.unwrap();
-        mgr.create(create_req("alpine:2")).await.unwrap();
+        mgr.create(create_req("alpine:1"), "").await.unwrap();
+        mgr.create(create_req("alpine:2"), "").await.unwrap();
 
         // Act
         let err = mgr
-            .create(create_req("alpine:3"))
+            .create(create_req("alpine:3"), "")
             .await
             .expect_err("third over cap");
 
@@ -966,7 +1037,7 @@ mod tests {
         for i in 0..5 {
             let mgr = Arc::clone(&mgr);
             handles.push(tokio::spawn(async move {
-                mgr.create(create_req(&format!("alpine:{i}"))).await
+                mgr.create(create_req(&format!("alpine:{i}")), "").await
             }));
         }
         let mut successes = 0;
@@ -1001,7 +1072,7 @@ mod tests {
         };
 
         // Act
-        let result = mgr.create(req).await;
+        let result = mgr.create(req, "").await;
 
         // Assert
         assert!(
@@ -1027,7 +1098,7 @@ mod tests {
 
         // Act
         let err = mgr
-            .create(req)
+            .create(req, "")
             .await
             .expect_err("the none backend cannot enforce Allowlist");
 
@@ -1040,13 +1111,175 @@ mod tests {
         }
     }
 
+    // ----- authorize -------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_correct_token_when_authorize_then_ok() {
+        // Arrange
+        let mgr = build_manager(4);
+        let info = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+
+        // Act
+        let result = mgr.authorize(&info.id, &info.token).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_wrong_token_when_authorize_then_permission_denied() {
+        // Arrange
+        let mgr = build_manager(4);
+        let info = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+
+        // Act
+        let result = mgr.authorize(&info.id, "not-the-token").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::PermissionDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_authorize_then_not_found() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let result = mgr.authorize("does-not-exist", "x").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::SandboxNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn given_valid_token_for_other_sandbox_when_authorize_then_permission_denied() {
+        // Arrange: two distinct sandboxes, each with its own real token.
+        let mgr = build_manager(4);
+        let sandbox_a = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+        let sandbox_b = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+
+        // Act: present A's valid token against B's id.
+        let result = mgr.authorize(&sandbox_b.id, &sandbox_a.token).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::PermissionDenied(_))));
+    }
+
+    // ----- token exposure --------------------------------------------------
+
+    #[tokio::test]
+    async fn given_create_when_returned_info_then_token_present() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let info = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+
+        // Assert: the freshly minted token is non-empty and authorize()
+        // accepts it for the sandbox it was minted for.
+        assert!(!info.token.is_empty());
+        assert!(mgr.authorize(&info.id, &info.token).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_get_when_returned_info_then_token_redacted() {
+        // Arrange: the sandbox holds a real, non-empty token internally.
+        let mgr = build_manager(4);
+        let info = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create should succeed");
+        assert!(!info.token.is_empty());
+
+        // Act
+        let fetched = mgr.get(&info.id).await.expect("get");
+
+        // Assert: get() never echoes the stored token back.
+        assert_eq!(fetched.token, "");
+    }
+
+    // ----- from_snapshot token gate ---------------------------------------
+
+    #[tokio::test]
+    async fn given_from_snapshot_with_source_token_when_create_then_ok() {
+        // Arrange: sandbox A and a snapshot of it.
+        let mgr = build_manager(4);
+        let a = mgr.create(create_req("alpine"), "").await.unwrap();
+        let snap = mgr
+            .create_snapshot(&a.id, "label")
+            .await
+            .expect("create_snapshot");
+        let req2 = CreateSandboxRequest {
+            from_snapshot: snap.snapshot_id,
+            ..create_req("alpine")
+        };
+
+        // Act: present A's own token when creating from A's snapshot.
+        let result = mgr.create(req2, &a.token).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_from_snapshot_without_source_token_when_create_then_permission_denied() {
+        // Arrange: sandbox A and a snapshot of it.
+        let mgr = build_manager(4);
+        let a = mgr.create(create_req("alpine"), "").await.unwrap();
+        let snap = mgr
+            .create_snapshot(&a.id, "label")
+            .await
+            .expect("create_snapshot");
+        let req2 = CreateSandboxRequest {
+            from_snapshot: snap.snapshot_id,
+            ..create_req("alpine")
+        };
+
+        // Act: no token presented for the snapshot's source sandbox.
+        let result = mgr.create(req2, "").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::PermissionDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn given_from_snapshot_with_unknown_snapshot_id_when_create_then_snapshot_not_found() {
+        // Arrange: a snapshot id nothing owns.
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            from_snapshot: "does-not-exist".to_string(),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let result = mgr.create(req, "x").await;
+
+        // Assert: the snapshot lookup fails before any token check runs.
+        assert!(matches!(result, Err(ApiError::SnapshotNotFound(_))));
+    }
+
     // ----- get -----------------------------------------------------------
 
     #[tokio::test]
     async fn given_created_sandbox_when_get_by_id_then_returns_same_info() {
         // Arrange
         let mgr = build_manager(4);
-        let created = mgr.create(create_req("alpine")).await.unwrap();
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let fetched = mgr.get(&created.id).await.expect("get");
@@ -1104,9 +1337,9 @@ mod tests {
     async fn given_three_sandboxes_when_list_then_returns_all_three() {
         // Arrange
         let mgr = build_manager(4);
-        mgr.create(create_req("alpine:a")).await.unwrap();
-        mgr.create(create_req("alpine:b")).await.unwrap();
-        mgr.create(create_req("alpine:c")).await.unwrap();
+        mgr.create(create_req("alpine:a"), "").await.unwrap();
+        mgr.create(create_req("alpine:b"), "").await.unwrap();
+        mgr.create(create_req("alpine:c"), "").await.unwrap();
 
         // Act
         let mut sandboxes = mgr.list().await.expect("list");
@@ -1124,7 +1357,7 @@ mod tests {
     async fn given_created_sandbox_when_remove_then_get_returns_not_found() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         mgr.remove(&s.id).await.expect("remove");
@@ -1165,7 +1398,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let s = mgr.create(req).await.expect("create");
+        let s = mgr.create(req, "").await.expect("create");
         assert_eq!(mgr.entries.read().await.len(), 1, "precondition");
 
         // Act: wait past the timeout so the watcher fires.
@@ -1190,12 +1423,12 @@ mod tests {
         // Arrange: regression for cap-counter bookkeeping. Fill the cap,
         // remove one, then create one more.
         let mgr = build_manager(2);
-        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
-        let _s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let s1 = mgr.create(create_req("alpine:1"), "").await.unwrap();
+        let _s2 = mgr.create(create_req("alpine:2"), "").await.unwrap();
 
         // Act
         mgr.remove(&s1.id).await.unwrap();
-        let s3 = mgr.create(create_req("alpine:3")).await;
+        let s3 = mgr.create(create_req("alpine:3"), "").await;
 
         // Assert
         assert!(s3.is_ok(), "removing a sandbox must free a cap slot");
@@ -1328,7 +1561,7 @@ mod tests {
     async fn given_existing_sandbox_when_exec_then_returns_process_info_with_pid() {
         // Arrange: create a sandbox so exec has a target.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let resp = mgr
@@ -1353,7 +1586,7 @@ mod tests {
     async fn given_empty_command_when_exec_then_returns_invalid_request() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act: empty command must be rejected by the validator before
         // it reaches the backend (where it would otherwise spawn nothing).
@@ -1420,7 +1653,7 @@ mod tests {
         // Run is stubbed until the vsock agent channel is wired (issue #9).
         // Every call returns InvalidRequest regardless of language or input.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         let err = mgr
             .run(crate::pb::RunRequest {
@@ -1450,7 +1683,7 @@ mod tests {
         // out and confirm the scripted stub events come through. The
         // first event is a Stdout line; the second is the Exit(0) marker.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1493,7 +1726,7 @@ mod tests {
     async fn given_unknown_pid_when_stream_output_then_process_not_found() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act: well-formed UUID that was never produced by an exec call.
         let err = mgr
@@ -1514,8 +1747,8 @@ mod tests {
         // for that pid from the second sandbox's perspective must hide
         // its existence — pid is scoped to its owning sandbox.
         let mgr = build_manager(4);
-        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
-        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let s1 = mgr.create(create_req("alpine:1"), "").await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s1.id.clone(),
@@ -1541,7 +1774,7 @@ mod tests {
         // Arrange: single-consumer contract. Once a caller takes the
         // receiver, subsequent calls see None.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1574,7 +1807,7 @@ mod tests {
         // they do not accumulate. Asking for a pid afterwards looks like
         // it never existed.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1600,7 +1833,7 @@ mod tests {
         // Arrange: seed a process record whose inner `output_rx` mutex is
         // held by this task, standing in for a slow consumer on that lock.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let pid = "abc123".to_string();
         let (_tx, rx) = mpsc::channel::<StreamEvent>(1);
         let output_rx = Arc::new(Mutex::new(Some(rx)));
@@ -1650,7 +1883,7 @@ mod tests {
         // Arrange: stub backend installs a drain task on stdin_rx, so a
         // send always succeeds for the lifetime of the ProcessRecord.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1674,7 +1907,7 @@ mod tests {
         // Arrange: empty data is a valid no-op send — sometimes used as
         // a connectivity probe. The validator must not reject it.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1695,7 +1928,7 @@ mod tests {
     async fn given_unknown_pid_when_write_stdin_then_process_not_found() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let err = mgr
@@ -1717,8 +1950,8 @@ mod tests {
         // that belongs to a different sandbox must fail as if the pid
         // didn't exist, not leak its existence.
         let mgr = build_manager(4);
-        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
-        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let s1 = mgr.create(create_req("alpine:1"), "").await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s1.id.clone(),
@@ -1742,7 +1975,7 @@ mod tests {
     async fn given_malformed_pid_when_write_stdin_then_invalid_request() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act: 'z' is not hex.
         let err = mgr
@@ -1760,7 +1993,7 @@ mod tests {
         // one buffered message, so the next send blocks until this task
         // drains it, standing in for a slow-to-consume backend.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let pid = "def456".to_string();
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<bytes::Bytes>(1);
         stdin_tx
@@ -1819,7 +2052,7 @@ mod tests {
         // probe via write_stdin because it's the most observable side
         // effect (send-to-closed-channel becomes an error).
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1848,7 +2081,7 @@ mod tests {
         // kills must be NotFound, not silently OK. This prevents callers
         // from masking real "I never knew about that pid" bugs as no-ops.
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s.id.clone(),
@@ -1873,7 +2106,7 @@ mod tests {
     async fn given_unknown_pid_when_kill_process_then_process_not_found() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let err = mgr
@@ -1890,8 +2123,8 @@ mod tests {
         // Arrange: tenant isolation regression — pid belongs to sandbox A,
         // sandbox B must not be able to kill it (or even confirm it exists).
         let mgr = build_manager(4);
-        let s1 = mgr.create(create_req("alpine:1")).await.unwrap();
-        let s2 = mgr.create(create_req("alpine:2")).await.unwrap();
+        let s1 = mgr.create(create_req("alpine:1"), "").await.unwrap();
+        let s2 = mgr.create(create_req("alpine:2"), "").await.unwrap();
         let proc = mgr
             .exec(ExecRequest {
                 sandbox_id: s1.id,
@@ -1915,7 +2148,7 @@ mod tests {
     async fn given_malformed_pid_when_kill_process_then_invalid_request() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let err = mgr
@@ -1933,7 +2166,7 @@ mod tests {
     async fn given_existing_sandbox_when_create_snapshot_then_returns_info() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let snap = mgr
@@ -1968,7 +2201,7 @@ mod tests {
         // backend returns NotFound(snapshot_id) which the manager must
         // translate to SnapshotNotFound (not SandboxNotFound).
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let err = mgr
@@ -1987,7 +2220,7 @@ mod tests {
     async fn given_no_snapshots_when_list_then_returns_empty_vec() {
         // Arrange
         let mgr = build_manager(4);
-        let s = mgr.create(create_req("alpine")).await.unwrap();
+        let s = mgr.create(create_req("alpine"), "").await.unwrap();
 
         // Act
         let snaps = mgr.list_snapshots(&s.id).await.unwrap();

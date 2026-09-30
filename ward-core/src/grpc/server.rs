@@ -45,6 +45,7 @@ fn api_err_to_status(err: ApiError) -> Status {
             error!(error = %detail, "internal error");
             Status::internal("internal error")
         }
+        ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
     }
 }
 
@@ -81,7 +82,14 @@ impl Ward for WardGrpcServer {
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
         let req = request.into_inner();
-        let info = self.sandbox.create(req).await.map_err(api_err_to_status)?;
+        // TODO(grpc-token): extract the caller's capability token from
+        // request metadata instead of this placeholder; until then,
+        // from_snapshot creates on this RPC path cannot pass authorize().
+        let info = self
+            .sandbox
+            .create(req, "")
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 

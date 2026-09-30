@@ -397,6 +397,9 @@ impl Backend for KrunvmBackend {
             } else {
                 None
             },
+            // The backend has no concept of tokens; the manager layer
+            // mints and stores the real token, then overwrites this.
+            token: String::new(),
         };
 
         let state = SandboxState {
@@ -640,6 +643,14 @@ impl Backend for KrunvmBackend {
         // Stable order: oldest first. HashMap iteration is unspecified.
         out.sort_by_key(|s| s.created_at);
         Ok(out)
+    }
+
+    async fn snapshot_owner(&self, snapshot_id: &str) -> Result<String> {
+        let guard = self.snapshots.read().await;
+        guard
+            .get(snapshot_id)
+            .map(|snap| snap.sandbox_id.clone())
+            .ok_or_else(|| BackendError::NotFound(snapshot_id.to_string()))
     }
 
     /// Exec a command inside a running sandbox.

@@ -101,4 +101,9 @@ pub trait Backend: Send + Sync + 'static {
     async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()>;
 
     async fn list_snapshots(&self, sandbox_id: &str) -> Result<Vec<crate::protocol::SnapshotInfo>>;
+
+    /// Return the id of the sandbox that owns `snapshot_id`. Lets callers
+    /// verify a capability token against the correct sandbox before
+    /// creating from a snapshot, without exposing snapshot contents.
+    async fn snapshot_owner(&self, snapshot_id: &str) -> Result<String>;
 }
