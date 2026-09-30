@@ -208,7 +208,10 @@ fn is_default_allowed_source(path: &str) -> bool {
 /// True if `path` is one of the system roots that must never be
 /// mounted writable into a sandbox.
 fn is_sensitive_host_path(path: &str) -> bool {
-    const SENSITIVE: &[&str] = &["/proc", "/sys", "/dev", "/etc", "/root", "/boot", "/usr"];
+    const SENSITIVE: &[&str] = &[
+        "/proc", "/sys", "/dev", "/etc", "/root", "/boot", "/usr", "/run", "/var/run", "/lib",
+        "/bin", "/sbin",
+    ];
     SENSITIVE
         .iter()
         .any(|root| path == *root || path.starts_with(&format!("{root}/")))
@@ -388,6 +391,24 @@ mod tests {
         // it both count as sensitive. Both must require `readonly`.
         assert!(is_sensitive_host_path("/etc"));
         assert!(is_sensitive_host_path("/etc/passwd"));
+    }
+
+    #[test]
+    fn given_run_var_run_lib_bin_sbin_roots_when_is_sensitive_then_flagged() {
+        // Regression for the audit gap (S-M3): these roots were missing
+        // from SENSITIVE, so under WARD_ALLOW_HOST_MOUNTS=1 with
+        // readonly:false, /var/run/docker.sock (and similar sockets or
+        // binaries under these roots) stayed mountable read-write.
+        assert!(is_sensitive_host_path("/run"));
+        assert!(is_sensitive_host_path("/run/docker.sock"));
+        assert!(is_sensitive_host_path("/var/run"));
+        assert!(is_sensitive_host_path("/var/run/docker.sock"));
+        assert!(is_sensitive_host_path("/lib"));
+        assert!(is_sensitive_host_path("/lib/systemd"));
+        assert!(is_sensitive_host_path("/bin"));
+        assert!(is_sensitive_host_path("/bin/sh"));
+        assert!(is_sensitive_host_path("/sbin"));
+        assert!(is_sensitive_host_path("/sbin/init"));
     }
 
     #[test]
