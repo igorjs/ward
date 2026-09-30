@@ -456,3 +456,135 @@ async fn given_endpoint_when_connected_then_unix_uri_displayed() {
         "endpoint must reference the socket file: {ep}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn given_created_sandbox_when_kill_with_wrong_token_then_permission_denied_error() {
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
+    let mut client = connect(&d).await;
+
+    let sandbox = client
+        .create_sandbox(create_opts("alpine"))
+        .await
+        .expect("create_sandbox succeeds on stub backend");
+    let pid = client
+        .exec(&sandbox.id, &sandbox.token, &["echo", "hello"], None)
+        .await
+        .expect("exec succeeds with the sandbox's real token");
+
+    let err = client
+        .kill_process(&sandbox.id, "wrong-token", &pid)
+        .await
+        .expect_err("kill with the wrong token must be rejected");
+
+    assert!(
+        matches!(err, WardError::PermissionDenied(_)),
+        "expected PermissionDenied, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn given_from_snapshot_with_source_token_when_create_sandbox_then_ok() {
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
+    let mut client = connect(&d).await;
+    let mut raw = connect_raw(&d).await;
+
+    let a = client
+        .create_sandbox(create_opts("alpine"))
+        .await
+        .expect("create sandbox A");
+
+    // create_snapshot has no SDK wrapper yet, so drive it through the raw
+    // client with A's real token attached, the same pattern the tests
+    // above use for RPCs the SDK doesn't cover.
+    let snapshot = raw
+        .create_snapshot(with_token(
+            pb::CreateSnapshotRequest {
+                sandbox_id: a.id.clone(),
+                label: "source-token-ok".into(),
+            },
+            &a.token,
+        ))
+        .await
+        .expect("create_snapshot succeeds with A's real token")
+        .into_inner();
+
+    let cloned = client
+        .create_sandbox(CreateOptions {
+            from_snapshot: Some(snapshot.snapshot_id),
+            source_token: Some(a.token.clone()),
+            ..create_opts("alpine")
+        })
+        .await
+        .expect("create_sandbox from a snapshot succeeds when source_token matches the owner");
+
+    assert!(
+        !cloned.id.is_empty(),
+        "cloned sandbox must be assigned an id"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn given_from_snapshot_without_source_token_when_create_sandbox_then_permission_denied_error()
+{
+    let d = match Daemon::try_spawn() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "ward-client e2e: wardd binary not built; skipping. \
+                 Build the workspace first or remove `--exclude ward-daemon`."
+            );
+            return;
+        }
+    };
+    let mut client = connect(&d).await;
+    let mut raw = connect_raw(&d).await;
+
+    let a = client
+        .create_sandbox(create_opts("alpine"))
+        .await
+        .expect("create sandbox A");
+
+    let snapshot = raw
+        .create_snapshot(with_token(
+            pb::CreateSnapshotRequest {
+                sandbox_id: a.id.clone(),
+                label: "source-token-missing".into(),
+            },
+            &a.token,
+        ))
+        .await
+        .expect("create_snapshot succeeds with A's real token")
+        .into_inner();
+
+    let err = client
+        .create_sandbox(CreateOptions {
+            from_snapshot: Some(snapshot.snapshot_id),
+            source_token: None,
+            ..create_opts("alpine")
+        })
+        .await
+        .expect_err("create_sandbox from a snapshot without source_token must be rejected");
+
+    assert!(
+        matches!(err, WardError::PermissionDenied(_)),
+        "expected PermissionDenied, got {err:?}"
+    );
+}

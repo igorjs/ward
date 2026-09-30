@@ -26,7 +26,9 @@
 //!     })
 //!     .await?;
 //!
-//! let result = client.run(&sandbox.id, &["echo", "hello"]).await?;
+//! let result = client
+//!     .run(&sandbox.id, &sandbox.token, &["echo", "hello"])
+//!     .await?;
 //! println!("stdout: {}", result.stdout);
 //! # Ok(()) }
 //! ```
@@ -105,6 +107,11 @@ pub struct CreateOptions {
     pub comms: CommunicationMode,
     pub comms_group: String,
     pub from_snapshot: Option<String>,
+    /// Capability token of the sandbox that owns `from_snapshot`'s
+    /// snapshot. Required whenever `from_snapshot` is set; the daemon
+    /// rejects a snapshot clone attempt that can't prove ownership of
+    /// the source sandbox.
+    pub source_token: Option<String>,
 }
 
 /// One ward sandbox. Returned by [`WardClient::create_sandbox`] and
@@ -114,6 +121,11 @@ pub struct Sandbox {
     pub id: String,
     pub image: String,
     pub status: String,
+    /// The sandbox's capability token. Only populated on the response to
+    /// `create_sandbox`; callers must hold onto it themselves since every
+    /// later sandbox-scoped call requires it and this SDK doesn't persist
+    /// it on the caller's behalf.
+    pub token: String,
 }
 
 impl From<pb::SandboxInfo> for Sandbox {
@@ -132,6 +144,7 @@ impl From<pb::SandboxInfo> for Sandbox {
             id: info.id,
             image: info.image,
             status: status.to_string(),
+            token: info.token,
         }
     }
 }
@@ -163,6 +176,8 @@ pub enum WardError {
     NotFound(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("daemon returned an error: {0}")]
     Daemon(String),
     #[error("io: {0}")]
@@ -177,6 +192,7 @@ impl From<tonic::Status> for WardError {
         match s.code() {
             tonic::Code::NotFound => WardError::NotFound(s.message().into()),
             tonic::Code::InvalidArgument => WardError::InvalidRequest(s.message().into()),
+            tonic::Code::PermissionDenied => WardError::PermissionDenied(s.message().into()),
             _ => WardError::Daemon(format!("{}: {}", s.code(), s.message())),
         }
     }
@@ -186,6 +202,18 @@ impl From<tonic::transport::Error> for WardError {
     fn from(e: tonic::transport::Error) -> Self {
         WardError::Transport(e.to_string())
     }
+}
+
+/// Wrap `msg` in a [`tonic::Request`] carrying the sandbox's capability
+/// token in the `x-ward-sandbox-token` metadata every sandbox-scoped RPC
+/// requires.
+fn attach_token<T>(msg: T, token: &str) -> Result<tonic::Request<T>, WardError> {
+    let mut req = tonic::Request::new(msg);
+    let value = token
+        .parse()
+        .map_err(|_| WardError::InvalidRequest("capability token is not valid metadata".into()))?;
+    req.metadata_mut().insert("x-ward-sandbox-token", value);
+    Ok(req)
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +313,17 @@ impl WardClient {
             volume_ids: Vec::new(),
             from_snapshot: opts.from_snapshot.unwrap_or_default(),
         };
-        let info = self.inner.create_sandbox(req).await?.into_inner();
+        // source_token proves ownership of the snapshot's source sandbox;
+        // the daemon only consults it when from_snapshot is set, so a
+        // plain create (no snapshot) goes out unauthenticated as before.
+        let info = match opts.source_token {
+            Some(token) => self
+                .inner
+                .create_sandbox(attach_token(req, &token)?)
+                .await?
+                .into_inner(),
+            None => self.inner.create_sandbox(req).await?.into_inner(),
+        };
         Ok(info.into())
     }
 
@@ -300,9 +338,9 @@ impl WardClient {
         Ok(resp.sandboxes.into_iter().map(Sandbox::from).collect())
     }
 
-    pub async fn remove_sandbox(&mut self, id: &str) -> Result<(), WardError> {
+    pub async fn remove_sandbox(&mut self, id: &str, token: &str) -> Result<(), WardError> {
         let req = pb::RemoveSandboxRequest { id: id.into() };
-        self.inner.remove_sandbox(req).await?;
+        self.inner.remove_sandbox(attach_token(req, token)?).await?;
         Ok(())
     }
 
@@ -313,6 +351,7 @@ impl WardClient {
     pub async fn exec(
         &mut self,
         sandbox_id: &str,
+        token: &str,
         argv: &[impl AsRef<str>],
         workdir: Option<&str>,
     ) -> Result<String, WardError> {
@@ -322,7 +361,11 @@ impl WardClient {
             working_dir: workdir.unwrap_or("").into(),
             env: HashMap::new(),
         };
-        let info = self.inner.exec(req).await?.into_inner();
+        let info = self
+            .inner
+            .exec(attach_token(req, token)?)
+            .await?
+            .into_inner();
         Ok(info.pid)
     }
 
@@ -331,10 +374,11 @@ impl WardClient {
     pub async fn run(
         &mut self,
         sandbox_id: &str,
+        token: &str,
         argv: &[impl AsRef<str>],
     ) -> Result<ExecResult, WardError> {
-        let pid = self.exec(sandbox_id, argv, None).await?;
-        let mut rx = self.stream_output(sandbox_id, &pid).await?;
+        let pid = self.exec(sandbox_id, token, argv, None).await?;
+        let mut rx = self.stream_output(sandbox_id, token, &pid).await?;
 
         let mut result = ExecResult {
             pid: pid.clone(),
@@ -358,13 +402,18 @@ impl WardClient {
     pub async fn stream_output(
         &mut self,
         sandbox_id: &str,
+        token: &str,
         pid: &str,
     ) -> Result<mpsc::Receiver<StreamEvent>, WardError> {
         let req = pb::StreamOutputRequest {
             sandbox_id: sandbox_id.into(),
             pid: pid.into(),
         };
-        let mut tonic_stream = self.inner.stream_output(req).await?.into_inner();
+        let mut tonic_stream = self
+            .inner
+            .stream_output(attach_token(req, token)?)
+            .await?
+            .into_inner();
 
         // Bound the channel so a slow consumer applies backpressure
         // back to the gRPC stream rather than buffering unboundedly.
@@ -397,6 +446,7 @@ impl WardClient {
     pub async fn write_stdin(
         &mut self,
         sandbox_id: &str,
+        token: &str,
         pid: &str,
         data: impl Into<Vec<u8>>,
     ) -> Result<(), WardError> {
@@ -405,17 +455,22 @@ impl WardClient {
             pid: pid.into(),
             data: data.into(),
         };
-        self.inner.write_stdin(req).await?;
+        self.inner.write_stdin(attach_token(req, token)?).await?;
         Ok(())
     }
 
     /// Send a signal to a running process.
-    pub async fn kill_process(&mut self, sandbox_id: &str, pid: &str) -> Result<(), WardError> {
+    pub async fn kill_process(
+        &mut self,
+        sandbox_id: &str,
+        token: &str,
+        pid: &str,
+    ) -> Result<(), WardError> {
         let req = pb::KillProcessRequest {
             sandbox_id: sandbox_id.into(),
             pid: pid.into(),
         };
-        self.inner.kill_process(req).await?;
+        self.inner.kill_process(attach_token(req, token)?).await?;
         Ok(())
     }
 }
