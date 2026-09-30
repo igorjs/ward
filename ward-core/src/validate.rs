@@ -903,7 +903,13 @@ mod proptests {
 
     #[test]
     fn given_sensitive_path_when_readonly_and_opt_in_then_accepted() {
-        for path in ["/etc", "/etc/passwd", "/proc", "/usr/lib", "/var/run/docker.sock"] {
+        for path in [
+            "/etc",
+            "/etc/passwd",
+            "/proc",
+            "/usr/lib",
+            "/var/run/docker.sock",
+        ] {
             assert!(
                 mount(path, "/x", true, true).is_ok(),
                 "expected {path:?} readonly with opt-in to be accepted"
