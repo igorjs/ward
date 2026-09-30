@@ -141,7 +141,7 @@ class WardClient(AbstractContextManager["WardClient"]):
         """
         raise NotImplementedError("first-cut scaffold; wire to gRPC stub when proto codegen lands")
 
-    def remove_sandbox(self, sandbox_id: str) -> None:
+    def remove_sandbox(self, sandbox_id: str, *, token: str = "") -> None:
         """Tear a sandbox down. Idempotent: removing an already-gone
         sandbox is a no-op success."""
         raise NotImplementedError("first-cut scaffold; wire to gRPC stub when proto codegen lands")
@@ -160,6 +160,7 @@ class WardClient(AbstractContextManager["WardClient"]):
         *,
         working_dir: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
+        token: str = "",
     ) -> ExecResult:
         """Run a command in the sandbox. Returns when the process exits.
 
@@ -168,7 +169,7 @@ class WardClient(AbstractContextManager["WardClient"]):
         """
         raise NotImplementedError("first-cut scaffold; wire to gRPC stub when proto codegen lands")
 
-    def stream_output(self, sandbox_id: str, pid: str) -> Iterator[StreamEvent]:
+    def stream_output(self, sandbox_id: str, pid: str, *, token: str = "") -> Iterator[StreamEvent]:
         """Stream stdout / stderr / exit events from a running process.
 
         Iteration ends when the process exits and the final ``exit``
