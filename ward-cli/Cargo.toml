@@ -29,6 +29,8 @@ ward-core = { path = "../ward-core" }
 [dev-dependencies]
 # Diff-style assertions for readable failures on multi-field structs.
 pretty_assertions = "1"
+# Per-test temporary directories for the token store round-trip tests.
+tempfile = "3"
 
 [lints]
 workspace = true
