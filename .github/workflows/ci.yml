@@ -232,6 +232,12 @@ jobs:
         # Separate step from the two above: ward-core's --tests run
         # doesn't touch ward-net's own tests/ directory.
         run: cargo test -p ward-net --tests
+      - name: Integration tests (ward-mcp)
+        run: cargo test -p ward-mcp --tests
+      - name: Integration tests (ward-runtime)
+        run: cargo test -p ward-runtime --tests
+      - name: Integration tests (ward-client SDK)
+        run: cargo test -p ward-client --tests
 
   # ── E2E tests ───────────────────────────────────────────────────────
   # Slow tier: spawns the real wardd binary as a subprocess and runs the
