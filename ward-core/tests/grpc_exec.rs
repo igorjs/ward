@@ -310,6 +310,25 @@ async fn given_authorized_sandbox_when_run_then_stub_rejects_with_invalid_argume
     assert_eq!(err.message(), RUN_STUB_MESSAGE);
 }
 
+#[tokio::test]
+async fn given_malformed_sandbox_id_when_run_then_invalid_argument() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let err = client
+        .run(RunRequest {
+            sandbox_id: "not-a-uuid-zzzz".into(),
+            language: "python".into(),
+            code: "print('hi')".into(),
+        })
+        .await
+        .expect_err("malformed id");
+
+    // Assert
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
 // ---------------------------------------------------------------------------
 // StreamOutput
 // ---------------------------------------------------------------------------

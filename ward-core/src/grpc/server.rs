@@ -179,6 +179,7 @@ impl Ward for WardGrpcServer {
     async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         self.sandbox
             .authorize(&req.sandbox_id, &token)
             .await
@@ -580,10 +581,17 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-        self.sandbox
-            .authorize(&req.sandbox_id, &token)
-            .await
-            .map_err(api_err_to_status)?;
+
+        // get_communication_log is lenient toward an unknown sandbox (empty
+        // log, not an error) even before token enforcement: callers use it as
+        // a cheap existence check. Preserve that by falling through past a
+        // SandboxNotFound from authorize(); any other outcome (including
+        // PermissionDenied for a real sandbox with a missing or wrong
+        // token) still fails the request here.
+        match self.sandbox.authorize(&req.sandbox_id, &token).await {
+            Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+            Err(err) => return Err(api_err_to_status(err)),
+        }
 
         let entries = self.sandbox.broker().log(&req.sandbox_id).await;
         let pb_entries = entries.into_iter().map(log_entry_to_pb).collect();

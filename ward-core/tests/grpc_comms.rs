@@ -531,6 +531,26 @@ async fn given_no_activity_when_get_communication_log_then_returns_empty() {
     assert!(log.entries.is_empty());
 }
 
+#[tokio::test]
+async fn given_unknown_sandbox_when_get_communication_log_then_empty_response() {
+    // Arrange: get_communication_log is lenient — a well-formed but never
+    // created sandbox id returns an empty log, not NotFound. Callers use it
+    // as a cheap existence check.
+    let mut client = common::test_server().await;
+
+    // Act
+    let log = client
+        .get_communication_log(GetCommunicationLogRequest {
+            sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
+        })
+        .await
+        .expect("get_communication_log tolerates unknown sandbox")
+        .into_inner();
+
+    // Assert
+    assert!(log.entries.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle: sandbox removal cleans up broker state
 // ---------------------------------------------------------------------------
