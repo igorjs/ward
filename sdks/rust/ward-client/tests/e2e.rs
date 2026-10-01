@@ -24,8 +24,8 @@ use tonic::Request;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
-use ward_client::{CreateOptions, EgressMode, WardClient, WardError, pb};
 use pb::ward_client::WardClient as PbClient;
+use ward_client::{CreateOptions, EgressMode, WardClient, WardError, pb};
 
 /// Resolve the wardd binary path without pulling in ward-daemon as a
 /// dev-dep (which would breach the Apache-2.0 ↔ AGPL boundary

@@ -158,6 +158,11 @@ pub async fn test_server() -> WardClient<Channel> {
 /// Centralised here so each gRPC integration test file attaches a token the
 /// same way, rather than repeating the metadata-insertion boilerplate at
 /// every call site.
+///
+/// `allow(dead_code)`: each `tests/*.rs` file compiles `common` as its own
+/// crate, so a binary whose tests don't need a token (e.g. `grpc_volume.rs`)
+/// reports this as unused even though sibling binaries call it.
+#[allow(dead_code)]
 pub fn with_token<T>(message: T, token: &str) -> Request<T> {
     let mut request = Request::new(message);
     request
