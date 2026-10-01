@@ -1198,19 +1198,57 @@ mod tests {
 
     #[tokio::test]
     async fn given_get_when_returned_info_then_token_redacted() {
-        // Arrange: the sandbox holds a real, non-empty token internally.
+        // Arrange: read the manager's own entry map, not create()'s
+        // response, to confirm the sandbox holds a real, non-empty token
+        // internally.
         let mgr = build_manager(4);
         let info = mgr
             .create(create_req("alpine:latest"), "")
             .await
             .expect("create should succeed");
-        assert!(!info.token.is_empty());
+        let stored_token = mgr
+            .entries
+            .read()
+            .await
+            .get(&info.id)
+            .expect("entry should exist")
+            .token
+            .clone();
+        assert!(!stored_token.is_empty());
 
         // Act
         let fetched = mgr.get(&info.id).await.expect("get");
 
         // Assert: get() never echoes the stored token back.
         assert_eq!(fetched.token, "");
+    }
+
+    #[tokio::test]
+    async fn given_list_when_returned_info_then_token_redacted() {
+        // Arrange: create multiple sandboxes and confirm, via the
+        // manager's own entry map, that each holds a real, non-empty
+        // token internally.
+        let mgr = build_manager(4);
+        let a = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create a should succeed");
+        let b = mgr
+            .create(create_req("alpine:latest"), "")
+            .await
+            .expect("create b should succeed");
+        {
+            let entries = mgr.entries.read().await;
+            assert!(!entries.get(&a.id).expect("entry a").token.is_empty());
+            assert!(!entries.get(&b.id).expect("entry b").token.is_empty());
+        }
+
+        // Act
+        let listed = mgr.list().await.expect("list");
+
+        // Assert: list() never echoes any stored token back.
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|info| info.token.is_empty()));
     }
 
     // ----- from_snapshot token gate ---------------------------------------
