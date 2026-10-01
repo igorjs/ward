@@ -9,7 +9,8 @@
 //! pass it explicitly.
 
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Build the token store's path as a sibling of the daemon's socket file.
@@ -34,13 +35,41 @@ fn read_map(store_path: &Path) -> anyhow::Result<HashMap<String, String>> {
     Ok(map)
 }
 
+/// Build a same-directory temp path to write the new store contents to
+/// before the atomic rename. Includes the pid so two `ward` processes
+/// racing to save at the same instant don't share one temp file.
+fn tmp_store_path(store_path: &Path) -> PathBuf {
+    let file_name = store_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tokens.json".to_string());
+    store_path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()))
+}
+
+/// Write `map` to `store_path` as 0600-permissioned JSON.
+///
+/// Writes to a sibling temp file first and renames it over `store_path`,
+/// so a concurrent `load` never observes a truncated or partially-written
+/// file. The temp file is created at 0600 from the start (the mode is
+/// also set explicitly, since `OpenOptions::mode` is subject to the
+/// process umask) so `store_path` is never visible at a looser mode.
 fn write_map(store_path: &Path, map: &HashMap<String, String>) -> anyhow::Result<()> {
     if let Some(parent) = store_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let contents = serde_json::to_string(map)?;
-    std::fs::write(store_path, contents)?;
-    std::fs::set_permissions(store_path, std::fs::Permissions::from_mode(0o600))?;
+
+    let tmp_path = tmp_store_path(store_path);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_path)?;
+    file.write_all(contents.as_bytes())?;
+    drop(file);
+    std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp_path, store_path)?;
     Ok(())
 }
 
@@ -144,6 +173,26 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn given_save_completed_when_store_dir_listed_then_no_tmp_file_remains() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("tokens.json");
+
+        // Act
+        save(&store, "sandbox-1", "token-abc").expect("save");
+
+        // Assert: the atomic rename leaves only the final store file behind
+        let leftover_tmp = std::fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !leftover_tmp,
+            "expected no .tmp file left in store directory"
+        );
     }
 
     #[test]

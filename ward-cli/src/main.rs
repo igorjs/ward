@@ -312,8 +312,10 @@ async fn main() -> anyhow::Result<()> {
                 c.create_sandbox(req).await?.into_inner()
             };
 
-            tokens::save(&token_store, &resp.id, &resp.token)?;
-
+            // Print before persisting: the sandbox already exists on the
+            // daemon by this point, so the user must see its id and token
+            // even if local persistence below fails, since without the
+            // token no later command can manage or remove the sandbox.
             if json {
                 println!(
                     "{}",
@@ -334,6 +336,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("ip_address: {}", resp.ip_address);
                 }
                 println!("token: {}", resp.token);
+            }
+
+            if let Err(e) = tokens::save(&token_store, &resp.id, &resp.token) {
+                eprintln!("warning: could not persist token locally: {e}");
             }
         }
 
@@ -567,7 +573,13 @@ async fn main() -> anyhow::Result<()> {
                 tonic::Request::new(ward_core::pb::RemoveSandboxRequest { id: id.clone() });
             tokens::attach_token(&mut request, token);
             c.remove_sandbox(request).await?;
-            tokens::remove(&token_store, &id)?;
+            // The daemon already removed the sandbox at this point, so a
+            // local store-pruning failure is a warning, not a command
+            // failure: the stale entry is harmless, since the daemon will
+            // reject any later request that still carries its token.
+            if let Err(e) = tokens::remove(&token_store, &id) {
+                eprintln!("warning: could not prune local token store: {e}");
+            }
             if json {
                 println!("{}", json!({"removed": id}));
             } else {
