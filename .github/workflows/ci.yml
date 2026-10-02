@@ -232,6 +232,19 @@ jobs:
         # Separate step from the two above: ward-core's --tests run
         # doesn't touch ward-net's own tests/ directory.
         run: cargo test -p ward-net --tests
+      - name: Integration tests (ward-mcp)
+        # Separate step: ward-mcp's tests/ (handshake, tool_calls) exercise
+        # the stdio JSON-RPC server against the stub backend, no libkrun.
+        run: cargo test -p ward-mcp --tests
+      - name: Integration tests (ward-runtime)
+        # Separate step: ward-runtime's tests/ boot the embedded runtime
+        # with the default (non-krunvm) stub backend, no libkrun.
+        run: cargo test -p ward-runtime --tests
+      - name: Integration tests (ward-client SDK)
+        # Separate step: ward-client's tests/e2e.rs spawns the wardd
+        # binary (built above) and drives it over gRPC using the default
+        # stub backend, no libkrun.
+        run: cargo test -p ward-client --tests
 
   # ── E2E tests ───────────────────────────────────────────────────────
   # Slow tier: spawns the real wardd binary as a subprocess and runs the
