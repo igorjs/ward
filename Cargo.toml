@@ -12,6 +12,11 @@ members = [
     "ward-net",
 ]
 
+# async_trait and tonic codegen box futures, which clippy 1.99 flags as a
+# double must_use. The lint has no real signal on generated code.
+[workspace.lints.clippy]
+double_must_use = "allow"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"

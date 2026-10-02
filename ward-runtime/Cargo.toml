@@ -30,3 +30,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # protobuf request shapes, and implement ImagePuller for the FakePuller
 # used to keep lifecycle tests offline.
 ward-core = { path = "../ward-core" }
+
+[lints]
+workspace = true

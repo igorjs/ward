@@ -30,3 +30,6 @@ tonic-prost = "0.14"
 [build-dependencies]
 # tonic 0.14 moved prost codegen out of tonic-build into tonic-prost-build.
 tonic-prost-build = "0.14"
+
+[lints]
+workspace = true
