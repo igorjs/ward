@@ -5,6 +5,7 @@
 mod client;
 mod output;
 mod socket;
+mod tokens;
 
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
@@ -70,6 +71,14 @@ enum Commands {
         /// Group name for --comms-mode=group. Ignored in deny mode.
         #[arg(long, default_value = "")]
         comms_group: String,
+        /// Snapshot ID to restore into the new sandbox. Requires
+        /// --source-sandbox to authorize the restore.
+        #[arg(long, requires = "source_sandbox")]
+        from_snapshot: Option<String>,
+        /// Sandbox whose stored token authorizes --from-snapshot. Ignored
+        /// unless --from-snapshot is also set.
+        #[arg(long)]
+        source_sandbox: Option<String>,
     },
 
     /// List all sandboxes.
@@ -238,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
     let no_pretty = flag_or_env(cli.no_pretty, "WARD_NO_PRETTY");
 
     let socket_path = cli.socket.unwrap_or_else(socket::default_socket);
+    // Computed once: every command below that touches a token reads or
+    // writes the same per-daemon store file.
+    let token_store = tokens::store_path(&socket_path);
 
     match cli.command {
         Commands::Create {
@@ -248,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
             timeout,
             comms_mode,
             comms_group,
+            from_snapshot,
+            source_sandbox,
         } => {
             // Parse KEY=VALUE env strings into a HashMap. Splitting on the
             // first '=' lets values themselves contain '=', which matters
@@ -270,25 +284,38 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let mut c = client::connect(&socket_path).await?;
-            let resp = c
-                .create_sandbox(ward_core::pb::CreateSandboxRequest {
-                    image,
-                    resources: Some(ward_core::pb::ResourceLimits {
-                        cpus,
-                        memory_mb: memory,
-                        pids_max: 0, // 0 == "use daemon default"
-                        timeout_seconds: timeout,
-                    }),
-                    env: env_map,
-                    comms: Some(ward_core::pb::CommunicationPolicy {
-                        mode: comms_mode_pb as i32,
-                        group: comms_group,
-                    }),
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
+            let req = ward_core::pb::CreateSandboxRequest {
+                image,
+                resources: Some(ward_core::pb::ResourceLimits {
+                    cpus,
+                    memory_mb: memory,
+                    pids_max: 0, // 0 == "use daemon default"
+                    timeout_seconds: timeout,
+                }),
+                env: env_map,
+                comms: Some(ward_core::pb::CommunicationPolicy {
+                    mode: comms_mode_pb as i32,
+                    group: comms_group,
+                }),
+                from_snapshot: from_snapshot.clone().unwrap_or_default(),
+                ..Default::default()
+            };
 
+            let resp = if let (Some(_), Some(source_sandbox)) = (&from_snapshot, &source_sandbox) {
+                // Restoring from a snapshot requires the source sandbox's
+                // token to authorize the daemon's from_snapshot gate.
+                let source_token = tokens::load(&token_store, source_sandbox)?;
+                let mut request = tonic::Request::new(req);
+                tokens::attach_token(&mut request, source_token)?;
+                c.create_sandbox(request).await?.into_inner()
+            } else {
+                c.create_sandbox(req).await?.into_inner()
+            };
+
+            // Print before persisting: the sandbox already exists on the
+            // daemon by this point, so the user must see its id and token
+            // even if local persistence below fails, since without the
+            // token no later command can manage or remove the sandbox.
             if json {
                 println!(
                     "{}",
@@ -297,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                         "status": status_name(resp.status),
                         "image": resp.image,
                         "ip_address": if resp.ip_address.is_empty() { Value::Null } else { Value::String(resp.ip_address) },
+                        "token": resp.token,
                     })
                 );
             } else {
@@ -307,6 +335,11 @@ async fn main() -> anyhow::Result<()> {
                 if !resp.ip_address.is_empty() {
                     println!("ip_address: {}", resp.ip_address);
                 }
+                println!("token: {}", resp.token);
+            }
+
+            if let Err(e) = tokens::save(&token_store, &resp.id, &resp.token) {
+                eprintln!("warning: could not persist token locally: {e}");
             }
         }
 
@@ -333,15 +366,15 @@ async fn main() -> anyhow::Result<()> {
             workdir,
         } => {
             let mut c = client::connect(&socket_path).await?;
-            let resp = c
-                .exec(ward_core::pb::ExecRequest {
-                    sandbox_id: id,
-                    command,
-                    working_dir: workdir.unwrap_or_default(),
-                    env: Default::default(),
-                })
-                .await?
-                .into_inner();
+            let token = tokens::load(&token_store, &id)?;
+            let mut request = tonic::Request::new(ward_core::pb::ExecRequest {
+                sandbox_id: id,
+                command,
+                working_dir: workdir.unwrap_or_default(),
+                env: Default::default(),
+            });
+            tokens::attach_token(&mut request, token)?;
+            let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`
             // to retrieve streamed output once StreamOutput is implemented.
             if json {
@@ -354,14 +387,14 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Run { id, language, code } => {
             let mut c = client::connect(&socket_path).await?;
-            let resp = c
-                .run(ward_core::pb::RunRequest {
-                    sandbox_id: id,
-                    language,
-                    code,
-                })
-                .await?
-                .into_inner();
+            let token = tokens::load(&token_store, &id)?;
+            let mut request = tonic::Request::new(ward_core::pb::RunRequest {
+                sandbox_id: id,
+                language,
+                code,
+            });
+            tokens::attach_token(&mut request, token)?;
+            let resp = c.run(request).await?.into_inner();
             if json {
                 println!("{}", json!({"pid": resp.pid, "status": resp.status}));
             } else {
@@ -376,13 +409,13 @@ async fn main() -> anyhow::Result<()> {
             // can grep "stdout:" / "stderr:" / "exit:" without parsing
             // structured output.
             let mut c = client::connect(&socket_path).await?;
-            let mut stream = c
-                .stream_output(ward_core::pb::StreamOutputRequest {
-                    sandbox_id: id,
-                    pid,
-                })
-                .await?
-                .into_inner();
+            let token = tokens::load(&token_store, &id)?;
+            let mut request = tonic::Request::new(ward_core::pb::StreamOutputRequest {
+                sandbox_id: id,
+                pid,
+            });
+            tokens::attach_token(&mut request, token)?;
+            let mut stream = c.stream_output(request).await?.into_inner();
 
             while let Some(evt) = stream.message().await? {
                 let kind = match ward_core::pb::StreamEventType::try_from(evt.r#type)
@@ -411,11 +444,13 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Kill { id, pid } => {
             let mut c = client::connect(&socket_path).await?;
-            c.kill_process(ward_core::pb::KillProcessRequest {
+            let token = tokens::load(&token_store, &id)?;
+            let mut request = tonic::Request::new(ward_core::pb::KillProcessRequest {
                 sandbox_id: id,
                 pid: pid.clone(),
-            })
-            .await?;
+            });
+            tokens::attach_token(&mut request, token)?;
+            c.kill_process(request).await?;
             if json {
                 println!("{}", json!({"killed": pid}));
             } else {
@@ -441,13 +476,15 @@ async fn main() -> anyhow::Result<()> {
                 }
             };
             let mut c = client::connect(&socket_path).await?;
+            let token = tokens::load(&token_store, &id)?;
             let bytes_written = bytes.len();
-            c.write_stdin(ward_core::pb::WriteStdinRequest {
+            let mut request = tonic::Request::new(ward_core::pb::WriteStdinRequest {
                 sandbox_id: id,
                 pid,
                 data: bytes,
-            })
-            .await?;
+            });
+            tokens::attach_token(&mut request, token)?;
+            c.write_stdin(request).await?;
             if json {
                 println!("{}", json!({"wrote": bytes_written}));
             } else {
@@ -458,10 +495,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Snapshot(snap_cmd) => match snap_cmd {
             SnapshotCommands::Create { sandbox_id, label } => {
                 let mut c = client::connect(&socket_path).await?;
-                let resp = c
-                    .create_snapshot(ward_core::pb::CreateSnapshotRequest { sandbox_id, label })
-                    .await?
-                    .into_inner();
+                let token = tokens::load(&token_store, &sandbox_id)?;
+                let mut request =
+                    tonic::Request::new(ward_core::pb::CreateSnapshotRequest { sandbox_id, label });
+                tokens::attach_token(&mut request, token)?;
+                let resp = c.create_snapshot(request).await?.into_inner();
                 if json {
                     println!(
                         "{}",
@@ -484,11 +522,13 @@ async fn main() -> anyhow::Result<()> {
                 snapshot_id,
             } => {
                 let mut c = client::connect(&socket_path).await?;
-                c.restore_snapshot(ward_core::pb::RestoreSnapshotRequest {
+                let token = tokens::load(&token_store, &sandbox_id)?;
+                let mut request = tonic::Request::new(ward_core::pb::RestoreSnapshotRequest {
                     sandbox_id: sandbox_id.clone(),
                     snapshot_id: snapshot_id.clone(),
-                })
-                .await?;
+                });
+                tokens::attach_token(&mut request, token)?;
+                c.restore_snapshot(request).await?;
                 if json {
                     println!(
                         "{}",
@@ -500,10 +540,11 @@ async fn main() -> anyhow::Result<()> {
             }
             SnapshotCommands::List { sandbox_id } => {
                 let mut c = client::connect(&socket_path).await?;
-                let resp = c
-                    .list_snapshots(ward_core::pb::ListSnapshotsRequest { sandbox_id })
-                    .await?
-                    .into_inner();
+                let token = tokens::load(&token_store, &sandbox_id)?;
+                let mut request =
+                    tonic::Request::new(ward_core::pb::ListSnapshotsRequest { sandbox_id });
+                tokens::attach_token(&mut request, token)?;
+                let resp = c.list_snapshots(request).await?.into_inner();
                 let rows: Vec<Vec<Value>> = resp
                     .snapshots
                     .into_iter()
@@ -527,8 +568,18 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Remove { id } => {
             let mut c = client::connect(&socket_path).await?;
-            c.remove_sandbox(ward_core::pb::RemoveSandboxRequest { id: id.clone() })
-                .await?;
+            let token = tokens::load(&token_store, &id)?;
+            let mut request =
+                tonic::Request::new(ward_core::pb::RemoveSandboxRequest { id: id.clone() });
+            tokens::attach_token(&mut request, token)?;
+            c.remove_sandbox(request).await?;
+            // The daemon already removed the sandbox at this point, so a
+            // local store-pruning failure is a warning, not a command
+            // failure: the stale entry is harmless, since the daemon will
+            // reject any later request that still carries its token.
+            if let Err(e) = tokens::remove(&token_store, &id) {
+                eprintln!("warning: could not prune local token store: {e}");
+            }
             if json {
                 println!("{}", json!({"removed": id}));
             } else {
@@ -597,12 +648,14 @@ async fn main() -> anyhow::Result<()> {
             payload,
         } => {
             let mut c = client::connect(&socket_path).await?;
-            c.publish(ward_core::pb::PublishRequest {
+            let token = tokens::load(&token_store, &sandbox_id)?;
+            let mut request = tonic::Request::new(ward_core::pb::PublishRequest {
                 sandbox_id,
                 topic,
                 payload: payload.into_bytes(),
-            })
-            .await?;
+            });
+            tokens::attach_token(&mut request, token)?;
+            c.publish(request).await?;
             if json {
                 println!("{}", json!({"published": true}));
             } else {
@@ -616,10 +669,11 @@ async fn main() -> anyhow::Result<()> {
             // the stream. Until the broker is implemented, the daemon
             // returns Unimplemented before any messages flow.
             let mut c = client::connect(&socket_path).await?;
-            let mut stream = c
-                .subscribe(ward_core::pb::SubscribeRequest { sandbox_id, topic })
-                .await?
-                .into_inner();
+            let token = tokens::load(&token_store, &sandbox_id)?;
+            let mut request =
+                tonic::Request::new(ward_core::pb::SubscribeRequest { sandbox_id, topic });
+            tokens::attach_token(&mut request, token)?;
+            let mut stream = c.subscribe(request).await?.into_inner();
 
             while let Some(msg) = stream.message().await? {
                 if json {
@@ -703,5 +757,35 @@ fn status_name(status: i32) -> &'static str {
         SandboxStatus::Stopped => "stopped",
         SandboxStatus::Failed => "failed",
         SandboxStatus::Unspecified => "unspecified",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// BDD/AAA style: function names read as `given_X_when_Y_then_Z`, bodies
+// have explicit Arrange / Act / Assert markers.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_from_snapshot_flag_without_source_sandbox_when_parsed_then_clap_error() {
+        // Arrange
+        let args = [
+            "ward",
+            "create",
+            "alpine",
+            "--from-snapshot",
+            "some-snap-id",
+        ];
+
+        // Act
+        let result = Cli::try_parse_from(args);
+
+        // Assert
+        assert!(result.is_err());
     }
 }
