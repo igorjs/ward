@@ -94,7 +94,7 @@ async fn given_runtime_when_create_then_list_then_remove_then_clean() {
 
     // ACT 1 — create.
     let info = mgr
-        .create(create_request("alpine"))
+        .create(create_request("alpine"), "")
         .await
         .expect("create succeeds on stub backend");
     assert!(!info.id.is_empty(), "manager should assign a non-empty id");
@@ -134,12 +134,12 @@ async fn given_runtime_when_cap_reached_then_next_create_errors() {
     let mgr = runtime.sandbox_manager();
 
     // Fill the cap.
-    mgr.create(create_request("alpine")).await.expect("1st");
-    mgr.create(create_request("alpine")).await.expect("2nd");
+    mgr.create(create_request("alpine"), "").await.expect("1st");
+    mgr.create(create_request("alpine"), "").await.expect("2nd");
 
     // 3rd should fail with a cap error.
     let err = mgr
-        .create(create_request("alpine"))
+        .create(create_request("alpine"), "")
         .await
         .expect_err("3rd create must fail because cap is 2");
     // ApiError doesn't expose a public discriminant; assert on the
@@ -170,7 +170,7 @@ async fn given_runtime_when_clone_then_managers_shared() {
 
     let info = a
         .sandbox_manager()
-        .create(create_request("alpine"))
+        .create(create_request("alpine"), "")
         .await
         .expect("a creates");
 

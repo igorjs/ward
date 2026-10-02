@@ -100,6 +100,7 @@ pub struct SandboxInfo {
     pub ip_address: Option<String>,
     pub resources: ResourceLimits,
     pub expires_at: Option<SystemTime>,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,6 +268,8 @@ pub enum ApiError {
     Backend(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 // ---------------------------------------------------------------------------

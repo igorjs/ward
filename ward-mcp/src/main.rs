@@ -266,7 +266,7 @@ impl Server {
         let info = self
             .runtime
             .sandbox_manager()
-            .create(req)
+            .create(req, "")
             .await
             .map_err(|e| RpcError::internal(format!("create_sandbox: {e}")))?;
         Ok(format!("sandbox {} created from {}", info.id, info.image))
