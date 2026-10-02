@@ -101,10 +101,13 @@ async fn given_existing_sandbox_when_create_snapshot_then_returns_info_with_new_
 
     // Act
     let snap = client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s.id.clone(),
-            label: "checkpoint-1".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                label: "checkpoint-1".into(),
+            },
+            &s.token,
+        ))
         .await
         .expect("create_snapshot")
         .into_inner();
@@ -139,15 +142,28 @@ async fn given_malformed_snapshot_id_when_restore_then_invalid_argument() {
 
 #[tokio::test]
 async fn given_unknown_snapshot_when_restore_then_not_found() {
-    // Arrange: well-formed but no snapshot exists.
+    // Arrange: a real, token-authorized sandbox so the request passes
+    // authorize() and reaches the snapshot lookup; the snapshot id itself
+    // is well-formed but was never created.
     let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
 
     // Act
     let err = client
-        .restore_snapshot(RestoreSnapshotRequest {
-            sandbox_id: VALID_UUID.into(),
-            snapshot_id: VALID_UUID.into(),
-        })
+        .restore_snapshot(common::with_token(
+            RestoreSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                snapshot_id: VALID_UUID.into(),
+            },
+            &s.token,
+        ))
         .await
         .expect_err("unknown snapshot");
 
@@ -183,20 +199,27 @@ async fn given_snapshot_of_other_sandbox_when_restore_then_not_found() {
         .unwrap()
         .into_inner();
     let snap = client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s1.id,
-            label: "x".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s1.id,
+                label: "x".into(),
+            },
+            &s1.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: sandbox 2's own real token, so the request passes authorization
+    // and reaches the cross-sandbox snapshot-ownership check under test.
     let err = client
-        .restore_snapshot(RestoreSnapshotRequest {
-            sandbox_id: s2.id,
-            snapshot_id: snap.snapshot_id,
-        })
+        .restore_snapshot(common::with_token(
+            RestoreSnapshotRequest {
+                sandbox_id: s2.id.clone(),
+                snapshot_id: snap.snapshot_id,
+            },
+            &s2.token,
+        ))
         .await
         .expect_err("cross-sandbox restore");
 
@@ -217,20 +240,26 @@ async fn given_existing_snapshot_when_restore_with_correct_owner_then_ok() {
         .unwrap()
         .into_inner();
     let snap = client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s.id.clone(),
-            label: "before-change".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                label: "before-change".into(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
 
     // Act
     let resp = client
-        .restore_snapshot(RestoreSnapshotRequest {
-            sandbox_id: s.id,
-            snapshot_id: snap.snapshot_id,
-        })
+        .restore_snapshot(common::with_token(
+            RestoreSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                snapshot_id: snap.snapshot_id,
+            },
+            &s.token,
+        ))
         .await
         .expect("restore_snapshot");
 
@@ -300,32 +329,44 @@ async fn given_two_snapshots_when_list_then_returns_both_for_that_sandbox() {
         .unwrap()
         .into_inner();
     client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s.id.clone(),
-            label: "first".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                label: "first".into(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap();
     client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s.id.clone(),
-            label: "second".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                label: "second".into(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap();
     client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: other.id,
-            label: "third".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: other.id.clone(),
+                label: "third".into(),
+            },
+            &other.token,
+        ))
         .await
         .unwrap();
 
     // Act
     let resp = client
-        .list_snapshots(ListSnapshotsRequest {
-            sandbox_id: s.id.clone(),
-        })
+        .list_snapshots(common::with_token(
+            ListSnapshotsRequest {
+                sandbox_id: s.id.clone(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -356,15 +397,21 @@ async fn given_sandbox_removed_when_restore_old_snapshot_then_not_found() {
         .unwrap()
         .into_inner();
     let snap = client
-        .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: s.id.clone(),
-            label: "before-remove".into(),
-        })
+        .create_snapshot(common::with_token(
+            CreateSnapshotRequest {
+                sandbox_id: s.id.clone(),
+                label: "before-remove".into(),
+            },
+            &s.token,
+        ))
         .await
         .unwrap()
         .into_inner();
     client
-        .remove_sandbox(ward_core::pb::RemoveSandboxRequest { id: s.id.clone() })
+        .remove_sandbox(common::with_token(
+            ward_core::pb::RemoveSandboxRequest { id: s.id.clone() },
+            &s.token,
+        ))
         .await
         .unwrap();
 
@@ -378,12 +425,16 @@ async fn given_sandbox_removed_when_restore_old_snapshot_then_not_found() {
         .unwrap()
         .into_inner();
 
-    // Act
+    // Act: sandbox 2's own real token, so the request passes authorization
+    // and reaches the dangling-snapshot lookup under test.
     let err = client
-        .restore_snapshot(RestoreSnapshotRequest {
-            sandbox_id: s2.id,
-            snapshot_id: snap.snapshot_id,
-        })
+        .restore_snapshot(common::with_token(
+            RestoreSnapshotRequest {
+                sandbox_id: s2.id.clone(),
+                snapshot_id: snap.snapshot_id,
+            },
+            &s2.token,
+        ))
         .await
         .expect_err("snapshot dangling after sandbox removed");
 

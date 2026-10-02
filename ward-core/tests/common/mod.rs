@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
+use tonic::Request;
 use tonic::transport::{Channel, Endpoint, Server};
 
 use ward_core::backend::Backend;
@@ -149,4 +150,23 @@ pub async fn test_server() -> WardClient<Channel> {
         }
     }
     unreachable!()
+}
+
+/// Wrap a request message with the sandbox capability token every
+/// authorize-gated RPC now requires in its `x-ward-sandbox-token` metadata.
+///
+/// Centralised here so each gRPC integration test file attaches a token the
+/// same way, rather than repeating the metadata-insertion boilerplate at
+/// every call site.
+///
+/// `allow(dead_code)`: each `tests/*.rs` file compiles `common` as its own
+/// crate, so a binary whose tests don't need a token (e.g. `grpc_volume.rs`)
+/// reports this as unused even though sibling binaries call it.
+#[allow(dead_code)]
+pub fn with_token<T>(message: T, token: &str) -> Request<T> {
+    let mut request = Request::new(message);
+    request
+        .metadata_mut()
+        .insert("x-ward-sandbox-token", token.parse().expect("valid token"));
+    request
 }

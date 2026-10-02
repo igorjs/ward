@@ -49,6 +49,19 @@ fn api_err_to_status(err: ApiError) -> Status {
     }
 }
 
+/// Read the caller-presented capability token off request metadata. A
+/// missing key and a value that fails ASCII/UTF-8 decoding are both
+/// treated as "no token" (empty string): `SandboxManager::authorize`
+/// rejects an empty token the same way it rejects a wrong one, so callers
+/// don't need a separate error path for a malformed header.
+fn token_from_metadata<T>(request: &Request<T>) -> &str {
+    request
+        .metadata()
+        .get("x-ward-sandbox-token")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+}
+
 // ---------------------------------------------------------------------------
 // gRPC server
 // ---------------------------------------------------------------------------
@@ -81,13 +94,11 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        // TODO(grpc-token): extract the caller's capability token from
-        // request metadata instead of this placeholder; until then,
-        // from_snapshot creates on this RPC path cannot pass authorize().
         let info = self
             .sandbox
-            .create(req, "")
+            .create(req, &token)
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(info))
@@ -129,7 +140,13 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<RemoveSandboxRequest>,
     ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.id, "sandbox").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         self.sandbox
             .remove(&req.id)
             .await
@@ -143,7 +160,13 @@ impl Ward for WardGrpcServer {
         fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
     )]
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ProcessInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         let info = self.sandbox.exec(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
@@ -154,7 +177,13 @@ impl Ward for WardGrpcServer {
         fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
     )]
     async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         let info = self.sandbox.run(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
@@ -174,10 +203,18 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<StreamOutputRequest>,
     ) -> Result<Response<Self::StreamOutputStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
 
-        // Manager runs the entity_id validators on both fields and the
-        // cross-sandbox ownership check before handing over the receiver.
+        // Manager re-runs the entity_id validators on both fields and
+        // performs the cross-sandbox ownership check before handing over
+        // the receiver.
         let mut inner_rx = self
             .sandbox
             .stream_output(&req.sandbox_id, &req.pid)
@@ -217,7 +254,14 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<WriteStdinRequest>,
     ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         self.sandbox
             .write_stdin(&req.sandbox_id, &req.pid, bytes::Bytes::from(req.data))
             .await
@@ -238,7 +282,14 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<KillProcessRequest>,
     ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         self.sandbox
             .kill_process(&req.sandbox_id, &req.pid)
             .await
@@ -255,7 +306,13 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<CreateSnapshotRequest>,
     ) -> Result<Response<SnapshotInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         let info = self
             .sandbox
             .create_snapshot(&req.sandbox_id, &req.label)
@@ -277,7 +334,14 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<RestoreSnapshotRequest>,
     ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        crate::validate::entity_id(&req.snapshot_id, "snapshot").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         self.sandbox
             .restore_snapshot(&req.sandbox_id, &req.snapshot_id)
             .await
@@ -294,7 +358,21 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<ListSnapshotsRequest>,
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+
+        // list_snapshots is lenient toward an unknown sandbox (empty list,
+        // not an error) even before token enforcement: callers use it as a
+        // cheap existence check. Preserve that by falling through past a
+        // SandboxNotFound from authorize(); any other outcome (including
+        // PermissionDenied for a real sandbox with a missing or wrong
+        // token) still fails the request here.
+        match self.sandbox.authorize(&req.sandbox_id, &token).await {
+            Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+            Err(err) => return Err(api_err_to_status(err)),
+        }
+
         let snaps = self
             .sandbox
             .list_snapshots(&req.sandbox_id)
@@ -371,7 +449,13 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<GetEgressLogRequest>,
     ) -> Result<Response<EgressLogResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
+        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
         let log = self
             .sandbox
             .egress_log(&req.sandbox_id)
@@ -412,10 +496,15 @@ impl Ward for WardGrpcServer {
         )
     )]
     async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
         crate::validate::publish_payload(&req.payload).map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
 
         // Delivery count is discarded by the proto (response is Empty) —
         // callers learn about fan-out via GetCommunicationLog. Errors
@@ -444,9 +533,14 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
+        self.sandbox
+            .authorize(&req.sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
 
         let mut inner_rx = self
             .sandbox
@@ -484,8 +578,20 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<GetCommunicationLogRequest>,
     ) -> Result<Response<CommunicationLogResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+
+        // get_communication_log is lenient toward an unknown sandbox (empty
+        // log, not an error) even before token enforcement: callers use it as
+        // a cheap existence check. Preserve that by falling through past a
+        // SandboxNotFound from authorize(); any other outcome (including
+        // PermissionDenied for a real sandbox with a missing or wrong
+        // token) still fails the request here.
+        match self.sandbox.authorize(&req.sandbox_id, &token).await {
+            Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+            Err(err) => return Err(api_err_to_status(err)),
+        }
 
         let entries = self.sandbox.broker().log(&req.sandbox_id).await;
         let pb_entries = entries.into_iter().map(log_entry_to_pb).collect();
