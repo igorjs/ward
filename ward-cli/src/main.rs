@@ -306,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
                 // token to authorize the daemon's from_snapshot gate.
                 let source_token = tokens::load(&token_store, source_sandbox)?;
                 let mut request = tonic::Request::new(req);
-                tokens::attach_token(&mut request, source_token);
+                tokens::attach_token(&mut request, source_token)?;
                 c.create_sandbox(request).await?.into_inner()
             } else {
                 c.create_sandbox(req).await?.into_inner()
@@ -373,7 +373,7 @@ async fn main() -> anyhow::Result<()> {
                 working_dir: workdir.unwrap_or_default(),
                 env: Default::default(),
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`
             // to retrieve streamed output once StreamOutput is implemented.
@@ -393,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
                 language,
                 code,
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             let resp = c.run(request).await?.into_inner();
             if json {
                 println!("{}", json!({"pid": resp.pid, "status": resp.status}));
@@ -414,7 +414,7 @@ async fn main() -> anyhow::Result<()> {
                 sandbox_id: id,
                 pid,
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             let mut stream = c.stream_output(request).await?.into_inner();
 
             while let Some(evt) = stream.message().await? {
@@ -449,7 +449,7 @@ async fn main() -> anyhow::Result<()> {
                 sandbox_id: id,
                 pid: pid.clone(),
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             c.kill_process(request).await?;
             if json {
                 println!("{}", json!({"killed": pid}));
@@ -483,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
                 pid,
                 data: bytes,
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             c.write_stdin(request).await?;
             if json {
                 println!("{}", json!({"wrote": bytes_written}));
@@ -498,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
                 let token = tokens::load(&token_store, &sandbox_id)?;
                 let mut request =
                     tonic::Request::new(ward_core::pb::CreateSnapshotRequest { sandbox_id, label });
-                tokens::attach_token(&mut request, token);
+                tokens::attach_token(&mut request, token)?;
                 let resp = c.create_snapshot(request).await?.into_inner();
                 if json {
                     println!(
@@ -527,7 +527,7 @@ async fn main() -> anyhow::Result<()> {
                     sandbox_id: sandbox_id.clone(),
                     snapshot_id: snapshot_id.clone(),
                 });
-                tokens::attach_token(&mut request, token);
+                tokens::attach_token(&mut request, token)?;
                 c.restore_snapshot(request).await?;
                 if json {
                     println!(
@@ -543,7 +543,7 @@ async fn main() -> anyhow::Result<()> {
                 let token = tokens::load(&token_store, &sandbox_id)?;
                 let mut request =
                     tonic::Request::new(ward_core::pb::ListSnapshotsRequest { sandbox_id });
-                tokens::attach_token(&mut request, token);
+                tokens::attach_token(&mut request, token)?;
                 let resp = c.list_snapshots(request).await?.into_inner();
                 let rows: Vec<Vec<Value>> = resp
                     .snapshots
@@ -571,7 +571,7 @@ async fn main() -> anyhow::Result<()> {
             let token = tokens::load(&token_store, &id)?;
             let mut request =
                 tonic::Request::new(ward_core::pb::RemoveSandboxRequest { id: id.clone() });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             c.remove_sandbox(request).await?;
             // The daemon already removed the sandbox at this point, so a
             // local store-pruning failure is a warning, not a command
@@ -654,7 +654,7 @@ async fn main() -> anyhow::Result<()> {
                 topic,
                 payload: payload.into_bytes(),
             });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             c.publish(request).await?;
             if json {
                 println!("{}", json!({"published": true}));
@@ -672,7 +672,7 @@ async fn main() -> anyhow::Result<()> {
             let token = tokens::load(&token_store, &sandbox_id)?;
             let mut request =
                 tonic::Request::new(ward_core::pb::SubscribeRequest { sandbox_id, topic });
-            tokens::attach_token(&mut request, token);
+            tokens::attach_token(&mut request, token)?;
             let mut stream = c.subscribe(request).await?.into_inner();
 
             while let Some(msg) = stream.message().await? {

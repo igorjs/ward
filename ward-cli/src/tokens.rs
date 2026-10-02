@@ -73,11 +73,37 @@ fn write_map(store_path: &Path, map: &HashMap<String, String>) -> anyhow::Result
     Ok(())
 }
 
+/// Run `f` while holding an exclusive lock on a sibling lock file.
+///
+/// `save` and `remove` read the whole map, change it, and write it back.
+/// Without the lock, two `ward` processes doing that at once lose one
+/// update, and a lost token strands its sandbox. The lock is released
+/// when the lock file handle drops.
+fn with_lock<R>(store_path: &Path, f: impl FnOnce() -> anyhow::Result<R>) -> anyhow::Result<R> {
+    if let Some(parent) = store_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = store_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tokens.json".to_string());
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(store_path.with_file_name(format!("{file_name}.lock")))?;
+    lock_file.lock()?;
+    f()
+}
+
 /// Persist `token` for `sandbox_id`, merging into any existing store.
 pub fn save(store_path: &Path, sandbox_id: &str, token: &str) -> anyhow::Result<()> {
-    let mut map = read_map(store_path)?;
-    map.insert(sandbox_id.to_string(), token.to_string());
-    write_map(store_path, &map)
+    with_lock(store_path, || {
+        let mut map = read_map(store_path)?;
+        map.insert(sandbox_id.to_string(), token.to_string());
+        write_map(store_path, &map)
+    })
 }
 
 /// Look up the stored token for `sandbox_id`, if any.
@@ -97,23 +123,33 @@ pub fn remove(store_path: &Path, sandbox_id: &str) -> anyhow::Result<()> {
     if !store_path.exists() {
         return Ok(());
     }
-    let mut map = read_map(store_path)?;
-    if map.remove(sandbox_id).is_none() {
-        return Ok(());
-    }
-    write_map(store_path, &map)
+    with_lock(store_path, || {
+        let mut map = read_map(store_path)?;
+        if map.remove(sandbox_id).is_none() {
+            return Ok(());
+        }
+        write_map(store_path, &map)
+    })
 }
 
 /// Attach the sandbox's capability token to an outgoing gRPC request.
 ///
 /// A no-op when `token` is `None`, matching call sites for sandboxes that
-/// predate this change and have no stored token.
-pub fn attach_token<T>(request: &mut tonic::Request<T>, token: Option<String>) {
+/// predate this change and have no stored token. Fails when a stored token
+/// is not a valid header value (for example a hand-edited store).
+pub fn attach_token<T>(
+    request: &mut tonic::Request<T>,
+    token: Option<String>,
+) -> anyhow::Result<()> {
     if let Some(t) = token {
-        request
-            .metadata_mut()
-            .insert("x-ward-sandbox-token", t.parse().expect("valid token"));
+        let value = t
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .map_err(|_| {
+                anyhow::anyhow!("stored sandbox token is not a valid header value; fix or delete its entry in the token store")
+            })?;
+        request.metadata_mut().insert("x-ward-sandbox-token", value);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -224,12 +260,49 @@ mod tests {
     }
 
     #[test]
+    fn given_concurrent_saves_when_all_finish_then_every_token_is_stored() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("tokens.json");
+        let ids: Vec<String> = (0..16).map(|i| format!("sandbox-{i}")).collect();
+
+        // Act: each thread does its own read-modify-write at the same time.
+        std::thread::scope(|scope| {
+            for id in &ids {
+                let store = &store;
+                scope.spawn(move || save(store, id, &format!("token-for-{id}")).expect("save"));
+            }
+        });
+
+        // Assert: no update was lost.
+        for id in &ids {
+            assert_eq!(
+                load(&store, id).expect("load"),
+                Some(format!("token-for-{id}"))
+            );
+        }
+    }
+
+    #[test]
+    fn given_token_with_newline_when_attach_token_then_error_not_panic() {
+        // Arrange: a hand-edited store can hold a value that is not a valid header.
+        let mut request = tonic::Request::new(());
+
+        // Act
+        let result = attach_token(&mut request, Some("bad\ntoken".to_string()));
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(request.metadata().len(), 0);
+    }
+
+    #[test]
     fn given_some_token_when_attach_token_then_metadata_header_set() {
         // Arrange
         let mut request = tonic::Request::new(());
 
         // Act
-        attach_token(&mut request, Some("t".to_string()));
+        attach_token(&mut request, Some("t".to_string())).expect("attach");
 
         // Assert
         let value = request
@@ -247,7 +320,7 @@ mod tests {
         let mut request = tonic::Request::new(());
 
         // Act
-        attach_token(&mut request, None);
+        attach_token(&mut request, None).expect("attach");
 
         // Assert
         assert_eq!(request.metadata().len(), 0);
@@ -260,7 +333,7 @@ mod tests {
     fn given_each_of_13_sandbox_scoped_request_builders_when_attach_token_called_then_header_present()
      {
         fn assert_header_present<T>(mut request: tonic::Request<T>) {
-            attach_token(&mut request, Some("t".to_string()));
+            attach_token(&mut request, Some("t".to_string())).expect("attach");
             let value = request
                 .metadata()
                 .get("x-ward-sandbox-token")
