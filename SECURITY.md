@@ -58,6 +58,16 @@ Vulnerabilities in this repository's code, including but not limited to:
 - Issues requiring physical access to the user's machine
 - Bugs in development-only tooling not shipped to end users
 
+## Trust model
+
+This section states exactly what each layer of the daemon's access control proves.
+
+- The Unix socket authenticates the connecting OS user. `ward-daemon/src/main.rs:149` sets its permissions to `0600`, so only the daemon's own OS user is able to open a connection. Any process running as that user is able to call any RPC on the socket.
+- A sandbox-scoped capability token is the boundary between two same-UID processes. `CreateSandbox` returns the token once, and every RPC that acts on a sandbox requires it, including creating a new sandbox from another sandbox's snapshot.
+- `GetSandbox` and `ListSandboxes` return sandbox existence and metadata, including `ip_address`, to any same-UID caller without a token. This is by design: the token gates actions on a sandbox, not knowledge that it exists. Network reachability to that address is not gated by the token either. Only the RPCs that act on the sandbox are.
+- The token has no expiry and no rotation. Its lifetime matches the sandbox's own: both live in memory, and both disappear when the sandbox is removed or the daemon restarts.
+- A token for a sandbox that no longer exists after a daemon restart returns `SandboxNotFound` on the next call, not `PermissionDenied`. `SandboxManager` rebuilds its in-memory state, including every token, empty on each daemon start.
+
 ## Hardening posture
 
 This repository is part of the `igorjs` repo set and follows a common

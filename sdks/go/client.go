@@ -63,6 +63,9 @@ type CreateSandboxOptions struct {
 	TimeoutSeconds  uint64
 	Env             map[string]string
 	FromSnapshot    string
+	// SourceToken authorizes reading FromSnapshot's source sandbox; required
+	// whenever FromSnapshot is set.
+	SourceToken string
 }
 
 // ─── Defaults ─────────────────────────────────────────────────────────
@@ -161,7 +164,7 @@ func (c *Client) CreateSandbox(_ctx context.Context, _opts *CreateSandboxOptions
 
 // RemoveSandbox tears a sandbox down. Idempotent: removing an
 // already-gone sandbox is a no-op success.
-func (c *Client) RemoveSandbox(_ctx context.Context, _sandboxID string) error {
+func (c *Client) RemoveSandbox(_ctx context.Context, _sandboxID string, _token string) error {
 	return fmt.Errorf("first-cut scaffold; wire to gRPC stub when proto codegen lands")
 }
 
@@ -169,12 +172,12 @@ func (c *Client) RemoveSandbox(_ctx context.Context, _sandboxID string) error {
 
 // Run executes a command in the sandbox and returns when the process exits.
 // For long-running commands, prefer StreamOutput.
-func (c *Client) Run(_ctx context.Context, _sandboxID string, _argv []string) (*ExecResult, error) {
+func (c *Client) Run(_ctx context.Context, _sandboxID string, _argv []string, _token string) (*ExecResult, error) {
 	return nil, fmt.Errorf("first-cut scaffold; wire to gRPC stub when proto codegen lands")
 }
 
 // StreamOutput streams stdout / stderr / exit events from a running process.
 // The returned channel is closed after the final exit event is delivered.
-func (c *Client) StreamOutput(_ctx context.Context, _sandboxID, _pid string) (<-chan StreamEvent, error) {
+func (c *Client) StreamOutput(_ctx context.Context, _sandboxID, _pid, _token string) (<-chan StreamEvent, error) {
 	return nil, fmt.Errorf("first-cut scaffold; wire to gRPC stub when proto codegen lands")
 }

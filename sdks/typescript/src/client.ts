@@ -102,7 +102,7 @@ export class WardClient {
     throw new Error("first-cut scaffold; wire to gRPC stub when proto codegen lands");
   }
 
-  async removeSandbox(_sandboxId: string): Promise<void> {
+  async removeSandbox(_sandboxId: string, _token?: string): Promise<void> {
     throw new Error("first-cut scaffold; wire to gRPC stub when proto codegen lands");
   }
 
@@ -124,11 +124,11 @@ export class WardClient {
 
   // ── Process operations ───────────────────────────────────────────
 
-  async run(_sandboxId: string, _argv: string[]): Promise<ExecResult> {
+  async run(_sandboxId: string, _argv: string[], _token?: string): Promise<ExecResult> {
     throw new Error("first-cut scaffold; wire to gRPC stub when proto codegen lands");
   }
 
-  async *streamOutput(_sandboxId: string, _pid: string): AsyncIterable<StreamEvent> {
+  async *streamOutput(_sandboxId: string, _pid: string, _token?: string): AsyncIterable<StreamEvent> {
     throw new Error("first-cut scaffold; wire to gRPC stub when proto codegen lands");
     // Once wired, the body will yield StreamEvents read from the
     // server-streaming RPC until the exit event arrives, then return.
