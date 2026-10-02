@@ -1296,6 +1296,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_from_snapshot_with_other_sandbox_token_when_create_then_permission_denied() {
+        // Arrange: two real sandboxes, each with its own token, and a
+        // snapshot owned by A.
+        let mgr = build_manager(4);
+        let a = mgr.create(create_req("alpine:a"), "").await.unwrap();
+        let b = mgr.create(create_req("alpine:b"), "").await.unwrap();
+        let snap = mgr
+            .create_snapshot(&a.id, "label")
+            .await
+            .expect("create_snapshot");
+        let req = CreateSandboxRequest {
+            from_snapshot: snap.snapshot_id,
+            ..create_req("alpine")
+        };
+
+        // Act: B's valid token is presented for A's snapshot.
+        let result = mgr.create(req, &b.token).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::PermissionDenied(_))));
+    }
+
+    #[tokio::test]
     async fn given_from_snapshot_with_unknown_snapshot_id_when_create_then_snapshot_not_found() {
         // Arrange: a snapshot id nothing owns.
         let mgr = build_manager(4);
