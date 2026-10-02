@@ -29,3 +29,6 @@ ward-core = { path = "../ward-core" }
 [dev-dependencies]
 # Diff-style assertions for readable failures on multi-field structs.
 pretty_assertions = "1"
+
+[lints]
+workspace = true

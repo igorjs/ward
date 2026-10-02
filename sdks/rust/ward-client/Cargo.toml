@@ -44,3 +44,6 @@ tempfile = "3"
 # the test file itself (walks workspace ancestors for target/<profile>/wardd)
 # so we don't need a dev-dep on ward-daemon — that would breach the
 # Apache-2.0 ↔ AGPL boundary documented above.
+
+[lints]
+workspace = true

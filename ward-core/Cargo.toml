@@ -100,3 +100,6 @@ proptest = "1"
 # asserting on side effects the recorder facade doesn't otherwise expose.
 metrics-util = "0.20"
 
+
+[lints]
+workspace = true
