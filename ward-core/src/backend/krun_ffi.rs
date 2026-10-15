@@ -36,7 +36,8 @@
 //!
 //! # Safety
 //!
-//! All functions here are `unsafe extern "C"`. Every call site in
+//! All functions here are `unsafe fn` wrappers over `extern "C"` symbols
+//! resolved from the embedded libkrun at runtime. Every call site in
 //! `ward-core` must justify the safety of its invocation (typically:
 //! `ctx_id` came from `krun_create_ctx()` and hasn't been freed; C
 //! strings are valid NUL-terminated UTF-8; arrays end with a null
@@ -58,205 +59,289 @@ use std::ffi::{c_char, c_int, c_void};
 type uid_t = u32;
 type gid_t = u32;
 
-unsafe extern "C" {
-    // ---- Context lifecycle --------------------------------------------------
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
-    pub fn krun_create_ctx() -> i32;
-    pub fn krun_free_ctx(ctx_id: u32) -> i32;
+use libloading::Library;
 
-    // ---- VM configuration ---------------------------------------------------
+/// `-ENOSYS`: returned by wrappers whose symbol the loaded libkrun lacks.
+const NEGATIVE_ENOSYS: i32 = -38;
 
-    pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-    pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
-    pub fn krun_set_root_disk(ctx_id: u32, disk_path: *const c_char) -> i32;
-    pub fn krun_set_data_disk(ctx_id: u32, disk_path: *const c_char) -> i32;
-    pub fn krun_add_disk(
-        ctx_id: u32,
-        block_id: *const c_char,
-        disk_path: *const c_char,
-        read_only: bool,
-    ) -> i32;
-    pub fn krun_add_disk2(
-        ctx_id: u32,
-        block_id: *const c_char,
-        disk_path: *const c_char,
-        disk_format: u32,
-        read_only: bool,
-    ) -> i32;
-    pub fn krun_set_mapped_volumes(ctx_id: u32, mapped_volumes: *const *const c_char) -> i32;
-    pub fn krun_add_virtiofs(ctx_id: u32, c_tag: *const c_char, c_path: *const c_char) -> i32;
-    pub fn krun_add_virtiofs2(
-        ctx_id: u32,
-        c_tag: *const c_char,
-        c_path: *const c_char,
-        shm_size: u64,
-    ) -> i32;
-    pub fn krun_add_virtiofs3(
-        ctx_id: u32,
-        c_tag: *const c_char,
-        c_path: *const c_char,
-        shm_size: u64,
-        read_only: bool,
-    ) -> i32;
+/// Generates, for each libkrun function: an optional resolved pointer on
+/// [`Api`] and a same-named `unsafe fn` wrapper that dispatches to it.
+/// A symbol missing from the loaded library yields `-ENOSYS` instead of a
+/// load failure, so a library without optional features (block devices,
+/// GPU) still works for everything else.
+macro_rules! krun_api {
+    ($( $(#[$meta:meta])* pub fn $name:ident($($arg:ident : $ty:ty),* $(,)?) -> i32; )*) => {
+        struct Api {
+            $( $name: Option<unsafe extern "C" fn($($ty),*) -> i32>, )*
+            _krun: Library,
+            _krunfw: Library,
+        }
 
-    // ---- Networking ---------------------------------------------------------
+        impl Api {
+            fn resolve(krun: Library, krunfw: Library) -> Self {
+                $(
+                    // SAFETY: the declared signature mirrors libkrun.h for this symbol.
+                    let $name = unsafe {
+                        krun.get::<unsafe extern "C" fn($($ty),*) -> i32>(
+                            concat!(stringify!($name), "\0").as_bytes(),
+                        )
+                    }
+                    .ok()
+                    .map(|sym| *sym);
+                )*
+                Self { $( $name, )* _krun: krun, _krunfw: krunfw }
+            }
+        }
 
-    pub fn krun_add_net_unixstream(
-        ctx_id: u32,
-        c_path: *const c_char,
-        fd: c_int,
-        c_mac: *mut u8,
-        features: u32,
-        flags: u32,
-    ) -> i32;
-    pub fn krun_add_net_unixgram(
-        ctx_id: u32,
-        c_path: *const c_char,
-        fd: c_int,
-        c_mac: *mut u8,
-        features: u32,
-        flags: u32,
-    ) -> i32;
-    pub fn krun_add_net_tap(
-        ctx_id: u32,
-        c_tap_name: *mut c_char,
-        c_mac: *mut u8,
-        features: u32,
-        flags: u32,
-    ) -> i32;
-    pub fn krun_set_net_mac(ctx_id: u32, c_mac: *mut u8) -> i32;
-    pub fn krun_set_port_map(ctx_id: u32, port_map: *const *const c_char) -> i32;
-
-    // ---- GPU + display ------------------------------------------------------
-
-    pub fn krun_set_gpu_options(ctx_id: u32, virgl_flags: u32) -> i32;
-    pub fn krun_set_gpu_options2(ctx_id: u32, virgl_flags: u32, shm_size: u64) -> i32;
-    pub fn krun_add_display(ctx_id: u32, width: u32, height: u32) -> i32;
-    pub fn krun_display_set_edid(
-        ctx_id: u32,
-        display_id: u32,
-        edid_blob: *const u8,
-        blob_size: usize,
-    ) -> i32;
-    pub fn krun_display_set_dpi(ctx_id: u32, display_id: u32, dpi: u32) -> i32;
-    pub fn krun_display_set_physical_size(
-        ctx_id: u32,
-        display_id: u32,
-        width_mm: u16,
-        height_mm: u16,
-    ) -> i32;
-    pub fn krun_display_set_refresh_rate(ctx_id: u32, display_id: u32, refresh_rate: u32) -> i32;
-    pub fn krun_set_display_backend(
-        ctx_id: u32,
-        display_backend: *const c_void,
-        backend_size: usize,
-    ) -> i32;
-
-    // ---- Audio --------------------------------------------------------------
-
-    pub fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32;
-
-    // ---- Resource limits + metadata -----------------------------------------
-
-    pub fn krun_set_rlimits(ctx_id: u32, rlimits: *const *const c_char) -> i32;
-    pub fn krun_set_smbios_oem_strings(ctx_id: u32, oem_strings: *const *const c_char) -> i32;
-
-    // ---- Exec configuration -------------------------------------------------
-
-    pub fn krun_set_workdir(ctx_id: u32, workdir_path: *const c_char) -> i32;
-    pub fn krun_set_exec(
-        ctx_id: u32,
-        exec_path: *const c_char,
-        argv: *const *const c_char,
-        envp: *const *const c_char,
-    ) -> i32;
-    pub fn krun_set_env(ctx_id: u32, envp: *const *const c_char) -> i32;
-    pub fn krun_setuid(ctx_id: u32, uid: uid_t) -> i32;
-    pub fn krun_setgid(ctx_id: u32, gid: gid_t) -> i32;
-
-    // ---- Firmware + kernel --------------------------------------------------
-
-    pub fn krun_set_firmware(ctx_id: u32, firmware_path: *const c_char) -> i32;
-    pub fn krun_set_kernel(
-        ctx_id: u32,
-        kernel_path: *const c_char,
-        kernel_format: u32,
-        initramfs: *const c_char,
-        cmdline: *const c_char,
-    ) -> i32;
-    pub fn krun_set_root_disk_remount(
-        ctx_id: u32,
-        device: *const c_char,
-        fstype: *const c_char,
-        options: *const c_char,
-    ) -> i32;
-
-    // ---- TEE (Trusted Execution Environment) --------------------------------
-
-    pub fn krun_set_tee_config_file(ctx_id: u32, filepath: *const c_char) -> i32;
-
-    // ---- vsock --------------------------------------------------------------
-
-    pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> i32;
-    pub fn krun_add_vsock_port2(
-        ctx_id: u32,
-        port: u32,
-        c_filepath: *const c_char,
-        listen: bool,
-    ) -> i32;
-    pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32;
-    pub fn krun_disable_implicit_vsock(ctx_id: u32) -> i32;
-
-    // ---- Console / serial ---------------------------------------------------
-
-    pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
-    pub fn krun_disable_implicit_console(ctx_id: u32) -> i32;
-    pub fn krun_set_kernel_console(ctx_id: u32, console_id: *const c_char) -> i32;
-    pub fn krun_add_virtio_console_default(
-        ctx_id: u32,
-        input_fd: c_int,
-        output_fd: c_int,
-        err_fd: c_int,
-    ) -> i32;
-    pub fn krun_add_serial_console_default(ctx_id: u32, input_fd: c_int, output_fd: c_int) -> i32;
-    pub fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32;
-    pub fn krun_add_console_port_tty(
-        ctx_id: u32,
-        console_id: u32,
-        name: *const c_char,
-        tty_fd: c_int,
-    ) -> i32;
-    pub fn krun_add_console_port_inout(
-        ctx_id: u32,
-        console_id: u32,
-        name: *const c_char,
-        input_fd: c_int,
-        output_fd: c_int,
-    ) -> i32;
-
-    // ---- Virtualisation features --------------------------------------------
-
-    pub fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32;
-    pub fn krun_check_nested_virt() -> i32;
-    pub fn krun_has_feature(feature: u64) -> i32;
-    pub fn krun_get_max_vcpus() -> i32;
-    pub fn krun_split_irqchip(ctx_id: u32, enable: bool) -> i32;
-
-    // ---- Logging ------------------------------------------------------------
-
-    pub fn krun_set_log_level(level: u32) -> i32;
-    pub fn krun_init_log(target_fd: c_int, level: u32, style: u32, options: u32) -> i32;
-
-    // ---- Shutdown signalling ------------------------------------------------
-
-    pub fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32;
-
-    // ---- Boot ---------------------------------------------------------------
-    //
-    // Blocking — call on a dedicated OS thread, not a tokio task.
-
-    pub fn krun_start_enter(ctx_id: u32) -> i32;
+        $(
+            $(#[$meta])*
+            pub unsafe fn $name($($arg: $ty),*) -> i32 {
+                match api().and_then(|a| a.$name) {
+                    // SAFETY: forwarded under the caller's contract for this libkrun function.
+                    Some(f) => unsafe { f($($arg),*) },
+                    None => NEGATIVE_ENOSYS,
+                }
+            }
+        )*
+    };
 }
+
+static API: OnceLock<Result<Api, String>> = OnceLock::new();
+
+fn api() -> Option<&'static Api> {
+    API.get_or_init(load).as_ref().ok()
+}
+
+/// Why libkrun could not be loaded, if loading failed.
+pub fn load_error() -> Option<&'static str> {
+    API.get_or_init(load).as_ref().err().map(String::as_str)
+}
+
+/// Load libkrun now. Safe to call repeatedly.
+pub fn ensure_loaded() -> Result<(), &'static str> {
+    match API.get_or_init(load) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.as_str()),
+    }
+}
+
+fn load() -> Result<Api, String> {
+    let base: PathBuf = ward_bundle::default_runtime_dir();
+    let paths = ward_bundle::extract_libs(&base)
+        .map_err(|e| format!("unpack embedded libkrun into {}: {e}", base.display()))?;
+    // libkrun dlopens libkrunfw (its kernel) by file name when a VM boots.
+    // Loading it first by absolute path makes that lookup resolve to this copy.
+    // SAFETY: loading a library runs its initialisers; these are the pinned,
+    // checksum-verified libkrun-builds artefacts.
+    let krunfw = unsafe { Library::new(&paths.krunfw) }
+        .map_err(|e| format!("load {}: {e}", paths.krunfw.display()))?;
+    // SAFETY: as above.
+    let krun = unsafe { Library::new(&paths.krun) }
+        .map_err(|e| format!("load {}: {e}", paths.krun.display()))?;
+    Ok(Api::resolve(krun, krunfw))
+}
+
+krun_api! {
+// ---- Context lifecycle --------------------------------------------------
+
+pub fn krun_create_ctx() -> i32;
+pub fn krun_free_ctx(ctx_id: u32) -> i32;
+
+// ---- VM configuration ---------------------------------------------------
+
+pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
+pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
+pub fn krun_set_root_disk(ctx_id: u32, disk_path: *const c_char) -> i32;
+pub fn krun_set_data_disk(ctx_id: u32, disk_path: *const c_char) -> i32;
+pub fn krun_add_disk(
+    ctx_id: u32,
+    block_id: *const c_char,
+    disk_path: *const c_char,
+    read_only: bool,
+) -> i32;
+pub fn krun_add_disk2(
+    ctx_id: u32,
+    block_id: *const c_char,
+    disk_path: *const c_char,
+    disk_format: u32,
+    read_only: bool,
+) -> i32;
+pub fn krun_set_mapped_volumes(ctx_id: u32, mapped_volumes: *const *const c_char) -> i32;
+pub fn krun_add_virtiofs(ctx_id: u32, c_tag: *const c_char, c_path: *const c_char) -> i32;
+pub fn krun_add_virtiofs2(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+) -> i32;
+pub fn krun_add_virtiofs3(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+) -> i32;
+
+// ---- Networking ---------------------------------------------------------
+
+pub fn krun_add_net_unixstream(
+    ctx_id: u32,
+    c_path: *const c_char,
+    fd: c_int,
+    c_mac: *mut u8,
+    features: u32,
+    flags: u32,
+) -> i32;
+pub fn krun_add_net_unixgram(
+    ctx_id: u32,
+    c_path: *const c_char,
+    fd: c_int,
+    c_mac: *mut u8,
+    features: u32,
+    flags: u32,
+) -> i32;
+pub fn krun_add_net_tap(
+    ctx_id: u32,
+    c_tap_name: *mut c_char,
+    c_mac: *mut u8,
+    features: u32,
+    flags: u32,
+) -> i32;
+pub fn krun_set_net_mac(ctx_id: u32, c_mac: *mut u8) -> i32;
+pub fn krun_set_port_map(ctx_id: u32, port_map: *const *const c_char) -> i32;
+
+// ---- GPU + display ------------------------------------------------------
+
+pub fn krun_set_gpu_options(ctx_id: u32, virgl_flags: u32) -> i32;
+pub fn krun_set_gpu_options2(ctx_id: u32, virgl_flags: u32, shm_size: u64) -> i32;
+pub fn krun_add_display(ctx_id: u32, width: u32, height: u32) -> i32;
+pub fn krun_display_set_edid(
+    ctx_id: u32,
+    display_id: u32,
+    edid_blob: *const u8,
+    blob_size: usize,
+) -> i32;
+pub fn krun_display_set_dpi(ctx_id: u32, display_id: u32, dpi: u32) -> i32;
+pub fn krun_display_set_physical_size(
+    ctx_id: u32,
+    display_id: u32,
+    width_mm: u16,
+    height_mm: u16,
+) -> i32;
+pub fn krun_display_set_refresh_rate(ctx_id: u32, display_id: u32, refresh_rate: u32) -> i32;
+pub fn krun_set_display_backend(
+    ctx_id: u32,
+    display_backend: *const c_void,
+    backend_size: usize,
+) -> i32;
+
+// ---- Audio --------------------------------------------------------------
+
+pub fn krun_set_snd_device(ctx_id: u32, enable: bool) -> i32;
+
+// ---- Resource limits + metadata -----------------------------------------
+
+pub fn krun_set_rlimits(ctx_id: u32, rlimits: *const *const c_char) -> i32;
+pub fn krun_set_smbios_oem_strings(ctx_id: u32, oem_strings: *const *const c_char) -> i32;
+
+// ---- Exec configuration -------------------------------------------------
+
+pub fn krun_set_workdir(ctx_id: u32, workdir_path: *const c_char) -> i32;
+pub fn krun_set_exec(
+    ctx_id: u32,
+    exec_path: *const c_char,
+    argv: *const *const c_char,
+    envp: *const *const c_char,
+) -> i32;
+pub fn krun_set_env(ctx_id: u32, envp: *const *const c_char) -> i32;
+pub fn krun_setuid(ctx_id: u32, uid: uid_t) -> i32;
+pub fn krun_setgid(ctx_id: u32, gid: gid_t) -> i32;
+
+// ---- Firmware + kernel --------------------------------------------------
+
+pub fn krun_set_firmware(ctx_id: u32, firmware_path: *const c_char) -> i32;
+pub fn krun_set_kernel(
+    ctx_id: u32,
+    kernel_path: *const c_char,
+    kernel_format: u32,
+    initramfs: *const c_char,
+    cmdline: *const c_char,
+) -> i32;
+pub fn krun_set_root_disk_remount(
+    ctx_id: u32,
+    device: *const c_char,
+    fstype: *const c_char,
+    options: *const c_char,
+) -> i32;
+
+// ---- TEE (Trusted Execution Environment) --------------------------------
+
+pub fn krun_set_tee_config_file(ctx_id: u32, filepath: *const c_char) -> i32;
+
+// ---- vsock --------------------------------------------------------------
+
+pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> i32;
+pub fn krun_add_vsock_port2(
+    ctx_id: u32,
+    port: u32,
+    c_filepath: *const c_char,
+    listen: bool,
+) -> i32;
+pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32;
+pub fn krun_disable_implicit_vsock(ctx_id: u32) -> i32;
+
+// ---- Console / serial ---------------------------------------------------
+
+pub fn krun_set_console_output(ctx_id: u32, c_filepath: *const c_char) -> i32;
+pub fn krun_disable_implicit_console(ctx_id: u32) -> i32;
+pub fn krun_set_kernel_console(ctx_id: u32, console_id: *const c_char) -> i32;
+pub fn krun_add_virtio_console_default(
+    ctx_id: u32,
+    input_fd: c_int,
+    output_fd: c_int,
+    err_fd: c_int,
+) -> i32;
+pub fn krun_add_serial_console_default(ctx_id: u32, input_fd: c_int, output_fd: c_int) -> i32;
+pub fn krun_add_virtio_console_multiport(ctx_id: u32) -> i32;
+pub fn krun_add_console_port_tty(
+    ctx_id: u32,
+    console_id: u32,
+    name: *const c_char,
+    tty_fd: c_int,
+) -> i32;
+pub fn krun_add_console_port_inout(
+    ctx_id: u32,
+    console_id: u32,
+    name: *const c_char,
+    input_fd: c_int,
+    output_fd: c_int,
+) -> i32;
+
+// ---- Virtualisation features --------------------------------------------
+
+pub fn krun_set_nested_virt(ctx_id: u32, enabled: bool) -> i32;
+pub fn krun_check_nested_virt() -> i32;
+pub fn krun_has_feature(feature: u64) -> i32;
+pub fn krun_get_max_vcpus() -> i32;
+pub fn krun_split_irqchip(ctx_id: u32, enable: bool) -> i32;
+
+// ---- Logging ------------------------------------------------------------
+
+pub fn krun_set_log_level(level: u32) -> i32;
+pub fn krun_init_log(target_fd: c_int, level: u32, style: u32, options: u32) -> i32;
+
+// ---- Shutdown signalling ------------------------------------------------
+
+pub fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32;
+
+// ---- Boot ---------------------------------------------------------------
+//
+// Blocking — call on a dedicated OS thread, not a tokio task.
+
+pub fn krun_start_enter(ctx_id: u32) -> i32;}
 
 /// Safe wrapper around [`krun_add_net_unixgram`].
 ///
