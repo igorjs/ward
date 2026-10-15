@@ -18,6 +18,9 @@ embed = []
 [dependencies]
 flate2 = "1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 flate2 = "1"
 sha2 = "0.10"

@@ -765,6 +765,47 @@ impl ImageStore {
 
 #[cfg(test)]
 mod tests {
+    fn index_entry(os: &str, arch: &str, digest: &str) -> oci_client::manifest::ImageIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest,
+            "size": 1,
+            "platform": { "os": os, "architecture": arch },
+        }))
+        .expect("index entry")
+    }
+
+    #[test]
+    fn given_mixed_platforms_when_resolving_then_linux_for_host_arch_is_chosen() {
+        let host_arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => other,
+        };
+        let other_arch = if host_arch == "arm64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        let entries = vec![
+            index_entry("windows", host_arch, "sha256:windows"),
+            index_entry("linux", other_arch, "sha256:wrong-arch"),
+            index_entry("linux", host_arch, "sha256:right"),
+        ];
+
+        assert_eq!(
+            linux_host_arch_resolver(&entries).as_deref(),
+            Some("sha256:right")
+        );
+    }
+
+    #[test]
+    fn given_no_linux_variant_for_host_arch_when_resolving_then_none() {
+        let entries = vec![index_entry("windows", "amd64", "sha256:windows")];
+
+        assert_eq!(linux_host_arch_resolver(&entries), None);
+    }
+
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;

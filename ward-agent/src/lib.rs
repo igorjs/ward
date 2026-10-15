@@ -313,6 +313,7 @@ fn signal_kill(_pid: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {
+    use super::proto::Ping;
     use super::*;
     use std::collections::HashMap;
     use tokio::io::AsyncWriteExt;
@@ -369,6 +370,20 @@ mod tests {
             }
         }
         (out, err, code)
+    }
+
+    #[tokio::test]
+    async fn given_ping_as_first_frame_when_handled_then_agent_answers_pong() {
+        let events = run(vec![Request {
+            kind: Some(request::Kind::Ping(Ping {})),
+        }])
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, Some(event::Kind::Pong(_)))),
+            "no Pong in {events:?}"
+        );
     }
 
     #[tokio::test]

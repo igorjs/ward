@@ -268,3 +268,60 @@ fn clear_close_on_exec(fd: RawFd) -> std::io::Result<()> {
     let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
     rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty()).map_err(std::io::Error::from)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_spec() -> VmSpec {
+        VmSpec {
+            rootfs: PathBuf::from("/data/sandboxes/abc/rootfs"),
+            cpus: 2,
+            memory_mb: 256,
+            exec_path: "/ward-agent".to_string(),
+            exec_args: vec![
+                "--mount".into(),
+                "ward-mnt-0".into(),
+                "/data".into(),
+                "ro".into(),
+            ],
+            agent_port: 1024,
+            agent_socket: PathBuf::from("/tmp/ward-501/abc.sock"),
+            mounts: vec![MountSpec {
+                tag: "ward-mnt-0".into(),
+                path: PathBuf::from("/host/dir"),
+                read_only: true,
+            }],
+            net: Some(NetSpec {
+                fd: 7,
+                mac: [2, 0, 0, 0, 0, 2],
+            }),
+        }
+    }
+
+    #[test]
+    fn given_spec_when_serialized_on_one_line_and_parsed_then_nothing_is_lost() {
+        let json = serde_json::to_string(&sample_spec()).unwrap();
+
+        assert!(!json.contains('\n'), "the shim reads the spec as one line");
+        let parsed: VmSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.rootfs, PathBuf::from("/data/sandboxes/abc/rootfs"));
+        assert_eq!((parsed.cpus, parsed.memory_mb), (2, 256));
+        assert_eq!(parsed.exec_args.len(), 4);
+        assert_eq!(parsed.mounts[0].tag, "ward-mnt-0");
+        assert!(parsed.mounts[0].read_only);
+        assert_eq!(parsed.net.unwrap().mac, [2, 0, 0, 0, 0, 2]);
+    }
+
+    #[test]
+    fn given_argument_that_is_not_the_shim_flag_when_run_if_requested_then_it_returns() {
+        // The test binary's own argv never carries SHIM_ARG, so this must
+        // return instead of exiting the test process.
+        run_if_requested();
+    }
+
+    #[test]
+    fn given_nul_byte_in_a_string_when_converted_to_cstring_then_error() {
+        assert!(cstring("a\0b").is_err());
+    }
+}

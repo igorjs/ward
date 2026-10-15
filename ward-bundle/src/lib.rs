@@ -128,3 +128,90 @@ fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
 fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_runtime_dir_env_when_default_runtime_dir_then_env_wins() {
+        // Arrange / Act / Assert: serial-safe because it only reads the env
+        // value it set itself and restores it.
+        let key = RUNTIME_DIR_ENV;
+        let previous = std::env::var_os(key);
+        // SAFETY: tests in this module do not run other env-reading code
+        // concurrently with this one.
+        unsafe { std::env::set_var(key, "/custom/ward-runtime") };
+        let dir = default_runtime_dir();
+        match previous {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        assert_eq!(dir, PathBuf::from("/custom/ward-runtime"));
+    }
+
+    #[test]
+    fn given_build_without_embedded_libs_when_extract_then_unsupported_error() {
+        if libs_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_libs(tmp.path()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn given_embedded_libs_when_extract_twice_then_same_paths_and_real_libraries() {
+        if !libs_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+
+        let first = extract_libs(tmp.path()).unwrap();
+        let second = extract_libs(tmp.path()).unwrap();
+
+        assert_eq!(first.krun, second.krun);
+        assert_eq!(first.krunfw, second.krunfw);
+        for lib in [&first.krun, &first.krunfw] {
+            let bytes = fs::read(lib).unwrap();
+            assert!(bytes.len() > 1_000_000, "{lib:?} is suspiciously small");
+            let is_elf = bytes.starts_with(b"\x7fELF");
+            let is_macho = bytes.starts_with(&0xfeed_facf_u32.to_le_bytes());
+            assert!(is_elf || is_macho, "{lib:?} is not an ELF or Mach-O file");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn given_embedded_libkrunfw_on_macos_when_extracted_then_install_name_is_the_leaf_dyld_searches_for()
+     {
+        if !libs_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let libs = extract_libs(tmp.path()).unwrap();
+
+        let out = std::process::Command::new("otool")
+            .arg("-D")
+            .arg(&libs.krunfw)
+            .output()
+            .unwrap();
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.lines()
+                .last()
+                .is_some_and(|l| l.trim() == KRUNFW_FILE_NAME),
+            "unexpected install name: {text}"
+        );
+    }
+
+    #[test]
+    fn given_embedded_agent_when_read_then_it_is_a_static_linux_elf() {
+        if !HAS_AGENT {
+            return;
+        }
+        let agent = guest_agent().unwrap();
+        assert!(agent.starts_with(b"\x7fELF"));
+    }
+}
