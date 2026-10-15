@@ -6,6 +6,8 @@ pub mod krunvm;
 
 #[cfg(feature = "krunvm")]
 pub(crate) mod krun_ffi;
+#[cfg(feature = "krunvm")]
+pub mod vmshim;
 
 /// Errors surfaced by any backend implementation.
 #[derive(Debug, thiserror::Error)]

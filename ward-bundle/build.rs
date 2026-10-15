@@ -400,5 +400,6 @@ fn build_agent(workspace: &Path, out_dir: &Path, guest_target: &str) -> BuildRes
 }
 
 fn missing_std(output: &std::process::Output) -> bool {
-    String::from_utf8_lossy(&output.stderr).contains("can't find crate for `std`")
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr.contains("can't find crate for `std`") || stderr.contains("can't find crate for `core`")
 }

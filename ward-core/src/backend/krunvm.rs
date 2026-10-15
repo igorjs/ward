@@ -122,6 +122,9 @@ const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
 
 struct SandboxState {
     info: SandboxInfo,
+    /// Environment given at create time. Applied to every exec; variables
+    /// passed to a single exec win over these.
+    env: HashMap<String, String>,
     /// Host process running this sandbox's microVM. `None` in stub builds.
     #[cfg(feature = "krunvm")]
     shim: Option<super::vmshim::ShimProcess>,
@@ -200,7 +203,14 @@ pub struct KrunvmBackend {
     /// given manifest digest; subsequent sandboxes for the same image skip
     /// the registry pull and hardlink from the cached rootfs instead.
     image_store: Arc<ImageStore>,
+    /// False when images are synthetic (offline puller, unit tests): there
+    /// is no bootable rootfs, so no VM host process is started.
+    #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
+    boot_vms: bool,
 }
+
+/// Env var that makes the image puller build a synthetic, unbootable rootfs.
+const OFFLINE_IMAGES_ENV: &str = "WARD_OCI_OFFLINE";
 
 impl KrunvmBackend {
     /// Production constructor. Defaults `max_cached_images` to 64,
@@ -224,7 +234,8 @@ impl KrunvmBackend {
     ) -> Self {
         let cache_dir = data_dir.join("cache").join("images");
         let image_store = Arc::new(ImageStore::new(cache_dir, max_cached_images));
-        Self::new_internal(data_dir, network_backend, image_store)
+        let boot_vms = std::env::var(OFFLINE_IMAGES_ENV).as_deref() != Ok("1");
+        Self::new_internal(data_dir, network_backend, image_store, boot_vms)
     }
 
     /// Internal constructor used by the public constructors and by tests that
@@ -233,6 +244,7 @@ impl KrunvmBackend {
         data_dir: std::path::PathBuf,
         network_backend: NetworkBackendChoice,
         image_store: Arc<ImageStore>,
+        boot_vms: bool,
     ) -> Self {
         Self {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
@@ -241,6 +253,7 @@ impl KrunvmBackend {
             processes: Arc::new(RwLock::new(HashMap::new())),
             network_backend,
             image_store,
+            boot_vms,
         }
     }
 
@@ -253,7 +266,12 @@ impl KrunvmBackend {
         data_dir: std::path::PathBuf,
         image_store: Arc<ImageStore>,
     ) -> Self {
-        Self::new_internal(data_dir, NetworkBackendChoice::default(), image_store)
+        Self::new_internal(
+            data_dir,
+            NetworkBackendChoice::default(),
+            image_store,
+            false,
+        )
     }
 }
 
@@ -289,12 +307,16 @@ impl Backend for KrunvmBackend {
         }
 
         #[cfg(feature = "krunvm")]
-        let booted = self.boot_vm(&id, opts, &rootfs).await?;
+        let booted = if self.boot_vms {
+            Some(self.boot_vm(&id, opts, &rootfs).await?)
+        } else {
+            None
+        };
 
         let now = std::time::SystemTime::now();
         let info = SandboxInfo {
             id: id.clone(),
-            status: if cfg!(feature = "krunvm") {
+            status: if cfg!(feature = "krunvm") && self.boot_vms {
                 SandboxStatus::Running
             } else {
                 SandboxStatus::Creating
@@ -313,14 +335,20 @@ impl Backend for KrunvmBackend {
             token: String::new(),
         };
 
+        #[cfg(feature = "krunvm")]
+        let (shim, smoltcp, egress) = match booted {
+            Some(vm) => (Some(vm.shim), vm.smoltcp, vm.egress),
+            None => (None, None, None),
+        };
         let state = SandboxState {
             info: info.clone(),
+            env: opts.env.clone(),
             #[cfg(feature = "krunvm")]
-            shim: Some(booted.shim),
+            shim,
             #[cfg(feature = "krunvm")]
-            smoltcp: booted.smoltcp,
+            smoltcp,
             #[cfg(feature = "krunvm")]
-            egress: booted.egress,
+            egress,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -564,13 +592,15 @@ impl Backend for KrunvmBackend {
         _working_dir: Option<String>,
         _env: HashMap<String, String>,
     ) -> Result<ProcessHandle> {
-        let _state = {
+        #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
+        let env = {
             let guard = self.sandboxes.read().await;
-            guard
+            let state = guard
                 .get(sandbox_id)
-                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?
-                .info
-                .clone()
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            let mut merged = state.env.clone();
+            merged.extend(_env);
+            merged
         };
 
         let pid = uuid::Uuid::new_v4().to_string();
@@ -595,7 +625,7 @@ impl Backend for KrunvmBackend {
                 sandbox_id.to_string(),
                 command,
                 _working_dir,
-                _env,
+                env,
             )
             .await
             .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
@@ -931,6 +961,9 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
     }
     let file = opts.open(archive).map_err(BackendError::Io)?;
     let mut builder = tar::Builder::new(file);
+    // Store symlinks as symlinks. Following them fails on the dangling links
+    // every distro rootfs has and would copy host files a link points at.
+    builder.follow_symlinks(false);
     if rootfs.is_dir() {
         builder
             .append_dir_all(".", rootfs)
@@ -1006,11 +1039,12 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
                     path.display()
                 )));
             }
-            // Reject symlink/hardlink entries pointing outside the dest.
-            if matches!(
-                entry.header().entry_type(),
-                tar::EntryType::Symlink | tar::EntryType::Link
-            ) {
+            // Hardlinks resolve on the host, so their targets must stay inside
+            // the staging dir. Symlinks resolve inside the guest, where
+            // absolute and `..` targets are normal (`var/run -> /run`).
+            // Writing a later entry through a symlink is stopped by
+            // `unpack_in`, which refuses paths that leave the staging dir.
+            if entry.header().entry_type() == tar::EntryType::Link {
                 let link = entry
                     .link_name()
                     .map_err(|e| BackendError::Internal(format!("link target: {e}")))?
@@ -1022,7 +1056,7 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
                         .any(|c| matches!(c, std::path::Component::ParentDir))
                 {
                     return Err(BackendError::Internal(format!(
-                        "snapshot archive contains unsafe link target: {}",
+                        "snapshot archive contains unsafe hardlink target: {}",
                         link.display()
                     )));
                 }
@@ -1188,7 +1222,7 @@ mod tests {
         let cache_dir = path.join("cache").join("images");
         let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(tmp);
-        KrunvmBackend::new_internal(path, network_backend, store)
+        KrunvmBackend::new_internal(path, network_backend, store, false)
     }
 
     fn create_opts() -> CreateOpts {
@@ -1634,6 +1668,7 @@ mod tests {
 
     // ----- network backend selection: smoltcp -----------------------------
 
+    #[ignore = "needs a bootable image; covered by e2e_vm"]
     #[cfg(feature = "krunvm")]
     #[tokio::test]
     async fn given_network_backend_smoltcp_when_create_sandbox_then_smoltcp_handle_set() {
@@ -1662,5 +1697,91 @@ mod tests {
             state.smoltcp.is_some(),
             "expected smoltcp handle to be set for NetworkBackendChoice::Smoltcp"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_rootfs_with_dangling_and_escaping_symlinks_when_archived_then_links_are_stored_not_followed()
+     {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/proc/self/mounts", rootfs.join("etc/mtab")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", rootfs.join("etc/host-link")).unwrap();
+        let archive = tmp.path().join("snap.tar");
+
+        // Act
+        archive_rootfs(&rootfs, &archive).expect("dangling symlinks must not fail the archive");
+
+        // Assert: both entries are symlinks in the tar, not file copies.
+        let mut tar = tar::Archive::new(std::fs::File::open(&archive).unwrap());
+        let kinds: Vec<_> = tar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().header().entry_type())
+            .filter(|t| t.is_symlink())
+            .collect();
+        assert_eq!(kinds.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_snapshot_with_absolute_and_relative_symlinks_when_restored_then_links_are_kept() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", rootfs.join("var/run")).unwrap();
+        std::os::unix::fs::symlink("../usr/lib", rootfs.join("var/lib")).unwrap();
+        let archive = tmp.path().join("snap.tar");
+        archive_rootfs(&rootfs, &archive).unwrap();
+        let dest = tmp.path().join("restored");
+
+        // Act
+        extract_rootfs(&archive, &dest).expect("legitimate guest symlinks must restore");
+
+        // Assert
+        assert_eq!(
+            std::fs::read_link(dest.join("var/run")).unwrap(),
+            std::path::Path::new("/run")
+        );
+        assert_eq!(
+            std::fs::read_link(dest.join("var/lib")).unwrap(),
+            std::path::Path::new("../usr/lib")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_snapshot_writing_through_an_escaping_symlink_when_restored_then_it_is_rejected() {
+        // Arrange: `etc -> <outside>` followed by `etc/evil`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let archive = tmp.path().join("evil.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        builder
+            .append_link(&mut link, "etc", &outside)
+            .expect("append link");
+        let mut file = tar::Header::new_gnu();
+        file.set_size(4);
+        file.set_mode(0o644);
+        builder
+            .append_data(&mut file, "etc/evil", &b"evil"[..])
+            .expect("append file");
+        builder.finish().unwrap();
+        drop(builder);
+        let dest = tmp.path().join("restored");
+
+        // Act
+        let result = extract_rootfs(&archive, &dest);
+
+        // Assert
+        assert!(result.is_err());
+        assert!(!outside.join("evil").exists(), "file escaped the rootfs");
     }
 }

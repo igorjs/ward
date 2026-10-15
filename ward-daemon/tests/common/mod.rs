@@ -31,30 +31,69 @@ pub struct Daemon {
     pub socket: PathBuf,
     /// Subprocess handle. Wrapped in Option so Drop can take ownership.
     child: Option<Child>,
+    /// Daemon output; printed when the test that owns the daemon panics.
+    log: PathBuf,
 }
 
 impl Daemon {
     /// Spawn `wardd` with isolated socket + data dirs and wait until it
     /// is accepting connections. Panics with a helpful message on timeout.
+    #[allow(dead_code)]
     pub fn spawn() -> Self {
+        Self::spawn_inner(false)
+    }
+
+    /// Like [`Daemon::spawn`] but images are really pulled and sandboxes
+    /// really boot as microVMs. Needs a `krunvm` build and a hypervisor.
+    #[allow(dead_code)]
+    pub fn spawn_vm() -> Self {
+        Self::spawn_inner(true)
+    }
+
+    /// Process id of the daemon.
+    #[allow(dead_code)]
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("daemon running").id()
+    }
+
+    /// SIGKILL the daemon without cleanup and reap it.
+    #[allow(dead_code)]
+    pub fn kill_hard(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    fn spawn_inner(real_vms: bool) -> Self {
         let data_dir = tempfile::tempdir().expect("create temp dir");
         let socket = data_dir.path().join("ward.sock");
+        let log = data_dir.path().join("wardd.log");
+        let daemon_log = std::fs::File::create(&log).expect("create daemon log");
 
         // Use assert_cmd to resolve the workspace's built wardd binary.
         // This works regardless of debug/release profile.
         let mut cmd = Command::cargo_bin("wardd").expect("locate wardd binary");
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())
-            .env("WARD_LOG_LEVEL", "warn") // quiet startup logs in test output
+            .env("WARD_LOG_LEVEL", "info")
             // WARD_OCI_OFFLINE=1: skip real registry pulls in e2e tests.
             // CI runs with egress-policy:block (step-security/harden-runner)
             // and docker.io is not in the allowed-endpoints list. Setting this
             // makes OciPuller materialise a minimal synthetic rootfs instead of
             // hitting the network, keeping e2e tests hermetic on any host.
-            .env("WARD_OCI_OFFLINE", "1")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(daemon_log.try_clone().expect("clone log")))
+            .stderr(Stdio::from(daemon_log));
+
+        if real_vms {
+            seed_image_cache(data_dir.path());
+            ensure_hypervisor_entitlement(cmd.get_program());
+            // One extraction of the embedded libkrun shared by all tests.
+            cmd.env("WARD_RUNTIME_DIR", shared_runtime_dir());
+        } else {
+            cmd.env("WARD_OCI_OFFLINE", "1");
+        }
 
         let mut child = cmd.spawn().expect("spawn wardd");
 
@@ -69,6 +108,7 @@ impl Daemon {
                     _data_dir: data_dir,
                     socket,
                     child: Some(child),
+                    log,
                 };
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -93,11 +133,115 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Ok(log) = std::fs::read_to_string(&self.log)
+        {
+            eprintln!("---- wardd log ----\n{log}");
+        }
         if let Some(mut child) = self.child.take() {
             // SIGKILL — we do not need a clean shutdown for tests, and a
             // hung daemon must not block test teardown.
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// Directory that holds the extracted libkrun for all VM tests in a run.
+#[allow(dead_code)]
+fn shared_runtime_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ward-e2e-runtime");
+    std::fs::create_dir_all(&dir).expect("create runtime dir");
+    dir
+}
+
+/// macOS only: Hypervisor.framework refuses processes without the
+/// `com.apple.security.hypervisor` entitlement, so sign the freshly built
+/// daemon once per test run. A no-op elsewhere.
+#[allow(dead_code)]
+fn ensure_hypervisor_entitlement(program: &std::ffi::OsStr) {
+    static SIGNED: std::sync::Once = std::sync::Once::new();
+    SIGNED.call_once(|| {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let entitlements = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("entitlements.plist");
+        let status = Command::new("codesign")
+            .args(["--force", "--sign", "-", "--entitlements"])
+            .arg(entitlements)
+            .arg(program)
+            .status()
+            .expect("run codesign");
+        assert!(status.success(), "codesign failed for {program:?}");
+    });
+}
+
+/// Pull the test image once per machine, then give every test daemon a copy
+/// of that cache. Without it each test would hit the registry and anonymous
+/// pulls get throttled.
+#[allow(dead_code)]
+fn seed_image_cache(data_dir: &std::path::Path) {
+    static PRIMED: std::sync::Once = std::sync::Once::new();
+    let template = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ward-e2e-image-cache");
+    let image = std::env::var("WARD_E2E_IMAGE").unwrap_or_else(|_| "alpine:3.20".to_string());
+    PRIMED.call_once(|| {
+        let marker = template.join(".primed");
+        let wanted = format!("{image}\n");
+        if std::fs::read_to_string(&marker).is_ok_and(|m| m == wanted) {
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&template);
+        let dir = tempfile::tempdir().expect("prime dir");
+        let socket = dir.path().join("ward.sock");
+        let mut cmd = Command::cargo_bin("wardd").expect("locate wardd");
+        cmd.env("WARD_SOCKET", &socket)
+            .env("WARD_DATA_DIR", dir.path())
+            .env("WARD_RUNTIME_DIR", shared_runtime_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        ensure_hypervisor_entitlement(cmd.get_program());
+        let mut daemon = cmd.spawn().expect("spawn priming wardd");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = Command::cargo_bin("ward")
+            .expect("locate ward")
+            .env("WARD_SOCKET", &socket)
+            .args(["create", &image])
+            .output()
+            .expect("prime pull");
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert!(
+            out.status.success(),
+            "priming pull of {image} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        copy_tree(&dir.path().join("cache"), &template.join("cache"));
+        std::fs::write(&marker, wanted).expect("write marker");
+    });
+    copy_tree(&template.join("cache"), &data_dir.join("cache"));
+}
+
+/// Copy a directory tree, hard-linking files when the filesystem allows.
+#[allow(dead_code)]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create dir");
+    for entry in std::fs::read_dir(from).expect("read dir") {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        let kind = entry.file_type().expect("file type");
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else if kind.is_symlink() {
+            let link = std::fs::read_link(entry.path()).expect("read link");
+            std::os::unix::fs::symlink(link, target).expect("symlink");
+        } else if std::fs::hard_link(entry.path(), &target).is_err() {
+            std::fs::copy(entry.path(), &target).expect("copy file");
         }
     }
 }
