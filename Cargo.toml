@@ -10,6 +10,7 @@ members = [
     "ward-runtime",
     "ward-mcp",
     "ward-net",
+    "ward-bundle",
 ]
 
 # async_trait and tonic codegen box futures, which clippy 1.99 flags as a

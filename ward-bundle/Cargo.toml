@@ -1,0 +1,28 @@
+[package]
+name = "ward-bundle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embeds libkrun, libkrunfw and the ward guest agent into the ward binaries so no system library is needed."
+build = "build.rs"
+
+[features]
+default = []
+# Download libkrun/libkrunfw and cross-compile the guest agent at build time.
+# Off by default so stub-only builds stay offline and fast.
+embed = []
+
+[dependencies]
+flate2 = "1"
+
+[build-dependencies]
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+[lints]
+workspace = true

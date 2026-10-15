@@ -9,14 +9,15 @@ license.workspace = true
 [features]
 default = []
 # Enables real libkrun integration. When off, the stub KrunvmBackend
-# returns synthetic IDs and scripted streams — covers tests + dev
-# without requiring libkrun installed. When on, `ward-core/build.rs`
-# emits the linker directives for libkrun + libkrunfw, and the
-# `backend::krun_ffi` module declares the FFI surface directly (no
-# bindgen, no krun-sys crate). See adr/003-isolation-backend.md.
-krunvm = []
+# returns synthetic IDs and scripted streams, which covers tests and dev.
+# When on, libkrun, libkrunfw and the guest agent are embedded in the
+# binary by `ward-bundle` and libkrun is loaded at runtime, so no system
+# library is needed. See adr/003-isolation-backend.md.
+krunvm = ["dep:ward-bundle", "dep:libloading"]
 
 [dependencies]
+ward-bundle = { path = "../ward-bundle", features = ["embed"], optional = true }
+libloading = { version = "0.8", optional = true }
 # Generated protobuf types + tonic gRPC stubs for the ward.v1 wire
 # protocol. ward-proto is Apache-2.0; ward-core re-exports its `pb`
 # module so call sites stay `crate::pb::...`-shaped. See ADR-017 for
@@ -55,7 +56,7 @@ uuid = { version = "1", features = ["v4"] }
 # (renameat2 RENAME_EXCHANGE on Linux for SEC-014 atomic snapshot swap).
 # Already a transitive dep via tempfile -> native-tls; promoted to a
 # direct dep so the rustix usage is explicit in this crate's manifest.
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 # ward-net: the smoltcp network backend for the krunvm boot path.
 ward-net = { path = "../ward-net" }
 # metrics: zero-overhead recorder façade. Daemon installs the
