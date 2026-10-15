@@ -24,6 +24,16 @@ async fn main() -> std::io::Result<()> {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    let mounts = ward_agent::parse_mount_args(std::env::args().skip(1))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    ward_agent::mount_all(&mounts)?;
+    if ward_agent::net::interface_present() {
+        match ward_agent::net::configure() {
+            Ok(()) => tracing::info!("guest network configured"),
+            Err(e) => tracing::warn!(error = %e, "guest network setup failed"),
+        }
+    }
+
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, AGENT_VSOCK_PORT))?;
     tracing::info!(port = AGENT_VSOCK_PORT, "ward-agent listening on vsock");
 

@@ -22,6 +22,7 @@ message Request {
     Exec exec = 1;
     Stdin stdin = 2;
     Kill kill = 3;
+    Ping ping = 4;
   }
 }
 
@@ -40,14 +41,22 @@ message Stdin {
 // Request termination of the running process (SIGKILL).
 message Kill {}
 
+// Readiness probe. Sent as the first and only frame on a connection; the
+// agent answers with one Pong event and closes the connection.
+message Ping {}
+
 // Agent -> daemon.
 message Event {
   oneof kind {
     Line stdout = 1;
     Line stderr = 2;
     Exited exited = 3;
+    Pong pong = 4;
   }
 }
+
+// Answer to Ping.
+message Pong {}
 
 // One line of output (newline already stripped).
 message Line {
