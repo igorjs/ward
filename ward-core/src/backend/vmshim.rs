@@ -14,7 +14,7 @@
 
 use std::ffi::{CString, OsStr};
 use std::io::{BufRead, Read};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -212,8 +212,13 @@ impl ShimProcess {
     pub async fn spawn(spec: &VmSpec, inherit_fd: Option<OwnedFd>) -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let mut cmd = Command::new(exe);
+        // libkrun writes the guest console to stdout. A host that speaks a
+        // protocol on stdout (ward-mcp) would see those lines mixed into its
+        // messages, so route the console to stderr.
+        let console = std::io::stderr().as_fd().try_clone_to_owned()?;
         cmd.arg(SHIM_ARG)
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(console))
             .kill_on_drop(true);
         if let Some(fd) = &inherit_fd {
             let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
