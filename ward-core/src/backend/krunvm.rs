@@ -40,6 +40,10 @@ const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
 
+/// Guest-agent argument that introduces one mount.
+#[cfg(feature = "krunvm")]
+const AGENT_MOUNT_ARG: &str = "--mount";
+
 /// Permissions of the agent binary in the rootfs (rwxr-xr-x).
 #[cfg(feature = "krunvm")]
 const AGENT_FILE_MODE: u32 = 0o755;
@@ -830,18 +834,25 @@ impl KrunvmBackend {
             (None, None, None)
         };
 
-        // Bind mounts become virtiofs shares. Volume attach (ext4 images as
+        // Bind mounts become virtiofs shares. The guest agent mounts each one
+        // at its target path when it starts. Volume attach (ext4 images as
         // block devices) is not wired yet; volume_ids are validated upstream.
-        let mounts = opts
-            .mounts
-            .iter()
-            .enumerate()
-            .map(|(idx, m)| MountSpec {
-                tag: format!("ward-mnt-{idx}"),
+        let mut mounts = Vec::with_capacity(opts.mounts.len());
+        let mut exec_args = Vec::with_capacity(opts.mounts.len() * 4);
+        for (idx, m) in opts.mounts.iter().enumerate() {
+            let tag = format!("ward-mnt-{idx}");
+            exec_args.extend([
+                AGENT_MOUNT_ARG.to_string(),
+                tag.clone(),
+                m.target.clone(),
+                if m.readonly { "ro" } else { "rw" }.to_string(),
+            ]);
+            mounts.push(MountSpec {
+                tag,
                 path: std::path::PathBuf::from(&m.source),
                 read_only: m.readonly,
-            })
-            .collect();
+            });
+        }
         let _ = &opts.volume_ids;
 
         let (net, inherit) = match net_fd {
@@ -859,6 +870,7 @@ impl KrunvmBackend {
             cpus: opts.resources.cpus,
             memory_mb: opts.resources.memory_mb,
             exec_path: AGENT_GUEST_PATH.to_string(),
+            exec_args,
             agent_port: AGENT_VSOCK_PORT,
             agent_socket: agent_socket.clone(),
             mounts,

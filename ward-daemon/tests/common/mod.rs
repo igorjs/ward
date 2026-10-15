@@ -91,6 +91,8 @@ impl Daemon {
             ensure_hypervisor_entitlement(cmd.get_program());
             // One extraction of the embedded libkrun shared by all tests.
             cmd.env("WARD_RUNTIME_DIR", shared_runtime_dir());
+            // Mount tests share directories from the test's temp dir.
+            cmd.env("WARD_ALLOW_HOST_MOUNTS", "1");
         } else {
             cmd.env("WARD_OCI_OFFLINE", "1");
         }

@@ -634,6 +634,25 @@ async fn poll_until_rst(
     None
 }
 
+async fn poll_until_fin(
+    stack: &mut Stack,
+    guest_fd: &OwnedFd,
+    budget: Duration,
+) -> Option<ParsedTcpSegment> {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        stack.poll();
+        while let Some(frame) = try_read_frame(guest_fd) {
+            let segment = parse_tcp_segment(&frame);
+            if segment.control == TcpControl::Fin {
+                return Some(segment);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
 #[tokio::test(start_paused = true)]
 async fn given_fake_connector_future_never_resolves_when_polled_then_flow_times_out_and_resets_within_timeout_window()
  {
@@ -734,15 +753,14 @@ async fn given_host_closes_connection_when_flow_torn_down_then_second_poll_does_
     let (host_stream, _) = listener.accept().await.expect("accept");
     drop(host_stream);
 
-    // poll_until_rst polls in a loop until the flow is actually torn
-    // down (previously queuing the flow for removal twice in that same
-    // pass: the write channel's Closed arm and the read channel's
-    // Disconnected arm both fire once the io task ends). This confirms
-    // teardown happened before the assertion below exercises the panic.
-    let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    // poll_until_fin polls in a loop until the flow starts closing (the
+    // write channel's Closed arm and the read channel's Disconnected arm
+    // both fire once the io task ends, and must not queue the flow for
+    // removal twice).
+    let fin = poll_until_fin(&mut stack, &guest_fd, Duration::from_secs(2)).await;
     assert!(
-        rst.is_some(),
-        "flow should be torn down (RST to the guest) once the host closes its side"
+        fin.is_some(),
+        "the guest should get a graceful FIN, not an RST, once the host closes its side"
     );
 
     // Assert: one more poll must not panic. This is where
@@ -750,4 +768,64 @@ async fn given_host_closes_connection_when_flow_torn_down_then_second_poll_does_
     // pass above previously made the second `SocketSet::remove` for the
     // same handle panic on an already-removed socket.
     stack.poll();
+}
+
+#[tokio::test]
+async fn given_host_sends_then_closes_when_polled_then_guest_gets_data_before_fin_and_no_rst() {
+    // Arrange: an established flow whose host peer writes a response and
+    // closes straight away, like an HTTP/1.0 server.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind loopback listener");
+    let listener_addr = listener.local_addr().expect("local addr");
+    let (host_stream_tx, host_stream_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let (host_stream, _) = listener.accept().await.expect("accept");
+        let _ = host_stream_tx.send(host_stream);
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let resolver: Box<dyn Resolver> = Box::new(NullResolver);
+    let connector: Box<dyn Connector> = Box::new(LoopbackConnector { listener_addr });
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(always_allow_egress));
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+    write_frame(&guest_fd, &build_tcp_syn_frame());
+    let syn_ack = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("SYN-ACK");
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame(TcpSeqNumber(1), syn_ack.seq_number + 1, &[]),
+    );
+    stack.poll();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    stack.poll();
+    let mut host_stream = tokio::time::timeout(Duration::from_secs(2), host_stream_rx)
+        .await
+        .expect("host connect")
+        .expect("host stream");
+
+    // Act: write the response and close; collect what the guest sees.
+    tokio::io::AsyncWriteExt::write_all(&mut host_stream, b"response body")
+        .await
+        .expect("host write");
+    drop(host_stream);
+    let mut received = Vec::new();
+    let mut saw_fin = false;
+    let mut saw_rst = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !saw_fin {
+        stack.poll();
+        while let Some(frame) = try_read_frame(&guest_fd) {
+            let segment = parse_tcp_segment(&frame);
+            received.extend_from_slice(&segment.payload);
+            saw_fin |= segment.control == TcpControl::Fin;
+            saw_rst |= segment.control == TcpControl::Rst;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Assert
+    assert!(!saw_rst, "the guest must not be reset");
+    assert!(saw_fin, "the guest should get a FIN once the host closes");
+    assert_eq!(received, b"response body");
 }

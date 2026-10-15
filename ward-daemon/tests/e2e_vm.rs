@@ -444,3 +444,95 @@ fn given_snapshot_when_restored_into_new_sandbox_then_files_are_present() {
     let r = exec(&d, &restored, &["cat", "/root/note"]);
     assert_eq!(r.stdout.trim(), "kept");
 }
+
+#[test]
+fn given_read_write_mount_when_guest_reads_and_writes_then_host_sees_the_changes() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let share = tempfile::tempdir().expect("share dir");
+    std::fs::write(share.path().join("in.txt"), "from host").unwrap();
+    let spec = format!("{}:/mnt/share", share.path().display());
+    let id = create(&d, &["--mount", &spec]);
+
+    let r = sh(
+        &d,
+        &id,
+        "cat /mnt/share/in.txt; echo from guest > /mnt/share/out.txt",
+    );
+
+    assert_eq!(r.stdout.trim(), "from host");
+    assert_eq!(
+        std::fs::read_to_string(share.path().join("out.txt"))
+            .unwrap()
+            .trim(),
+        "from guest"
+    );
+}
+
+#[test]
+fn given_read_only_mount_when_guest_writes_then_the_write_fails_and_host_is_unchanged() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let share = tempfile::tempdir().expect("share dir");
+    std::fs::write(share.path().join("in.txt"), "original").unwrap();
+    let spec = format!("{}:/mnt/ro:ro", share.path().display());
+    let id = create(&d, &["--mount", &spec]);
+
+    let r = sh(&d, &id, "echo changed > /mnt/ro/in.txt; echo rc=$?");
+
+    assert_ne!(r.stdout.trim(), "rc=0");
+    assert_eq!(
+        std::fs::read_to_string(share.path().join("in.txt")).unwrap(),
+        "original"
+    );
+}
+
+/// First line of an HTTP response from `host`, or empty when unreachable.
+fn http_status_line(d: &Daemon, id: &str, host: &str) -> String {
+    let script = format!(
+        "wget -q -T 15 -S -O /dev/null http://{host} 2>&1 | grep -m1 -o 'HTTP/[0-9.]* [0-9]*'; true"
+    );
+    sh(d, id, &script).stdout.trim().to_string()
+}
+
+#[test]
+fn given_allowlist_egress_when_guest_requests_listed_host_then_it_is_reachable() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(
+        &d,
+        &["--egress", "allowlist", "--allow-domain", "github.com"],
+    );
+
+    let status = http_status_line(&d, &id, "github.com");
+
+    assert!(
+        status.starts_with("HTTP/"),
+        "no HTTP response from github.com: {status:?}"
+    );
+}
+
+#[test]
+fn given_allowlist_egress_when_guest_requests_unlisted_host_then_it_is_blocked() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(
+        &d,
+        &["--egress", "allowlist", "--allow-domain", "github.com"],
+    );
+
+    let status = http_status_line(&d, &id, "api.github.com");
+
+    assert_eq!(status, "", "unlisted host must not answer");
+}
+
+#[test]
+fn given_open_egress_when_guest_targets_cloud_metadata_address_then_it_is_blocked() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["--egress", "open"]);
+
+    let status = http_status_line(&d, &id, "169.254.169.254");
+
+    assert_eq!(status, "");
+}

@@ -537,3 +537,123 @@ mod tests {
         assert!(result.is_err(), "Kill as the first frame must be rejected");
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod net;
+
+/// A host directory shared into the guest over virtiofs, to be mounted at
+/// `target` when the agent starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestMount {
+    pub tag: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// Argument that introduces one mount: `--mount <tag> <target> <ro|rw>`.
+pub const MOUNT_ARG: &str = "--mount";
+
+/// Parse the agent's command-line arguments (without the program name).
+///
+/// # Errors
+///
+/// Fails on an unknown argument, a truncated `--mount`, or a mode other than
+/// `ro` or `rw`.
+pub fn parse_mount_args<I: IntoIterator<Item = String>>(
+    args: I,
+) -> Result<Vec<GuestMount>, String> {
+    let mut args = args.into_iter();
+    let mut mounts = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg != MOUNT_ARG {
+            return Err(format!("unknown argument {arg:?}"));
+        }
+        let (Some(tag), Some(target), Some(mode)) = (args.next(), args.next(), args.next()) else {
+            return Err("--mount needs <tag> <target> <ro|rw>".to_string());
+        };
+        let read_only = match mode.as_str() {
+            "ro" => true,
+            "rw" => false,
+            other => return Err(format!("mount mode must be ro or rw, got {other:?}")),
+        };
+        mounts.push(GuestMount {
+            tag,
+            target,
+            read_only,
+        });
+    }
+    Ok(mounts)
+}
+
+/// Mount every share in `mounts`, creating the target directories first.
+///
+/// # Errors
+///
+/// Fails on the first mount that the kernel refuses.
+#[cfg(target_os = "linux")]
+pub fn mount_all(mounts: &[GuestMount]) -> std::io::Result<()> {
+    use rustix::mount::{MountFlags, mount};
+    for m in mounts {
+        std::fs::create_dir_all(&m.target)?;
+        let flags = if m.read_only {
+            MountFlags::RDONLY
+        } else {
+            MountFlags::empty()
+        };
+        mount(m.tag.as_str(), m.target.as_str(), "virtiofs", flags, None)
+            .map_err(|e| std::io::Error::other(format!("mount {} at {}: {e}", m.tag, m.target)))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mount_arg_tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn given_no_args_when_parsed_then_no_mounts() {
+        assert_eq!(parse_mount_args(args(&[])), Ok(vec![]));
+    }
+
+    #[test]
+    fn given_two_mounts_when_parsed_then_both_returned_in_order() {
+        let parsed = parse_mount_args(args(&[
+            "--mount", "t0", "/data", "rw", "--mount", "t1", "/cfg dir", "ro",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                GuestMount {
+                    tag: "t0".into(),
+                    target: "/data".into(),
+                    read_only: false
+                },
+                GuestMount {
+                    tag: "t1".into(),
+                    target: "/cfg dir".into(),
+                    read_only: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn given_truncated_mount_when_parsed_then_error() {
+        assert!(parse_mount_args(args(&["--mount", "t0", "/data"])).is_err());
+    }
+
+    #[test]
+    fn given_bad_mode_when_parsed_then_error() {
+        assert!(parse_mount_args(args(&["--mount", "t0", "/d", "rwx"])).is_err());
+    }
+
+    #[test]
+    fn given_unknown_flag_when_parsed_then_error() {
+        assert!(parse_mount_args(args(&["--bogus"])).is_err());
+    }
+}

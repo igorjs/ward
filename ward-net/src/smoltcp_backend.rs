@@ -536,6 +536,10 @@ enum FlowState {
         to_host_tx: mpsc::Sender<Vec<u8>>,
         from_host_rx: mpsc::Receiver<Vec<u8>>,
         pending_from_host: Option<Vec<u8>>,
+        /// The host side ended. Once `pending_from_host` is delivered the
+        /// socket is closed gracefully (FIN) instead of aborted (RST), so the
+        /// guest still reads everything the server sent.
+        host_closed: bool,
     },
 }
 
@@ -570,6 +574,7 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
     tokio::task::spawn(async move {
         let write_loop = async {
             while let Some(chunk) = to_host_rx.recv().await {
+                tracing::debug!(bytes = chunk.len(), "write to host for a guest TCP flow");
                 match tokio::time::timeout(HOST_WRITE_TIMEOUT, write_half.write_all(&chunk)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -596,8 +601,12 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
             let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
             loop {
                 match read_half.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        tracing::debug!("host closed a guest-initiated TCP flow");
+                        break;
+                    }
                     Ok(n) => {
+                        tracing::debug!(bytes = n, "read from host for a guest TCP flow");
                         if from_host_tx.send(buf[..n].to_vec()).await.is_err() {
                             // pump_flows already tore this flow down.
                             break;
@@ -936,6 +945,7 @@ impl Stack {
             return;
         }
         let dst_ip = SocketAddr::from(dst).ip();
+        tracing::debug!(source = %src, destination = %dst, "new guest TCP flow");
         if !is_flow_destination_safe(dst_ip) {
             // Same rejection path as the capacity check above: no listening
             // socket is opened, so smoltcp finds no socket willing to accept
@@ -1017,6 +1027,14 @@ impl Stack {
                     ),
                 ))
             };
+            if let Err(err) = &result {
+                tracing::warn!(
+                    destination = %addr,
+                    domain = %domain,
+                    error = %err,
+                    "guest TCP flow failed to connect"
+                );
+            }
             // The receiver may already be gone if pump_flows gave up on
             // this flow (e.g. the guest reset it) before the connect
             // resolved; a dropped send is not this task's problem.
@@ -1051,6 +1069,7 @@ impl Stack {
                             to_host_tx,
                             from_host_rx,
                             pending_from_host: None,
+                            host_closed: false,
                         };
                     }
                     Ok(Err(err)) => {
@@ -1070,6 +1089,7 @@ impl Stack {
                     to_host_tx,
                     from_host_rx,
                     pending_from_host,
+                    host_closed,
                 } => {
                     match to_host_tx.try_reserve() {
                         Ok(permit) => {
@@ -1086,19 +1106,21 @@ impl Stack {
                         // dropping them, so the guest's TCP window naturally
                         // shrinks until the writer catches up.
                         Err(mpsc::error::TrySendError::Full(())) => {}
-                        Err(mpsc::error::TrySendError::Closed(())) => {
-                            to_remove.push((key, flow.handle));
-                        }
+                        // The host task ended, so nothing more can be written.
+                        // Responses it already read are still queued in
+                        // `from_host_rx`; the read side below decides when the
+                        // flow is finished.
+                        Err(mpsc::error::TrySendError::Closed(())) => {}
                     }
 
-                    if pending_from_host.is_none() {
+                    if pending_from_host.is_none() && !*host_closed {
                         match from_host_rx.try_recv() {
                             Ok(chunk) => *pending_from_host = Some(chunk),
                             Err(mpsc::error::TryRecvError::Empty) => {}
                             // The host-io task ended (error, timeout, or the
                             // stream closed): nothing more will ever arrive.
                             Err(mpsc::error::TryRecvError::Disconnected) => {
-                                to_remove.push((key, flow.handle));
+                                *host_closed = true;
                             }
                         }
                     }
@@ -1125,6 +1147,16 @@ impl Stack {
                                     to_remove.push((key, flow.handle));
                                 }
                             }
+                        }
+                    }
+                    if *host_closed && pending_from_host.is_none() {
+                        let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+                        if socket.is_open() {
+                            // FIN after the send buffer drains.
+                            socket.close();
+                        }
+                        if !socket.is_active() {
+                            to_remove.push((key, flow.handle));
                         }
                     }
                 }
@@ -1231,13 +1263,18 @@ impl Stack {
         }
         let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).ok()?;
         let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
-        let tcp_repr = TcpRepr::parse(
+        let tcp_repr = match TcpRepr::parse(
             &tcp_packet,
             &IpAddress::Ipv4(ip_repr.src_addr),
             &IpAddress::Ipv4(ip_repr.dst_addr),
             &ChecksumCapabilities::default(),
-        )
-        .ok()?;
+        ) {
+            Ok(repr) => repr,
+            Err(err) => {
+                tracing::debug!(error = %err, "ignoring an unparsable guest TCP segment");
+                return None;
+            }
+        };
         if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
             return None;
         }

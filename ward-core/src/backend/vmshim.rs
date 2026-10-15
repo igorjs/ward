@@ -64,6 +64,8 @@ pub struct VmSpec {
     pub cpus: u32,
     pub memory_mb: u32,
     pub exec_path: String,
+    /// Arguments after the program name, passed to the guest entry process.
+    pub exec_args: Vec<String>,
     pub agent_port: u32,
     pub agent_socket: PathBuf,
     pub mounts: Vec<MountSpec>,
@@ -133,7 +135,15 @@ fn boot(spec: &VmSpec) -> Result<(), String> {
     let root = path_cstring(&spec.rootfs)?;
     let exec_path = cstring(&spec.exec_path)?;
     let socket = path_cstring(&spec.agent_socket)?;
-    // Empty argv and envp: one null sentinel each, as libkrun requires.
+    // libkrun wants null-terminated pointer arrays. argv excludes the
+    // program name; envp is empty.
+    let exec_args = spec
+        .exec_args
+        .iter()
+        .map(|a| cstring(a))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut argv: Vec<*const std::ffi::c_char> = exec_args.iter().map(|a| a.as_ptr()).collect();
+    argv.push(std::ptr::null());
     let empty: [*const std::ffi::c_char; 1] = [std::ptr::null()];
 
     // SAFETY (whole block): every pointer passed below comes from a live
@@ -165,7 +175,7 @@ fn boot(spec: &VmSpec) -> Result<(), String> {
         }
 
         check(
-            krun_ffi::krun_set_exec(ctx, exec_path.as_ptr(), empty.as_ptr(), empty.as_ptr()),
+            krun_ffi::krun_set_exec(ctx, exec_path.as_ptr(), argv.as_ptr(), empty.as_ptr()),
             "krun_set_exec",
         )?;
         // `listen = true`: the guest agent listens on this port and the host
