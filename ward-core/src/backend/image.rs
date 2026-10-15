@@ -148,7 +148,10 @@ impl ImagePuller for OciPuller {
             )));
         }
 
-        let client = Client::default();
+        let client = Client::new(oci_client::client::ClientConfig {
+            platform_resolver: Some(Box::new(linux_host_arch_resolver)),
+            ..Default::default()
+        });
         let auth = RegistryAuth::Anonymous;
         let accepted = vec![
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
@@ -180,6 +183,29 @@ impl ImagePuller for OciPuller {
         let _ = layer_count; // available for future meta.json enrichment
         Ok(image.digest.unwrap_or_else(|| "sha256:unknown".to_string()))
     }
+}
+
+/// OCI operating system name of every ward guest.
+const GUEST_OS: &str = "linux";
+
+/// Pick the Linux image variant that matches the host CPU architecture.
+///
+/// The guest is always Linux, even when the host is macOS, so the client's
+/// default resolver (host OS and arch) finds no match on a Mac.
+fn linux_host_arch_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    let want_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().is_some_and(|p| {
+                p.os.to_string() == GUEST_OS && p.architecture.to_string() == want_arch
+            })
+        })
+        .map(|entry| entry.digest.clone())
 }
 
 /// SEC-019: check whether `registry` falls in the comma-separated

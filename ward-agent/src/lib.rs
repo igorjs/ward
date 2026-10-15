@@ -20,7 +20,7 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/ward.agent.v1.rs"));
 }
 
-use proto::{Event, Exec, Exited, Line, Request, event, request};
+use proto::{Event, Exec, Exited, Line, Pong, Request, event, request};
 
 /// Frames larger than this are rejected as malformed, protecting the agent
 /// from a hostile or buggy peer that advertises a huge length.
@@ -149,10 +149,17 @@ where
     };
     let exec = match decode_request(&first)?.kind {
         Some(request::Kind::Exec(e)) => e,
+        Some(request::Kind::Ping(_)) => {
+            let mut writer = writer;
+            let pong = Event {
+                kind: Some(event::Kind::Pong(Pong {})),
+            };
+            return write_frame(&mut writer, &encode_event(&pong)).await;
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec",
+                "first frame must be Exec or Ping",
             ));
         }
     };
@@ -358,7 +365,7 @@ mod tests {
                 Some(event::Kind::Stdout(l)) => out.push(l.text.clone()),
                 Some(event::Kind::Stderr(l)) => err.push(l.text.clone()),
                 Some(event::Kind::Exited(x)) => code = Some(x.code),
-                None => {}
+                Some(event::Kind::Pong(_)) | None => {}
             }
         }
         (out, err, code)

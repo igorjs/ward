@@ -201,7 +201,7 @@ where
                         .await;
                     break; // terminal event; closing output_tx ends the stream
                 }
-                None => continue,
+                _ => continue,
             };
             if output_tx.send(event).await.is_err() {
                 break; // consumer gone
@@ -216,6 +216,36 @@ where
         output_rx: Some(output_rx),
     };
     Ok((handle, kill_tx))
+}
+
+/// Check that the guest agent is up: send `Ping` and expect `Pong`.
+///
+/// # Errors
+///
+/// Returns an error if the connection closes early or the reply is not `Pong`.
+pub async fn ping<S>(mut stream: S) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let req = Request {
+        kind: Some(request::Kind::Ping(proto::Ping {})),
+    };
+    write_frame(&mut stream, &encode(&req)).await?;
+    let frame = read_frame(&mut stream).await?.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "agent closed the connection before replying",
+        )
+    })?;
+    match Event::decode(&frame[..]) {
+        Ok(Event {
+            kind: Some(event::Kind::Pong(_)),
+        }) => Ok(()),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "agent reply to Ping was not Pong",
+        )),
+    }
 }
 
 #[cfg(test)]

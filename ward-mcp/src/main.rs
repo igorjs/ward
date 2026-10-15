@@ -52,6 +52,9 @@ const RUN_TIMEOUT_SECS: u64 = 30;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A sandbox's microVM runs in a re-executed copy of this binary.
+    ward_core::run_vm_shim_if_requested();
+
     // MCP servers are spawned by clients (Claude / Cursor / ...) which
     // own the stdio pair. Logs MUST go to stderr -- stdout is the wire
     // protocol. tracing_subscriber defaults to stderr; lock it in.
