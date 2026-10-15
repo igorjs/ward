@@ -24,6 +24,10 @@ pub const RUNTIME_DIR_ENV: &str = "WARD_RUNTIME_DIR";
 const LIB_FILE_MODE: u32 = 0o755;
 const RUNTIME_DIR_MODE: u32 = 0o700;
 const HOME_RUNTIME_SUBDIR: &str = ".ward/runtime";
+const TEMP_RUNTIME_PREFIX: &str = "ward-runtime";
+/// Group and other write bits. An unpacked library with either set could be
+/// replaced by another local user.
+const UNSAFE_WRITE_BITS: u32 = 0o022;
 
 /// Absolute paths of the unpacked shared libraries.
 #[derive(Debug, Clone)]
@@ -46,7 +50,22 @@ pub fn default_runtime_dir() -> PathBuf {
     }
     match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home).join(HOME_RUNTIME_SUBDIR),
-        None => std::env::temp_dir().join("ward-runtime"),
+        None => std::env::temp_dir().join(temp_runtime_name()),
+    }
+}
+
+/// Per-user name for the no-`HOME` fallback, so users never share a directory.
+fn temp_runtime_name() -> String {
+    #[cfg(unix)]
+    {
+        format!(
+            "{TEMP_RUNTIME_PREFIX}-{}",
+            rustix::process::geteuid().as_raw()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        TEMP_RUNTIME_PREFIX.to_string()
     }
 }
 
@@ -69,6 +88,11 @@ pub fn extract_libs(base: &Path) -> io::Result<LibPaths> {
         krunfw: final_dir.join(KRUNFW_FILE_NAME),
     };
     if paths.krun.is_file() && paths.krunfw.is_file() {
+        // Reuse only what this user owns. The daemon loads these files into
+        // its own process, so a file planted by someone else must never load.
+        for path in [base, &final_dir, &paths.krun, &paths.krunfw] {
+            verify_private(path)?;
+        }
         return Ok(paths);
     }
 
@@ -110,6 +134,32 @@ pub fn guest_agent() -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Fail unless `path` is owned by the current user, is not a symlink and is
+/// not writable by group or other.
+#[cfg(unix)]
+fn verify_private(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path)?;
+    let owner_ok = meta.uid() == rustix::process::geteuid().as_raw();
+    let mode_ok = meta.mode() & UNSAFE_WRITE_BITS == 0;
+    if meta.file_type().is_symlink() || !owner_ok || !mode_ok {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not private to this user (owner, mode or symlink); \
+                 remove it or set {RUNTIME_DIR_ENV} to a directory you own",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn write_payload(path: &Path, gz: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(path)?;
     let mut decoder = GzDecoder::new(gz);
@@ -148,6 +198,34 @@ mod tests {
             None => unsafe { std::env::remove_var(key) },
         }
         assert_eq!(dir, PathBuf::from("/custom/ward-runtime"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_group_writable_file_when_verified_then_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("lib.so");
+        fs::write(&file, b"x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_private(&file).is_ok());
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o775)).unwrap();
+
+        let err = verify_private(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_symlink_when_verified_then_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("real");
+        fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(verify_private(&link).is_err());
     }
 
     #[test]

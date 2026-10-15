@@ -248,12 +248,14 @@ fn locate_tarball(
 ) -> BuildResult<PathBuf> {
     if let Some(path) = env::var_os(TARBALL_OVERRIDE_ENV).map(PathBuf::from) {
         let actual = sha256_file(&path)?;
+        // The override is an explicit local choice, and the LGPL lets users
+        // rebuild ward against a modified libkrunfw. A different hash is a
+        // warning, not an error.
         if actual != expected {
-            return Err(format!(
-                "{TARBALL_OVERRIDE_ENV}={} has sha256 {actual}, expected {expected}",
+            println!(
+                "cargo:warning={TARBALL_OVERRIDE_ENV}={} has sha256 {actual}, not the pinned {expected}; using it as given",
                 path.display()
-            )
-            .into());
+            );
         }
         return Ok(path);
     }
