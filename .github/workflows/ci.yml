@@ -415,6 +415,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
+            index.docker.io:443
             registry-1.docker.io:443
             auth.docker.io:443
             production.cloudflare.docker.com:443
