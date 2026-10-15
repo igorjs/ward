@@ -13,25 +13,20 @@ The default `cargo build` (stub backend) compiles on any platform Rust supports.
 
 ## Real microVMs (`--features krunvm`)
 
-Install libkrun + libkrunfw, then build with the feature flag:
-
-### macOS Apple Silicon (12+)
+libkrun, its guest kernel (libkrunfw) and the in-guest agent are embedded in the ward binaries at build time. There is nothing to install on the host except a hypervisor: Hypervisor.framework on macOS (present on every supported Mac) or KVM on Linux (`/dev/kvm` readable by your user, see [rootless.md](rootless.md)).
 
 ```sh
-brew tap slp/krun
-brew install slp/krun/libkrun slp/krun/libkrunfw
-cargo build --release --features krunvm
+cargo build --release --workspace --features ward-core/krunvm,ward-daemon/krunvm,ward-mcp/krunvm
 ```
 
-### Linux (Debian/Ubuntu, kernel 5.10+ with KVM)
+The build needs network access once, to fetch the pinned libkrun release from GitHub, and `rustup` so it can add the Linux musl target for the guest agent. See the README for the offline override and the macOS signing step.
 
-```sh
-# Follow https://github.com/containers/libkrun#installing
-sudo apt-get install -y libkrun-dev libkrunfw-dev
-cargo build --release --features krunvm
-```
+### Known limitations
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full setup matrix and build-time gotchas.
+- Volumes (`ward volume`) are created as ext4 images but not yet attached to guests; block devices need a libkrun build with block support ([#43](https://github.com/igorjs/ward/issues/43)). Creating a volume also needs `mkfs.ext4` on the host.
+- `ward run` (language snippets) is not implemented. Use `ward exec`, or `ward_run` through ward-mcp.
+- Bind mounts must point inside the daemon's allowed roots (`/home/`, `/tmp/`, `/var/lib/ward/`) unless `WARD_ALLOW_HOST_MOUNTS=1` is set on the daemon.
+- macOS CI runners cannot start VMs, so the real-VM test suite runs on Linux/KVM in CI and on macOS locally.
 
 ## End-user install (post-v0.1.0)
 

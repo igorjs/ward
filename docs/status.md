@@ -6,9 +6,11 @@ Live status, tickets, and priorities live on the [Ward project board](https://gi
 - libkrun FFI surface: complete (60 symbols, hand-maintained)
 - VM lifecycle wiring (`krun_start_enter` + shutdown signalling): complete
 - OCI image pull + unpack: complete
-- Guest agent (`ward-agent`): crate + vsock protocol shipped; boot-path integration tracked by [#9](https://github.com/igorjs/ward/issues/9)
+- Self-contained runtime: libkrun, libkrunfw and the guest agent are embedded in the binaries; one host process per microVM
+- Guest agent (`ward-agent`): runs as the VM's init process; mounts shares, configures the network, serves exec over vsock
+- Real-VM end-to-end tests run in CI on Linux/KVM (`vm-e2e`) and cover exec, env, mounts, snapshots, egress, isolation and ward-mcp
 - Cross-sandbox pub/sub broker: complete (deny default + group routing)
-- Egress: forward proxy + `GetEgressLog` shipped; in-VM TAP routing gated
+- Egress: deny / allowlist / open enforced by the in-process smoltcp stack, with a private-address block
 - Volumes: fixed-size ext4 images shipped; block-attach blocked on libkrun built with `--enable-blk` ([#43](https://github.com/igorjs/ward/issues/43))
 - Snapshots: disk-level archive/restore + `from_snapshot` shipped; live checkpoint/restore tracked by [#29](https://github.com/igorjs/ward/issues/29)
 - First signed release (v0.1.0): release smoke-test ([#4](https://github.com/igorjs/ward/issues/4)), then cut v0.1.0 ([#5](https://github.com/igorjs/ward/issues/5))

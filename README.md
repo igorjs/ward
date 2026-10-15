@@ -36,17 +36,18 @@ Workspace binaries:
 ```sh
 git clone https://github.com/igorjs/ward.git
 cd ward
-
-# macOS (Apple Silicon)
-brew install slp/krun/libkrun slp/krun/libkrunfw
-# Linux (Debian/Ubuntu)
-sudo apt-get install -y libkrun-dev libkrunfw-dev
-
-cargo build --release --features krunvm
-cargo test --features krunvm
+cargo build --release --workspace --features ward-core/krunvm,ward-daemon/krunvm,ward-mcp/krunvm
 ```
 
-Release binaries always ship with `--features krunvm` and a bundled libkrun bottle from [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds); the installer above does this for you. The default `cargo build` (no features) compiles against a stub backend on any platform; useful for contributors hacking on broker/CLI/MCP code without libkrun installed, not for actually running sandboxes. See [`docs/platforms.md`](docs/platforms.md) for the full setup matrix.
+Nothing else needs to be installed. The build downloads the pinned libkrun release (checked against `vendor/libkrun-checksums.txt`), cross-compiles the in-guest agent for Linux with the `rust-lld` linker that ships with `rustup`, and embeds both in the binaries. At first run ward unpacks them to `~/.ward/runtime/` (override with `WARD_RUNTIME_DIR`). Set `WARD_LIBKRUN_TARBALL=/path/to/tarball` to build offline.
+
+On macOS, sign the binaries that start VMs once after building (release downloads are already signed):
+
+```sh
+codesign --force --sign - --entitlements entitlements.plist target/release/wardd target/release/ward-mcp
+```
+
+Release binaries are built exactly this way. The default `cargo build` (no features) compiles a stub backend on any platform: useful for hacking on broker/CLI/MCP code, not for running sandboxes. See [`docs/platforms.md`](docs/platforms.md) for details and [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for the licenses of what is embedded.
 
 ## Hello world (daemon + CLI)
 

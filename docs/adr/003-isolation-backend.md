@@ -118,3 +118,5 @@ The original decision (use libkrun, gated behind `--features krunvm`) is unchang
 **Maintenance:** on each libkrun bump, diff `containers/libkrun/include/libkrun.h` against `krun_ffi.rs` and translate any new signatures. Procedure tracked in `CONTRIBUTING.md` and issue #32.
 
 Implementation: issue #31.
+
+**Amendment (ADR-021):** libkrun is no longer linked from the host. It is embedded in the ward binaries and loaded at runtime, and each microVM runs in its own host process.
