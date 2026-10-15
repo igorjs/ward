@@ -195,13 +195,15 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         let _ = std::fs::remove_dir_all(&template);
         let dir = tempfile::tempdir().expect("prime dir");
         let socket = dir.path().join("ward.sock");
+        let prime_log_path = dir.path().join("wardd.log");
+        let prime_log = std::fs::File::create(&prime_log_path).expect("create log");
         let mut cmd = Command::cargo_bin("wardd").expect("locate wardd");
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", dir.path())
             .env("WARD_RUNTIME_DIR", shared_runtime_dir())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::from(prime_log.try_clone().expect("clone log")))
+            .stderr(Stdio::from(prime_log));
         ensure_hypervisor_entitlement(cmd.get_program());
         let mut daemon = cmd.spawn().expect("spawn priming wardd");
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -218,8 +220,9 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         let _ = daemon.wait();
         assert!(
             out.status.success(),
-            "priming pull of {image} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+            "priming pull of {image} failed: {}\n---- wardd log ----\n{}",
+            String::from_utf8_lossy(&out.stderr),
+            std::fs::read_to_string(&prime_log_path).unwrap_or_default()
         );
         copy_tree(&dir.path().join("cache"), &template.join("cache"));
         std::fs::write(&marker, wanted).expect("write marker");

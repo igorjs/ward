@@ -38,6 +38,9 @@ allow = [
     # Permissive, OSI-approved. Pulled in via smoltcp and its `managed`
     # dependency (ADR-019's in-process network stack).
     "0BSD",
+    # Permissive data license on the Mozilla CA bundle (webpki-roots). Pulled
+    # in only as a build dependency of ward-bundle, which downloads libkrun.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 

@@ -225,7 +225,7 @@ jobs:
           # can be wired against a stable install path. Same Hypervisor
           # entitlement applied above on macOS.
           cp "target/${TARGET}/release/ward-mcp" "${STAGE}/bin/"
-          cp LICENSE "${STAGE}/" 2>/dev/null || true
+          cp LICENSE THIRD-PARTY-NOTICES.md "${STAGE}/" 2>/dev/null || true
           cp README.md "${STAGE}/" 2>/dev/null || true
           tar -czf "${STAGE}.tar.gz" "${STAGE}"
           # Cross-platform SHA-256.
