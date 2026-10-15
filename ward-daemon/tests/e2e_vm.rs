@@ -501,14 +501,19 @@ fn given_allowlist_egress_when_guest_requests_listed_host_then_it_is_reachable()
     let d = Daemon::spawn_vm();
     let id = create(
         &d,
-        &["--egress", "allowlist", "--allow-domain", "github.com"],
+        &[
+            "--egress",
+            "allowlist",
+            "--allow-domain",
+            "archive.ubuntu.com",
+        ],
     );
 
-    let status = http_status_line(&d, &id, "github.com");
+    let status = http_status_line(&d, &id, "archive.ubuntu.com");
 
     assert!(
         status.starts_with("HTTP/"),
-        "no HTTP response from github.com: {status:?}"
+        "no HTTP response from archive.ubuntu.com: {status:?}"
     );
 }
 
@@ -518,10 +523,15 @@ fn given_allowlist_egress_when_guest_requests_unlisted_host_then_it_is_blocked()
     let d = Daemon::spawn_vm();
     let id = create(
         &d,
-        &["--egress", "allowlist", "--allow-domain", "github.com"],
+        &[
+            "--egress",
+            "allowlist",
+            "--allow-domain",
+            "archive.ubuntu.com",
+        ],
     );
 
-    let status = http_status_line(&d, &id, "api.github.com");
+    let status = http_status_line(&d, &id, "security.ubuntu.com");
 
     assert_eq!(status, "", "unlisted host must not answer");
 }
