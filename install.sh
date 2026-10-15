@@ -16,7 +16,7 @@
 #   WARD_VERSION      Release tag to install. Defaults to the latest stable
 #                     release (whatever `latest` resolves to on GitHub).
 #   WARD_INSTALL_DIR  Prefix to install into. Binaries go in
-#                     $WARD_INSTALL_DIR/bin/; dylibs in $WARD_INSTALL_DIR/lib/.
+#                     $WARD_INSTALL_DIR/bin/.
 #                     Default: $HOME/.ward
 #   WARD_NO_MODIFY_PATH
 #                     If set to any non-empty value, skip modifying shell rc
@@ -256,7 +256,7 @@ if [[ ! -d "$EXTRACTED_DIR" ]]; then
 fi
 
 log "Installing to ${C_BOLD}${WARD_INSTALL_DIR}${C_RESET}"
-mkdir -p "${WARD_INSTALL_DIR}/bin" "${WARD_INSTALL_DIR}/lib"
+mkdir -p "${WARD_INSTALL_DIR}/bin"
 # SEC-013 follow-through: ensure the prefix itself is 0700, not just
 # umask-derived. `mkdir -p` honours the current umask (077 above) so
 # new dirs land at 0700, but an existing prefix from an older install
@@ -264,9 +264,6 @@ mkdir -p "${WARD_INSTALL_DIR}/bin" "${WARD_INSTALL_DIR}/lib"
 chmod 0700 "${WARD_INSTALL_DIR}"
 # Copy with -p to preserve mtimes and exec bits; -R for nested directories.
 cp -pR "${EXTRACTED_DIR}/bin/." "${WARD_INSTALL_DIR}/bin/"
-if [[ -d "${EXTRACTED_DIR}/lib" ]] && [[ -n "$(ls -A "${EXTRACTED_DIR}/lib" 2>/dev/null || true)" ]]; then
-  cp -pR "${EXTRACTED_DIR}/lib/." "${WARD_INSTALL_DIR}/lib/"
-fi
 # Documentation is best-effort.
 for f in LICENSE README.md; do
   [[ -f "${EXTRACTED_DIR}/${f}" ]] && cp "${EXTRACTED_DIR}/${f}" "${WARD_INSTALL_DIR}/" || true
@@ -281,7 +278,7 @@ if "${WARD_INSTALL_DIR}/bin/ward" --version > /dev/null 2>&1; then
   ok "ward installed: $(${WARD_INSTALL_DIR}/bin/ward --version 2>&1 | head -n1)"
 else
   warn "the installed ward binary did not respond to --version. Continuing,"
-  warn "but you may need to investigate (rpath issues are the usual cause)."
+  warn "but you may need to investigate (check that the binary matches this platform)."
 fi
 
 echo
