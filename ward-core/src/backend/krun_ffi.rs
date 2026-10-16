@@ -72,6 +72,14 @@ fn api() -> Option<&'static Api> {
     API.get_or_init(load).as_ref().ok()
 }
 
+/// Load libkrun now. Safe to call repeatedly.
+pub fn ensure_loaded() -> Result<(), &'static str> {
+    match API.get_or_init(load) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.as_str()),
+    }
+}
+
 fn load() -> Result<Api, String> {
     let base: PathBuf = ward_bundle::default_runtime_dir();
     let paths = ward_bundle::extract_libs(&base)
@@ -89,8 +97,8 @@ fn load() -> Result<Api, String> {
 }
 
 krun_api! {
+    pub fn krun_set_log_level(level: u32) -> i32;
     pub fn krun_create_ctx() -> i32;
-    pub fn krun_free_ctx(ctx_id: u32) -> i32;
     pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> i32;
     pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> i32;
     pub fn krun_add_virtiofs3(
@@ -114,13 +122,14 @@ krun_api! {
         argv: *const *const c_char,
         envp: *const *const c_char,
     ) -> i32;
+    pub fn krun_disable_implicit_vsock(ctx_id: u32) -> i32;
+    pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> i32;
     pub fn krun_add_vsock_port2(
         ctx_id: u32,
         port: u32,
         c_filepath: *const c_char,
         listen: bool,
     ) -> i32;
-    pub fn krun_get_shutdown_eventfd(ctx_id: u32) -> i32;
     // Blocks until the guest ends: call it on a dedicated process or thread.
     pub fn krun_start_enter(ctx_id: u32) -> i32;
 }

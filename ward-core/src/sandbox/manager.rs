@@ -1618,6 +1618,7 @@ mod tests {
 
     // ----- exec ----------------------------------------------------------
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_existing_sandbox_when_exec_then_returns_process_info_with_pid() {
         // Arrange: create a sandbox so exec has a target.
@@ -1738,6 +1739,7 @@ mod tests {
 
     // ----- stream_output -------------------------------------------------
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_exec_when_stream_output_then_drains_scripted_stdout_and_exit() {
         // Arrange: exec parks the receiver under the pid; we take it back
@@ -1802,6 +1804,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_pid_owned_by_other_sandbox_when_stream_output_then_process_not_found() {
         // Arrange: two sandboxes, one process under the first. Asking
@@ -1830,6 +1833,7 @@ mod tests {
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_stream_output_consumed_when_called_again_then_invalid_request() {
         // Arrange: single-consumer contract. Once a caller takes the
@@ -1862,6 +1866,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_sandbox_removed_when_stream_output_for_old_pid_then_process_not_found() {
         // Arrange: removing a sandbox must drop its process records so
@@ -1939,6 +1944,7 @@ mod tests {
 
     // ----- write_stdin ---------------------------------------------------
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_exec_when_write_stdin_then_send_succeeds() {
         // Arrange: stub backend installs a drain task on stdin_rx, so a
@@ -1963,6 +1969,7 @@ mod tests {
         assert!(result.is_ok(), "write_stdin should succeed: {result:?}");
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_exec_when_write_empty_stdin_then_succeeds() {
         // Arrange: empty data is a valid no-op send — sometimes used as
@@ -2005,6 +2012,7 @@ mod tests {
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_pid_owned_by_other_sandbox_when_write_stdin_then_process_not_found() {
         // Arrange: tenant isolation regression guard — writing to a pid
@@ -2106,6 +2114,7 @@ mod tests {
 
     // ----- kill_process --------------------------------------------------
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_exec_when_kill_process_then_subsequent_write_stdin_fails() {
         // Arrange: after a kill, the pid effectively no longer exists.
@@ -2136,6 +2145,7 @@ mod tests {
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_kill_already_done_when_called_again_then_process_not_found() {
         // Arrange: idempotency contract — once a pid is killed, subsequent
@@ -2179,6 +2189,7 @@ mod tests {
         assert!(matches!(err, ApiError::ProcessNotFound(_)));
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_pid_owned_by_other_sandbox_when_kill_then_process_not_found() {
         // Arrange: tenant isolation regression — pid belongs to sandbox A,
