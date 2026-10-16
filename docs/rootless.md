@@ -30,8 +30,8 @@ Everything ward creates lives in `$HOME/.ward/` (or `$WARD_DATA_DIR`) with `0700
 libkrun on macOS uses the Hypervisor framework, which requires a binary entitlement. ward's release artefacts ship pre-signed with this entitlement (see `entitlements.plist` at the workspace root and the release workflow's "Codesign macOS binaries" step). Building from source needs:
 
 1. Xcode command-line tools (`xcode-select --install`).
-2. libkrun installed via `brew install slp/krun/libkrun slp/krun/libkrunfw`.
-3. The build sets `com.apple.security.hypervisor` on `wardd` and `ward-mcp` (both spawn libkrun via `ward-runtime`). CI handles this for release tarballs; for local dev:
+2. Nothing else: libkrun is embedded in the binaries.
+3. The `com.apple.security.hypervisor` entitlement on `wardd` and `ward-mcp` (both start VMs). The `disable-library-validation` entitlement lets the hardened runtime load the embedded libraries that ward unpacks at first run. CI handles this for release tarballs; for local dev:
 
 ```sh
 codesign --sign - \
