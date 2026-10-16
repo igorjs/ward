@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::image::ImageStore;
+use super::image::{ImageStore, OFFLINE_IMAGES_ENV};
 use super::{Backend, BackendError, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
 use crate::egress::EgressProxy;
 #[cfg(feature = "krunvm")]
 use crate::protocol::EgressMode;
-use crate::protocol::{CreateOpts, ResourceLimits, SandboxInfo, SandboxStatus, SnapshotInfo};
+use crate::protocol::{CreateOpts, SandboxInfo, SandboxStatus, SnapshotInfo};
 
 /// vsock port the guest agent listens on; must match `ward-agent`.
 /// Only referenced by the krunvm-gated FFI wrappers.
@@ -39,6 +39,22 @@ const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 /// Only referenced by the krunvm-gated FFI wrappers.
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
+
+/// Guest-agent argument that introduces one mount.
+#[cfg(feature = "krunvm")]
+const AGENT_MOUNT_ARG: &str = "--mount";
+/// Mode words the guest agent accepts after a mount target.
+#[cfg(feature = "krunvm")]
+const MOUNT_MODE_RO: &str = "ro";
+#[cfg(feature = "krunvm")]
+const MOUNT_MODE_RW: &str = "rw";
+/// Words per mount on the agent command line: flag, tag, target, mode.
+#[cfg(feature = "krunvm")]
+const MOUNT_ARG_WORDS: usize = 4;
+
+/// Permissions of the agent binary in the rootfs (rwxr-xr-x).
+#[cfg(feature = "krunvm")]
+const AGENT_FILE_MODE: u32 = 0o755;
 
 /// Delay before the stub exec path's scripted process signals completion.
 /// A real caller's follow-up RPCs (kill_process, write_stdin, a second
@@ -93,16 +109,6 @@ where
 // libc bindings used only by the krunvm boot path
 // ---------------------------------------------------------------------------
 //
-// We need `write(2)` to poke the shutdown eventfd that libkrun returns
-// from `krun_get_shutdown_eventfd`. Declaring it directly here keeps
-// us off the `libc` crate dependency, which is otherwise unjustified
-// (one syscall, two-line declaration).
-
-#[cfg(feature = "krunvm")]
-unsafe extern "C" {
-    fn write(fd: std::ffi::c_int, buf: *const std::ffi::c_void, count: usize) -> isize;
-}
-
 // macOS-only: renamex_np(2) with RENAME_SWAP atomically swaps two
 // existing paths. Used by extract_rootfs to close the SEC-014 residual
 // on Darwin (Linux uses rustix::fs::renameat_with(RENAME_EXCHANGE) for
@@ -126,35 +132,14 @@ const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
 // Per-sandbox state
 // ---------------------------------------------------------------------------
 
-/// Resources tied to a running microVM. Only populated when the
-/// `krunvm` feature is enabled and `krun_start_enter` has been spawned.
-#[cfg(feature = "krunvm")]
-#[derive(Debug)]
-struct VmRuntime {
-    /// OS thread running the blocking `krun_start_enter` call. Joined
-    /// in `remove_sandbox` after the shutdown eventfd is poked. The
-    /// return value is `krun_start_enter`'s exit code (negative on
-    /// libkrun-side failure).
-    thread: std::thread::JoinHandle<i32>,
-    /// Eventfd handed out by `krun_get_shutdown_eventfd(ctx_id)`.
-    /// Writing 8 bytes of `u64(1)` to it asks the VM to unwind. We do
-    /// NOT close this fd ourselves: libkrun owns its lifetime and
-    /// reaps it during `krun_free_ctx`. Stored as a raw `c_int` for
-    /// that reason. Negative values are tolerated (some platforms
-    /// signal "no fd available" with -1).
-    shutdown_fd: std::os::fd::RawFd,
-}
-
 struct SandboxState {
     info: SandboxInfo,
-    /// krun context ID returned by krun_create_ctx().
-    /// 0 means not yet started.
-    ctx_id: u32,
-    /// VM thread + shutdown eventfd. `None` in stub builds and during
-    /// the brief window before `krun_start_enter` is spawned. Always
-    /// `Some` in `--features krunvm` after `create_sandbox` returns Ok.
+    /// Environment given at create time. Applied to every exec; variables
+    /// passed to a single exec win over these.
+    env: HashMap<String, String>,
+    /// Host process running this sandbox's microVM. `None` in stub builds.
     #[cfg(feature = "krunvm")]
-    vm: Option<VmRuntime>,
+    shim: Option<super::vmshim::ShimProcess>,
     /// Live smoltcp stack task. `None` when egress mode is Deny, when the
     /// network backend is `None`, or when the `krunvm` feature is
     /// disabled.
@@ -174,9 +159,9 @@ struct SandboxState {
 impl std::fmt::Debug for SandboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("SandboxState");
-        s.field("info", &self.info).field("ctx_id", &self.ctx_id);
+        s.field("info", &self.info);
         #[cfg(feature = "krunvm")]
-        s.field("vm", &self.vm)
+        s.field("shim", &self.shim)
             .field("smoltcp_active", &self.smoltcp.is_some())
             .field("egress_active", &self.egress.is_some());
         s.finish()
@@ -228,8 +213,12 @@ pub struct KrunvmBackend {
     network_backend: NetworkBackendChoice,
     /// Content-addressable OCI image cache. Populated on first pull of a
     /// given manifest digest; subsequent sandboxes for the same image skip
-    /// the registry pull and hardlink from the cached rootfs instead.
+    /// the registry pull and copy from the cached rootfs instead.
     image_store: Arc<ImageStore>,
+    /// False when images are synthetic (offline puller, unit tests): there
+    /// is no bootable rootfs, so no VM host process is started.
+    #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
+    boot_vms: bool,
 }
 
 impl KrunvmBackend {
@@ -254,7 +243,8 @@ impl KrunvmBackend {
     ) -> Self {
         let cache_dir = data_dir.join("cache").join("images");
         let image_store = Arc::new(ImageStore::new(cache_dir, max_cached_images));
-        Self::new_internal(data_dir, network_backend, image_store)
+        let boot_vms = std::env::var(OFFLINE_IMAGES_ENV).as_deref() != Ok("1");
+        Self::new_internal(data_dir, network_backend, image_store, boot_vms)
     }
 
     /// Internal constructor used by the public constructors and by tests that
@@ -263,6 +253,7 @@ impl KrunvmBackend {
         data_dir: std::path::PathBuf,
         network_backend: NetworkBackendChoice,
         image_store: Arc<ImageStore>,
+        boot_vms: bool,
     ) -> Self {
         Self {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
@@ -271,6 +262,7 @@ impl KrunvmBackend {
             processes: Arc::new(RwLock::new(HashMap::new())),
             network_backend,
             image_store,
+            boot_vms,
         }
     }
 
@@ -283,7 +275,12 @@ impl KrunvmBackend {
         data_dir: std::path::PathBuf,
         image_store: Arc<ImageStore>,
     ) -> Self {
-        Self::new_internal(data_dir, NetworkBackendChoice::default(), image_store)
+        Self::new_internal(
+            data_dir,
+            NetworkBackendChoice::default(),
+            image_store,
+            false,
+        )
     }
 }
 
@@ -291,103 +288,71 @@ impl KrunvmBackend {
 impl Backend for KrunvmBackend {
     /// Create a new sandbox and start the microVM.
     ///
-    /// Under `--features krunvm` this configures the libkrun context,
-    /// captures the shutdown eventfd, and spawns the dedicated OS
-    /// thread that runs `krun_start_enter`. The thread runs for the
-    /// lifetime of the VM and is reaped in `remove_sandbox`.
+    /// Under `--features krunvm` this starts a VM host process for the
+    /// sandbox (see `vmshim`) and returns once the guest agent answers.
+    /// `remove_sandbox` stops that process.
     async fn create_sandbox(&self, id: String, opts: &CreateOpts) -> Result<SandboxInfo> {
-        let ctx_id = self.krun_create_ctx()?;
-        self.krun_apply_resources(ctx_id, &opts.resources)?;
-
         let rootfs = self.sandbox_rootfs(&id);
 
-        if let Some(snapshot_id) = &opts.from_snapshot {
-            // Seed the rootfs from a snapshot if requested. The snapshot must
-            // exist; its archived filesystem becomes this sandbox's starting
-            // state (host-side; the VM then boots from it).
-            if !self.snapshots.read().await.contains_key(snapshot_id) {
-                return Err(BackendError::NotFound(snapshot_id.clone()));
+        // Everything that can fail after the rootfs exists runs here, so one
+        // cleanup covers a failed pull, extract or boot.
+        let prepared = async {
+            if let Some(snapshot_id) = &opts.from_snapshot {
+                // Seed the rootfs from a snapshot if requested. The snapshot must
+                // exist; its archived filesystem becomes this sandbox's starting
+                // state (host-side; the VM then boots from it).
+                if !self.snapshots.read().await.contains_key(snapshot_id) {
+                    return Err(BackendError::NotFound(snapshot_id.clone()));
+                }
+                let archive = self.snapshot_dir(snapshot_id).join("rootfs.tar");
+                let dest = rootfs.clone();
+                tokio::task::spawn_blocking(move || extract_rootfs(&archive, &dest))
+                    .await
+                    .map_err(|e| BackendError::Internal(format!("from_snapshot task: {e}")))??;
+            } else if !opts.image.is_empty() {
+                // Pull the image from the content-addressable cache (or the
+                // registry on cache miss) and copy it into the sandbox rootfs.
+                // This is the standard path for every `ward create` invocation.
+                self.image_store
+                    .prepare_sandbox_rootfs(&opts.image, &rootfs)
+                    .await?;
             }
-            let archive = self.snapshot_dir(snapshot_id).join("rootfs.tar");
-            let dest = rootfs.clone();
-            tokio::task::spawn_blocking(move || extract_rootfs(&archive, &dest))
-                .await
-                .map_err(|e| BackendError::Internal(format!("from_snapshot task: {e}")))??;
-        } else if !opts.image.is_empty() {
-            // Pull the image from the content-addressable cache (or the
-            // registry on cache miss) and hardlink it into the sandbox rootfs.
-            // This is the standard path for every `ward create` invocation.
-            self.image_store
-                .prepare_sandbox_rootfs(&opts.image, &rootfs)
-                .await?;
+
+            #[cfg(feature = "krunvm")]
+            let booted = if self.boot_vms {
+                Some(self.boot_vm(&id, opts, &rootfs).await?)
+            } else {
+                None
+            };
+            #[cfg(feature = "krunvm")]
+            let result: Result<Option<BootedVm>> = Ok(booted);
+            #[cfg(not(feature = "krunvm"))]
+            let result: Result<()> = Ok(());
+            result
         }
-
-        self.krun_set_root(ctx_id, &rootfs)?;
-
+        .await;
         #[cfg(feature = "krunvm")]
-        let (smoltcp_handle, egress_proxy) = if opts.egress.mode != EgressMode::Deny
-            && self.network_backend == NetworkBackendChoice::Smoltcp
-        {
-            use super::krun_ffi;
-            // The proxy is the single source of truth for this sandbox's
-            // allow/deny decisions; the spawned Stack task consults it
-            // through the closure below on every flow.
-            let egress_proxy = Arc::new(EgressProxy::new(id.clone(), opts.egress.clone()));
-            let egress_for_check = Arc::clone(&egress_proxy);
-            let egress_check: Box<ward_net::smoltcp_backend::EgressCheckFn> =
-                Box::new(move |domain: &str, port: u16| {
-                    let proxy = Arc::clone(&egress_for_check);
-                    let domain = domain.to_string();
-                    Box::pin(async move { proxy.check(&domain, port).await })
-                });
-            let handle = ward_net::smoltcp_backend::spawn_for_sandbox(
-                &id,
-                &ward_net::AttachOptions::default(),
-                egress_check,
-            )
-            .await
-            .map_err(|e| BackendError::Internal(format!("smoltcp spawn: {e}")))?;
-            krun_ffi::set_net_unixgram(ctx_id, handle.guest_fd, SMOLTCP_GUEST_MAC)
-                .map_err(BackendError::Internal)?;
-            (Some(handle), Some(egress_proxy))
-        } else {
-            // Either Deny mode (no egress) or NetworkBackendChoice::None
-            // (no network backend at all): no datapath to spawn.
-            (None, None)
+        let booted = match prepared {
+            Ok(booted) => booted,
+            Err(e) => {
+                self.remove_sandbox_dir(&id).await;
+                return Err(e);
+            }
         };
-
-        // Bind mounts → virtiofs shares; volumes → raw block devices. The
-        // mapping/validation is host-side; the attach FFI is gated and
-        // compile-verified under --features krunvm.
-        for (idx, m) in opts.mounts.iter().enumerate() {
-            // A deterministic, collision-free tag per mount. The guest agent
-            // mounts `tag` at `m.target`.
-            let tag = format!("ward-mnt-{idx}");
-            self.krun_add_mount(ctx_id, &tag, std::path::Path::new(&m.source), m.readonly)?;
+        #[cfg(not(feature = "krunvm"))]
+        if let Err(e) = prepared {
+            self.remove_sandbox_dir(&id).await;
+            return Err(e);
         }
-        // Volume attach (ext4 images as block devices via krun_add_disk) is
-        // deferred: the pinned libkrun 1.18.0 bottle exports no krun_add_disk*
-        // symbols (built without block-device support). volume_ids are still
-        // validated upstream; wiring them needs a block-capable libkrun build.
-        let _ = &opts.volume_ids;
-
-        // Boot the guest agent as the entry process and expose its vsock
-        // over a host Unix socket so exec() can reach it. Compile-verified
-        // under --features krunvm; runtime requires a booting microVM.
-        self.krun_set_agent_entry(ctx_id)?;
-        self.krun_add_agent_vsock(ctx_id, &self.agent_socket_path(&id))?;
-
-        // Spawn the VM thread *after* all configuration calls. libkrun
-        // requires krun_get_shutdown_eventfd + krun_start_enter to come
-        // last. In stub builds this is a no-op; the state's `vm` field
-        // doesn't exist.
-        #[cfg(feature = "krunvm")]
-        let vm = Some(self.krun_spawn_vm(&id, ctx_id)?);
 
         let now = std::time::SystemTime::now();
         let info = SandboxInfo {
             id: id.clone(),
-            status: SandboxStatus::Creating,
+            status: if cfg!(feature = "krunvm") && self.boot_vms {
+                SandboxStatus::Running
+            } else {
+                SandboxStatus::Creating
+            },
             image: opts.image.clone(),
             created_at: now,
             ip_address: None,
@@ -402,15 +367,20 @@ impl Backend for KrunvmBackend {
             token: String::new(),
         };
 
+        #[cfg(feature = "krunvm")]
+        let (shim, smoltcp, egress) = match booted {
+            Some(vm) => (Some(vm.shim), vm.smoltcp, vm.egress),
+            None => (None, None, None),
+        };
         let state = SandboxState {
             info: info.clone(),
-            ctx_id,
+            env: opts.env.clone(),
             #[cfg(feature = "krunvm")]
-            vm,
+            shim,
             #[cfg(feature = "krunvm")]
-            smoltcp: smoltcp_handle,
+            smoltcp,
             #[cfg(feature = "krunvm")]
-            egress: egress_proxy,
+            egress,
         };
 
         self.sandboxes.write().await.insert(id, state);
@@ -440,13 +410,10 @@ impl Backend for KrunvmBackend {
 
     /// Stop and remove a sandbox.
     ///
-    /// Under `--features krunvm` this signals the VM thread to shut
-    /// down via its eventfd, waits for the thread to exit (bounded),
-    /// then frees the libkrun context. The order matters: freeing the
-    /// context before the thread exits would race with the still-live
-    /// `krun_start_enter` call.
+    /// Under `--features krunvm` this stops the VM host process, which
+    /// ends the microVM and releases everything it held.
     async fn remove_sandbox(&self, id: &str) -> Result<()> {
-        #[allow(unused_mut)]
+        #[cfg_attr(not(feature = "krunvm"), allow(unused_variables, unused_mut))]
         let mut state = self
             .sandboxes
             .write()
@@ -454,27 +421,18 @@ impl Backend for KrunvmBackend {
             .remove(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
 
-        // Signal + join the VM thread before freeing the context.
+        // Stop the VM host process first so the guest stops using the
+        // network socket, then stop the smoltcp task behind it.
         #[cfg(feature = "krunvm")]
-        if let Some(vm) = state.vm.take() {
-            // Errors here are already logged inside the helper; we don't
-            // surface them because the sandbox is being torn down and
-            // any further failure on krun_free_ctx is the actionable one.
-            let _ = self.krun_signal_and_join(id, vm).await;
+        if let Some(mut shim) = state.shim.take() {
+            shim.stop().await;
         }
 
-        // Stop the smoltcp stack task before freeing the libkrun context.
-        // Ordering: the task must exit before krun_free_ctx so there is no
-        // dangling virtio-net peer after the context is freed.
         #[cfg(feature = "krunvm")]
         if let Some(mut smoltcp) = state.smoltcp.take()
             && let Err(e) = smoltcp.detach().await
         {
             tracing::warn!(sandbox_id = %id, "smoltcp teardown error: {e}");
-        }
-
-        if state.ctx_id != 0 {
-            self.krun_free_ctx(state.ctx_id)?;
         }
 
         // Drop the sandbox's snapshots too. Snapshots are bound to their
@@ -495,6 +453,11 @@ impl Backend for KrunvmBackend {
         for snapshot_id in reaped {
             let _ = std::fs::remove_dir_all(self.snapshot_dir(&snapshot_id));
         }
+
+        // Best-effort host cleanup: the agent socket and the unpacked rootfs.
+        let _ = std::fs::remove_file(self.agent_socket_path(id));
+        let sandbox_dir = self.data_dir.join("sandboxes").join(id);
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(sandbox_dir)).await;
 
         Ok(())
     }
@@ -654,20 +617,23 @@ impl Backend for KrunvmBackend {
     }
 
     /// Exec a command inside a running sandbox.
+    #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
     async fn exec(
         &self,
         sandbox_id: &str,
         command: Vec<String>,
-        _working_dir: Option<String>,
-        _env: HashMap<String, String>,
+        working_dir: Option<String>,
+        extra_env: HashMap<String, String>,
     ) -> Result<ProcessHandle> {
-        let _state = {
+        #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
+        let env = {
             let guard = self.sandboxes.read().await;
-            guard
+            let state = guard
                 .get(sandbox_id)
-                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?
-                .info
-                .clone()
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            let mut merged = state.env.clone();
+            merged.extend(extra_env);
+            merged
         };
 
         let pid = uuid::Uuid::new_v4().to_string();
@@ -691,8 +657,8 @@ impl Backend for KrunvmBackend {
                 pid,
                 sandbox_id.to_string(),
                 command,
-                _working_dir,
-                _env,
+                working_dir,
+                env,
             )
             .await
             .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
@@ -761,209 +727,92 @@ impl Backend for KrunvmBackend {
     }
 }
 
+/// Parent of the per-user socket directory, and that directory's name prefix.
+const SOCKET_ROOT: &str = "/tmp";
+const SOCKET_DIR_PREFIX: &str = "ward-";
+
+/// Number of sandbox-id characters used in an agent socket file name.
+const SOCKET_ID_LEN: usize = 16;
+
+/// Permissions of the per-user agent socket directory (rwx------).
+#[cfg(feature = "krunvm")]
+const SOCKET_DIR_MODE: u32 = 0o700;
+
+/// Per-user directory holding agent sockets. Kept short on purpose, see
+/// [`KrunvmBackend::agent_socket_path`].
+fn agent_socket_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(SOCKET_ROOT).join(format!(
+        "{SOCKET_DIR_PREFIX}{}",
+        rustix::process::getuid().as_raw()
+    ))
+}
+
+/// Create the agent socket directory, refusing one that another user owns
+/// or that is a symlink.
+#[cfg(feature = "krunvm")]
+fn ensure_agent_socket_dir() -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = agent_socket_dir();
+    match std::fs::DirBuilder::new()
+        .mode(SOCKET_DIR_MODE)
+        .create(&dir)
+    {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(BackendError::Io(e)),
+    }
+    let meta = std::fs::symlink_metadata(&dir).map_err(BackendError::Io)?;
+    if !meta.is_dir() || meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(BackendError::Internal(format!(
+            "{} must be a directory owned by the current user",
+            dir.display()
+        )));
+    }
+    Ok(dir)
+}
+
+/// Write the embedded guest agent to `/ward-agent` in a sandbox rootfs.
+///
+/// The old file is removed first so a read-only or symlinked `/ward-agent` in
+/// the image cannot block or redirect the write.
+#[cfg(feature = "krunvm")]
+async fn install_guest_agent(rootfs: &std::path::Path) -> Result<()> {
+    let dest = rootfs.join(AGENT_GUEST_PATH.trim_start_matches('/'));
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let agent = ward_bundle::guest_agent()
+            .map_err(|e| BackendError::Internal(format!("embedded guest agent: {e}")))?;
+        match std::fs::remove_file(&dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(BackendError::Io(e)),
+        }
+        std::fs::write(&dest, agent).map_err(BackendError::Io)?;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(AGENT_FILE_MODE))
+            .map_err(BackendError::Io)
+    })
+    .await
+    .map_err(|e| BackendError::Internal(format!("install agent task: {e}")))?
+}
+
 impl KrunvmBackend {
-    // -----------------------------------------------------------------------
-    // Private krun FFI wrappers – all unsafe confined here
-    // -----------------------------------------------------------------------
-
-    fn krun_create_ctx(&self) -> Result<u32> {
-        // SAFETY: krun_create_ctx() is always safe to call and returns a
-        // non-negative context ID on success, or a negative errno on failure.
-        #[cfg(feature = "krunvm")]
-        {
-            let ret = unsafe { super::krun_ffi::krun_create_ctx() };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_create_ctx failed: errno {}",
-                    -ret
-                )));
-            }
-            Ok(ret as u32)
-        }
-        #[cfg(not(feature = "krunvm"))]
-        {
-            // Stub: return a synthetic context ID for builds without krunvm.
-            Ok(1)
-        }
-    }
-
-    fn krun_free_ctx(&self, ctx_id: u32) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            // SAFETY: ctx_id came from krun_create_ctx and has not been freed.
-            let ret = unsafe { super::krun_ffi::krun_free_ctx(ctx_id) };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_free_ctx failed: errno {}",
-                    -ret
-                )));
-            }
-        }
-        let _ = ctx_id;
-        Ok(())
-    }
-
-    fn krun_apply_resources(&self, ctx_id: u32, limits: &ResourceLimits) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            if limits.cpus > 0 {
-                // libkrun's num_vcpus is uint8_t; values >255 cannot
-                // round-trip and silent truncation would produce a
-                // microVM with the wrong CPU count (or zero). Reject
-                // explicitly.
-                let num_vcpus: u8 = u8::try_from(limits.cpus).map_err(|_| {
-                    BackendError::Internal(format!(
-                        "cpus={} exceeds libkrun's uint8_t limit (255)",
-                        limits.cpus
-                    ))
-                })?;
-                // SAFETY: ctx_id came from krun_create_ctx and is live.
-                let ret = unsafe {
-                    super::krun_ffi::krun_set_vm_config(ctx_id, num_vcpus, limits.memory_mb)
-                };
-                if ret < 0 {
-                    return Err(BackendError::Internal(format!(
-                        "krun_set_vm_config failed: errno {}",
-                        -ret
-                    )));
-                }
-            }
-        }
-        let _ = (ctx_id, limits);
-        Ok(())
-    }
-
-    fn krun_set_root(&self, ctx_id: u32, rootfs: &std::path::Path) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            use std::ffi::CString;
-            let path = CString::new(rootfs.to_string_lossy().as_ref())
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
-            // SAFETY: path is a valid NUL-terminated C string; ctx_id is live.
-            let ret = unsafe { super::krun_ffi::krun_set_root(ctx_id, path.as_ptr()) };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_set_root failed: errno {}",
-                    -ret
-                )));
-            }
-        }
-        let _ = (ctx_id, rootfs);
-        Ok(())
-    }
-
-    /// Set the guest agent as the microVM's entry process. libkrun runs one
-    /// process per boot; ward boots the agent, which then serves exec
-    /// requests over vsock for the sandbox's lifetime.
-    ///
-    /// The agent binary is expected at `/ward-agent` inside the rootfs;
-    /// baking it there is part of the image/packaging pipeline.
-    fn krun_set_agent_entry(&self, ctx_id: u32) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            use std::ffi::CString;
-            let exec_path = CString::new(AGENT_GUEST_PATH)
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
-            // Empty argv/envp: a single null-pointer sentinel each.
-            let argv: [*const std::ffi::c_char; 1] = [std::ptr::null()];
-            let envp: [*const std::ffi::c_char; 1] = [std::ptr::null()];
-            // SAFETY: ctx_id is live; exec_path is a valid C string; argv and
-            // envp are null-terminated arrays as libkrun requires.
-            let ret = unsafe {
-                super::krun_ffi::krun_set_exec(
-                    ctx_id,
-                    exec_path.as_ptr(),
-                    argv.as_ptr(),
-                    envp.as_ptr(),
-                )
-            };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_set_exec failed: errno {}",
-                    -ret
-                )));
-            }
-        }
-        let _ = ctx_id;
-        Ok(())
-    }
-
-    /// Bridge the agent's guest vsock port to a host Unix socket. The daemon
-    /// connects to `sock_path` to reach the agent listening on
-    /// [`AGENT_VSOCK_PORT`] inside the guest.
-    fn krun_add_agent_vsock(&self, ctx_id: u32, sock_path: &std::path::Path) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            use std::ffi::CString;
-            let path = CString::new(sock_path.to_string_lossy().as_ref())
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
-            // `listen = false`: libkrun owns the host-side Unix socket and the
-            // daemon connects to it; traffic is forwarded to the guest's
-            // listening vsock port. (Boot-path semantics are verified once a
-            // KVM runner exists; see the spec's verification ceiling.)
-            // SAFETY: ctx_id is live; path is a valid C string.
-            let ret = unsafe {
-                super::krun_ffi::krun_add_vsock_port2(
-                    ctx_id,
-                    AGENT_VSOCK_PORT,
-                    path.as_ptr(),
-                    false,
-                )
-            };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_add_vsock_port2 failed: errno {}",
-                    -ret
-                )));
-            }
-        }
-        let _ = (ctx_id, sock_path);
-        Ok(())
-    }
-
-    /// Share a host directory into the guest via virtiofs. `tag` is the
-    /// mount tag the guest uses to mount the share at the desired target.
-    fn krun_add_mount(
-        &self,
-        ctx_id: u32,
-        tag: &str,
-        source: &std::path::Path,
-        read_only: bool,
-    ) -> Result<()> {
-        #[cfg(feature = "krunvm")]
-        {
-            use std::ffi::CString;
-            let c_tag = CString::new(tag).map_err(|e| BackendError::Internal(e.to_string()))?;
-            let c_path = CString::new(source.to_string_lossy().as_ref())
-                .map_err(|e| BackendError::Internal(e.to_string()))?;
-            // shm_size 0 → libkrun's default DAX window.
-            // SAFETY: ctx_id is live; both C strings are valid and NUL-terminated.
-            let ret = unsafe {
-                super::krun_ffi::krun_add_virtiofs3(
-                    ctx_id,
-                    c_tag.as_ptr(),
-                    c_path.as_ptr(),
-                    0,
-                    read_only,
-                )
-            };
-            if ret < 0 {
-                return Err(BackendError::Internal(format!(
-                    "krun_add_virtiofs3 failed for {tag}: errno {}",
-                    -ret
-                )));
-            }
-        }
-        let _ = (ctx_id, tag, source, read_only);
-        Ok(())
-    }
-
     /// Host-side Unix socket path bridging to the sandbox's agent vsock.
+    ///
+    /// Lives in a short per-user directory because `sockaddr_un` paths are
+    /// limited to 104 bytes on macOS, which a long data dir would exceed.
     fn agent_socket_path(&self, sandbox_id: &str) -> std::path::PathBuf {
-        self.data_dir
-            .join("sandboxes")
-            .join(sandbox_id)
-            .join("agent.sock")
+        let short_id: String = sandbox_id
+            .chars()
+            .filter(|c| *c != '-')
+            .take(SOCKET_ID_LEN)
+            .collect();
+        agent_socket_dir().join(format!("{short_id}.sock"))
+    }
+
+    /// Remove a sandbox's directory after a failed create. Best effort.
+    async fn remove_sandbox_dir(&self, id: &str) {
+        let dir = self.data_dir.join("sandboxes").join(id);
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
     }
 
     /// Unpacked rootfs directory for a sandbox.
@@ -979,139 +828,179 @@ impl KrunvmBackend {
         self.data_dir.join("snapshots").join(snapshot_id)
     }
 
-    /// Capture the shutdown eventfd and spawn the dedicated OS thread
-    /// that runs `krun_start_enter`. Must be called only after every
-    /// `krun_set_*` configuration call for the context.
-    ///
-    /// `krun_start_enter` blocks for the lifetime of the microVM, so we
-    /// do **not** put it on a tokio task or `spawn_blocking` pool slot.
-    /// A bare `std::thread::spawn` is the documented contract.
-    ///
-    /// Returns the runtime metadata to be stored in `SandboxState`. The
-    /// thread logs its own exit via `tracing` so failures surface in
-    /// the daemon log without the caller needing to await the handle.
+    /// Start the VM host process for a sandbox and wait until its guest
+    /// agent answers.
     #[cfg(feature = "krunvm")]
-    fn krun_spawn_vm(&self, sandbox_id: &str, ctx_id: u32) -> Result<VmRuntime> {
-        // SAFETY: ctx_id came from krun_create_ctx and is configured but
-        // not yet entered. Per libkrun's contract, this must be called
-        // before krun_start_enter; calling it after is a use-after-enter
-        // bug. We enforce ordering by sequencing here in create_sandbox.
-        let shutdown_fd = unsafe { super::krun_ffi::krun_get_shutdown_eventfd(ctx_id) };
-        if shutdown_fd < 0 {
-            // Negative is documented for some platforms (e.g. macOS may
-            // not have a usable eventfd). Don't fail the boot. Just
-            // accept that remove_sandbox won't be able to signal shutdown
-            // cleanly. Log so the operator knows.
-            tracing::warn!(
-                sandbox = %sandbox_id,
-                ctx_id,
-                ret = shutdown_fd,
-                "krun_get_shutdown_eventfd returned negative; shutdown signalling disabled"
-            );
+    async fn boot_vm(
+        &self,
+        id: &str,
+        opts: &CreateOpts,
+        rootfs: &std::path::Path,
+    ) -> Result<BootedVm> {
+        use super::vmshim::{MountSpec, NetSpec, ShimProcess, VmSpec};
+        use std::os::fd::{FromRawFd, OwnedFd};
+
+        install_guest_agent(rootfs).await?;
+        ensure_agent_socket_dir()?;
+        let agent_socket = self.agent_socket_path(id);
+        let _ = std::fs::remove_file(&agent_socket);
+
+        let (smoltcp, egress, net_fd) = if opts.egress.mode != EgressMode::Deny
+            && self.network_backend == NetworkBackendChoice::Smoltcp
+        {
+            // The proxy is the single source of truth for this sandbox's
+            // allow/deny decisions; the spawned Stack task consults it
+            // through the closure below on every flow.
+            let egress_proxy = Arc::new(EgressProxy::new(id.to_string(), opts.egress.clone()));
+            let egress_for_check = Arc::clone(&egress_proxy);
+            let egress_check: Box<ward_net::smoltcp_backend::EgressCheckFn> =
+                Box::new(move |domain: &str, port: u16| {
+                    let proxy = Arc::clone(&egress_for_check);
+                    let domain = domain.to_string();
+                    Box::pin(async move { proxy.check(&domain, port).await })
+                });
+            let mut handle = ward_net::smoltcp_backend::spawn_for_sandbox(
+                id,
+                &ward_net::AttachOptions::default(),
+                egress_check,
+            )
+            .await
+            .map_err(|e| BackendError::Internal(format!("smoltcp spawn: {e}")))?;
+            let raw = std::mem::replace(&mut handle.guest_fd, -1);
+            // SAFETY: `raw` is the open guest end of the socketpair and the
+            // handle no longer refers to it.
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            (Some(handle), Some(egress_proxy), Some((raw, owned)))
+        } else {
+            // Deny mode or NetworkBackendChoice::None: no datapath to spawn.
+            (None, None, None)
+        };
+
+        // Bind mounts become virtiofs shares. The guest agent mounts each one
+        // at its target path when it starts. Volume attach (ext4 images as
+        // block devices) is not wired yet; volume_ids are validated upstream.
+        let mut mounts = Vec::with_capacity(opts.mounts.len());
+        let mut exec_args = Vec::with_capacity(opts.mounts.len() * MOUNT_ARG_WORDS);
+        for (idx, m) in opts.mounts.iter().enumerate() {
+            let tag = format!("ward-mnt-{idx}");
+            exec_args.extend([
+                AGENT_MOUNT_ARG.to_string(),
+                tag.clone(),
+                m.target.clone(),
+                if m.readonly {
+                    MOUNT_MODE_RO
+                } else {
+                    MOUNT_MODE_RW
+                }
+                .to_string(),
+            ]);
+            mounts.push(MountSpec {
+                tag,
+                path: std::path::PathBuf::from(&m.source),
+                read_only: m.readonly,
+            });
         }
 
-        let sandbox_id_for_thread = sandbox_id.to_string();
-        let thread = std::thread::Builder::new()
-            .name(format!("krun-vm-{sandbox_id}"))
-            .spawn(move || {
-                tracing::info!(
-                    sandbox = %sandbox_id_for_thread,
-                    ctx_id,
-                    "krun_start_enter starting"
-                );
-                // SAFETY: ctx_id is live and fully configured. This call
-                // blocks until the VM exits, either because guest init
-                // ran to completion, or because the shutdown eventfd was
-                // poked, or because libkrun failed early (missing init,
-                // bad rootfs, KVM unavailable, ...).
-                let ret = unsafe { super::krun_ffi::krun_start_enter(ctx_id) };
-                if ret < 0 {
-                    tracing::error!(
-                        sandbox = %sandbox_id_for_thread,
-                        ctx_id,
-                        errno = -ret,
-                        "krun_start_enter failed"
-                    );
-                } else {
-                    tracing::info!(
-                        sandbox = %sandbox_id_for_thread,
-                        ctx_id,
-                        code = ret,
-                        "krun_start_enter returned"
-                    );
-                }
-                ret
-            })
-            .map_err(|e| BackendError::Internal(format!("spawn VM thread failed: {e}")))?;
+        let (net, inherit) = match net_fd {
+            Some((raw, owned)) => (
+                Some(NetSpec {
+                    fd: raw,
+                    mac: SMOLTCP_GUEST_MAC,
+                }),
+                Some(owned),
+            ),
+            None => (None, None),
+        };
+        let spec = VmSpec {
+            rootfs: rootfs.to_path_buf(),
+            cpus: opts.resources.cpus,
+            memory_mb: opts.resources.memory_mb,
+            exec_path: AGENT_GUEST_PATH.to_string(),
+            exec_args,
+            agent_port: AGENT_VSOCK_PORT,
+            agent_socket: agent_socket.clone(),
+            mounts,
+            net,
+        };
 
-        Ok(VmRuntime {
-            thread,
-            shutdown_fd,
+        let mut shim = match ShimProcess::spawn(&spec, inherit).await {
+            Ok(shim) => shim,
+            Err(e) => {
+                if let Some(mut handle) = smoltcp {
+                    let _ = handle.detach().await;
+                }
+                return Err(BackendError::Internal(format!(
+                    "start VM host process: {e}"
+                )));
+            }
+        };
+        if let Err(e) = wait_for_agent(&mut shim, &agent_socket).await {
+            shim.stop().await;
+            if let Some(mut handle) = smoltcp {
+                let _ = handle.detach().await;
+            }
+            let _ = std::fs::remove_file(&agent_socket);
+            return Err(e);
+        }
+        Ok(BootedVm {
+            shim,
+            smoltcp,
+            egress,
         })
     }
+}
 
-    /// Poke the shutdown eventfd, wait for the VM thread to exit, and
-    /// reap the thread. Best-effort: a stuck VM is detached after the
-    /// timeout rather than blocking `remove_sandbox` indefinitely.
-    ///
-    /// Returns the thread's exit code on a clean reap; `None` if we
-    /// timed out and detached the thread. Errors only on truly
-    /// catastrophic failures (none currently).
-    #[cfg(feature = "krunvm")]
-    async fn krun_signal_and_join(&self, sandbox_id: &str, vm: VmRuntime) -> Result<Option<i32>> {
-        // 1. Signal: write u64(1) to the eventfd. Best-effort. If the
-        //    fd is bogus or write fails, we still try to join in case
-        //    the VM is already on its way out for other reasons (guest
-        //    poweroff, OOM, etc).
-        if vm.shutdown_fd >= 0 {
-            let val: u64 = 1;
-            // SAFETY: shutdown_fd was obtained from krun_get_shutdown_eventfd
-            // and is valid until krun_free_ctx (which we call after this).
-            // We're writing exactly 8 bytes from a stack u64.
-            let n = unsafe {
-                write(
-                    vm.shutdown_fd,
-                    &val as *const u64 as *const std::ffi::c_void,
-                    std::mem::size_of::<u64>(),
-                )
-            };
-            if n < 0 {
-                tracing::warn!(
-                    sandbox = %sandbox_id,
-                    fd = vm.shutdown_fd,
-                    "write(shutdown_eventfd) failed; will still attempt to join"
-                );
-            }
+/// A started microVM and the host-side pieces that serve it.
+#[cfg(feature = "krunvm")]
+struct BootedVm {
+    shim: super::vmshim::ShimProcess,
+    smoltcp: Option<ward_net::smoltcp_backend::SmoltcpHandle>,
+    egress: Option<Arc<EgressProxy>>,
+}
+
+/// How long a new VM gets to start its guest agent.
+#[cfg(feature = "krunvm")]
+const AGENT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Pause between readiness probes.
+#[cfg(feature = "krunvm")]
+const AGENT_READY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Per-probe limit for the connect and the `Ping` round trip.
+#[cfg(feature = "krunvm")]
+const AGENT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Probe the guest agent until it answers `Ping`, the VM host process dies
+/// or [`AGENT_READY_TIMEOUT`] passes.
+#[cfg(feature = "krunvm")]
+async fn wait_for_agent(
+    shim: &mut super::vmshim::ShimProcess,
+    socket: &std::path::Path,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + AGENT_READY_TIMEOUT;
+    loop {
+        if !shim.is_running() {
+            return Err(BackendError::Internal(
+                "VM host process exited before the guest agent was ready".to_string(),
+            ));
         }
-
-        // 2. Bounded join. `JoinHandle::join` is unbounded. If libkrun
-        //    or the host wedges, we'd block forever. Poll `is_finished`
-        //    instead, capped at JOIN_TIMEOUT.
-        const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
-        let start = std::time::Instant::now();
-        while start.elapsed() < JOIN_TIMEOUT {
-            if vm.thread.is_finished() {
-                let ret = vm
-                    .thread
-                    .join()
-                    .map_err(|_| BackendError::Internal("VM thread panicked".into()))?;
-                return Ok(Some(ret));
-            }
-            tokio::time::sleep(POLL_INTERVAL).await;
+        let probe = async {
+            let stream = tokio::net::UnixStream::connect(socket).await?;
+            super::agent::ping(stream).await
+        };
+        if matches!(
+            tokio::time::timeout(AGENT_PROBE_TIMEOUT, probe).await,
+            Ok(Ok(()))
+        ) {
+            return Ok(());
         }
-
-        // Timeout: detach. The thread keeps running but the daemon
-        // continues; libkrun resource leak is acknowledged but the
-        // alternative (block remove_sandbox forever) is worse. Operator
-        // visibility via log.
-        tracing::warn!(
-            sandbox = %sandbox_id,
-            timeout_s = JOIN_TIMEOUT.as_secs(),
-            "VM thread did not exit within timeout; detaching (libkrun context will leak)"
-        );
-        drop(vm.thread);
-        Ok(None)
+        if tokio::time::Instant::now() >= deadline {
+            return Err(BackendError::Internal(format!(
+                "guest agent did not become ready within {}s",
+                AGENT_READY_TIMEOUT.as_secs()
+            )));
+        }
+        tokio::time::sleep(AGENT_READY_POLL).await;
     }
 }
 
@@ -1138,6 +1027,9 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
     }
     let file = opts.open(archive).map_err(BackendError::Io)?;
     let mut builder = tar::Builder::new(file);
+    // Store symlinks as symlinks. Following them fails on the dangling links
+    // every distro rootfs has and would copy host files a link points at.
+    builder.follow_symlinks(false);
     if rootfs.is_dir() {
         builder
             .append_dir_all(".", rootfs)
@@ -1213,11 +1105,12 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
                     path.display()
                 )));
             }
-            // Reject symlink/hardlink entries pointing outside the dest.
-            if matches!(
-                entry.header().entry_type(),
-                tar::EntryType::Symlink | tar::EntryType::Link
-            ) {
+            // Hardlinks resolve on the host, so their targets must stay inside
+            // the staging dir. Symlinks resolve inside the guest, where
+            // absolute and `..` targets are normal (`var/run -> /run`).
+            // Writing a later entry through a symlink is stopped by
+            // `unpack_in`, which refuses paths that leave the staging dir.
+            if entry.header().entry_type() == tar::EntryType::Link {
                 let link = entry
                     .link_name()
                     .map_err(|e| BackendError::Internal(format!("link target: {e}")))?
@@ -1229,7 +1122,7 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
                         .any(|c| matches!(c, std::path::Component::ParentDir))
                 {
                     return Err(BackendError::Internal(format!(
-                        "snapshot archive contains unsafe link target: {}",
+                        "snapshot archive contains unsafe hardlink target: {}",
                         link.display()
                     )));
                 }
@@ -1395,7 +1288,7 @@ mod tests {
         let cache_dir = path.join("cache").join("images");
         let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(tmp);
-        KrunvmBackend::new_internal(path, network_backend, store)
+        KrunvmBackend::new_internal(path, network_backend, store, false)
     }
 
     fn create_opts() -> CreateOpts {
@@ -1404,7 +1297,7 @@ mod tests {
             mounts: vec![],
             volume_ids: vec![],
             egress: EgressPolicy::default(),
-            resources: ResourceLimits::default(),
+            resources: crate::protocol::ResourceLimits::default(),
             env: HashMap::new(),
             from_snapshot: None,
             comms: CommunicationPolicy::default(),
@@ -1841,6 +1734,7 @@ mod tests {
 
     // ----- network backend selection: smoltcp -----------------------------
 
+    #[ignore = "needs a bootable image; covered by e2e_vm"]
     #[cfg(feature = "krunvm")]
     #[tokio::test]
     async fn given_network_backend_smoltcp_when_create_sandbox_then_smoltcp_handle_set() {
@@ -1869,5 +1763,91 @@ mod tests {
             state.smoltcp.is_some(),
             "expected smoltcp handle to be set for NetworkBackendChoice::Smoltcp"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_rootfs_with_dangling_and_escaping_symlinks_when_archived_then_links_are_stored_not_followed()
+     {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("etc")).unwrap();
+        std::os::unix::fs::symlink("/proc/self/mounts", rootfs.join("etc/mtab")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", rootfs.join("etc/host-link")).unwrap();
+        let archive = tmp.path().join("snap.tar");
+
+        // Act
+        archive_rootfs(&rootfs, &archive).expect("dangling symlinks must not fail the archive");
+
+        // Assert: both entries are symlinks in the tar, not file copies.
+        let mut tar = tar::Archive::new(std::fs::File::open(&archive).unwrap());
+        let kinds: Vec<_> = tar
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().header().entry_type())
+            .filter(|t| t.is_symlink())
+            .collect();
+        assert_eq!(kinds.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_snapshot_with_absolute_and_relative_symlinks_when_restored_then_links_are_kept() {
+        // Arrange
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let rootfs = tmp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("var")).unwrap();
+        std::os::unix::fs::symlink("/run", rootfs.join("var/run")).unwrap();
+        std::os::unix::fs::symlink("../usr/lib", rootfs.join("var/lib")).unwrap();
+        let archive = tmp.path().join("snap.tar");
+        archive_rootfs(&rootfs, &archive).unwrap();
+        let dest = tmp.path().join("restored");
+
+        // Act
+        extract_rootfs(&archive, &dest).expect("legitimate guest symlinks must restore");
+
+        // Assert
+        assert_eq!(
+            std::fs::read_link(dest.join("var/run")).unwrap(),
+            std::path::Path::new("/run")
+        );
+        assert_eq!(
+            std::fs::read_link(dest.join("var/lib")).unwrap(),
+            std::path::Path::new("../usr/lib")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_snapshot_writing_through_an_escaping_symlink_when_restored_then_it_is_rejected() {
+        // Arrange: `etc -> <outside>` followed by `etc/evil`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let archive = tmp.path().join("evil.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        builder
+            .append_link(&mut link, "etc", &outside)
+            .expect("append link");
+        let mut file = tar::Header::new_gnu();
+        file.set_size(4);
+        file.set_mode(0o644);
+        builder
+            .append_data(&mut file, "etc/evil", &b"evil"[..])
+            .expect("append file");
+        builder.finish().unwrap();
+        drop(builder);
+        let dest = tmp.path().join("restored");
+
+        // Act
+        let result = extract_rootfs(&archive, &dest);
+
+        // Assert
+        assert!(result.is_err());
+        assert!(!outside.join("evil").exists(), "file escaped the rootfs");
     }
 }

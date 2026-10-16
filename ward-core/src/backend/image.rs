@@ -31,6 +31,9 @@ use flate2::read::GzDecoder;
 
 use super::{BackendError, Result};
 
+/// Set to `1` to skip registry pulls and build synthetic, unbootable images.
+pub(crate) const OFFLINE_IMAGES_ENV: &str = "WARD_OCI_OFFLINE";
+
 // ---------------------------------------------------------------------------
 // Cached image entry (returned by list())
 // ---------------------------------------------------------------------------
@@ -93,7 +96,7 @@ impl ImagePuller for OciPuller {
         // release binaries entirely. Tests run with debug_assertions on,
         // production `cargo build --release` does not see this branch.
         #[cfg(debug_assertions)]
-        if std::env::var("WARD_OCI_OFFLINE").as_deref() == Ok("1") {
+        if std::env::var(OFFLINE_IMAGES_ENV).as_deref() == Ok("1") {
             std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
             // Derive a stable fake digest from the reference so distinct
             // image refs get distinct cache entries even in offline mode.

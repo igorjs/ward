@@ -20,3 +20,14 @@ pub mod volume;
 /// existing call sites do not move. See ADR-017 for the rationale and
 /// the `ward-proto` crate docs for the boundary contract.
 pub use ward_proto::pb;
+
+/// Turn this process into a microVM host when ward started it as one.
+///
+/// Every binary that can run sandboxes must call this first thing in
+/// `main`, before any other setup. It returns immediately in a normal run
+/// and never returns in a VM host process. Without the `krunvm` feature
+/// it does nothing.
+pub fn run_vm_shim_if_requested() {
+    #[cfg(feature = "krunvm")]
+    backend::vmshim::run_if_requested();
+}

@@ -39,6 +39,12 @@ use ward_core::config::Config;
 use ward_core::sandbox::SandboxManager;
 use ward_core::volume::VolumeManager;
 
+/// Call first in `main` of any program that embeds the runtime with the
+/// `krunvm` feature. Each sandbox boots in a re-executed copy of the host
+/// binary, and this hands control to that copy. It returns at once in a
+/// normal run.
+pub use ward_core::run_vm_shim_if_requested;
+
 /// Errors that can occur while booting an embedded runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

@@ -50,8 +50,17 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Default timeout for `ward_run` output collection: 30 seconds.
 const RUN_TIMEOUT_SECS: u64 = 30;
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A sandbox's microVM runs in a re-executed copy of this binary. Check
+    // before the async runtime exists.
+    ward_core::run_vm_shim_if_requested();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // MCP servers are spawned by clients (Claude / Cursor / ...) which
     // own the stdio pair. Logs MUST go to stderr -- stdout is the wire
     // protocol. tracing_subscriber defaults to stderr; lock it in.

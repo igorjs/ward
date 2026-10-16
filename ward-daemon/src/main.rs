@@ -35,8 +35,17 @@ const _: () = assert!(
      transport error."
 );
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A sandbox's microVM runs in a re-executed copy of this binary. Check
+    // before the async runtime and its threads exist.
+    ward_core::run_vm_shim_if_requested();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // SEC-002: clamp the process umask BEFORE binding the Unix socket or
     // creating data directories. Without this the socket file and the
     // data tree inherit whatever umask the operator's shell set
