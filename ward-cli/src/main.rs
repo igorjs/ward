@@ -54,6 +54,15 @@ enum Commands {
         /// Environment variables in KEY=VALUE form.
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
+        #[arg(short = 'v', long = "mount", value_name = "SOURCE:TARGET[:ro]")]
+        mount: Vec<String>,
+        /// Outbound network policy: "deny" (default), "allowlist" or "open".
+        #[arg(long, default_value = "deny")]
+        egress: String,
+        /// Host name the sandbox may reach with --egress=allowlist. Repeatable.
+        #[arg(long = "allow-domain", value_name = "DOMAIN")]
+        allow_domain: Vec<String>,
         /// Memory limit in MiB.
         #[arg(long, default_value = "512")]
         memory: u32,
@@ -224,6 +233,22 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
+/// Parse `SOURCE:TARGET[:ro]` from `ward create --mount`.
+fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (source, target, readonly) = match parts.as_slice() {
+        [source, target] => (*source, *target, false),
+        [source, target, "ro"] => (*source, *target, true),
+        [source, target, "rw"] => (*source, *target, false),
+        _ => anyhow::bail!("--mount expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
+    };
+    Ok(ward_core::pb::Mount {
+        source: source.to_string(),
+        target: target.to_string(),
+        readonly,
+    })
+}
+
 /// `--json` / `--no-pretty` accept either the flag or a truthy env
 /// var. clap's built-in `env` for bool fields only accepts the literal
 /// strings `"true"` / `"false"`, which collides with the Unix idiom of
@@ -255,6 +280,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Create {
             image,
             env,
+            mount,
+            egress,
+            allow_domain,
             memory,
             cpus,
             timeout,
@@ -283,9 +311,26 @@ async fn main() -> anyhow::Result<()> {
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
 
+            let mounts = mount
+                .iter()
+                .map(|spec| parse_mount_spec(spec))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let egress_mode = match egress.as_str() {
+                "deny" => ward_core::pb::EgressMode::Deny,
+                "allowlist" => ward_core::pb::EgressMode::Allowlist,
+                "open" => ward_core::pb::EgressMode::Open,
+                other => {
+                    anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'")
+                }
+            };
             let mut c = client::connect(&socket_path).await?;
             let req = ward_core::pb::CreateSandboxRequest {
                 image,
+                mounts,
+                egress: Some(ward_core::pb::EgressPolicy {
+                    mode: egress_mode as i32,
+                    domains: allow_domain,
+                }),
                 resources: Some(ward_core::pb::ResourceLimits {
                     cpus,
                     memory_mb: memory,
@@ -770,6 +815,27 @@ fn status_name(status: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_source_and_target_when_parse_mount_then_read_write() {
+        let m = parse_mount_spec("/tmp/a:/data").unwrap();
+        assert_eq!(
+            (m.source.as_str(), m.target.as_str(), m.readonly),
+            ("/tmp/a", "/data", false)
+        );
+    }
+
+    #[test]
+    fn given_ro_suffix_when_parse_mount_then_readonly() {
+        assert!(parse_mount_spec("/tmp/a:/data:ro").unwrap().readonly);
+    }
+
+    #[test]
+    fn given_malformed_spec_when_parse_mount_then_error() {
+        assert!(parse_mount_spec("/tmp/a").is_err());
+        assert!(parse_mount_spec("/tmp/a:/data:wat").is_err());
+        assert!(parse_mount_spec("a:b:ro:extra").is_err());
+    }
 
     #[test]
     fn given_from_snapshot_flag_without_source_sandbox_when_parsed_then_clap_error() {
