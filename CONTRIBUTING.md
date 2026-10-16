@@ -70,28 +70,24 @@ cargo build
 cargo test
 ```
 
-### Setup with real microVMs (libkrun)
+### Setup with real microVMs
 
-If you want `wardd` to boot actual microVMs (i.e. build with `--features krunvm`), you need libkrun and libkrunfw on the system. The release artefacts we publish to end users bundle these dylibs inside the binary's rpath — bottle production lives in the separate [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) repo — but developer builds rely on the system package manager:
-
-**macOS Apple Silicon**
+Nothing has to be installed. Build with the real backend:
 
 ```bash
-brew tap slp/krun
-brew install slp/krun/libkrun slp/krun/libkrunfw
-cargo build --features krunvm
+cargo build --features ward-core/krunvm,ward-daemon/krunvm
 ```
 
-**Linux (Debian/Ubuntu)**
+The `ward-bundle` crate downloads the pinned libkrun release (checked against `vendor/libkrun-checksums.txt`), cross-compiles the in-guest agent for Linux, and embeds both. You need `rustup` and network access once. Set `WARD_LIBKRUN_TARBALL=/path/to/tarball` to build offline. On macOS, sign `wardd` and `ward-mcp` after each build (see "macOS codesign" below).
+
+The real-VM end-to-end tests need KVM on Linux or Hypervisor.framework on macOS:
 
 ```bash
-# Add the libkrun apt repo per upstream instructions:
-# https://github.com/containers/libkrun#installing
-sudo apt-get install -y libkrun-dev libkrunfw-dev
-cargo build --features krunvm
+cargo build -p ward-daemon -p ward-cli --features ward-daemon/krunvm
+WARD_E2E_VM=1 cargo test -p ward-daemon --features krunvm --test e2e_vm
 ```
 
-Why this isn't bundled at `cargo build` time: the "users install nothing but ward" promise is satisfied by *end-user release artefacts* (`.pkg`, `.deb`, install.sh) that bundle the dylibs, not by per-build downloads. Bottles are produced by [`igorjs/libkrun-builds`](https://github.com/igorjs/libkrun-builds) and consumed by `release.yml` in this repo. FFI declarations live in `ward-core/src/backend/krun_ffi.rs` (hand-maintained, no `krun-sys` crate, no bindgen, no libclang build-dep).
+FFI declarations live in `ward-core/src/backend/krun_ffi.rs` (hand-maintained, loaded with `dlopen`, no `krun-sys` crate and no bindgen).
 
 ### Bumping libkrun
 
@@ -122,7 +118,7 @@ scripts/diff-libkrun.sh 1.19.0 | grep -E '^\+(int32_t|uint32_t|void) krun_'
 
 ```bash
 cargo build                          # stub path, must still compile
-cargo check --features krunvm        # FFI path, requires libkrun installed
+cargo check --features ward-core/krunvm   # real backend, downloads libkrun once
 cargo test --workspace
 ```
 
@@ -203,12 +199,12 @@ git push origin v0.2.0
 
 For every target in `{aarch64-apple-darwin, x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu}`:
 
-- `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`, `bin/ward-mcp`, `LICENSE`, `README.md`, plus `lib/libkrun.<ext>` and `lib/libkrunfw.<ext>` if the build is configured to bundle them (see below).
+- `ward-<version>-<target>.tar.gz` — contains `bin/ward`, `bin/wardd`, `bin/ward-mcp`, `LICENSE`, `README.md`, and `THIRD-PARTY-NOTICES.md`. libkrun, libkrunfw and the guest agent are embedded in the binaries.
 - `ward-<version>-<target>.tar.gz.sha256` — checksum for `install.sh` verification.
 
 ### macOS codesign
 
-The `aarch64-apple-darwin` build path ad-hoc signs `wardd` and `ward-mcp` with `entitlements.plist` (at workspace root) before staging. The entitlement is `com.apple.security.hypervisor` — required by libkrun's Hypervisor framework calls. Without it, `krun_start_enter` returns `HV_ERROR_BAD_ARGUMENT` on Apple Silicon.
+The `aarch64-apple-darwin` build path ad-hoc signs `wardd` and `ward-mcp` with `entitlements.plist` (at workspace root) before staging. Two entitlements are needed. `com.apple.security.hypervisor` is required by the Hypervisor framework calls: without it, `krun_start_enter` returns `HV_ERROR_BAD_ARGUMENT` on Apple Silicon. `com.apple.security.cs.disable-library-validation` lets the hardened runtime load the libkrun that ward unpacks at first run.
 
 `ward` (the CLI) is not signed because it never touches libkrun directly — it's a thin gRPC client.
 
@@ -224,12 +220,9 @@ codesign --sign - \
   target/release/wardd target/release/ward-mcp
 ```
 
-### Bundling libkrun in the release
+### What the release embeds
 
-The release workflow has two modes:
-
-- **Stub mode** (default for tag pushes): builds without the `krunvm` feature. Binaries ship without microVM support — useful for the very first release and for demoing the CLI surface without provisioning hypervisor entitlements.
-- **Bundled mode** (`workflow_dispatch` with `include_libkrun=true`): builds with `--features ward-core/krunvm` and copies the matching `libkrun.dylib`/`libkrunfw.dylib` from the `igorjs/libkrun-builds` GitHub Release into the archive next to the binaries. Requires the `build` workflow at `libkrun-builds` to have run for the pinned version AND the resulting SHA-256s to be committed here in `vendor/libkrun-checksums.txt`.
+Every tagged release is built with the real microVM backend. `ward-bundle` downloads the pinned libkrun release, verifies it against `vendor/libkrun-checksums.txt` and embeds it with the guest agent. The matching SHA-256s must be committed in that file before a release can build.
 
 ### One-line install for users
 

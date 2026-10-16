@@ -1,6 +1,6 @@
 # ADR-003: Isolation Backend
 
-**Status:** Accepted (amended 2026-05-18, see Update section below)
+**Status:** Accepted (amended 2026-05-18; linking and process model superseded by ADR-021)
 **Date:** 2026-05-12
 **Authors:** Igor
 
@@ -115,6 +115,10 @@ The original decision (use libkrun, gated behind `--features krunvm`) is unchang
 
 **Linking:** the symbols still resolve through the system's libkrun + libkrunfw shared libraries. `ward-core/build.rs` emits `cargo:rustc-link-lib=krun` + `cargo:rustc-link-lib=krunfw` when the `krunvm` feature is on (work previously done by `krun-sys`'s own build.rs).
 
+**Note (ADR-021):** the sections below that say libkrun links into `wardd`, or that `ward-core/build.rs` emits `cargo:rustc-link-lib=krun`, describe the earlier design. libkrun is now embedded and loaded at runtime, and each microVM runs in its own host process.
+
 **Maintenance:** on each libkrun bump, diff `containers/libkrun/include/libkrun.h` against `krun_ffi.rs` and translate any new signatures. Procedure tracked in `CONTRIBUTING.md` and issue #32.
 
 Implementation: issue #31.
+
+**Amendment (ADR-021):** libkrun is no longer linked from the host. It is embedded in the ward binaries and loaded at runtime, and each microVM runs in its own host process.
