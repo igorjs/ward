@@ -3561,8 +3561,10 @@ dependencies = [
 name = "ward-agent"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "prost",
  "prost-build",
+ "rustix",
  "tokio",
  "tokio-vsock",
  "tracing",
