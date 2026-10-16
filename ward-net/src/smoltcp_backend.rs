@@ -383,6 +383,11 @@ const MAX_PENDING_DNS_QUERIES: usize = 4096;
 /// unrelated new one would surprise whichever guest process owns it.
 const MAX_FLOW_ENTRIES: usize = 1024;
 
+/// How long a flow may stay half-closed after ward sent its FIN. A guest that
+/// never closes its own side (an idle keep-alive pool) would otherwise hold a
+/// flow slot and two socket buffers forever.
+const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Hand-encodes a DNS response: header, the query's own echoed question,
 /// then one `A` record per IPv4 address in `answers` (IPv6 addresses are
 /// dropped; there is no relay-side AAAA support yet). smoltcp's wire types
@@ -536,6 +541,13 @@ enum FlowState {
         to_host_tx: mpsc::Sender<Vec<u8>>,
         from_host_rx: mpsc::Receiver<Vec<u8>>,
         pending_from_host: Option<Vec<u8>>,
+        /// The host side ended. Once `pending_from_host` is delivered the
+        /// socket is closed gracefully (FIN) instead of aborted (RST), so the
+        /// guest still reads everything the server sent.
+        host_closed: bool,
+        /// When ward sent its FIN. The flow is aborted if the guest has not
+        /// finished closing by `Stack::half_close_timeout` after this.
+        fin_sent_at: Option<std::time::Instant>,
     },
 }
 
@@ -570,6 +582,7 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
     tokio::task::spawn(async move {
         let write_loop = async {
             while let Some(chunk) = to_host_rx.recv().await {
+                tracing::debug!(bytes = chunk.len(), "write to host for a guest TCP flow");
                 match tokio::time::timeout(HOST_WRITE_TIMEOUT, write_half.write_all(&chunk)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
@@ -596,8 +609,12 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
             let mut buf = [0u8; TCP_SOCKET_BUFFER_BYTES];
             loop {
                 match read_half.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        tracing::debug!("host closed a guest-initiated TCP flow");
+                        break;
+                    }
                     Ok(n) => {
+                        tracing::debug!(bytes = n, "read from host for a guest TCP flow");
                         if from_host_tx.send(buf[..n].to_vec()).await.is_err() {
                             // pump_flows already tore this flow down.
                             break;
@@ -709,6 +726,8 @@ pub struct Stack {
     /// socket immediately after aborting it would discard the pending RST
     /// unsent.
     sockets_pending_removal: Vec<SocketHandle>,
+    /// See [`HALF_CLOSE_TIMEOUT`]. A field so tests can shorten it.
+    half_close_timeout: std::time::Duration,
     dns_socket_handle: SocketHandle,
     /// Queries relayed to the resolver, awaiting an answer. Capped at
     /// `MAX_PENDING_DNS_QUERIES` via `push_pending_dns_query`, oldest
@@ -793,6 +812,7 @@ impl Stack {
             egress_check: Arc::from(egress_check),
             flows: HashMap::new(),
             sockets_pending_removal: Vec::new(),
+            half_close_timeout: HALF_CLOSE_TIMEOUT,
             dns_socket_handle,
             pending_dns_queries: VecDeque::new(),
             dhcp_socket_handle,
@@ -862,6 +882,17 @@ impl Stack {
             )),
             answer: answer_rx,
         });
+    }
+
+    /// Shortens the half-close deadline so a test need not wait a minute.
+    pub fn set_half_close_timeout_for_test(&mut self, timeout: std::time::Duration) {
+        self.half_close_timeout = timeout;
+    }
+
+    /// Number of guest TCP flows currently tracked.
+    #[must_use]
+    pub fn flow_count_for_test(&self) -> usize {
+        self.flows.len()
     }
 
     /// Number of DNS queries currently awaiting a resolver answer.
@@ -936,6 +967,7 @@ impl Stack {
             return;
         }
         let dst_ip = SocketAddr::from(dst).ip();
+        tracing::debug!(source = %src, destination = %dst, "new guest TCP flow");
         if !is_flow_destination_safe(dst_ip) {
             // Same rejection path as the capacity check above: no listening
             // socket is opened, so smoltcp finds no socket willing to accept
@@ -1017,6 +1049,14 @@ impl Stack {
                     ),
                 ))
             };
+            if let Err(err) = &result {
+                tracing::warn!(
+                    destination = %addr,
+                    domain = %domain,
+                    error = %err,
+                    "guest TCP flow failed to connect"
+                );
+            }
             // The receiver may already be gone if pump_flows gave up on
             // this flow (e.g. the guest reset it) before the connect
             // resolved; a dropped send is not this task's problem.
@@ -1051,6 +1091,8 @@ impl Stack {
                             to_host_tx,
                             from_host_rx,
                             pending_from_host: None,
+                            host_closed: false,
+                            fin_sent_at: None,
                         };
                     }
                     Ok(Err(err)) => {
@@ -1070,6 +1112,8 @@ impl Stack {
                     to_host_tx,
                     from_host_rx,
                     pending_from_host,
+                    host_closed,
+                    fin_sent_at,
                 } => {
                     match to_host_tx.try_reserve() {
                         Ok(permit) => {
@@ -1086,19 +1130,21 @@ impl Stack {
                         // dropping them, so the guest's TCP window naturally
                         // shrinks until the writer catches up.
                         Err(mpsc::error::TrySendError::Full(())) => {}
-                        Err(mpsc::error::TrySendError::Closed(())) => {
-                            to_remove.push((key, flow.handle));
-                        }
+                        // The host task ended, so nothing more can be written.
+                        // Responses it already read are still queued in
+                        // `from_host_rx`; the read side below decides when the
+                        // flow is finished.
+                        Err(mpsc::error::TrySendError::Closed(())) => {}
                     }
 
-                    if pending_from_host.is_none() {
+                    if pending_from_host.is_none() && !*host_closed {
                         match from_host_rx.try_recv() {
                             Ok(chunk) => *pending_from_host = Some(chunk),
                             Err(mpsc::error::TryRecvError::Empty) => {}
                             // The host-io task ended (error, timeout, or the
                             // stream closed): nothing more will ever arrive.
                             Err(mpsc::error::TryRecvError::Disconnected) => {
-                                to_remove.push((key, flow.handle));
+                                *host_closed = true;
                             }
                         }
                     }
@@ -1126,6 +1172,24 @@ impl Stack {
                                 }
                             }
                         }
+                    }
+                    if *host_closed && pending_from_host.is_none() {
+                        let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+                        if socket.is_open() {
+                            // FIN after the send buffer drains.
+                            socket.close();
+                            fin_sent_at.get_or_insert_with(std::time::Instant::now);
+                        }
+                        let timed_out = fin_sent_at
+                            .is_some_and(|sent| sent.elapsed() >= self.half_close_timeout);
+                        if !socket.is_active() || timed_out {
+                            to_remove.push((key, flow.handle));
+                        }
+                    }
+                    // The guest reset or closed its side. Nothing can be
+                    // delivered any more, even if a host chunk is still pending.
+                    if self.sockets.get::<tcp::Socket>(flow.handle).state() == tcp::State::Closed {
+                        to_remove.push((key, flow.handle));
                     }
                 }
             }
@@ -1231,13 +1295,18 @@ impl Stack {
         }
         let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).ok()?;
         let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
-        let tcp_repr = TcpRepr::parse(
+        let tcp_repr = match TcpRepr::parse(
             &tcp_packet,
             &IpAddress::Ipv4(ip_repr.src_addr),
             &IpAddress::Ipv4(ip_repr.dst_addr),
             &ChecksumCapabilities::default(),
-        )
-        .ok()?;
+        ) {
+            Ok(repr) => repr,
+            Err(err) => {
+                tracing::debug!(error = %err, "ignoring an unparsable guest TCP segment");
+                return None;
+            }
+        };
         if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
             return None;
         }
@@ -1454,6 +1523,18 @@ impl SmoltcpHandle {
 /// `select!` race is noticed.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+fn set_close_on_exec(fd: RawFd) -> Result<(), Error> {
+    // SAFETY: `fd` is an open descriptor owned by the caller.
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if ret == -1 {
+        return Err(Error::Process(format!(
+            "fcntl(F_SETFD, FD_CLOEXEC) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
 /// Allocates an `AF_UNIX SOCK_DGRAM` socketpair for `sandbox_id` and
 /// spawns a dedicated task that owns the host-side end exclusively via
 /// a `RawFdDevice`, polling it on a schedule and listening for commands.
@@ -1491,6 +1572,11 @@ pub async fn spawn_for_sandbox(
     // SAFETY: socketpair succeeded; sv[0] and sv[1] are valid open fds.
     let host_fd = unsafe { OwnedFd::from_raw_fd(sv[0]) };
     let guest_fd: RawFd = sv[1];
+    // Without close-on-exec, every VM host process started later would
+    // inherit the descriptors of every other sandbox. The one VM that needs
+    // its guest end clears the flag on that fd before it execs.
+    set_close_on_exec(sv[0])?;
+    set_close_on_exec(sv[1])?;
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
     let task = tokio::task::spawn(async move {
