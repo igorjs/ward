@@ -19,10 +19,9 @@
 //! # Materialization
 //!
 //! `prepare_sandbox_rootfs` copies the cached rootfs into the per-sandbox
-//! directory by hardlinking each file (zero-cost, same inode). On `EXDEV`
-//! (cross-device) or unsupported, it falls back to `std::fs::copy`. Either
-//! way the sandbox rootfs is independent: evicting the cache entry later does
-//! not remove the sandbox copy because the hardlink keeps the inode alive.
+//! directory file by file. Files are copied, not hardlinked: the guest writes
+//! to its rootfs in place, and a shared inode would let one sandbox change
+//! the image cache and every later sandbox built from it.
 
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
@@ -148,7 +147,10 @@ impl ImagePuller for OciPuller {
             )));
         }
 
-        let client = Client::default();
+        let client = Client::new(oci_client::client::ClientConfig {
+            platform_resolver: Some(Box::new(linux_host_arch_resolver)),
+            ..Default::default()
+        });
         let auth = RegistryAuth::Anonymous;
         let accepted = vec![
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
@@ -156,10 +158,7 @@ impl ImagePuller for OciPuller {
             manifest::IMAGE_LAYER_MEDIA_TYPE,
         ];
 
-        let image = client
-            .pull(&image_ref, &auth, accepted)
-            .await
-            .map_err(|e| BackendError::Image(format!("pull {reference} failed: {e}")))?;
+        let image = pull_with_retry(&client, &image_ref, &auth, accepted, reference).await?;
 
         let layer_count = image.layers.len();
 
@@ -180,6 +179,64 @@ impl ImagePuller for OciPuller {
         let _ = layer_count; // available for future meta.json enrichment
         Ok(image.digest.unwrap_or_else(|| "sha256:unknown".to_string()))
     }
+}
+
+/// Attempts for one registry pull. Registries drop or throttle anonymous
+/// requests, and the failure surfaces as an opaque decode error.
+const PULL_ATTEMPTS: u32 = 3;
+const PULL_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn pull_with_retry(
+    client: &oci_client::Client,
+    image_ref: &oci_client::Reference,
+    auth: &oci_client::secrets::RegistryAuth,
+    accepted: Vec<&str>,
+    reference: &str,
+) -> Result<oci_client::client::ImageData> {
+    let mut attempt = 1;
+    loop {
+        match client.pull(image_ref, auth, accepted.clone()).await {
+            Ok(image) => return Ok(image),
+            Err(e) if attempt < PULL_ATTEMPTS => {
+                let delay = PULL_RETRY_BASE_DELAY * attempt;
+                tracing::warn!(
+                    reference,
+                    attempt,
+                    "image pull failed, retrying in {delay:?}: {e}"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(e) => {
+                return Err(BackendError::Image(format!(
+                    "pull {reference} failed after {PULL_ATTEMPTS} attempts: {e}"
+                )));
+            }
+        }
+    }
+}
+
+/// OCI operating system name of every ward guest.
+const GUEST_OS: &str = "linux";
+
+/// Pick the Linux image variant that matches the host CPU architecture.
+///
+/// The guest is always Linux, even when the host is macOS, so the client's
+/// default resolver (host OS and arch) finds no match on a Mac.
+fn linux_host_arch_resolver(manifests: &[oci_client::manifest::ImageIndexEntry]) -> Option<String> {
+    let want_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    };
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().is_some_and(|p| {
+                p.os.to_string() == GUEST_OS && p.architecture.to_string() == want_arch
+            })
+        })
+        .map(|entry| entry.digest.clone())
 }
 
 /// SEC-019: check whether `registry` falls in the comma-separated
@@ -442,12 +499,11 @@ fn write_meta_json(path: &Path, meta: &CacheMeta) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Materialization (hardlink with copy fallback)
+// Materialization (independent copy)
 // ---------------------------------------------------------------------------
 
-/// Recursively materialize `src_dir` into `dst_dir` by hardlinking each
-/// regular file. On `EXDEV` (cross-device link) or `Unsupported`, falls back
-/// to `std::fs::copy` for that file. Symlinks are reproduced as symlinks.
+/// Recursively materialize `src_dir` into `dst_dir` by copying each regular
+/// file. Symlinks are reproduced as symlinks.
 /// Directory structure is replicated via `create_dir_all`.
 ///
 /// This is intentionally a sync fn because it is called from
@@ -475,28 +531,38 @@ pub(crate) fn materialize_dir(src_dir: &Path, dst_dir: &Path) -> std::io::Result
     Ok(())
 }
 
-/// Hardlink `src` to `dst`, falling back to copy on EXDEV or Unsupported.
+/// Copy `src` to `dst`. The guest writes to its rootfs in place, so sandboxes
+/// must not share inodes with each other or with the image cache.
+///
+/// A cached file with no read bit (mode 0000 is common for `/etc/shadow`)
+/// cannot be read by the unprivileged owner. The owner bit is added for the
+/// copy and the original mode is restored on both files.
 fn materialize_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    match std::fs::hard_link(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::CrossesDevices
-                || e.kind() == std::io::ErrorKind::Unsupported =>
-        {
-            std::fs::copy(src, dst)?;
-            Ok(())
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::copy(src, dst) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            let original = std::fs::metadata(src)?.permissions();
+            let readable = std::fs::Permissions::from_mode(original.mode() | OWNER_READ_BIT);
+            std::fs::set_permissions(src, readable)?;
+            let copied = std::fs::copy(src, dst);
+            std::fs::set_permissions(src, original.clone())?;
+            copied?;
+            std::fs::set_permissions(dst, original)
         }
-        Err(e) => Err(e),
+        other => other.map(|_| ()),
     }
 }
+
+/// Owner read permission bit.
+const OWNER_READ_BIT: u32 = 0o400;
 
 // ---------------------------------------------------------------------------
 // ImageStore
 // ---------------------------------------------------------------------------
 
 /// Manages the disk-persistent OCI image cache: pull, unpack, and serve
-/// rootfs paths. Per-sandbox rootfs copies are materialised via hardlink
-/// (or copy fallback) from the shared cache entry.
+/// rootfs paths. Per-sandbox rootfs copies are materialised by copying from the
+/// shared cache entry.
 #[derive(Debug)]
 pub struct ImageStore {
     cache_dir: PathBuf,
@@ -587,11 +653,8 @@ impl ImageStore {
     /// Materialize the image rootfs for `reference` into `dest` (the
     /// per-sandbox rootfs directory). On cache miss the image is pulled first.
     ///
-    /// Files are hardlinked from the cache entry when possible (same
-    /// filesystem, Linux/macOS). On `EXDEV` or unsupported, each file is
-    /// copied instead. Either way the sandbox copy is independent: evicting
-    /// the cache entry does not affect the sandbox because the inode survives
-    /// as long as any hardlink exists.
+    /// Each file is copied from the cache entry, so the sandbox copy is
+    /// independent: neither guest writes nor cache eviction affect the other.
     ///
     /// This is the entry point called by the krunvm backend.
     pub async fn prepare_sandbox_rootfs(&self, reference: &str, dest: &Path) -> Result<()> {
@@ -617,8 +680,7 @@ impl ImageStore {
     }
 
     /// Remove an image from the cache, deleting its directory. Per-sandbox
-    /// rootfs copies that were hardlinked from this entry are unaffected (the
-    /// inode survives until all hardlinks are gone).
+    /// rootfs copies made from this entry are unaffected.
     pub async fn remove(&self, reference: &str) -> Result<()> {
         let (entry_dir, _) = self
             .find_cache_entry_by_ref(reference)?
@@ -721,6 +783,47 @@ impl ImageStore {
 
 #[cfg(test)]
 mod tests {
+    fn index_entry(os: &str, arch: &str, digest: &str) -> oci_client::manifest::ImageIndexEntry {
+        serde_json::from_value(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": digest,
+            "size": 1,
+            "platform": { "os": os, "architecture": arch },
+        }))
+        .expect("index entry")
+    }
+
+    #[test]
+    fn given_mixed_platforms_when_resolving_then_linux_for_host_arch_is_chosen() {
+        let host_arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "amd64",
+            other => other,
+        };
+        let other_arch = if host_arch == "arm64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        let entries = vec![
+            index_entry("windows", host_arch, "sha256:windows"),
+            index_entry("linux", other_arch, "sha256:wrong-arch"),
+            index_entry("linux", host_arch, "sha256:right"),
+        ];
+
+        assert_eq!(
+            linux_host_arch_resolver(&entries).as_deref(),
+            Some("sha256:right")
+        );
+    }
+
+    #[test]
+    fn given_no_linux_variant_for_host_arch_when_resolving_then_none() {
+        let entries = vec![index_entry("windows", "amd64", "sha256:windows")];
+
+        assert_eq!(linux_host_arch_resolver(&entries), None);
+    }
+
     use super::*;
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -984,7 +1087,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_evicted_cache_entry_when_sandbox_rootfs_still_has_hardlinked_files() {
+    async fn given_evicted_cache_entry_when_sandbox_rootfs_still_has_its_files() {
         let tmp = TempDir::new().expect("tempdir");
         // max 1 so inserting a second image evicts the first.
         let store = ImageStore::with_puller(tmp.path().to_path_buf(), 1, Arc::new(FakePuller));
@@ -1011,7 +1114,7 @@ mod tests {
             "image-a should be evicted from cache"
         );
 
-        // Sandbox rootfs must still have its files (hardlinked inodes survive).
+        // Sandbox rootfs must still have its files (the files are copies).
         assert!(
             sandbox_rootfs.join("bin").exists(),
             "sandbox rootfs must survive cache eviction"
@@ -1317,7 +1420,31 @@ mod tests {
         assert!(!is_registry_allowed("localhost", "localhost:5000"));
     }
 
-    // ----- materialize_dir: hardlink + copy fallback ---------------------
+    // ----- materialize_dir: independent copies ---------------------
+
+    #[test]
+    fn given_unreadable_cached_file_when_materialize_dir_then_copy_keeps_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        const NO_ACCESS_MODE: u32 = 0o000;
+        let tmp = TempDir::new().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).expect("mkdir");
+        let secret = src.join("shadow");
+        std::fs::write(&secret, b"root:*").expect("write");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(NO_ACCESS_MODE))
+            .expect("chmod");
+
+        materialize_dir(&src, &dst).expect("materialize");
+
+        let mode_of = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode_of(&dst.join("shadow")), NO_ACCESS_MODE);
+        assert_eq!(mode_of(&secret), NO_ACCESS_MODE, "cache mode restored");
+        // Root ignores mode bits, so read back only after restoring access.
+        std::fs::set_permissions(dst.join("shadow"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod dst");
+        assert_eq!(std::fs::read(dst.join("shadow")).expect("read"), b"root:*");
+    }
 
     #[test]
     fn given_src_tree_when_materialize_dir_then_dst_mirrors_src() {
@@ -1337,8 +1464,7 @@ mod tests {
 
     #[test]
     fn given_materialized_file_when_src_modified_then_dst_unchanged_after_copy() {
-        // Verifies that hardlinked or copied files are independent from the
-        // source after materialization (sandbox isolation).
+        // Sandbox isolation: copies must not share an inode with the source.
         let tmp = TempDir::new().expect("tempdir");
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
@@ -1347,14 +1473,12 @@ mod tests {
         std::fs::write(src.join("file.txt"), b"original").expect("write");
         materialize_dir(&src, &dst).expect("materialize");
 
-        // Overwrite src - dst must be unaffected (copy case) or still hold
-        // "original" via its own inode reference (hardlink case).
+        // Overwrite src in place - dst must keep its own content.
         std::fs::write(src.join("file.txt"), b"mutated").expect("overwrite");
-        let dst_content = std::fs::read(dst.join("file.txt")).expect("read dst");
-        // With hardlinks both files share an inode, so writes to src via
-        // open+truncate+write affect dst too. What we verify here is that the
-        // dst file exists and is accessible (not that it's isolated from
-        // in-place edits, which is not a requirement when using hardlinks).
-        assert!(!dst_content.is_empty(), "dst file should be accessible");
+        assert_eq!(std::fs::read(dst.join("file.txt")).unwrap(), b"original");
+
+        // And the other way round: a guest edit must not reach the source.
+        std::fs::write(dst.join("file.txt"), b"guest edit").expect("guest edit");
+        assert_eq!(std::fs::read(src.join("file.txt")).unwrap(), b"mutated");
     }
 }
