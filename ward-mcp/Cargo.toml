@@ -15,6 +15,10 @@ description = "Model Context Protocol server for ward: exposes sandboxed-executi
 name = "ward-mcp"
 path = "src/main.rs"
 
+[features]
+# Real microVM backend (see ward-core). Needed by tests/e2e_vm.rs.
+krunvm = ["ward-runtime/krunvm"]
+
 [dependencies]
 ward-runtime = { path = "../ward-runtime" }
 ward-core = { path = "../ward-core" }
