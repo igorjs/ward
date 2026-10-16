@@ -313,15 +313,11 @@ jobs:
         run: cargo test -p ward-daemon --tests
 
   # ── libkrun feature build ────────────────────────────────────────────
-  # Compiles + lints the workspace with the real libkrun backend enabled
-  # on both supported host targets. Downloads the pinned libkrun bottle
-  # from igorjs/libkrun-builds (the same source release.yml uses) and verifies
-  # it against the SHA-256 sums in vendor/libkrun-checksums.txt. Does NOT
-  # boot a microVM: standard runners lack hypervisor access (no /dev/kvm
-  # on Linux runners, no nested HVF on macOS runners), so this tier proves
-  # FFI signatures, linking, and all non-boot logic compile on each target.
-  # Real boot tests are gated behind WARD_KVM_TESTS for a future self-hosted
-  # KVM runner (see ward-core/tests/krun_boot.rs).
+  # Compiles, lints and unit-tests the workspace with the real microVM
+  # backend on both supported host targets. ward-bundle downloads the pinned
+  # libkrun bottle itself and verifies it against
+  # vendor/libkrun-checksums.txt. macOS runners cannot boot a microVM (no
+  # nested HVF); the vm-e2e job below boots real VMs on Linux with KVM.
   krunvm-build:
     needs: [changes, clippy]
     if: needs.changes.outputs.rust == 'true'
@@ -331,11 +327,11 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            guest_target: x86_64-unknown-linux-musl
           - os: macos-15
             target: aarch64-apple-darwin
+            guest_target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -370,6 +366,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: ${{ matrix.guest_target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
@@ -377,45 +374,77 @@ jobs:
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - name: Fetch + verify libkrun bottle
-        shell: bash
-        run: |
-          set -euo pipefail
-          LIBKRUN_VERSION="$(tr -d '[:space:]' < vendor/libkrun-version.txt)"
-          TARBALL="libkrun-${LIBKRUN_VERSION}-${{ matrix.target }}.tar.gz"
-          mkdir -p libkrun-vendor
-          gh release download "libkrun-v${LIBKRUN_VERSION}" \
-            --repo igorjs/libkrun-builds \
-            --pattern "$TARBALL" \
-            --dir libkrun-vendor
-          EXPECTED="$(grep -E "^[a-f0-9]+  ${TARBALL}\$" vendor/libkrun-checksums.txt | awk '{print $1}')"
-          if [[ -z "$EXPECTED" ]]; then
-            echo "::error::no checksum entry for ${TARBALL} in vendor/libkrun-checksums.txt"
-            exit 1
-          fi
-          # macOS runners may not ship coreutils' sha256sum; fall back to shasum.
-          if command -v sha256sum >/dev/null 2>&1; then
-            ACTUAL="$(sha256sum "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
-          else
-            ACTUAL="$(shasum -a 256 "libkrun-vendor/${TARBALL}" | awk '{print $1}')"
-          fi
-          if [[ "$EXPECTED" != "$ACTUAL" ]]; then
-            echo "::error::SHA-256 mismatch for ${TARBALL}: expected ${EXPECTED}, got ${ACTUAL}"
-            exit 1
-          fi
-          mkdir -p libkrun-vendor/extracted
-          tar -xzf "libkrun-vendor/${TARBALL}" -C libkrun-vendor/extracted
-          PREFIX="$(pwd)/libkrun-vendor/extracted"
-          echo "LIBKRUN_PREFIX=${PREFIX}" >> "$GITHUB_ENV"
-          if [[ "${RUNNER_OS}" == "macOS" ]]; then
-            echo "DYLD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
-          else
-            echo "LD_LIBRARY_PATH=${PREFIX}/lib" >> "$GITHUB_ENV"
-          fi
       - name: Build (--features krunvm)
         run: cargo build --workspace --features ward-core/krunvm
       - name: Clippy (--features krunvm)
         run: cargo clippy --all-targets --features ward-core/krunvm -- -D warnings
+      - name: Unit tests (--features krunvm)
+        run: cargo test -p ward-core --lib --features krunvm
+      - name: Bundle tests with the libraries embedded
+        run: cargo test -p ward-bundle --features embed
+
+  # ── Real microVM end-to-end ──────────────────────────────────────────
+  # Boots real Linux guests through the shipped code path: wardd, the
+  # embedded libkrun, a pulled OCI image and the ward CLI. Needs KVM, which
+  # GitHub's Linux x64 runners expose as /dev/kvm once the udev rule below
+  # makes it world-accessible.
+  vm-e2e:
+    needs: [changes, clippy]
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+            static.rust-lang.org:443
+            static.crates.io:443
+            index.crates.io:443
+            crates.io:443
+            archive.ubuntu.com:80
+            security.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
+            ppa.launchpadcontent.net:443
+            azure.archive.ubuntu.com:80
+            packages.microsoft.com:443
+            formulae.brew.sh:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install protoc
+        run: sudo apt-get install -y protobuf-compiler
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Build
+        run: cargo build -p ward-daemon -p ward-cli --features ward-daemon/krunvm
+      - name: Real-VM end-to-end tests
+        env:
+          WARD_E2E_VM: "1"
+          # GHCR is already on the egress allowlist. Docker Hub serves layers
+          # from rotating CDN hosts that cannot be pinned.
+          WARD_E2E_IMAGE: ghcr.io/linuxcontainers/alpine:3.20
+        run: cargo test -p ward-daemon --features krunvm --test e2e_vm -- --test-threads=2
+      - name: Real-VM MCP end-to-end test
+        env:
+          WARD_E2E_VM: "1"
+          WARD_E2E_IMAGE: ghcr.io/linuxcontainers/alpine:3.20
+        run: cargo test -p ward-mcp --features krunvm --test e2e_vm
 
   # ── MSRV (minimum supported Rust version) ───────────────────────────
   # Reads rust-version from Cargo.toml; no extra tooling needed.
