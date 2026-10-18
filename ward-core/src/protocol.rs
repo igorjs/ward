@@ -8,7 +8,7 @@ use std::time::SystemTime;
 // ---------------------------------------------------------------------------
 
 /// Options for creating a new sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CreateOpts {
     pub image: String,
     pub mounts: Vec<Mount>,
@@ -24,7 +24,7 @@ pub struct CreateOpts {
 }
 
 /// User-facing identity and main-process settings kept on the sandbox record.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SandboxSpec {
     pub name: String,
     /// Main process argv. Empty means the sandbox has no main process.
@@ -34,7 +34,7 @@ pub struct SandboxSpec {
 }
 
 /// A filesystem bind-mount passed into a sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Mount {
     pub source: String,
     pub target: String,
@@ -46,14 +46,14 @@ pub struct Mount {
 // ---------------------------------------------------------------------------
 
 /// Network egress control policy.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EgressPolicy {
     pub mode: EgressMode,
     /// Domain allowlist when mode is `Allowlist`.
     pub domains: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EgressMode {
     /// Block all outbound traffic (default-safe).
     #[default]
@@ -69,7 +69,7 @@ pub enum EgressMode {
 // ---------------------------------------------------------------------------
 
 /// Policy declaring how a sandbox may use the daemon's pub/sub bus.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct CommunicationPolicy {
     pub mode: CommunicationMode,
     /// Required when `mode` is `Group`. Two sandboxes with identical group
@@ -77,7 +77,7 @@ pub struct CommunicationPolicy {
     pub group: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CommunicationMode {
     /// No publish or subscribe permitted (default-safe).
     #[default]
@@ -90,7 +90,7 @@ pub enum CommunicationMode {
 // Resource limits
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ResourceLimits {
     pub cpus: u32,
     pub memory_mb: u32,
@@ -117,7 +117,8 @@ pub struct SandboxInfo {
     pub exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SandboxStatus {
     Creating,
     Running,

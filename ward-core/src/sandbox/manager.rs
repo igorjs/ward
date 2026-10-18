@@ -17,6 +17,7 @@ use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, ResourceLimits,
     StreamEvent, StreamEventKind,
 };
+use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -54,9 +55,10 @@ struct SandboxEntry {
     /// waiting on the cap can proceed. Never read directly; the field
     /// exists for its `Drop` side effect.
     _creation_permit: tokio::sync::OwnedSemaphorePermit,
-    /// The capability token minted for this sandbox at creation. Compared
-    /// by `authorize()`; never returned by `get()`/`list()`.
-    token: String,
+    /// The persisted record, including the hash of the capability token
+    /// minted at creation. `authorize()` compares against that hash; the
+    /// token itself is never kept.
+    meta: SandboxMeta,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +121,8 @@ pub struct SandboxManager {
     /// is bounded by sandbox lifetime and cleaned up when the sandbox
     /// is removed.
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    /// On-disk sandbox records. `None` keeps everything in memory.
+    store: Option<MetaStore>,
 }
 
 impl SandboxManager {
@@ -138,7 +142,133 @@ impl SandboxManager {
             allow_host_mounts,
             network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
+            store: None,
         }
+    }
+
+    /// Persist sandbox records under `data_dir` and reload them with
+    /// [`restore`](Self::restore).
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.store = Some(MetaStore::new(&data_dir));
+        self
+    }
+
+    /// Reload sandboxes persisted by an earlier daemon run. Running ones
+    /// come back stopped, since no VM outlives the daemon.
+    pub async fn restore(&self) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let metas = match tokio::task::spawn_blocking(move || store.load_all()).await {
+            Ok(metas) => metas,
+            Err(e) => {
+                tracing::warn!(error = %e, "sandbox reload task failed");
+                return;
+            }
+        };
+        for meta in metas {
+            self.adopt_persisted(meta).await;
+        }
+    }
+
+    /// Record a state change and write it to disk.
+    pub async fn record_state(
+        &self,
+        id: &str,
+        status: crate::protocol::SandboxStatus,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        // The write lock is held across the save so a concurrent removal
+        // cannot delete the dir and then see this write recreate it.
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        entry.meta.status = status;
+        entry.meta.exit_code = exit_code;
+        self.persist(entry.meta.clone()).await
+    }
+
+    async fn persist(&self, meta: SandboxMeta) -> Result<()> {
+        let Some(store) = self.store.clone() else {
+            return Ok(());
+        };
+        let id = meta.id.clone();
+        tokio::task::spawn_blocking(move || store.save(&meta))
+            .await
+            .map_err(|e| ApiError::Internal(format!("persist task for sandbox {id}: {e}")))?
+            .map_err(|e| ApiError::Internal(format!("cannot persist sandbox {id}: {e}")))
+    }
+
+    /// Bring one reloaded record back into the manager, or delete it if
+    /// its wall-time limit has already passed.
+    async fn adopt_persisted(&self, meta: SandboxMeta) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let id = meta.id.clone();
+        let created_at = meta.created_at;
+        let timeout_seconds = meta.options.resources.timeout_seconds;
+        let limit = std::time::Duration::from_secs(timeout_seconds);
+        let now = std::time::SystemTime::now();
+        let expires_at = (timeout_seconds > 0).then(|| created_at + limit);
+        let remaining = expires_at.map(|at| at.duration_since(now).ok());
+        if remaining == Some(None) {
+            tracing::info!(sandbox_id = %id, "removing reloaded sandbox past its timeout");
+            let doomed = id.clone();
+            match tokio::task::spawn_blocking(move || store.delete(&doomed)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(sandbox_id = %id, error = %e, "cannot remove expired sandbox");
+                }
+                Err(e) => {
+                    tracing::warn!(sandbox_id = %id, error = %e, "expired sandbox removal task failed");
+                }
+            }
+            return;
+        }
+        let remaining = remaining.flatten();
+
+        let Ok(permit) = Arc::clone(&self.create_semaphore).try_acquire_owned() else {
+            tracing::warn!(sandbox_id = %id, "skipping reloaded sandbox: sandbox limit reached");
+            return;
+        };
+        let info = crate::protocol::SandboxInfo {
+            id: id.clone(),
+            status: meta.status.clone(),
+            image: meta.options.image.clone(),
+            created_at,
+            ip_address: None,
+            resources: meta.options.resources.clone(),
+            expires_at,
+            token: String::new(),
+            spec: meta.options.spec.clone(),
+            exit_code: meta.exit_code,
+        };
+        if let Err(e) = self
+            .backend
+            .adopt_sandbox(info, meta.options.env.clone(), store.rootfs_path(&id))
+            .await
+        {
+            tracing::warn!(sandbox_id = %id, error = %e, "skipping reloaded sandbox: backend refused it");
+            return;
+        }
+
+        let timeout_handle = remaining.map(|left| self.spawn_timeout(&id, left));
+        let comms = meta.options.comms.clone();
+        let egress = EgressProxy::new(id.clone(), meta.options.egress.clone());
+        self.entries.write().await.insert(
+            id.clone(),
+            SandboxEntry {
+                egress,
+                timeout_handle,
+                _creation_permit: permit,
+                meta,
+            },
+        );
+        self.broker.register_sandbox(id.clone(), comms).await;
+        metrics::gauge!("wardd_sandbox_active").increment(1.0);
+        tracing::info!(sandbox_id = %id, "reloaded sandbox from disk");
     }
 
     /// Borrow the shared broker. Useful for the gRPC layer which needs
@@ -287,50 +417,36 @@ impl SandboxManager {
             .await
             .map_err(backend_err)?;
 
-        let egress = EgressProxy::new(id.clone(), egress_policy);
-
-        // Register a timeout watcher if requested. The watcher routes the
-        // cleanup through `cleanup_sandbox_inner` (with from_timeout=true)
-        // so the bookkeeping side effects, entry removal, process record
-        // purge, broker deregistration, and the active-gauge decrement,
-        // match the user-initiated remove path exactly. Without this the
-        // gauge would never drop on timeout-driven shutdowns, gradually
-        // overstating "active sandboxes" forever after the first timer
-        // fires.
-        let timeout_handle = if info.resources.timeout_seconds > 0 {
-            let entries = Arc::clone(&self.entries);
-            let broker = Arc::clone(&self.broker);
-            let backend = Arc::clone(&self.backend);
-            let processes = Arc::clone(&self.processes);
-            let sandbox_id = id.clone();
-            let secs = info.resources.timeout_seconds;
-            Some(tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-                tracing::info!(sandbox_id = %sandbox_id, "sandbox timeout reached, removing");
-                if let Err(e) = Self::cleanup_sandbox_inner(
-                    &entries,
-                    &broker,
-                    &backend,
-                    &processes,
-                    &sandbox_id,
-                    /* from_timeout = */ true,
-                )
-                .await
-                {
-                    tracing::warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "backend remove failed during timeout cleanup; local state still purged"
-                    );
-                }
-            }))
-        } else {
-            None
-        };
-
         // Capability token for this sandbox: a fresh random UUID, checked
-        // by authorize() and never echoed back by get()/list().
+        // by authorize() and never echoed back by get()/list(). Only its
+        // hash is kept.
         let token = uuid::Uuid::new_v4().to_string();
+        let meta = SandboxMeta {
+            id: id.clone(),
+            options: opts.clone(),
+            created_at: info.created_at,
+            status: info.status.clone(),
+            exit_code: None,
+            token_hash: hash_token(&token),
+        };
+        if let Err(e) = self.persist(meta.clone()).await {
+            if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %remove_err,
+                    "backend remove failed after a persist failure"
+                );
+            }
+            return Err(e);
+        }
+
+        let egress = EgressProxy::new(id.clone(), egress_policy);
+        let timeout_handle = (info.resources.timeout_seconds > 0).then(|| {
+            self.spawn_timeout(
+                &id,
+                std::time::Duration::from_secs(info.resources.timeout_seconds),
+            )
+        });
 
         self.entries.write().await.insert(
             id.clone(),
@@ -338,7 +454,7 @@ impl SandboxManager {
                 egress,
                 timeout_handle,
                 _creation_permit: permit,
-                token: token.clone(),
+                meta,
             },
         );
 
@@ -365,6 +481,39 @@ impl SandboxManager {
 
         // The creator supplied the arguments, so echoing them back is safe.
         Ok(protocol_info_to_pb(info, CommandView::Full))
+    }
+
+    /// Remove sandbox `id` after `after` of wall time. The watcher routes
+    /// the cleanup through `cleanup_sandbox_inner` (with from_timeout=true)
+    /// so the bookkeeping side effects, entry removal, process record
+    /// purge, broker deregistration, and the active-gauge decrement,
+    /// match the user-initiated remove path exactly.
+    fn spawn_timeout(&self, id: &str, after: std::time::Duration) -> tokio::task::JoinHandle<()> {
+        let entries = Arc::clone(&self.entries);
+        let broker = Arc::clone(&self.broker);
+        let backend = Arc::clone(&self.backend);
+        let processes = Arc::clone(&self.processes);
+        let sandbox_id = id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            tracing::info!(sandbox_id = %sandbox_id, "sandbox timeout reached, removing");
+            if let Err(e) = Self::cleanup_sandbox_inner(
+                &entries,
+                &broker,
+                &backend,
+                &processes,
+                &sandbox_id,
+                /* from_timeout = */ true,
+            )
+            .await
+            {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %e,
+                    "backend remove failed during timeout cleanup; local state still purged"
+                );
+            }
+        })
     }
 
     /// Retrieve info for an existing sandbox. The command carries argv[0]
@@ -406,7 +555,7 @@ impl SandboxManager {
         let entry = entries
             .get(sandbox_id)
             .ok_or_else(|| ApiError::SandboxNotFound(sandbox_id.to_string()))?;
-        if entry.token == token {
+        if token_hash_eq(&entry.meta.token_hash, &hash_token(token)) {
             Ok(())
         } else {
             Err(ApiError::PermissionDenied(format!(
@@ -1236,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn given_get_when_returned_info_then_token_redacted() {
         // Arrange: read the manager's own entry map, not create()'s
-        // response, to confirm the sandbox holds a real, non-empty token
+        // response, to confirm the sandbox holds a non-empty token hash
         // internally.
         let mgr = build_manager(4);
         let info = mgr
@@ -1249,7 +1398,8 @@ mod tests {
             .await
             .get(&info.id)
             .expect("entry should exist")
-            .token
+            .meta
+            .token_hash
             .clone();
         assert!(!stored_token.is_empty());
 
@@ -1263,8 +1413,8 @@ mod tests {
     #[tokio::test]
     async fn given_list_when_returned_info_then_token_redacted() {
         // Arrange: create multiple sandboxes and confirm, via the
-        // manager's own entry map, that each holds a real, non-empty
-        // token internally.
+        // manager's own entry map, that each holds a non-empty
+        // token hash internally.
         let mgr = build_manager(4);
         let a = mgr
             .create(create_req("alpine:latest"), "")
@@ -1276,8 +1426,22 @@ mod tests {
             .expect("create b should succeed");
         {
             let entries = mgr.entries.read().await;
-            assert!(!entries.get(&a.id).expect("entry a").token.is_empty());
-            assert!(!entries.get(&b.id).expect("entry b").token.is_empty());
+            assert!(
+                !entries
+                    .get(&a.id)
+                    .expect("entry a")
+                    .meta
+                    .token_hash
+                    .is_empty()
+            );
+            assert!(
+                !entries
+                    .get(&b.id)
+                    .expect("entry b")
+                    .meta
+                    .token_hash
+                    .is_empty()
+            );
         }
 
         // Act
@@ -2351,5 +2515,305 @@ mod tests {
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    // ----- persistence ---------------------------------------------------
+
+    use crate::protocol::SandboxStatus as ProtoStatus;
+    use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token};
+
+    /// A manager that persists under `path`. Calling it twice on one path
+    /// models a daemon restart.
+    fn manager_on(path: &std::path::Path, max_sandboxes: usize) -> Arc<SandboxManager> {
+        manager_with_backend(path, max_sandboxes).0
+    }
+
+    fn manager_with_backend(
+        path: &std::path::Path,
+        max_sandboxes: usize,
+    ) -> (
+        Arc<SandboxManager>,
+        Arc<crate::backend::krunvm::KrunvmBackend>,
+    ) {
+        use crate::backend::image::ImageStore;
+        use crate::backend::krunvm::KrunvmBackend;
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+        let krunvm = Arc::new(KrunvmBackend::with_image_store_for_test(
+            path.to_path_buf(),
+            store,
+        ));
+        let backend: Arc<dyn Backend> = krunvm.clone();
+        let manager = Arc::new(
+            SandboxManager::new(
+                backend,
+                Arc::new(Broker::new()),
+                max_sandboxes,
+                /* allow_host_mounts = */ false,
+                crate::config::NetworkBackendChoice::Smoltcp,
+            )
+            .with_data_dir(path.to_path_buf()),
+        );
+        (manager, krunvm)
+    }
+
+    fn named_req() -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            image: "alpine".into(),
+            name: "web1".into(),
+            command: vec!["sh".into(), "-c".into(), "echo hi".into()],
+            workdir: "/srv".into(),
+            tty: true,
+            ..Default::default()
+        }
+    }
+
+    async fn restart(path: &std::path::Path) -> Arc<SandboxManager> {
+        let mgr = manager_on(path, 4);
+        mgr.restore().await;
+        mgr
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_when_daemon_restarts_then_listed_stopped_with_same_identity() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first.create(named_req(), "").await.unwrap();
+        first
+            .record_state(&created.id, ProtoStatus::Running, None)
+            .await
+            .unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+
+        // Assert
+        let listed = second.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+        assert_eq!(listed[0].name, "web1");
+        assert_eq!(listed[0].image, "alpine");
+        assert_eq!(listed[0].status, crate::pb::SandboxStatus::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn given_command_tty_workdir_when_daemon_restarts_then_record_holds_them() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first.create(named_req(), "").await.unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+
+        // Assert
+        let on_disk = MetaStore::new(tmp.path()).load_all();
+        let spec = &on_disk[0].options.spec;
+        assert_eq!(spec.command, vec!["sh", "-c", "echo hi"]);
+        assert!(spec.tty);
+        assert_eq!(spec.workdir, "/srv");
+        let token_view = second
+            .get_authorized(&created.id, &created.token)
+            .await
+            .unwrap();
+        assert_eq!(token_view.command, vec!["sh", "-c", "echo hi"]);
+        assert_eq!(token_view.workdir, "/srv");
+    }
+
+    #[tokio::test]
+    async fn given_exited_sandbox_with_code_7_when_daemon_restarts_then_still_exited_with_7() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first.create(named_req(), "").await.unwrap();
+        first
+            .record_state(&created.id, ProtoStatus::Exited, Some(7))
+            .await
+            .unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+
+        // Assert
+        let info = second.get(&created.id).await.unwrap();
+        assert_eq!(info.status, crate::pb::SandboxStatus::Exited as i32);
+        assert_eq!(info.exit_code, Some(7));
+    }
+
+    #[tokio::test]
+    async fn given_right_token_when_authorize_after_restart_then_ok() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let created = manager_on(tmp.path(), 4)
+            .create(named_req(), "")
+            .await
+            .unwrap();
+        let second = restart(tmp.path()).await;
+
+        // Act
+        let result = second.authorize(&created.id, &created.token).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_wrong_token_when_authorize_after_restart_then_permission_denied() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let created = manager_on(tmp.path(), 4)
+            .create(named_req(), "")
+            .await
+            .unwrap();
+        let second = restart(tmp.path()).await;
+
+        // Act
+        let result = second.authorize(&created.id, "not-the-token").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::PermissionDenied(_))));
+    }
+
+    #[tokio::test]
+    async fn given_created_sandbox_when_meta_read_then_token_is_not_stored() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let created = manager_on(tmp.path(), 4)
+            .create(named_req(), "")
+            .await
+            .unwrap();
+
+        // Act
+        let path = tmp
+            .path()
+            .join("sandboxes")
+            .join(&created.id)
+            .join("meta.json");
+        let text = std::fs::read_to_string(path).unwrap();
+
+        // Assert
+        assert!(!text.contains(&created.token));
+        assert!(text.contains(&hash_token(&created.token)));
+    }
+
+    #[rstest::rstest]
+    #[case::stopped(ProtoStatus::Stopped)]
+    #[case::exited(ProtoStatus::Exited)]
+    #[tokio::test]
+    async fn given_reloaded_sandbox_past_timeout_when_daemon_starts_then_removed(
+        #[case] status: ProtoStatus,
+    ) {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first
+            .create(
+                CreateSandboxRequest {
+                    resources: Some(PbResourceLimits {
+                        timeout_seconds: 60,
+                        ..Default::default()
+                    }),
+                    ..named_req()
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        let store = MetaStore::new(tmp.path());
+        let mut meta: SandboxMeta = store.load_all().remove(0);
+        meta.status = status;
+        meta.created_at = std::time::SystemTime::now() - std::time::Duration::from_secs(61);
+        store.save(&meta).unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+
+        // Assert
+        assert!(second.list().await.unwrap().is_empty());
+        assert!(!tmp.path().join("sandboxes").join(&created.id).exists());
+    }
+
+    #[tokio::test]
+    async fn given_reloaded_failed_sandbox_past_timeout_when_daemon_starts_then_removed() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first
+            .create(
+                CreateSandboxRequest {
+                    resources: Some(PbResourceLimits {
+                        timeout_seconds: 60,
+                        ..Default::default()
+                    }),
+                    ..named_req()
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        let store = MetaStore::new(tmp.path());
+        let mut meta: SandboxMeta = store.load_all().remove(0);
+        meta.status = ProtoStatus::Failed;
+        meta.created_at = std::time::SystemTime::now() - std::time::Duration::from_secs(61);
+        store.save(&meta).unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+
+        // Assert
+        assert!(second.list().await.unwrap().is_empty());
+        assert!(!tmp.path().join("sandboxes").join(&created.id).exists());
+    }
+
+    #[tokio::test]
+    async fn given_stale_agent_socket_at_real_path_when_daemon_restarts_then_removed() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let (first, backend) = manager_with_backend(tmp.path(), 4);
+        let created = first.create(named_req(), "").await.unwrap();
+        let socket = backend.agent_socket_path_for_test(&created.id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"").unwrap();
+
+        // Act
+        let _second = restart(tmp.path()).await;
+
+        // Assert
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn given_reloaded_sandbox_when_adopted_then_backend_rootfs_is_the_store_path() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let created = manager_on(tmp.path(), 4)
+            .create(named_req(), "")
+            .await
+            .unwrap();
+        let (second, backend) = manager_with_backend(tmp.path(), 4);
+
+        // Act
+        second.restore().await;
+
+        // Assert
+        let expected = MetaStore::new(tmp.path()).rootfs_path(&created.id);
+        assert_eq!(backend.rootfs_for_test(&created.id).await, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn given_reloaded_sandboxes_when_cap_reached_then_create_fails() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 1);
+        first.create(named_req(), "").await.unwrap();
+        let second = manager_on(tmp.path(), 1);
+        second.restore().await;
+
+        // Act
+        let result = second.create(create_req("alpine"), "").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 }

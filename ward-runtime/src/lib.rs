@@ -88,10 +88,11 @@ impl Runtime {
             cfg.allow_host_mounts,
             cfg.network_backend,
             None,
-        ))
+        )
+        .await)
     }
 
-    fn wire(
+    async fn wire(
         data_dir: PathBuf,
         max_sandboxes: usize,
         max_volumes: usize,
@@ -112,13 +113,17 @@ impl Runtime {
             )),
         };
         let broker = Arc::new(Broker::new());
-        let sandbox_manager = Arc::new(SandboxManager::new(
-            Arc::clone(&backend),
-            Arc::clone(&broker),
-            max_sandboxes,
-            allow_host_mounts,
-            network_backend,
-        ));
+        let sandbox_manager = Arc::new(
+            SandboxManager::new(
+                Arc::clone(&backend),
+                Arc::clone(&broker),
+                max_sandboxes,
+                allow_host_mounts,
+                network_backend,
+            )
+            .with_data_dir(data_dir.clone()),
+        );
+        sandbox_manager.restore().await;
         let volume_manager = Arc::new(VolumeManager::new(data_dir, max_volumes));
         Self {
             backend,
@@ -266,7 +271,8 @@ impl RuntimeBuilder {
             self.allow_host_mounts,
             ward_core::config::NetworkBackendChoice::default(),
             self.image_store_override,
-        ))
+        )
+        .await)
     }
 }
 
