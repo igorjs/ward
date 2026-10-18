@@ -222,9 +222,23 @@ impl SandboxManager {
         let entry = entries
             .get_mut(id)
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        entry.meta.status = status;
-        entry.meta.exit_code = exit_code;
-        self.persist(entry.meta.clone()).await
+        self.commit(entry, status, exit_code).await
+    }
+
+    /// Write the new state to disk, then adopt it in memory, so a failed
+    /// write leaves the entry in its old state.
+    async fn commit(
+        &self,
+        entry: &mut SandboxEntry,
+        status: crate::protocol::SandboxStatus,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        let mut next = entry.meta.clone();
+        next.status = status;
+        next.exit_code = exit_code;
+        self.persist(next.clone()).await?;
+        entry.meta = next;
+        Ok(())
     }
 
     async fn persist(&self, meta: SandboxMeta) -> Result<()> {
@@ -285,7 +299,7 @@ impl SandboxManager {
         };
         if let Err(e) = self
             .backend
-            .adopt_sandbox(info, meta.options.env.clone(), store.rootfs_path(&id))
+            .adopt_sandbox(info, meta.options.clone(), store.rootfs_path(&id))
             .await
         {
             tracing::warn!(sandbox_id = %id, error = %e, "skipping reloaded sandbox: backend refused it");
@@ -293,7 +307,6 @@ impl SandboxManager {
         }
 
         let timeout_handle = remaining.map(|left| self.spawn_timeout(&id, left));
-        let comms = meta.options.comms.clone();
         let egress = EgressProxy::new(id.clone(), meta.options.egress.clone());
         self.entries.write().await.insert(
             id.clone(),
@@ -304,7 +317,8 @@ impl SandboxManager {
                 meta,
             },
         );
-        self.broker.register_sandbox(id.clone(), comms).await;
+        // No broker registration: a reloaded sandbox is not running, and
+        // `start` registers its stored policy.
         metrics::gauge!("wardd_sandbox_active").increment(1.0);
         tracing::info!(sandbox_id = %id, "reloaded sandbox from disk");
     }
@@ -456,6 +470,9 @@ impl SandboxManager {
             .create_sandbox(id.clone(), &opts)
             .await
             .map_err(backend_err)?;
+        // The backend has finished creating it, whatever it reports for a
+        // sandbox it did not boot.
+        info.status = crate::protocol::SandboxStatus::Running;
 
         // Capability token for this sandbox: a fresh random UUID, checked
         // by authorize() and never echoed back by get()/list(). Only its
@@ -619,30 +636,32 @@ impl SandboxManager {
     /// only, because full arguments can hold secrets.
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
         let id = self.resolve(id).await?;
-        let id = id.as_str();
-        let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
-        Ok(protocol_info_to_pb(
-            redact_token(info),
-            CommandView::Argv0Only,
-        ))
+        self.info(&id, CommandView::Argv0Only).await
     }
 
     /// Like [`get`](Self::get), but also returns the full command when the
     /// presented token matches the sandbox's token.
     pub async fn get_authorized(&self, id: &str, token: &str) -> Result<PbSandboxInfo> {
         let id = self.resolve(id).await?;
-        let id = id.as_str();
-        self.authorize(id, token).await?;
+        self.authorize(&id, token).await?;
+        self.info(&id, CommandView::Full).await
+    }
+
+    /// Backend info for `id`, with the state the manager recorded.
+    async fn info(&self, id: &str, view: CommandView) -> Result<PbSandboxInfo> {
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
-        Ok(protocol_info_to_pb(redact_token(info), CommandView::Full))
+        let info = recorded_state(&*self.entries.read().await, redact_token(info));
+        Ok(protocol_info_to_pb(info, view))
     }
 
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;
+        let entries = self.entries.read().await;
         Ok(infos
             .into_iter()
             .map(redact_token)
+            .map(|info| recorded_state(&entries, info))
             .map(|info| protocol_info_to_pb(info, CommandView::Argv0Only))
             .collect())
     }
@@ -692,6 +711,159 @@ impl SandboxManager {
         )
         .await
         .map_err(backend_err)
+    }
+
+    // -----------------------------------------------------------------------
+    // Stop, start, restart
+    // -----------------------------------------------------------------------
+
+    /// Stop a sandbox: the VM goes away and the rootfs stays. Stopping a
+    /// stopped sandbox succeeds without doing anything.
+    pub async fn stop(&self, reference: &str) -> Result<PbSandboxInfo> {
+        let id = self.resolve(reference).await?;
+        self.stop_resolved(&id).await?;
+        self.info(&id, CommandView::Full).await
+    }
+
+    /// Boot a stopped, exited or failed sandbox again. Starting a running
+    /// sandbox succeeds without doing anything.
+    pub async fn start(&self, reference: &str) -> Result<PbSandboxInfo> {
+        let id = self.resolve(reference).await?;
+        self.start_resolved(&id).await?;
+        self.info(&id, CommandView::Full).await
+    }
+
+    /// Stop, then start. A failed sandbox has no VM to stop, so it only
+    /// starts.
+    pub async fn restart(&self, reference: &str) -> Result<PbSandboxInfo> {
+        let id = self.resolve(reference).await?;
+        let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
+        if !failed {
+            self.stop_resolved(&id).await?;
+        }
+        self.start_resolved(&id).await?;
+        self.info(&id, CommandView::Full).await
+    }
+
+    async fn recorded_status(&self, id: &str) -> Result<crate::protocol::SandboxStatus> {
+        self.entries
+            .read()
+            .await
+            .get(id)
+            .map(|entry| entry.meta.status.clone())
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))
+    }
+
+    async fn stop_resolved(&self, id: &str) -> Result<()> {
+        if !self.begin_stop(id).await? {
+            tracing::info!(sandbox_id = %id, "sandbox already stopped");
+            return Ok(());
+        }
+        tracing::info!(sandbox_id = %id, "stopping sandbox");
+        if let Err(e) = self.backend.stop_sandbox(id).await {
+            self.mark_failed(id).await;
+            return Err(backend_err(e));
+        }
+        self.processes
+            .write()
+            .await
+            .retain(|_, rec| rec.sandbox_id != id);
+        self.broker.deregister_sandbox(id).await;
+        self.set_state(id, crate::protocol::SandboxStatus::Stopped)
+            .await?;
+        tracing::info!(sandbox_id = %id, "sandbox stopped");
+        Ok(())
+    }
+
+    async fn start_resolved(&self, id: &str) -> Result<()> {
+        let Some(comms) = self.begin_start(id).await? else {
+            tracing::info!(sandbox_id = %id, "sandbox already running");
+            return Ok(());
+        };
+        tracing::info!(sandbox_id = %id, "starting sandbox");
+        if let Err(e) = self.backend.start_sandbox(id).await {
+            self.mark_failed(id).await;
+            return Err(backend_err(e));
+        }
+        self.commit_running_and_register(id, comms).await?;
+        tracing::info!(sandbox_id = %id, "sandbox started");
+        Ok(())
+    }
+
+    /// Commit `running` and register the comms policy under one `entries`
+    /// lock, so a concurrent cleanup cannot deregister in between and leave
+    /// the broker holding a policy for a sandbox that is gone.
+    async fn commit_running_and_register(
+        &self,
+        id: &str,
+        comms: CommunicationPolicy,
+    ) -> Result<()> {
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        let exit_code = entry.meta.exit_code;
+        self.commit(entry, crate::protocol::SandboxStatus::Running, exit_code)
+            .await?;
+        self.broker.register_sandbox(id.to_string(), comms).await;
+        Ok(())
+    }
+
+    /// Move a running or exited sandbox to `stopping`. `false` means it is
+    /// already stopped and there is nothing to do.
+    async fn begin_stop(&self, id: &str) -> Result<bool> {
+        use crate::protocol::SandboxStatus as State;
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        match entry.meta.status {
+            State::Stopped => return Ok(false),
+            State::Running | State::Exited => {}
+            ref other => return Err(wrong_state(id, other, "stop")),
+        }
+        let exit_code = entry.meta.exit_code;
+        self.commit(entry, State::Stopping, exit_code).await?;
+        Ok(true)
+    }
+
+    /// Move a stopped, exited or failed sandbox to `creating` and clear its
+    /// exit code. Returns the stored comms policy to register once it runs,
+    /// or `None` when it is already running.
+    async fn begin_start(&self, id: &str) -> Result<Option<CommunicationPolicy>> {
+        use crate::protocol::SandboxStatus as State;
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        match entry.meta.status {
+            State::Running => return Ok(None),
+            State::Stopped | State::Exited | State::Failed => {}
+            ref other => return Err(wrong_state(id, other, "start")),
+        }
+        self.commit(entry, State::Creating, None).await?;
+        Ok(Some(entry.meta.options.comms.clone()))
+    }
+
+    /// Change the state and keep the exit code.
+    async fn set_state(&self, id: &str, status: crate::protocol::SandboxStatus) -> Result<()> {
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        let exit_code = entry.meta.exit_code;
+        self.commit(entry, status, exit_code).await
+    }
+
+    /// Record a failed transition. A sandbox removed meanwhile is already
+    /// gone, so this only logs when it cannot save.
+    async fn mark_failed(&self, id: &str) {
+        if let Err(e) = self
+            .set_state(id, crate::protocol::SandboxStatus::Failed)
+            .await
+        {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot record the failed state");
+        }
     }
 
     /// Shared cleanup path for user-initiated `remove()` and timer-driven
@@ -1063,6 +1235,24 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
     }
 }
 
+/// The state the manager recorded wins over the backend's: only the
+/// manager knows a boot failed.
+fn recorded_state(
+    entries: &HashMap<String, SandboxEntry>,
+    mut info: crate::protocol::SandboxInfo,
+) -> crate::protocol::SandboxInfo {
+    if let Some(entry) = entries.get(&info.id) {
+        info.status = entry.meta.status.clone();
+        info.exit_code = entry.meta.exit_code;
+    }
+    info
+}
+
+fn wrong_state(id: &str, state: &crate::protocol::SandboxStatus, action: &str) -> ApiError {
+    let state = format!("{state:?}").to_lowercase();
+    ApiError::InvalidRequest(format!("sandbox {id} is {state}, cannot {action}"))
+}
+
 /// Clear the capability token before a sandbox's info is returned by
 /// `get()`/`list()`. Only the `create()` response carries the real token;
 /// echoing it back here would let anyone who can query the API bypass the
@@ -1224,8 +1414,7 @@ mod tests {
         // Assert: the daemon assigns a UUID and echoes the image back.
         assert_eq!(info.id.len(), 36);
         assert_eq!(info.image, "alpine:latest");
-        // SandboxStatus::Creating = 1 in the generated enum.
-        assert_eq!(info.status, crate::pb::SandboxStatus::Creating as i32);
+        assert_eq!(info.status, crate::pb::SandboxStatus::Running as i32);
     }
 
     #[tokio::test]
@@ -3209,5 +3398,476 @@ mod tests {
         // Assert
         assert_eq!(winners, 1);
         assert_eq!(mgr.list().await.unwrap().len(), 1);
+    }
+
+    // ----- stop, start, restart ------------------------------------------
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::pb::{CommunicationMode as PbMode, CommunicationPolicy as PbPolicy};
+
+    const WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    const WAIT_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+    const SHORT_TIMEOUT_SECONDS: u64 = 1;
+    const GROUP_NAME: &str = "workers";
+    const RACE_ROUNDS: usize = 500;
+    const RACE_SANDBOX_SLOTS: usize = 2;
+    const KEPT_FILE: &str = "kept.txt";
+    const KEPT_BYTES: &[u8] = b"still here\n";
+
+    /// Delegates to the stub backend, but `start_sandbox` fails while
+    /// `fail_start` is set, standing in for a VM that does not boot.
+    struct BootGate {
+        inner: Arc<crate::backend::krunvm::KrunvmBackend>,
+        fail_start: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for BootGate {
+        async fn create_sandbox(
+            &self,
+            id: String,
+            opts: &CreateOpts,
+        ) -> crate::backend::Result<crate::protocol::SandboxInfo> {
+            self.inner.create_sandbox(id, opts).await
+        }
+        async fn get_sandbox(
+            &self,
+            id: &str,
+        ) -> crate::backend::Result<crate::protocol::SandboxInfo> {
+            self.inner.get_sandbox(id).await
+        }
+        async fn list_sandboxes(
+            &self,
+        ) -> crate::backend::Result<Vec<crate::protocol::SandboxInfo>> {
+            self.inner.list_sandboxes().await
+        }
+        async fn remove_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            self.inner.remove_sandbox(id).await
+        }
+        async fn adopt_sandbox(
+            &self,
+            info: crate::protocol::SandboxInfo,
+            opts: CreateOpts,
+            rootfs: std::path::PathBuf,
+        ) -> crate::backend::Result<()> {
+            self.inner.adopt_sandbox(info, opts, rootfs).await
+        }
+        async fn stop_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            self.inner.stop_sandbox(id).await
+        }
+        async fn start_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            if self.fail_start.load(Ordering::SeqCst) {
+                return Err(BackendError::Spawn("boot failed".into()));
+            }
+            self.inner.start_sandbox(id).await
+        }
+        async fn count(&self) -> crate::backend::Result<usize> {
+            self.inner.count().await
+        }
+        async fn exec(
+            &self,
+            sandbox_id: &str,
+            command: Vec<String>,
+            working_dir: Option<String>,
+            env: HashMap<String, String>,
+        ) -> crate::backend::Result<crate::backend::ProcessHandle> {
+            self.inner.exec(sandbox_id, command, working_dir, env).await
+        }
+        async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
+            self.inner.kill_process(sandbox_id, pid).await
+        }
+        async fn create_snapshot(
+            &self,
+            sandbox_id: &str,
+            label: &str,
+        ) -> crate::backend::Result<crate::protocol::SnapshotInfo> {
+            self.inner.create_snapshot(sandbox_id, label).await
+        }
+        async fn restore_snapshot(
+            &self,
+            sandbox_id: &str,
+            snapshot_id: &str,
+        ) -> crate::backend::Result<()> {
+            self.inner.restore_snapshot(sandbox_id, snapshot_id).await
+        }
+        async fn list_snapshots(
+            &self,
+            sandbox_id: &str,
+        ) -> crate::backend::Result<Vec<crate::protocol::SnapshotInfo>> {
+            self.inner.list_snapshots(sandbox_id).await
+        }
+        async fn snapshot_owner(&self, snapshot_id: &str) -> crate::backend::Result<String> {
+            self.inner.snapshot_owner(snapshot_id).await
+        }
+    }
+
+    /// A persisting manager whose backend boot can be made to fail.
+    fn manager_with_boot_gate(
+        path: &std::path::Path,
+        max_sandboxes: usize,
+    ) -> (Arc<SandboxManager>, Arc<AtomicBool>) {
+        use crate::backend::image::ImageStore;
+        use crate::backend::krunvm::KrunvmBackend;
+        let store = Arc::new(ImageStore::with_puller(
+            path.join("cache").join("images"),
+            64,
+            Arc::new(FakePuller),
+        ));
+        let fail_start = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Backend> = Arc::new(BootGate {
+            inner: Arc::new(KrunvmBackend::with_image_store_for_test(
+                path.to_path_buf(),
+                store,
+            )),
+            fail_start: Arc::clone(&fail_start),
+        });
+        let manager = SandboxManager::new(
+            backend,
+            Arc::new(Broker::new()),
+            max_sandboxes,
+            /* allow_host_mounts = */ false,
+            crate::config::NetworkBackendChoice::Smoltcp,
+        )
+        .with_data_dir(path.to_path_buf());
+        (Arc::new(manager), fail_start)
+    }
+
+    async fn status_of(mgr: &SandboxManager, id: &str) -> SandboxStatus {
+        let info = mgr.get(id).await.unwrap();
+        SandboxStatus::try_from(info.status).unwrap()
+    }
+
+    /// Poll `done` every `WAIT_STEP` until it holds or `WAIT_DEADLINE` passes.
+    async fn wait_until<F, Fut>(mut done: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = std::time::Instant::now() + WAIT_DEADLINE;
+        while std::time::Instant::now() < deadline {
+            if done().await {
+                return true;
+            }
+            tokio::time::sleep(WAIT_STEP).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_without_command_when_stopped_and_started_then_it_runs_again() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Act
+        let stopped = mgr.stop(&created.id).await.unwrap();
+        let after_stop = status_of(&mgr, &created.id).await;
+        let started = mgr.start(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(stopped.status, SandboxStatus::Stopped as i32);
+        assert_eq!(after_stop, SandboxStatus::Stopped);
+        assert_eq!(started.status, SandboxStatus::Running as i32);
+        assert_eq!(status_of(&mgr, &created.id).await, SandboxStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn given_stopped_sandbox_when_stopped_again_then_it_succeeds_and_stays_stopped() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+
+        // Act
+        let again = mgr.stop(&created.id).await;
+
+        // Assert
+        assert_eq!(again.unwrap().status, SandboxStatus::Stopped as i32);
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_when_started_then_it_succeeds_and_stays_running() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Act
+        let started = mgr.start(&created.id).await;
+
+        // Assert
+        assert_eq!(started.unwrap().status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_stop_start_or_restart_then_not_found() {
+        // Arrange
+        let mgr = build_manager(2);
+        let id = "aaaaaaaa-0000-0000-0000-000000000000";
+
+        // Act
+        let results = [
+            mgr.stop(id).await,
+            mgr.start(id).await,
+            mgr.restart(id).await,
+        ];
+
+        // Assert
+        for result in results {
+            assert!(matches!(result, Err(ApiError::SandboxNotFound(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn given_stopped_sandbox_when_restarted_then_it_is_running() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+
+        // Act
+        let restarted = mgr.restart(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(restarted.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_when_restarted_then_it_is_running() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Act
+        let restarted = mgr.restart(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(restarted.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_boot_failure_when_started_then_sandbox_is_failed_and_persisted_as_failed() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, fail_start) = manager_with_boot_gate(tmp.path(), 2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+        fail_start.store(true, Ordering::SeqCst);
+
+        // Act
+        let result = mgr.start(&created.id).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::Backend(_))));
+        assert_eq!(status_of(&mgr, &created.id).await, SandboxStatus::Failed);
+        let reloaded = restart(tmp.path()).await;
+        assert_eq!(
+            status_of(&reloaded, &created.id).await,
+            SandboxStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn given_failed_sandbox_when_started_again_after_the_fault_clears_then_it_runs() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, fail_start) = manager_with_boot_gate(tmp.path(), 2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+        fail_start.store(true, Ordering::SeqCst);
+        mgr.start(&created.id).await.unwrap_err();
+        fail_start.store(false, Ordering::SeqCst);
+
+        // Act
+        let started = mgr.start(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(started.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_failed_sandbox_when_stopped_then_invalid_request() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, fail_start) = manager_with_boot_gate(tmp.path(), 2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+        fail_start.store(true, Ordering::SeqCst);
+        mgr.start(&created.id).await.unwrap_err();
+
+        // Act
+        let result = mgr.stop(&created.id).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn given_failed_sandbox_when_restarted_after_the_fault_clears_then_it_runs() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, fail_start) = manager_with_boot_gate(tmp.path(), 2);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+        fail_start.store(true, Ordering::SeqCst);
+        mgr.start(&created.id).await.unwrap_err();
+        fail_start.store(false, Ordering::SeqCst);
+
+        // Act
+        let restarted = mgr.restart(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(restarted.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_stopped_sandbox_when_daemon_restarts_then_it_is_still_stopped_and_can_start() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let created = first.create(named_req(), "").await.unwrap();
+        first.stop(&created.id).await.unwrap();
+        let file = MetaStore::new(tmp.path())
+            .rootfs_path(&created.id)
+            .join(KEPT_FILE);
+        std::fs::write(&file, KEPT_BYTES).unwrap();
+
+        // Act
+        let second = restart(tmp.path()).await;
+        second.authorize(&created.id, &created.token).await.unwrap();
+        let started = second.start(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(started.status, SandboxStatus::Running as i32);
+        assert_eq!(std::fs::read(&file).unwrap(), KEPT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn given_max_sandboxes_with_one_stopped_when_another_is_created_then_limit_error() {
+        // Arrange
+        let mgr = build_manager(2);
+        let first = mgr.create(create_req("alpine:1"), "").await.unwrap();
+        mgr.create(create_req("alpine:2"), "").await.unwrap();
+        mgr.stop(&first.id).await.unwrap();
+
+        // Act
+        let result = mgr.create(create_req("alpine:3"), "").await;
+
+        // Assert
+        match result {
+            Err(ApiError::InvalidRequest(msg)) => assert!(msg.contains("limit"), "{msg}"),
+            other => panic!("expected the sandbox limit error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_stopped_sandbox_with_timeout_when_it_expires_then_it_is_removed() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr
+            .create(
+                CreateSandboxRequest {
+                    resources: Some(PbResourceLimits {
+                        timeout_seconds: SHORT_TIMEOUT_SECONDS,
+                        ..Default::default()
+                    }),
+                    ..create_req("alpine")
+                },
+                "",
+            )
+            .await
+            .unwrap();
+        mgr.stop(&created.id).await.unwrap();
+
+        // Act
+        let removed = wait_until(|| async { mgr.list().await.unwrap().is_empty() }).await;
+
+        // Assert
+        assert!(removed, "the stopped sandbox outlived its timeout");
+    }
+
+    #[tokio::test]
+    async fn given_group_policy_when_stopped_and_started_then_broker_forgets_then_restores_it() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr
+            .create(
+                CreateSandboxRequest {
+                    comms: Some(PbPolicy {
+                        mode: PbMode::Group as i32,
+                        group: GROUP_NAME.into(),
+                    }),
+                    ..create_req("alpine")
+                },
+                "",
+            )
+            .await
+            .unwrap();
+
+        // Act
+        mgr.stop(&created.id).await.unwrap();
+        let while_stopped = mgr.broker().subscribe(&created.id, "topic").await;
+        mgr.start(&created.id).await.unwrap();
+        let after_start = mgr.broker().subscribe(&created.id, "topic").await;
+
+        // Assert
+        assert!(matches!(while_stopped, Err(ApiError::SandboxNotFound(_))));
+        assert!(after_start.is_ok(), "start must restore the stored policy");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn given_start_racing_remove_when_both_finish_then_broker_holds_no_policy_for_removed_sandbox()
+     {
+        // Arrange
+        let mgr = build_manager(RACE_SANDBOX_SLOTS);
+        for _ in 0..RACE_ROUNDS {
+            let created = mgr.create(create_req("alpine"), "").await.unwrap();
+            mgr.stop(&created.id).await.unwrap();
+
+            // Act
+            let starter = {
+                let mgr = Arc::clone(&mgr);
+                let id = created.id.clone();
+                tokio::spawn(async move { mgr.start(&id).await })
+            };
+            let remover = {
+                let mgr = Arc::clone(&mgr);
+                let id = created.id.clone();
+                tokio::spawn(async move {
+                    while status_of(&mgr, &id).await != SandboxStatus::Running {
+                        tokio::task::yield_now().await;
+                    }
+                    mgr.remove(&id).await
+                })
+            };
+            let _ = starter.await.unwrap();
+            let _ = remover.await.unwrap();
+
+            // Assert
+            let gone = matches!(
+                mgr.get(&created.id).await,
+                Err(ApiError::SandboxNotFound(_))
+            );
+            let subscribed = mgr.broker().subscribe(&created.id, "topic").await;
+            assert!(
+                !gone || matches!(subscribed, Err(ApiError::SandboxNotFound(_))),
+                "broker kept a policy for removed sandbox {}",
+                created.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn given_named_sandbox_when_stopped_by_name_then_that_sandbox_stops() {
+        // Arrange
+        let mgr = build_manager(2);
+        let created = mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        let stopped = mgr.stop("web1").await.unwrap();
+
+        // Assert
+        assert_eq!(stopped.id, created.id);
+        assert_eq!(stopped.status, SandboxStatus::Stopped as i32);
     }
 }

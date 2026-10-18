@@ -15,6 +15,9 @@ service Ward {
   rpc GetSandbox(GetSandboxRequest) returns (SandboxInfo);
   rpc ListSandboxes(google.protobuf.Empty) returns (ListSandboxesResponse);
   rpc RemoveSandbox(RemoveSandboxRequest) returns (google.protobuf.Empty);
+  rpc Stop(StopRequest) returns (SandboxInfo);
+  rpc Start(StartRequest) returns (SandboxInfo);
+  rpc Restart(RestartRequest) returns (SandboxInfo);
 
   // Execution
   rpc Exec(ExecRequest) returns (ProcessInfo);
@@ -71,6 +74,19 @@ message GetSandboxRequest {
 }
 
 message RemoveSandboxRequest {
+  string id = 1;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message StopRequest {
+  string id = 1;
+}
+
+message StartRequest {
+  string id = 1;
+}
+
+message RestartRequest {
   string id = 1;
 }
 

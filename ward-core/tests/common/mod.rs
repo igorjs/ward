@@ -91,10 +91,24 @@ impl VolumeFormatter for NoopFormatter {
 /// A `WardClient<Channel>` already connected to the server, ready to call
 /// any RPC defined on the `Ward` service.
 pub async fn test_server() -> WardClient<Channel> {
+    let data_dir = std::env::temp_dir().join(format!("ward-test-{}", uuid::Uuid::new_v4()));
+    serve(data_dir, /* persistent = */ false).await
+}
+
+/// Like [`test_server`], but on a caller-owned `data_dir` with sandbox
+/// records persisted and reloaded. Calling it twice on one directory models
+/// a daemon restart.
+///
+/// `allow(dead_code)`: only some test binaries restart a daemon.
+#[allow(dead_code)]
+pub async fn persistent_server(data_dir: &Path) -> WardClient<Channel> {
+    serve(data_dir.to_path_buf(), /* persistent = */ true).await
+}
+
+async fn serve(data_dir: std::path::PathBuf, persistent: bool) -> WardClient<Channel> {
     // 1) Build domain managers. The KrunvmBackend without the "krunvm"
     //    feature is a stub: it tracks state but doesn't touch libkrun. That
     //    is exactly what we want for boundary-validation tests.
-    let data_dir = std::env::temp_dir().join(format!("ward-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&data_dir).expect("create temp data dir");
 
     let cache_dir = data_dir.join("cache").join("images");
@@ -104,13 +118,18 @@ pub async fn test_server() -> WardClient<Channel> {
         image_store,
     ));
     let broker = Arc::new(Broker::new());
-    let sandbox_mgr = Arc::new(SandboxManager::new(
+    let mut manager = SandboxManager::new(
         Arc::clone(&backend),
         Arc::clone(&broker),
         4,
         /* allow_host_mounts = */ false,
         ward_core::config::NetworkBackendChoice::Smoltcp,
-    ));
+    );
+    if persistent {
+        manager = manager.with_data_dir(data_dir.clone());
+        manager.restore().await;
+    }
+    let sandbox_mgr = Arc::new(manager);
     let volume_mgr = Arc::new(VolumeManager::with_formatter(
         data_dir,
         4,

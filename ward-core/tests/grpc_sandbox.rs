@@ -38,10 +38,10 @@ async fn given_empty_daemon_when_create_sandbox_then_returns_sandbox_info() {
         .expect("create should succeed");
     let s = resp.into_inner();
 
-    // Assert: daemon-assigned UUID, image echoed back, status is Creating.
+    // Assert: daemon-assigned UUID, image echoed back, status is Running.
     assert!(!s.id.is_empty(), "id must be assigned");
     assert_eq!(s.image, "alpine:latest");
-    assert_eq!(s.status, ward_core::pb::SandboxStatus::Creating as i32);
+    assert_eq!(s.status, ward_core::pb::SandboxStatus::Running as i32);
 }
 
 #[tokio::test]

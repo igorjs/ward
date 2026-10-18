@@ -44,7 +44,7 @@ fn given_running_daemon_when_user_creates_sandbox_then_command_succeeds_and_prin
     assertion
         .success()
         .stdout(predicate::str::contains("id:"))
-        .stdout(predicate::str::contains("status: creating"))
+        .stdout(predicate::str::contains("status: running"))
         .stdout(predicate::str::contains("image: alpine:latest"));
 }
 

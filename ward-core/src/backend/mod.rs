@@ -79,14 +79,23 @@ pub trait Backend: Send + Sync + 'static {
     async fn remove_sandbox(&self, id: &str) -> Result<()>;
 
     /// Take over a sandbox reloaded from disk after a daemon restart. It
-    /// enters the backend's table with its stored rootfs so a later boot
-    /// can find it. No VM is started.
+    /// enters the backend's table with its stored options and rootfs so a
+    /// later boot can find them. No VM is started.
     async fn adopt_sandbox(
         &self,
         info: crate::protocol::SandboxInfo,
-        env: std::collections::HashMap<String, String>,
+        opts: crate::protocol::CreateOpts,
         rootfs: std::path::PathBuf,
     ) -> Result<()>;
+
+    /// End the sandbox's VM and keep its rootfs and record. The status
+    /// becomes `Stopped`. Stopping a sandbox with no VM up is a no-op.
+    async fn stop_sandbox(&self, id: &str) -> Result<()>;
+
+    /// Boot the sandbox's rootfs again. Any VM still up for it is ended
+    /// first, so exactly one VM host process exists. The status becomes
+    /// `Running`.
+    async fn start_sandbox(&self, id: &str) -> Result<()>;
 
     async fn count(&self) -> Result<usize>;
 
