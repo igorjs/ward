@@ -285,7 +285,7 @@ impl SandboxManager {
         };
         if let Err(e) = self
             .backend
-            .adopt_sandbox(info, meta.options.env.clone(), store.rootfs_path(&id))
+            .adopt_sandbox(info, meta.options.clone(), store.rootfs_path(&id))
             .await
         {
             tracing::warn!(sandbox_id = %id, error = %e, "skipping reloaded sandbox: backend refused it");

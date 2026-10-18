@@ -135,9 +135,9 @@ const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
 
 struct SandboxState {
     info: SandboxInfo,
-    /// Environment given at create time. Applied to every exec; variables
-    /// passed to a single exec win over these.
-    env: HashMap<String, String>,
+    /// Options given at create time. `env` applies to every exec (variables
+    /// passed to a single exec win); the rest configures each boot.
+    opts: CreateOpts,
     /// Unpacked rootfs a boot of this sandbox starts from.
     rootfs: std::path::PathBuf,
     /// Host process running this sandbox's microVM. `None` in stub builds.
@@ -322,13 +322,7 @@ impl Backend for KrunvmBackend {
             }
 
             #[cfg(feature = "krunvm")]
-            let booted = if self.boot_vms {
-                Some(self.boot_vm(&id, opts, &rootfs).await?)
-            } else {
-                None
-            };
-            #[cfg(feature = "krunvm")]
-            let result: Result<Option<BootedVm>> = Ok(booted);
+            let result: Result<Option<BootedVm>> = self.boot_if_enabled(&id, opts, &rootfs).await;
             #[cfg(not(feature = "krunvm"))]
             let result: Result<()> = Ok(());
             result
@@ -379,7 +373,7 @@ impl Backend for KrunvmBackend {
         };
         let state = SandboxState {
             info: info.clone(),
-            env: opts.env.clone(),
+            opts: opts.clone(),
             rootfs,
             #[cfg(feature = "krunvm")]
             shim,
@@ -427,19 +421,8 @@ impl Backend for KrunvmBackend {
             .remove(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
 
-        // Stop the VM host process first so the guest stops using the
-        // network socket, then stop the smoltcp task behind it.
         #[cfg(feature = "krunvm")]
-        if let Some(mut shim) = state.shim.take() {
-            shim.stop().await;
-        }
-
-        #[cfg(feature = "krunvm")]
-        if let Some(mut smoltcp) = state.smoltcp.take()
-            && let Err(e) = smoltcp.detach().await
-        {
-            tracing::warn!(sandbox_id = %id, "smoltcp teardown error: {e}");
-        }
+        teardown_vm(id, state.shim.take(), state.smoltcp.take()).await;
 
         // Drop the sandbox's snapshots too. Snapshots are bound to their
         // parent sandbox's lifetime; the proto keys list_snapshots by
@@ -470,13 +453,13 @@ impl Backend for KrunvmBackend {
     async fn adopt_sandbox(
         &self,
         info: SandboxInfo,
-        env: HashMap<String, String>,
+        opts: CreateOpts,
         rootfs: std::path::PathBuf,
     ) -> Result<()> {
         // No VM outlives the daemon, so a socket file left behind is stale.
         let _ = std::fs::remove_file(self.agent_socket_path(&info.id));
         let state = SandboxState {
-            env,
+            opts,
             rootfs,
             #[cfg(feature = "krunvm")]
             shim: None,
@@ -490,6 +473,50 @@ impl Backend for KrunvmBackend {
             .write()
             .await
             .insert(state.info.id.clone(), state);
+        Ok(())
+    }
+
+    /// End the sandbox's VM: the host process first so the guest stops
+    /// using the network socket, then the smoltcp task behind it.
+    async fn stop_sandbox(&self, id: &str) -> Result<()> {
+        self.end_vm(id).await?;
+        self.set_status(id, SandboxStatus::Stopped).await
+    }
+
+    /// Boot the stored rootfs again through the same path as create.
+    async fn start_sandbox(&self, id: &str) -> Result<()> {
+        // Ending first keeps one VM host process per sandbox, and frees the
+        // agent socket the new boot binds.
+        self.end_vm(id).await?;
+        #[cfg(feature = "krunvm")]
+        let booted = {
+            let (opts, rootfs) = {
+                let sandboxes = self.sandboxes.read().await;
+                let state = sandboxes
+                    .get(id)
+                    .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+                (state.opts.clone(), state.rootfs.clone())
+            };
+            self.boot_if_enabled(id, &opts, &rootfs).await?
+        };
+
+        let mut sandboxes = self.sandboxes.write().await;
+        let Some(state) = sandboxes.get_mut(id) else {
+            // Removed while booting: nothing owns the new VM, so end it.
+            drop(sandboxes);
+            #[cfg(feature = "krunvm")]
+            if let Some(vm) = booted {
+                teardown_vm(id, Some(vm.shim), vm.smoltcp).await;
+            }
+            return Err(BackendError::NotFound(id.to_string()));
+        };
+        #[cfg(feature = "krunvm")]
+        if let Some(vm) = booted {
+            state.shim = Some(vm.shim);
+            state.smoltcp = vm.smoltcp;
+            state.egress = vm.egress;
+        }
+        state.info.status = SandboxStatus::Running;
         Ok(())
     }
 
@@ -662,7 +689,7 @@ impl Backend for KrunvmBackend {
             let state = guard
                 .get(sandbox_id)
                 .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
-            let mut merged = state.env.clone();
+            let mut merged = state.opts.env.clone();
             merged.extend(extra_env);
             merged
         };
@@ -876,6 +903,57 @@ impl KrunvmBackend {
         self.data_dir.join("snapshots").join(snapshot_id)
     }
 
+    /// End a sandbox's VM and drop what only lived as long as it: the agent
+    /// socket and the exec processes. A sandbox with no VM up is left as is.
+    async fn end_vm(&self, id: &str) -> Result<()> {
+        #[cfg(feature = "krunvm")]
+        let (shim, smoltcp) = {
+            let mut sandboxes = self.sandboxes.write().await;
+            let state = sandboxes
+                .get_mut(id)
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+            state.egress = None;
+            (state.shim.take(), state.smoltcp.take())
+        };
+        #[cfg(not(feature = "krunvm"))]
+        if !self.sandboxes.read().await.contains_key(id) {
+            return Err(BackendError::NotFound(id.to_string()));
+        }
+
+        #[cfg(feature = "krunvm")]
+        teardown_vm(id, shim, smoltcp).await;
+        let _ = std::fs::remove_file(self.agent_socket_path(id));
+        self.processes
+            .write()
+            .await
+            .retain(|_, record| record.sandbox_id != id);
+        Ok(())
+    }
+
+    async fn set_status(&self, id: &str, status: SandboxStatus) -> Result<()> {
+        self.sandboxes
+            .write()
+            .await
+            .get_mut(id)
+            .map(|state| state.info.status = status)
+            .ok_or_else(|| BackendError::NotFound(id.to_string()))
+    }
+
+    /// Boot a VM unless images are synthetic and there is nothing to boot.
+    #[cfg(feature = "krunvm")]
+    async fn boot_if_enabled(
+        &self,
+        id: &str,
+        opts: &CreateOpts,
+        rootfs: &std::path::Path,
+    ) -> Result<Option<BootedVm>> {
+        if self.boot_vms {
+            Ok(Some(self.boot_vm(id, opts, rootfs).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Start the VM host process for a sandbox and wait until its guest
     /// agent answers.
     #[cfg(feature = "krunvm")]
@@ -995,6 +1073,23 @@ impl KrunvmBackend {
             smoltcp,
             egress,
         })
+    }
+}
+
+/// Stop a VM host process, then the smoltcp task that served it.
+#[cfg(feature = "krunvm")]
+async fn teardown_vm(
+    id: &str,
+    shim: Option<super::vmshim::ShimProcess>,
+    smoltcp: Option<ward_net::smoltcp_backend::SmoltcpHandle>,
+) {
+    if let Some(mut shim) = shim {
+        shim.stop().await;
+    }
+    if let Some(mut smoltcp) = smoltcp
+        && let Err(e) = smoltcp.detach().await
+    {
+        tracing::warn!(sandbox_id = %id, "smoltcp teardown error: {e}");
     }
 }
 
@@ -1378,7 +1473,7 @@ mod tests {
 
         // Act
         backend
-            .adopt_sandbox(info, HashMap::new(), stored_rootfs.clone())
+            .adopt_sandbox(info, create_opts(), stored_rootfs.clone())
             .await
             .expect("adopt");
 
@@ -1387,6 +1482,120 @@ mod tests {
         let state = table.get("sb2").expect("entry for adopted id");
         assert_eq!(state.rootfs, stored_rootfs);
         assert_eq!(state.info.status, SandboxStatus::Stopped);
+    }
+
+    // ----- stop_sandbox / start_sandbox ---------------------------------
+
+    const PERSISTED_FILE: &str = "note";
+    const PERSISTED_BYTES: &[u8] = b"kept\0across\xffstop";
+
+    #[tokio::test]
+    async fn given_running_sandbox_with_file_when_stopped_and_started_then_file_has_identical_bytes()
+     {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        seed_rootfs(&backend, "sb1", PERSISTED_FILE, PERSISTED_BYTES);
+
+        // Act
+        backend.stop_sandbox("sb1").await.expect("stop");
+        let stopped = backend.get_sandbox("sb1").await.expect("record kept");
+        backend.start_sandbox("sb1").await.expect("start");
+
+        // Assert
+        let started = backend.get_sandbox("sb1").await.expect("record kept");
+        let bytes = std::fs::read(backend.sandbox_rootfs("sb1").join(PERSISTED_FILE))
+            .expect("file persists");
+        assert_eq!(stopped.status, SandboxStatus::Stopped);
+        assert_eq!(started.status, SandboxStatus::Running);
+        assert_eq!(bytes, PERSISTED_BYTES);
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_when_started_then_it_is_running() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+
+        // Act
+        backend.start_sandbox("sb1").await.expect("start");
+
+        // Assert
+        let info = backend.get_sandbox("sb1").await.unwrap();
+        assert_eq!(info.status, SandboxStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn given_stopped_sandbox_when_stopped_again_then_it_succeeds_and_stays_stopped() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        backend.stop_sandbox("sb1").await.expect("first stop");
+
+        // Act
+        let second = backend.stop_sandbox("sb1").await;
+
+        // Assert
+        assert!(second.is_ok());
+        let info = backend.get_sandbox("sb1").await.unwrap();
+        assert_eq!(info.status, SandboxStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn given_adopted_stopped_sandbox_when_started_then_it_is_running_on_its_stored_rootfs() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        let mut info = backend.get_sandbox("sb1").await.unwrap();
+        info.id = "sb2".into();
+        info.status = SandboxStatus::Stopped;
+        let stored_rootfs = backend.sandbox_rootfs("sb2");
+        backend
+            .adopt_sandbox(info, create_opts(), stored_rootfs)
+            .await
+            .expect("adopt");
+
+        // Act
+        backend.start_sandbox("sb2").await.expect("start");
+
+        // Assert
+        let info = backend.get_sandbox("sb2").await.unwrap();
+        assert_eq!(info.status, SandboxStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_stopped_or_started_then_not_found() {
+        // Arrange
+        let backend = backend_in_tempdir();
+
+        // Act
+        let stop = backend.stop_sandbox("ghost").await.unwrap_err();
+        let start = backend.start_sandbox("ghost").await.unwrap_err();
+
+        // Assert
+        assert!(matches!(stop, BackendError::NotFound(_)));
+        assert!(matches!(start, BackendError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_process_record_when_sandbox_stopped_then_record_is_dropped() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sb1".to_string(),
+                kill_tx: tx,
+            },
+        );
+
+        // Act
+        backend.stop_sandbox("sb1").await.expect("stop");
+
+        // Assert
+        assert!(backend.processes.read().await.is_empty());
     }
 
     // ----- create_snapshot ----------------------------------------------
