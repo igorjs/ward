@@ -37,7 +37,7 @@ fn given_create_with_json_flag_when_run_then_emits_single_json_object() {
         let parsed: serde_json::Value = serde_json::from_str(s.trim())
             .expect("--json stdout must be a single valid JSON object");
         parsed.get("id").and_then(|v| v.as_str()).is_some()
-            && parsed.get("status").and_then(|v| v.as_str()) == Some("creating")
+            && parsed.get("status").and_then(|v| v.as_str()) == Some("running")
             && parsed.get("image").and_then(|v| v.as_str()) == Some("alpine:latest")
     }));
 }
@@ -56,7 +56,7 @@ fn given_create_without_json_when_run_then_emits_key_value_lines() {
     assertion
         .success()
         .stdout(predicate::str::contains("id:"))
-        .stdout(predicate::str::contains("status: creating"))
+        .stdout(predicate::str::contains("status: running"))
         .stdout(predicate::str::contains("image: alpine:latest"))
         // Negative: no JSON braces leak into the default path.
         .stdout(predicate::str::contains("{").not());

@@ -1516,6 +1516,14 @@ mod tests {
         // Arrange
         let backend = backend_in_tempdir();
         create_sandbox(&backend, "sb1").await;
+        let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+        backend.processes.write().await.insert(
+            "pid-1".to_string(),
+            ProcessRecord {
+                sandbox_id: "sb1".to_string(),
+                kill_tx: tx,
+            },
+        );
 
         // Act
         backend.start_sandbox("sb1").await.expect("start");
@@ -1523,6 +1531,7 @@ mod tests {
         // Assert
         let info = backend.get_sandbox("sb1").await.unwrap();
         assert_eq!(info.status, SandboxStatus::Running);
+        assert!(backend.processes.read().await.is_empty());
     }
 
     #[tokio::test]

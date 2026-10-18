@@ -13,9 +13,9 @@ use crate::pb::{
     GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
     HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
     ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo, PublishRequest,
-    RemoveSandboxRequest, RemoveVolumeRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo,
-    SnapshotInfo, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo,
-    WriteStdinRequest,
+    RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
+    SandboxInfo, SnapshotInfo, StartRequest, StopRequest, StreamEvent, StreamOutputRequest,
+    SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -54,6 +54,20 @@ fn api_err_to_status(err: ApiError) -> Status {
 /// before authorizing, so the token is checked against the resolved id.
 async fn resolve_sandbox(sandbox: &SandboxManager, reference: &str) -> Result<String, Status> {
     sandbox.resolve(reference).await.map_err(api_err_to_status)
+}
+
+/// Resolve `reference` to a sandbox id and check `token` against that id.
+async fn authorized_id(
+    sandbox: &SandboxManager,
+    reference: &str,
+    token: &str,
+) -> Result<String, Status> {
+    let id = resolve_sandbox(sandbox, reference).await?;
+    sandbox
+        .authorize(&id, token)
+        .await
+        .map_err(api_err_to_status)?;
+    Ok(id)
 }
 
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
@@ -170,6 +184,48 @@ impl Ward for WardGrpcServer {
             .map_err(api_err_to_status)?;
         self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.stop",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn stop(&self, request: Request<StopRequest>) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.stop(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.start",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn start(&self, request: Request<StartRequest>) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.start(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.restart",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn restart(
+        &self,
+        request: Request<RestartRequest>,
+    ) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.restart(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
     }
 
     #[tracing::instrument(
