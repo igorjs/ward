@@ -497,6 +497,29 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --all-targets
 
+  # ── Wire compatibility of the public protos (ADR-004, ADR-022) ───────
+  proto-compat:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Test the compatibility check
+        run: bash scripts/check-proto-compat.test.sh
+      - name: Check protos against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: bash scripts/check-proto-compat.sh "origin/${BASE_REF}"
+
   # ── Supply chain audit ───────────────────────────────────────────────
   deny:
     needs: [changes]
