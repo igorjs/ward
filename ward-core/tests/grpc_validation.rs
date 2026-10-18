@@ -130,7 +130,7 @@ async fn get_sandbox_rejects_malformed_id() {
     // InvalidArgument; a missing-but-well-formed ID would return NotFound.
     let err = client
         .get_sandbox(GetSandboxRequest {
-            id: "not-a-valid-uuid-zzzz".into(),
+            id: "not a uuid!".into(),
         })
         .await
         .expect_err("malformed ID must be rejected");

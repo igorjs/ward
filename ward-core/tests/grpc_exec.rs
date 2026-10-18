@@ -119,7 +119,7 @@ async fn given_malformed_sandbox_id_when_exec_then_invalid_argument() {
     // Act
     let err = client
         .exec(ExecRequest {
-            sandbox_id: "not-a-uuid-zzzz".into(),
+            sandbox_id: "not a uuid!".into(),
             command: vec!["echo".into()],
             working_dir: String::new(),
             env: Default::default(),
@@ -318,7 +318,7 @@ async fn given_malformed_sandbox_id_when_run_then_invalid_argument() {
     // Act
     let err = client
         .run(RunRequest {
-            sandbox_id: "not-a-uuid-zzzz".into(),
+            sandbox_id: "not a uuid!".into(),
             language: "python".into(),
             code: "print('hi')".into(),
         })
@@ -752,4 +752,37 @@ async fn given_malformed_pid_when_kill_process_then_invalid_argument() {
 
     // Assert
     assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn given_named_sandbox_when_exec_by_name_then_process_reports_resolved_id() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let s = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine".into(),
+            name: "execweb".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Act
+    let info = client
+        .exec(common::with_token(
+            ExecRequest {
+                sandbox_id: "execweb".into(),
+                command: vec!["true".into()],
+                working_dir: String::new(),
+                env: Default::default(),
+            },
+            &s.token,
+        ))
+        .await
+        .expect("exec by name")
+        .into_inner();
+
+    // Assert: the manager ran against the id the token was checked for.
+    assert_eq!(info.sandbox_id, s.id);
 }

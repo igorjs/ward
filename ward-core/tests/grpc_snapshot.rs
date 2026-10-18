@@ -58,7 +58,7 @@ async fn given_malformed_sandbox_id_when_create_snapshot_then_invalid_argument()
     // Act
     let err = client
         .create_snapshot(CreateSnapshotRequest {
-            sandbox_id: "not-a-uuid-zzzz".into(),
+            sandbox_id: "not a uuid!".into(),
             label: String::new(),
         })
         .await

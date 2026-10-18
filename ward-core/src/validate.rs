@@ -18,6 +18,10 @@ const MAX_VOLUME_SIZE_MB: u32 = 1_048_576; // 1 TiB
 /// Maximum sizes for cross-sandbox communication primitives.
 const MAX_TOPIC_LEN: usize = 128;
 const MAX_GROUP_LEN: usize = 64;
+
+/// Longest sandbox name, and so the longest name, id or id prefix a lookup
+/// may carry.
+pub const MAX_SANDBOX_NAME_LEN: usize = 64;
 /// 1 MiB per published message. Large enough for batched events; small enough
 /// to bound per-sandbox memory under burst traffic.
 pub const MAX_PUBLISH_PAYLOAD_BYTES: usize = 1_048_576;
@@ -240,10 +244,73 @@ pub fn entity_id(id: &str, entity: &str) -> Result<(), ApiError> {
             "{entity} ID exceeds 36 characters"
         )));
     }
-    if !id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f' | '-')) {
+    if !id.chars().all(is_id_char) {
         return Err(ApiError::InvalidRequest(format!(
             "{entity} ID contains invalid characters (allowed: lowercase hex digits and '-')"
         )));
+    }
+    Ok(())
+}
+
+fn is_reference_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
+}
+
+fn is_id_char(c: char) -> bool {
+    matches!(c, '0'..='9' | 'a'..='f' | '-')
+}
+
+/// Validate a sandbox name given at creation: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`,
+/// at most [`MAX_SANDBOX_NAME_LEN`] characters. A name made only of id
+/// characters is rejected, because it could be taken for an id or an id
+/// prefix when a lookup resolves it.
+pub fn sandbox_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "sandbox name must not be empty".into(),
+        ));
+    }
+    if name.len() > MAX_SANDBOX_NAME_LEN {
+        return Err(ApiError::InvalidRequest(format!(
+            "sandbox name exceeds {MAX_SANDBOX_NAME_LEN} characters"
+        )));
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        || !name.chars().all(is_reference_char)
+    {
+        return Err(ApiError::InvalidRequest(
+            "sandbox name must start with a letter or digit and contain only \
+             letters, digits, '_', '.' and '-'"
+                .into(),
+        ));
+    }
+    if name.chars().all(is_id_char) {
+        return Err(ApiError::InvalidRequest(
+            "sandbox name must not be made only of lowercase hex digits and '-', \
+             because it could be an id or an id prefix"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a value that names a sandbox in a lookup: a name, an id or an id
+/// prefix. Looser than [`entity_id`], which still guards ids at creation.
+pub fn sandbox_reference(reference: &str) -> Result<(), ApiError> {
+    if reference.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "sandbox name or ID must not be empty".into(),
+        ));
+    }
+    if reference.len() > MAX_SANDBOX_NAME_LEN {
+        return Err(ApiError::InvalidRequest(format!(
+            "sandbox name or ID exceeds {MAX_SANDBOX_NAME_LEN} characters"
+        )));
+    }
+    if !reference.chars().all(is_reference_char) {
+        return Err(ApiError::InvalidRequest(
+            "sandbox name or ID contains invalid characters".into(),
+        ));
     }
     Ok(())
 }
@@ -518,6 +585,58 @@ mod tests {
     #[case::too_long("a".repeat(37))]
     fn entity_id_rejects_invalid(#[case] input: String) {
         assert!(entity_id(&input, "volume").is_err());
+    }
+
+    // ----- sandbox_name ---------------------------------------------------
+
+    #[rstest]
+    #[case::single_char("w")]
+    #[case::max_length("g".repeat(MAX_SANDBOX_NAME_LEN))]
+    #[case::hyphen("web-1")]
+    #[case::underscore("web_1")]
+    #[case::dot("web.1")]
+    fn sandbox_name_accepts_valid(#[case] input: String) {
+        assert!(sandbox_name(&input).is_ok());
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::at_sign("web_1@host")]
+    #[case::bang("web-1!")]
+    #[case::space("web 1")]
+    #[case::leading_hyphen("-web")]
+    #[case::leading_dot(".web")]
+    #[case::over_length("g".repeat(MAX_SANDBOX_NAME_LEN + 1))]
+    #[case::hex_only("a1")]
+    #[case::uuid_prefix("550e8400-e29b")]
+    fn sandbox_name_rejects_invalid(#[case] input: String) {
+        assert!(matches!(
+            sandbox_name(&input),
+            Err(ApiError::InvalidRequest(_))
+        ));
+    }
+
+    // ----- sandbox_reference ----------------------------------------------
+
+    #[rstest]
+    #[case::name("web1")]
+    #[case::full_uuid("550e8400-e29b-41d4-a716-446655440000")]
+    #[case::prefix("550e")]
+    #[case::mixed_case_name("Web_1.x")]
+    fn sandbox_reference_accepts_valid(#[case] input: &str) {
+        assert!(sandbox_reference(input).is_ok());
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::path_traversal("../etc")]
+    #[case::space("web 1")]
+    #[case::over_length("g".repeat(MAX_SANDBOX_NAME_LEN + 1))]
+    fn sandbox_reference_rejects_invalid(#[case] input: String) {
+        assert!(matches!(
+            sandbox_reference(&input),
+            Err(ApiError::InvalidRequest(_))
+        ));
     }
 
     #[test]
