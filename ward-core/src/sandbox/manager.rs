@@ -3121,6 +3121,7 @@ mod tests {
         assert!(matches!(wrong, Err(ApiError::PermissionDenied(_))));
     }
 
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
     async fn given_named_sandbox_when_exec_by_name_then_process_reports_resolved_id() {
         // Arrange
