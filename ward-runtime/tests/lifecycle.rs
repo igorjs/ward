@@ -71,6 +71,7 @@ fn create_request(image: &str) -> pb::CreateSandboxRequest {
         mounts: Vec::new(),
         volume_ids: Vec::new(),
         from_snapshot: String::new(),
+        ..Default::default()
     }
 }
 

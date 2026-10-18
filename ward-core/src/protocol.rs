@@ -20,6 +20,17 @@ pub struct CreateOpts {
     pub from_snapshot: Option<String>,
     /// Cross-sandbox pub/sub access policy. Defaults to `Deny`.
     pub comms: CommunicationPolicy,
+    pub spec: SandboxSpec,
+}
+
+/// User-facing identity and main-process settings kept on the sandbox record.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SandboxSpec {
+    pub name: String,
+    /// Main process argv. Empty means the sandbox has no main process.
+    pub command: Vec<String>,
+    pub workdir: String,
+    pub tty: bool,
 }
 
 /// A filesystem bind-mount passed into a sandbox.
@@ -101,6 +112,9 @@ pub struct SandboxInfo {
     pub resources: ResourceLimits,
     pub expires_at: Option<SystemTime>,
     pub token: String,
+    pub spec: SandboxSpec,
+    /// `None` until the main process has exited.
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +123,8 @@ pub enum SandboxStatus {
     Running,
     Stopped,
     Failed,
+    Exited,
+    Stopping,
 }
 
 // ---------------------------------------------------------------------------

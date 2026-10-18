@@ -801,6 +801,8 @@ fn status_name(status: i32) -> &'static str {
         SandboxStatus::Running => "running",
         SandboxStatus::Stopped => "stopped",
         SandboxStatus::Failed => "failed",
+        SandboxStatus::Exited => "exited",
+        SandboxStatus::Stopping => "stopping",
         SandboxStatus::Unspecified => "unspecified",
     }
 }

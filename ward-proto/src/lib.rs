@@ -33,3 +33,69 @@
 pub mod pb {
     tonic::include_proto!("ward.v1");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pb::{CreateSandboxRequest, SandboxInfo, SandboxStatus};
+    use prost::Message;
+
+    #[test]
+    fn given_create_request_with_tty_when_round_tripped_then_tty_is_true() {
+        // Arrange
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            tty: true,
+            ..Default::default()
+        };
+
+        // Act
+        let decoded = CreateSandboxRequest::decode(req.encode_to_vec().as_slice())
+            .expect("request must decode");
+
+        // Assert
+        assert!(decoded.tty);
+    }
+
+    #[test]
+    fn given_sandbox_status_when_numbers_read_then_old_values_keep_and_new_ones_are_fresh() {
+        // Arrange
+        let old = [
+            (SandboxStatus::Creating, 1),
+            (SandboxStatus::Running, 2),
+            (SandboxStatus::Stopped, 3),
+            (SandboxStatus::Failed, 4),
+        ];
+
+        // Act
+        let new = [SandboxStatus::Exited as i32, SandboxStatus::Stopping as i32];
+
+        // Assert
+        for (status, number) in old {
+            assert_eq!(status as i32, number);
+        }
+        for number in new {
+            assert!(number > 4, "new status must use a number not used before");
+        }
+        assert_ne!(new[0], new[1]);
+    }
+
+    #[test]
+    fn given_exit_code_zero_when_round_tripped_then_presence_differs_from_never_exited() {
+        // Arrange
+        let exited_zero = SandboxInfo {
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        let never_exited = SandboxInfo::default();
+
+        // Act
+        let decoded_zero =
+            SandboxInfo::decode(exited_zero.encode_to_vec().as_slice()).expect("info must decode");
+        let decoded_never =
+            SandboxInfo::decode(never_exited.encode_to_vec().as_slice()).expect("info must decode");
+
+        // Assert
+        assert_eq!(decoded_zero.exit_code, Some(0));
+        assert_eq!(decoded_never.exit_code, None);
+    }
+}

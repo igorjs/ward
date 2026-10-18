@@ -49,17 +49,25 @@ fn api_err_to_status(err: ApiError) -> Status {
     }
 }
 
+const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
+
 /// Read the caller-presented capability token off request metadata. A
 /// missing key and a value that fails ASCII/UTF-8 decoding are both
 /// treated as "no token" (empty string): `SandboxManager::authorize`
 /// rejects an empty token the same way it rejects a wrong one, so callers
 /// don't need a separate error path for a malformed header.
 fn token_from_metadata<T>(request: &Request<T>) -> &str {
+    optional_token_from_metadata(request).unwrap_or("")
+}
+
+/// Like [`token_from_metadata`], but tells a missing header (`None`) apart
+/// from a present one. An undecodable value counts as present and empty,
+/// so it is rejected rather than treated as an anonymous caller.
+fn optional_token_from_metadata<T>(request: &Request<T>) -> Option<&str> {
     request
         .metadata()
-        .get("x-ward-sandbox-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
+        .get(TOKEN_METADATA_KEY)
+        .map(|value| value.to_str().unwrap_or(""))
 }
 
 // ---------------------------------------------------------------------------
@@ -113,8 +121,14 @@ impl Ward for WardGrpcServer {
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxInfo>, Status> {
+        // A missing header is the public view; a present one must be valid.
+        let token = optional_token_from_metadata(&request).map(str::to_string);
         let req = request.into_inner();
-        let info = self.sandbox.get(&req.id).await.map_err(api_err_to_status)?;
+        let info = match token {
+            Some(token) => self.sandbox.get_authorized(&req.id, &token).await,
+            None => self.sandbox.get(&req.id).await,
+        }
+        .map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 

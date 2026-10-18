@@ -365,6 +365,8 @@ impl Backend for KrunvmBackend {
             // The backend has no concept of tokens; the manager layer
             // mints and stores the real token, then overwrites this.
             token: String::new(),
+            spec: opts.spec.clone(),
+            exit_code: None,
         };
 
         #[cfg(feature = "krunvm")]
@@ -1301,6 +1303,7 @@ mod tests {
             env: HashMap::new(),
             from_snapshot: None,
             comms: CommunicationPolicy::default(),
+            spec: crate::protocol::SandboxSpec::default(),
         }
     }
 

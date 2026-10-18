@@ -139,6 +139,8 @@ impl From<pb::SandboxInfo> for Sandbox {
             pb::SandboxStatus::Running => "running",
             pb::SandboxStatus::Stopped => "stopped",
             pb::SandboxStatus::Failed => "failed",
+            pb::SandboxStatus::Exited => "exited",
+            pb::SandboxStatus::Stopping => "stopping",
         };
         Self {
             id: info.id,
@@ -312,6 +314,7 @@ impl WardClient {
             mounts: Vec::new(),
             volume_ids: Vec::new(),
             from_snapshot: opts.from_snapshot.unwrap_or_default(),
+            ..Default::default()
         };
         // source_token proves ownership of the snapshot's source sandbox;
         // the daemon only consults it when from_snapshot is set, so a
@@ -575,6 +578,19 @@ mod tests {
         };
         let sb: Sandbox = info.into();
         assert_eq!(sb.status, "unspecified");
+    }
+
+    #[test]
+    fn given_exited_and_stopping_status_when_converted_then_not_running() {
+        let convert = |status: pb::SandboxStatus| {
+            let info = pb::SandboxInfo {
+                status: status as i32,
+                ..Default::default()
+            };
+            Sandbox::from(info).status
+        };
+        assert_eq!(convert(pb::SandboxStatus::Exited), "exited");
+        assert_eq!(convert(pb::SandboxStatus::Stopping), "stopping");
     }
 
     #[test]

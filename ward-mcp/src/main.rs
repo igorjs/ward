@@ -271,6 +271,7 @@ impl Server {
             mounts: Vec::new(),
             volume_ids: Vec::new(),
             from_snapshot: String::new(),
+            ..Default::default()
         };
         let info = self
             .runtime
@@ -293,10 +294,7 @@ impl Server {
         }
         let mut lines = Vec::with_capacity(sandboxes.len());
         for s in sandboxes {
-            let status = pb::SandboxStatus::try_from(s.status)
-                .map(|st| format!("{st:?}"))
-                .unwrap_or_else(|_| "unknown".to_string());
-            lines.push(format!("{}\t{}\t{}", s.id, s.image, status));
+            lines.push(format!("{}\t{}\t{}", s.id, s.image, status_label(s.status)));
         }
         Ok(lines.join("\n"))
     }
@@ -774,4 +772,45 @@ fn tools_descriptors() -> serde_json::Value {
             }
         }
     ])
+}
+
+/// Name of a wire status, or "unknown" for a value this build does not
+/// know, which callers must treat as not running.
+fn status_label(status: i32) -> String {
+    pb::SandboxStatus::try_from(status)
+        .map(|st| format!("{st:?}"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNKNOWN_STATUS: i32 = 9999;
+
+    #[test]
+    fn given_unknown_status_when_labelled_then_not_running_and_no_panic() {
+        // Arrange
+        let running = pb::SandboxStatus::Running as i32;
+
+        // Act
+        let label = status_label(UNKNOWN_STATUS);
+
+        // Assert
+        assert_eq!(label, "unknown");
+        assert_ne!(label, status_label(running));
+    }
+
+    #[test]
+    fn given_new_statuses_when_labelled_then_names_are_shown() {
+        // Arrange
+        let exited = pb::SandboxStatus::Exited as i32;
+        let stopping = pb::SandboxStatus::Stopping as i32;
+
+        // Act
+        let labels = (status_label(exited), status_label(stopping));
+
+        // Assert
+        assert_eq!(labels, ("Exited".to_string(), "Stopping".to_string()));
+    }
 }
