@@ -88,7 +88,7 @@ for entry in "${CASES[@]}"; do
 
   # Act
   actual=$PASS
-  (cd "$work" && bash "$CHECK" "$BASE_REV") >/dev/null 2>&1 || actual=$FAIL
+  (cd "$work" && bash "$CHECK" "$BASE_REV") >/dev/null 2>&1 || actual=$?
 
   # Assert
   if [ "$actual" -eq "$expected" ]; then
