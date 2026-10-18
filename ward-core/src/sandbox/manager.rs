@@ -2,7 +2,7 @@
 
 //! SandboxManager coordinates the backend, egress proxies, and timeout tracking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -59,6 +59,41 @@ struct SandboxEntry {
     /// minted at creation. `authorize()` compares against that hash; the
     /// token itself is never kept.
     meta: SandboxMeta,
+}
+
+/// Holds a sandbox name while its creation is in flight, so two concurrent
+/// creates cannot both claim it. Released on drop, whether the create
+/// succeeded or failed.
+struct NameReservation {
+    pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    name: String,
+}
+
+impl NameReservation {
+    /// `None` when another create already holds `name`.
+    fn claim(pending: &Arc<std::sync::Mutex<HashSet<String>>>, name: &str) -> Option<Self> {
+        let claimed = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string());
+        claimed.then(|| Self {
+            pending: Arc::clone(pending),
+            name: name.to_string(),
+        })
+    }
+}
+
+impl Drop for NameReservation {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.name);
+    }
+}
+
+fn name_in_use(name: &str) -> ApiError {
+    ApiError::InvalidRequest(format!("sandbox name \"{name}\" is already in use"))
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +158,8 @@ pub struct SandboxManager {
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
     /// On-disk sandbox records. `None` keeps everything in memory.
     store: Option<MetaStore>,
+    /// Names claimed by creates that have not yet inserted their entry.
+    pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl SandboxManager {
@@ -143,6 +180,7 @@ impl SandboxManager {
             network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
             store: None,
+            pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
     }
 
@@ -333,6 +371,8 @@ impl SandboxManager {
             crate::validate::entity_id(vid, "volume")?;
         }
 
+        let name_reservation = self.reserve_name(&req.name).await?;
+
         let id = uuid::Uuid::new_v4().to_string();
 
         let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
@@ -458,6 +498,9 @@ impl SandboxManager {
             },
         );
 
+        // The entry now carries the name, so the in-flight claim can go.
+        drop(name_reservation);
+
         // Register the comms policy with the broker so publish/subscribe
         // calls from this sandbox have something to match against. Done
         // after the entries-insert so we don't leak broker state if the
@@ -481,6 +524,62 @@ impl SandboxManager {
 
         // The creator supplied the arguments, so echoing them back is safe.
         Ok(protocol_info_to_pb(info, CommandView::Full))
+    }
+
+    /// Claim `name` for a new sandbox. An empty name means no name and
+    /// claims nothing. Fails when the name is invalid or already used by a
+    /// live sandbox or an in-flight create.
+    async fn reserve_name(&self, name: &str) -> Result<Option<NameReservation>> {
+        if name.is_empty() {
+            return Ok(None);
+        }
+        crate::validate::sandbox_name(name)?;
+        let reservation =
+            NameReservation::claim(&self.pending_names, name).ok_or_else(|| name_in_use(name))?;
+        // A create that finished before this claim has released its own, so
+        // its name is in `entries` by now.
+        let taken = self
+            .entries
+            .read()
+            .await
+            .values()
+            .any(|entry| entry.meta.options.spec.name == name);
+        if taken {
+            return Err(name_in_use(name));
+        }
+        Ok(Some(reservation))
+    }
+
+    /// Resolve a sandbox name, id or id prefix to the full id, trying an
+    /// exact name, then an exact id, then a unique id prefix. Names never
+    /// look like ids (see `validate::sandbox_name`), so the order cannot
+    /// pick the wrong sandbox.
+    pub async fn resolve(&self, reference: &str) -> Result<String> {
+        crate::validate::sandbox_reference(reference)?;
+        let entries = self.entries.read().await;
+        if let Some((id, _)) = entries
+            .iter()
+            .find(|(_, entry)| entry.meta.options.spec.name == reference)
+        {
+            return Ok(id.clone());
+        }
+        if entries.contains_key(reference) {
+            return Ok(reference.to_string());
+        }
+        let mut matches: Vec<&str> = entries
+            .keys()
+            .filter(|id| id.starts_with(reference))
+            .map(String::as_str)
+            .collect();
+        matches.sort_unstable();
+        match matches.as_slice() {
+            [] => Err(ApiError::SandboxNotFound(reference.to_string())),
+            [id] => Ok((*id).to_string()),
+            _ => Err(ApiError::AmbiguousReference(format!(
+                "ID prefix \"{reference}\" matches several sandboxes: {}",
+                matches.join(", ")
+            ))),
+        }
     }
 
     /// Remove sandbox `id` after `after` of wall time. The watcher routes
@@ -519,7 +618,8 @@ impl SandboxManager {
     /// Retrieve info for an existing sandbox. The command carries argv[0]
     /// only, because full arguments can hold secrets.
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
-        crate::validate::entity_id(id, "sandbox")?;
+        let id = self.resolve(id).await?;
+        let id = id.as_str();
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
         Ok(protocol_info_to_pb(
             redact_token(info),
@@ -530,7 +630,8 @@ impl SandboxManager {
     /// Like [`get`](Self::get), but also returns the full command when the
     /// presented token matches the sandbox's token.
     pub async fn get_authorized(&self, id: &str, token: &str) -> Result<PbSandboxInfo> {
-        crate::validate::entity_id(id, "sandbox")?;
+        let id = self.resolve(id).await?;
+        let id = id.as_str();
         self.authorize(id, token).await?;
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
         Ok(protocol_info_to_pb(redact_token(info), CommandView::Full))
@@ -551,6 +652,8 @@ impl SandboxManager {
     /// wrong token so callers (and the gRPC layer's status mapping) can
     /// tell the two apart.
     pub async fn authorize(&self, sandbox_id: &str, token: &str) -> Result<()> {
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         let entries = self.entries.read().await;
         let entry = entries
             .get(sandbox_id)
@@ -566,7 +669,8 @@ impl SandboxManager {
 
     /// Return the egress decision log for a sandbox's proxy.
     pub async fn egress_log(&self, id: &str) -> Result<Vec<crate::egress::LogEntry>> {
-        crate::validate::entity_id(id, "sandbox")?;
+        let id = self.resolve(id).await?;
+        let id = id.as_str();
         let entries = self.entries.read().await;
         let entry = entries
             .get(id)
@@ -576,7 +680,8 @@ impl SandboxManager {
 
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
-        crate::validate::entity_id(id, "sandbox")?;
+        let id = self.resolve(id).await?;
+        let id = id.as_str();
         Self::cleanup_sandbox_inner(
             &self.entries,
             &self.broker,
@@ -650,7 +755,8 @@ impl SandboxManager {
         sandbox_id: &str,
         label: &str,
     ) -> Result<crate::protocol::SnapshotInfo> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         self.backend
             .create_snapshot(sandbox_id, label)
             .await
@@ -664,7 +770,8 @@ impl SandboxManager {
     /// is "the snapshot doesn't exist for this sandbox", which is true
     /// either way.
     pub async fn restore_snapshot(&self, sandbox_id: &str, snapshot_id: &str) -> Result<()> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         crate::validate::entity_id(snapshot_id, "snapshot")?;
         self.backend
             .restore_snapshot(sandbox_id, snapshot_id)
@@ -677,7 +784,8 @@ impl SandboxManager {
         &self,
         sandbox_id: &str,
     ) -> Result<Vec<crate::protocol::SnapshotInfo>> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         self.backend
             .list_snapshots(sandbox_id)
             .await
@@ -690,12 +798,12 @@ impl SandboxManager {
 
     /// Execute an arbitrary command inside a sandbox.
     pub async fn exec(&self, req: ExecRequest) -> Result<ProcessInfo> {
-        crate::validate::entity_id(&req.sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(&req.sandbox_id).await?;
         crate::validate::exec_command(&req.command)?;
         let handle = self
             .backend
             .exec(
-                &req.sandbox_id,
+                &sandbox_id,
                 req.command.clone(),
                 if req.working_dir.is_empty() {
                     None
@@ -712,7 +820,7 @@ impl SandboxManager {
         // produced a process without that channel attached.
         let pid = handle.pid.clone();
         let record = ProcessRecord {
-            sandbox_id: req.sandbox_id.clone(),
+            sandbox_id: sandbox_id.clone(),
             output_rx: Arc::new(Mutex::new(handle.output_rx)),
             stdin_tx: handle.stdin_tx,
         };
@@ -720,7 +828,7 @@ impl SandboxManager {
 
         Ok(ProcessInfo {
             pid,
-            sandbox_id: req.sandbox_id,
+            sandbox_id,
             status: "running".to_string(),
         })
     }
@@ -773,7 +881,8 @@ impl SandboxManager {
         sandbox_id: &str,
         pid: &str,
     ) -> Result<mpsc::Receiver<StreamEvent>> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         crate::validate::entity_id(pid, "process")?;
 
         // Extract the output handle inside a short scope and drop the
@@ -820,7 +929,8 @@ impl SandboxManager {
     /// the user's perspective the pid disappears: subsequent stream_output,
     /// write_stdin, and kill_process calls all return ProcessNotFound.
     pub async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         crate::validate::entity_id(pid, "process")?;
 
         // Verify ownership in a read scope first — a kill of an unknown or
@@ -856,7 +966,8 @@ impl SandboxManager {
     /// is a valid no-op — callers occasionally use it as a connectivity
     /// probe before streaming real input.
     pub async fn write_stdin(&self, sandbox_id: &str, pid: &str, data: bytes::Bytes) -> Result<()> {
-        crate::validate::entity_id(sandbox_id, "sandbox")?;
+        let sandbox_id = self.resolve(sandbox_id).await?;
+        let sandbox_id = sandbox_id.as_str();
         crate::validate::entity_id(pid, "process")?;
 
         // Clone the sender inside a short scope and drop the `processes`
@@ -1571,11 +1682,9 @@ mod tests {
         // Arrange
         let mgr = build_manager(4);
 
-        // Act: non-hex characters fail validate::entity_id before lookup.
-        let err = mgr
-            .get("not-a-valid-uuid-zzzz")
-            .await
-            .expect_err("malformed id");
+        // Act: characters outside the reference alphabet fail validation
+        // before lookup.
+        let err = mgr.get("not a valid id!").await.expect_err("malformed id");
 
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
@@ -1875,7 +1984,7 @@ mod tests {
         // Act
         let err = mgr
             .exec(crate::pb::ExecRequest {
-                sandbox_id: "not-a-uuid-zzzz".into(),
+                sandbox_id: "not a uuid!".into(),
                 command: vec!["echo".into()],
                 working_dir: String::new(),
                 env: Default::default(),
@@ -2069,10 +2178,10 @@ mod tests {
 
     #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
     #[tokio::test]
-    async fn given_sandbox_removed_when_stream_output_for_old_pid_then_process_not_found() {
+    async fn given_sandbox_removed_when_stream_output_for_old_pid_then_sandbox_not_found() {
         // Arrange: removing a sandbox must drop its process records so
-        // they do not accumulate. Asking for a pid afterwards looks like
-        // it never existed.
+        // they do not accumulate. The sandbox reference no longer resolves,
+        // so the lookup stops before the pid is read.
         let mgr = build_manager(4);
         let s = mgr.create(create_req("alpine"), "").await.unwrap();
         let proc = mgr
@@ -2092,7 +2201,7 @@ mod tests {
             .expect_err("after remove");
 
         // Assert
-        assert!(matches!(err, ApiError::ProcessNotFound(_)));
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
     }
 
     #[tokio::test]
@@ -2509,7 +2618,7 @@ mod tests {
 
         // Act
         let err = mgr
-            .create_snapshot("not-hex-zzz", "x")
+            .create_snapshot("not hex!", "x")
             .await
             .expect_err("malformed");
 
@@ -2815,5 +2924,290 @@ mod tests {
 
         // Assert
         assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    }
+
+    // ----- names and id lookup -------------------------------------------
+
+    const ID_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
+    const ID_A2: &str = "aaaaaaaa-0000-4000-8000-000000000002";
+    const ID_B: &str = "bbbbbbbb-0000-4000-8000-000000000003";
+    const SEED_TOKEN: &str = "11111111-2222-3333-4444-555555555555";
+    const RACE_CREATORS: usize = 8;
+
+    /// Write a stopped sandbox record with a fixed id so a restart loads it.
+    fn seed_sandbox(path: &std::path::Path, id: &str, name: &str) {
+        let meta = SandboxMeta {
+            id: id.to_string(),
+            options: crate::protocol::CreateOpts {
+                image: "alpine".into(),
+                mounts: Vec::new(),
+                volume_ids: Vec::new(),
+                egress: Default::default(),
+                resources: Default::default(),
+                env: Default::default(),
+                from_snapshot: None,
+                comms: Default::default(),
+                spec: crate::protocol::SandboxSpec {
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+            },
+            created_at: std::time::SystemTime::now(),
+            status: ProtoStatus::Stopped,
+            exit_code: None,
+            token_hash: hash_token(SEED_TOKEN),
+        };
+        MetaStore::new(path).save(&meta).unwrap();
+    }
+
+    fn named(name: &str) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            image: "alpine".into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn given_two_sandboxes_sharing_a_prefix_when_prefix_resolved_then_ambiguous_naming_both_ids()
+     {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        seed_sandbox(tmp.path(), ID_A, "");
+        seed_sandbox(tmp.path(), ID_A2, "");
+        let mgr = restart(tmp.path()).await;
+
+        // Act
+        let err = mgr.get("aaaa").await.expect_err("ambiguous prefix");
+
+        // Assert
+        let ApiError::AmbiguousReference(msg) = err else {
+            panic!("expected AmbiguousReference, got {err:?}");
+        };
+        assert!(msg.contains(ID_A) && msg.contains(ID_A2), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn given_full_uuid_when_get_then_returns_that_sandbox() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        seed_sandbox(tmp.path(), ID_A, "");
+        let mgr = restart(tmp.path()).await;
+
+        // Act
+        let info = mgr.get(ID_A).await.unwrap();
+
+        // Assert
+        assert_eq!(info.id, ID_A);
+    }
+
+    #[tokio::test]
+    async fn given_unique_prefix_when_get_then_resolves_to_that_sandbox() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        seed_sandbox(tmp.path(), ID_A, "");
+        seed_sandbox(tmp.path(), ID_B, "");
+        let mgr = restart(tmp.path()).await;
+
+        // Act
+        let info = mgr.get("bbbb").await.unwrap();
+
+        // Assert
+        assert_eq!(info.id, ID_B);
+    }
+
+    #[tokio::test]
+    async fn given_unmatched_prefix_when_resolve_then_sandbox_not_found() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        seed_sandbox(tmp.path(), ID_A, "");
+        let mgr = restart(tmp.path()).await;
+
+        // Act
+        let err = mgr.resolve("cccc").await.expect_err("no match");
+
+        // Assert
+        assert!(matches!(err, ApiError::SandboxNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn given_empty_reference_when_resolve_then_invalid_request() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr.resolve("").await.expect_err("empty prefix");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+    }
+
+    #[rstest::rstest]
+    #[case::single_char("w")]
+    #[case::max_length("g".repeat(crate::validate::MAX_SANDBOX_NAME_LEN))]
+    #[case::hyphen("web-1")]
+    #[case::underscore("web_1")]
+    #[case::dot("web.1")]
+    #[tokio::test]
+    async fn given_valid_name_when_create_then_succeeds(#[case] name: String) {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let created = mgr.create(named(&name), "").await.unwrap();
+
+        // Assert
+        assert_eq!(created.name, name);
+    }
+
+    #[rstest::rstest]
+    #[case::bad_char_at("web_1@host".to_string())]
+    #[case::bad_char_bang("web-1!".to_string())]
+    #[case::space("web 1".to_string())]
+    #[case::over_length("g".repeat(crate::validate::MAX_SANDBOX_NAME_LEN + 1))]
+    #[case::hex_only("a1".to_string())]
+    #[case::uuid_prefix("550e8400-e29b".to_string())]
+    #[tokio::test]
+    async fn given_invalid_name_when_create_then_rejected(#[case] name: String) {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr.create(named(&name), "").await.expect_err("bad name");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+        assert!(mgr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_no_name_when_two_sandboxes_created_then_both_succeed() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.create(named(""), "").await.unwrap();
+
+        // Act
+        let second = mgr.create(named(""), "").await;
+
+        // Assert
+        assert!(second.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_named_sandbox_when_get_by_name_then_returns_it() {
+        // Arrange
+        let mgr = build_manager(4);
+        let created = mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        let info = mgr.get("web1").await.unwrap();
+
+        // Assert
+        assert_eq!(info.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn given_named_sandbox_when_authorize_by_name_then_checks_token_of_resolved_id() {
+        // Arrange
+        let mgr = build_manager(4);
+        let created = mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        let right = mgr.authorize("web1", &created.token).await;
+        let wrong = mgr.authorize("web1", "wrong").await;
+
+        // Assert
+        assert!(right.is_ok());
+        assert!(matches!(wrong, Err(ApiError::PermissionDenied(_))));
+    }
+
+    #[cfg(not(feature = "krunvm"))] // needs a real guest agent; covered by e2e_vm
+    #[tokio::test]
+    async fn given_named_sandbox_when_exec_by_name_then_process_reports_resolved_id() {
+        // Arrange
+        let mgr = build_manager(4);
+        let created = mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        let process = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: "web1".into(),
+                command: vec!["echo".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Assert
+        assert_eq!(process.sandbox_id, created.id);
+    }
+
+    #[tokio::test]
+    async fn given_named_sandbox_when_remove_by_name_then_name_is_free_again() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        mgr.remove("web1").await.unwrap();
+        let again = mgr.create(named("web1"), "").await;
+
+        // Assert
+        assert!(again.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_named_web1_when_another_created_with_that_name_then_rejected() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.create(named("web1"), "").await.unwrap();
+
+        // Act
+        let err = mgr
+            .create(named("web1"), "")
+            .await
+            .expect_err("duplicate name");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_reloaded_sandbox_named_web1_when_created_with_that_name_then_rejected() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        seed_sandbox(tmp.path(), ID_A, "web1");
+        let mgr = restart(tmp.path()).await;
+
+        // Act
+        let result = mgr.create(named("web1"), "").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn given_concurrent_creates_of_one_name_when_finished_then_exactly_one_succeeds() {
+        // Arrange
+        let mgr = build_manager(RACE_CREATORS);
+        let tasks: Vec<_> = (0..RACE_CREATORS)
+            .map(|_| {
+                let mgr = Arc::clone(&mgr);
+                tokio::spawn(async move { mgr.create(named("web1"), "").await })
+            })
+            .collect();
+
+        // Act
+        let mut winners = 0;
+        for task in tasks {
+            if task.await.unwrap().is_ok() {
+                winners += 1;
+            }
+        }
+
+        // Assert
+        assert_eq!(winners, 1);
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
     }
 }

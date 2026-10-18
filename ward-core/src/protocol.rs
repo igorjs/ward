@@ -287,6 +287,8 @@ pub enum ApiError {
     Internal(String),
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+    #[error("ambiguous sandbox reference: {0}")]
+    AmbiguousReference(String),
 }
 
 // ---------------------------------------------------------------------------

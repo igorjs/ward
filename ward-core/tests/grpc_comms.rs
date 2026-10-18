@@ -83,7 +83,7 @@ async fn given_malformed_sandbox_id_when_publish_then_invalid_argument() {
     // Act
     let err = client
         .publish(PublishRequest {
-            sandbox_id: "not-a-uuid-zzzz".into(),
+            sandbox_id: "not a uuid!".into(),
             topic: "events".into(),
             payload: vec![],
         })

@@ -190,10 +190,56 @@ async fn given_malformed_id_when_get_sandbox_then_invalid_argument() {
     // Act
     let err = client
         .get_sandbox(GetSandboxRequest {
-            id: "not-a-uuid-zzzz".into(),
+            id: "not a uuid!".into(),
         })
         .await
         .expect_err("malformed id");
+
+    // Assert
+    assert_eq!(err.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn given_sandbox_named_web1_when_get_sandbox_by_name_then_returns_it() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let created = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            name: "web1".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner();
+
+    // Act
+    let info = client
+        .get_sandbox(GetSandboxRequest { id: "web1".into() })
+        .await
+        .expect("get by name")
+        .into_inner();
+
+    // Assert
+    assert_eq!(info.id, created.id);
+}
+
+#[tokio::test]
+async fn given_duplicate_name_when_create_sandbox_then_invalid_argument() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let request = CreateSandboxRequest {
+        image: "alpine:latest".into(),
+        name: "web1".into(),
+        ..Default::default()
+    };
+    client.create_sandbox(request.clone()).await.expect("first");
+
+    // Act
+    let err = client
+        .create_sandbox(request)
+        .await
+        .expect_err("duplicate name");
 
     // Assert
     assert_eq!(err.code(), Code::InvalidArgument);

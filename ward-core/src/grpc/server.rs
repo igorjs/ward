@@ -46,7 +46,14 @@ fn api_err_to_status(err: ApiError) -> Status {
             Status::internal("internal error")
         }
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
+        ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
     }
+}
+
+/// Turn a name, id or id prefix into a full sandbox id. Handlers call this
+/// before authorizing, so the token is checked against the resolved id.
+async fn resolve_sandbox(sandbox: &SandboxManager, reference: &str) -> Result<String, Status> {
+    sandbox.resolve(reference).await.map_err(api_err_to_status)
 }
 
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
@@ -156,15 +163,12 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.id, "sandbox").map_err(api_err_to_status)?;
+        let id = resolve_sandbox(&self.sandbox, &req.id).await?;
         self.sandbox
-            .authorize(&req.id, &token)
+            .authorize(&id, &token)
             .await
             .map_err(api_err_to_status)?;
-        self.sandbox
-            .remove(&req.id)
-            .await
-            .map_err(api_err_to_status)?;
+        self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(()))
     }
 
@@ -175,12 +179,14 @@ impl Ward for WardGrpcServer {
     )]
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ProcessInfo>, Status> {
         let token = token_from_metadata(&request).to_string();
-        let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        let mut req = request.into_inner();
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
+        // Run against the id the token was checked for, never a second lookup.
+        req.sandbox_id = sandbox_id;
         let info = self.sandbox.exec(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
@@ -192,12 +198,14 @@ impl Ward for WardGrpcServer {
     )]
     async fn run(&self, request: Request<RunRequest>) -> Result<Response<ProcessInfo>, Status> {
         let token = token_from_metadata(&request).to_string();
-        let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        let mut req = request.into_inner();
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
+        // Run against the id the token was checked for, never a second lookup.
+        req.sandbox_id = sandbox_id;
         let info = self.sandbox.run(req).await.map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
@@ -219,19 +227,19 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<Self::StreamOutputStream>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
 
-        // Manager re-runs the entity_id validators on both fields and
+        // Manager re-resolves the sandbox, re-validates the pid and
         // performs the cross-sandbox ownership check before handing over
         // the receiver.
         let mut inner_rx = self
             .sandbox
-            .stream_output(&req.sandbox_id, &req.pid)
+            .stream_output(&sandbox_id, &req.pid)
             .await
             .map_err(api_err_to_status)?;
 
@@ -270,14 +278,14 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
         self.sandbox
-            .write_stdin(&req.sandbox_id, &req.pid, bytes::Bytes::from(req.data))
+            .write_stdin(&sandbox_id, &req.pid, bytes::Bytes::from(req.data))
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -298,14 +306,14 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
         self.sandbox
-            .kill_process(&req.sandbox_id, &req.pid)
+            .kill_process(&sandbox_id, &req.pid)
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -322,14 +330,14 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<SnapshotInfo>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
         let info = self
             .sandbox
-            .create_snapshot(&req.sandbox_id, &req.label)
+            .create_snapshot(&sandbox_id, &req.label)
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(snapshot_info_to_pb(info)))
@@ -350,14 +358,14 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::entity_id(&req.snapshot_id, "snapshot").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
         self.sandbox
-            .restore_snapshot(&req.sandbox_id, &req.snapshot_id)
+            .restore_snapshot(&sandbox_id, &req.snapshot_id)
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -374,22 +382,27 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<ListSnapshotsResponse>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-
-        // list_snapshots is lenient toward an unknown sandbox (empty list,
+        // list_snapshots is lenient toward an unknown sandbox (empty result,
         // not an error) even before token enforcement: callers use it as a
-        // cheap existence check. Preserve that by falling through past a
-        // SandboxNotFound from authorize(); any other outcome (including
-        // PermissionDenied for a real sandbox with a missing or wrong
-        // token) still fails the request here.
-        match self.sandbox.authorize(&req.sandbox_id, &token).await {
-            Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+        // cheap existence check. Any other failure, including PermissionDenied for
+        // a real sandbox with a missing or wrong token, still fails here.
+        let sandbox_id = match self.sandbox.resolve(&req.sandbox_id).await {
+            Ok(id) => id,
+            Err(ApiError::SandboxNotFound(_)) => {
+                return Ok(Response::new(ListSnapshotsResponse {
+                    snapshots: Vec::new(),
+                }));
+            }
             Err(err) => return Err(api_err_to_status(err)),
-        }
+        };
+        self.sandbox
+            .authorize(&sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
 
         let snaps = self
             .sandbox
-            .list_snapshots(&req.sandbox_id)
+            .list_snapshots(&sandbox_id)
             .await
             .map_err(api_err_to_status)?;
         let snapshots = snaps.into_iter().map(snapshot_info_to_pb).collect();
@@ -465,14 +478,14 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<EgressLogResponse>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
         let log = self
             .sandbox
-            .egress_log(&req.sandbox_id)
+            .egress_log(&sandbox_id)
             .await
             .map_err(api_err_to_status)?;
 
@@ -512,11 +525,11 @@ impl Ward for WardGrpcServer {
     async fn publish(&self, request: Request<PublishRequest>) -> Result<Response<()>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
         crate::validate::publish_payload(&req.payload).map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
 
@@ -526,7 +539,7 @@ impl Ward for WardGrpcServer {
         // sandbox (NotFound).
         self.sandbox
             .broker()
-            .publish(&req.sandbox_id, &req.topic, bytes::Bytes::from(req.payload))
+            .publish(&sandbox_id, &req.topic, bytes::Bytes::from(req.payload))
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -549,17 +562,17 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
         crate::validate::topic_name(&req.topic).map_err(api_err_to_status)?;
+        let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
-            .authorize(&req.sandbox_id, &token)
+            .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
 
         let mut inner_rx = self
             .sandbox
             .broker()
-            .subscribe(&req.sandbox_id, &req.topic)
+            .subscribe(&sandbox_id, &req.topic)
             .await
             .map_err(api_err_to_status)?;
 
@@ -594,20 +607,25 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<CommunicationLogResponse>, Status> {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
-        crate::validate::entity_id(&req.sandbox_id, "sandbox").map_err(api_err_to_status)?;
-
         // get_communication_log is lenient toward an unknown sandbox (empty
-        // log, not an error) even before token enforcement: callers use it as
-        // a cheap existence check. Preserve that by falling through past a
-        // SandboxNotFound from authorize(); any other outcome (including
-        // PermissionDenied for a real sandbox with a missing or wrong
-        // token) still fails the request here.
-        match self.sandbox.authorize(&req.sandbox_id, &token).await {
-            Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+        // result, not an error) even before token enforcement: callers use
+        // it as a cheap existence check. Any other failure, including PermissionDenied for
+        // a real sandbox with a missing or wrong token, still fails here.
+        let sandbox_id = match self.sandbox.resolve(&req.sandbox_id).await {
+            Ok(id) => id,
+            Err(ApiError::SandboxNotFound(_)) => {
+                return Ok(Response::new(CommunicationLogResponse {
+                    entries: Vec::new(),
+                }));
+            }
             Err(err) => return Err(api_err_to_status(err)),
-        }
+        };
+        self.sandbox
+            .authorize(&sandbox_id, &token)
+            .await
+            .map_err(api_err_to_status)?;
 
-        let entries = self.sandbox.broker().log(&req.sandbox_id).await;
+        let entries = self.sandbox.broker().log(&sandbox_id).await;
         let pb_entries = entries.into_iter().map(log_entry_to_pb).collect();
         Ok(Response::new(CommunicationLogResponse {
             entries: pb_entries,
@@ -763,6 +781,19 @@ mod tests {
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             Ok(format!("sha256:{hash:016x}"))
         }
+    }
+
+    #[test]
+    fn given_ambiguous_reference_when_mapped_then_failed_precondition_naming_ids() {
+        // Arrange
+        let err = ApiError::AmbiguousReference("matches aaaa-1 and aaaa-2".into());
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("aaaa-1") && status.message().contains("aaaa-2"));
     }
 
     fn build_test_server() -> WardGrpcServer {

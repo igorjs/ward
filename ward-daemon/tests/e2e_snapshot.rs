@@ -237,7 +237,7 @@ fn given_malformed_sandbox_id_when_user_runs_snapshot_list_then_fails_with_inval
 
     // Act
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["snapshot", "list", "not-a-uuid-zzz"]).assert();
+    let assertion = cmd.args(["snapshot", "list", "not a uuid!"]).assert();
 
     // Assert
     assertion
