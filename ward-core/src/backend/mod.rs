@@ -78,6 +78,16 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn remove_sandbox(&self, id: &str) -> Result<()>;
 
+    /// Take over a sandbox reloaded from disk after a daemon restart. It
+    /// enters the backend's table with its stored rootfs so a later boot
+    /// can find it. No VM is started.
+    async fn adopt_sandbox(
+        &self,
+        info: crate::protocol::SandboxInfo,
+        env: std::collections::HashMap<String, String>,
+        rootfs: std::path::PathBuf,
+    ) -> Result<()>;
+
     async fn count(&self) -> Result<usize>;
 
     // -- Processes ------------------------------------------------------

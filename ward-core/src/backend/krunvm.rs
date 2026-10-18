@@ -19,6 +19,7 @@ use crate::egress::EgressProxy;
 #[cfg(feature = "krunvm")]
 use crate::protocol::EgressMode;
 use crate::protocol::{CreateOpts, SandboxInfo, SandboxStatus, SnapshotInfo};
+use crate::sandbox::store::MetaStore;
 
 /// vsock port the guest agent listens on; must match `ward-agent`.
 /// Only referenced by the krunvm-gated FFI wrappers.
@@ -137,6 +138,8 @@ struct SandboxState {
     /// Environment given at create time. Applied to every exec; variables
     /// passed to a single exec win over these.
     env: HashMap<String, String>,
+    /// Unpacked rootfs a boot of this sandbox starts from.
+    rootfs: std::path::PathBuf,
     /// Host process running this sandbox's microVM. `None` in stub builds.
     #[cfg(feature = "krunvm")]
     shim: Option<super::vmshim::ShimProcess>,
@@ -159,7 +162,7 @@ struct SandboxState {
 impl std::fmt::Debug for SandboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("SandboxState");
-        s.field("info", &self.info);
+        s.field("info", &self.info).field("rootfs", &self.rootfs);
         #[cfg(feature = "krunvm")]
         s.field("shim", &self.shim)
             .field("smoltcp_active", &self.smoltcp.is_some())
@@ -377,6 +380,7 @@ impl Backend for KrunvmBackend {
         let state = SandboxState {
             info: info.clone(),
             env: opts.env.clone(),
+            rootfs,
             #[cfg(feature = "krunvm")]
             shim,
             #[cfg(feature = "krunvm")]
@@ -458,9 +462,34 @@ impl Backend for KrunvmBackend {
 
         // Best-effort host cleanup: the agent socket and the unpacked rootfs.
         let _ = std::fs::remove_file(self.agent_socket_path(id));
-        let sandbox_dir = self.data_dir.join("sandboxes").join(id);
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(sandbox_dir)).await;
+        self.remove_sandbox_dir(id).await;
 
+        Ok(())
+    }
+
+    async fn adopt_sandbox(
+        &self,
+        info: SandboxInfo,
+        env: HashMap<String, String>,
+        rootfs: std::path::PathBuf,
+    ) -> Result<()> {
+        // No VM outlives the daemon, so a socket file left behind is stale.
+        let _ = std::fs::remove_file(self.agent_socket_path(&info.id));
+        let state = SandboxState {
+            env,
+            rootfs,
+            #[cfg(feature = "krunvm")]
+            shim: None,
+            #[cfg(feature = "krunvm")]
+            smoltcp: None,
+            #[cfg(feature = "krunvm")]
+            egress: None,
+            info,
+        };
+        self.sandboxes
+            .write()
+            .await
+            .insert(state.info.id.clone(), state);
         Ok(())
     }
 
@@ -811,18 +840,35 @@ impl KrunvmBackend {
         agent_socket_dir().join(format!("{short_id}.sock"))
     }
 
-    /// Remove a sandbox's directory after a failed create. Best effort.
+    /// Remove a sandbox's directory, record first. Best effort.
     async fn remove_sandbox_dir(&self, id: &str) {
-        let dir = self.data_dir.join("sandboxes").join(id);
-        let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(dir)).await;
+        let store = MetaStore::new(&self.data_dir);
+        let doomed = id.to_string();
+        match tokio::task::spawn_blocking(move || store.delete(&doomed)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(sandbox_id = %id, error = %e, "cannot remove sandbox directory")
+            }
+            Err(e) => {
+                tracing::warn!(sandbox_id = %id, error = %e, "sandbox directory removal task failed")
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_socket_path_for_test(&self, sandbox_id: &str) -> std::path::PathBuf {
+        self.agent_socket_path(sandbox_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rootfs_for_test(&self, sandbox_id: &str) -> Option<std::path::PathBuf> {
+        let sandboxes = self.sandboxes.read().await;
+        sandboxes.get(sandbox_id).map(|s| s.rootfs.clone())
     }
 
     /// Unpacked rootfs directory for a sandbox.
     fn sandbox_rootfs(&self, sandbox_id: &str) -> std::path::PathBuf {
-        self.data_dir
-            .join("sandboxes")
-            .join(sandbox_id)
-            .join("rootfs")
+        MetaStore::new(&self.data_dir).rootfs_path(sandbox_id)
     }
 
     /// On-disk directory holding a snapshot's archive and metadata.
@@ -1312,6 +1358,35 @@ mod tests {
             .create_sandbox(id.to_string(), &create_opts())
             .await
             .expect("create_sandbox");
+    }
+
+    // ----- adopt_sandbox ------------------------------------------------
+
+    #[tokio::test]
+    async fn given_reloaded_sandbox_when_adopted_then_table_holds_entry_with_stored_rootfs() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        let mut info = backend.get_sandbox("sb1").await.unwrap();
+        info.id = "sb2".into();
+        info.status = SandboxStatus::Stopped;
+        let stored_rootfs = backend
+            .data_dir
+            .join("sandboxes")
+            .join("sb2")
+            .join("rootfs");
+
+        // Act
+        backend
+            .adopt_sandbox(info, HashMap::new(), stored_rootfs.clone())
+            .await
+            .expect("adopt");
+
+        // Assert
+        let table = backend.sandboxes.read().await;
+        let state = table.get("sb2").expect("entry for adopted id");
+        assert_eq!(state.rootfs, stored_rootfs);
+        assert_eq!(state.info.status, SandboxStatus::Stopped);
     }
 
     // ----- create_snapshot ----------------------------------------------

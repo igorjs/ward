@@ -44,6 +44,11 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tar = "0.4"
+# sha2: SHA-256 of the sandbox capability token, so meta.json never holds
+# the token itself.
+sha2 = "0.10"
+# subtle: constant-time compare of token hashes (BSD-3-Clause).
+subtle = "2"
 tonic = "0.14"
 # tonic 0.14 split prost integration into a separate crate; the generated
 # code (include_proto!) references it.
