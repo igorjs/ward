@@ -60,6 +60,10 @@ message CreateSandboxRequest {
   map<string, string> env = 6;
   string from_snapshot = 7;  // optional: create from snapshot ID
   CommunicationPolicy comms = 8;  // cross-sandbox pub/sub access
+  string name = 9;
+  repeated string command = 10;  // main process argv; empty means none
+  string workdir = 11;
+  bool tty = 12;
 }
 
 message GetSandboxRequest {
@@ -84,6 +88,14 @@ message SandboxInfo {
   google.protobuf.Timestamp expires_at = 7;
   // Populated only on CreateSandbox's response; empty on GetSandbox/ListSandboxes.
   string token = 8;
+  string name = 9;
+  // Absent until the main process has exited, so exit 0 differs from never exited.
+  optional int32 exit_code = 10;
+  string workdir = 11;
+  // argv[0] of the main command. Always safe to show.
+  string command_name = 12;
+  // Full argv, which can hold secrets. Filled only for a caller with a valid token.
+  repeated string command = 13;
 }
 
 enum SandboxStatus {
@@ -92,6 +104,8 @@ enum SandboxStatus {
   SANDBOX_STATUS_RUNNING = 2;
   SANDBOX_STATUS_STOPPED = 3;
   SANDBOX_STATUS_FAILED = 4;
+  SANDBOX_STATUS_EXITED = 5;
+  SANDBOX_STATUS_STOPPING = 6;
 }
 
 message Mount {

@@ -243,6 +243,12 @@ impl SandboxManager {
                 Some(req.from_snapshot.clone())
             },
             comms: comms.clone(),
+            spec: crate::protocol::SandboxSpec {
+                name: req.name.clone(),
+                command: req.command.clone(),
+                workdir: req.workdir.clone(),
+                tty: req.tty,
+            },
         };
 
         // Cloning a sandbox from a snapshot requires the snapshot owner's
@@ -357,14 +363,28 @@ impl SandboxManager {
         // the caller sees.
         info.token = token;
 
-        Ok(protocol_info_to_pb(info))
+        // The creator supplied the arguments, so echoing them back is safe.
+        Ok(protocol_info_to_pb(info, CommandView::Full))
     }
 
-    /// Retrieve info for an existing sandbox.
+    /// Retrieve info for an existing sandbox. The command carries argv[0]
+    /// only, because full arguments can hold secrets.
     pub async fn get(&self, id: &str) -> Result<PbSandboxInfo> {
         crate::validate::entity_id(id, "sandbox")?;
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
-        Ok(protocol_info_to_pb(redact_token(info)))
+        Ok(protocol_info_to_pb(
+            redact_token(info),
+            CommandView::Argv0Only,
+        ))
+    }
+
+    /// Like [`get`](Self::get), but also returns the full command when the
+    /// presented token matches the sandbox's token.
+    pub async fn get_authorized(&self, id: &str, token: &str) -> Result<PbSandboxInfo> {
+        crate::validate::entity_id(id, "sandbox")?;
+        self.authorize(id, token).await?;
+        let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
+        Ok(protocol_info_to_pb(redact_token(info), CommandView::Full))
     }
 
     /// List all sandboxes.
@@ -373,7 +393,7 @@ impl SandboxManager {
         Ok(infos
             .into_iter()
             .map(redact_token)
-            .map(protocol_info_to_pb)
+            .map(|info| protocol_info_to_pb(info, CommandView::Argv0Only))
             .collect())
     }
 
@@ -792,7 +812,14 @@ fn redact_token(mut info: crate::protocol::SandboxInfo) -> crate::protocol::Sand
     info
 }
 
-fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
+/// How much of a sandbox's command a response may carry.
+#[derive(Clone, Copy)]
+enum CommandView {
+    Argv0Only,
+    Full,
+}
+
+fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) -> PbSandboxInfo {
     use crate::protocol::SandboxStatus as ProtocolStatus;
 
     let status = match info.status {
@@ -800,6 +827,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
         ProtocolStatus::Running => SandboxStatus::Running,
         ProtocolStatus::Stopped => SandboxStatus::Stopped,
         ProtocolStatus::Failed => SandboxStatus::Failed,
+        ProtocolStatus::Exited => SandboxStatus::Exited,
+        ProtocolStatus::Stopping => SandboxStatus::Stopping,
     } as i32;
 
     let created_at = Some(system_time_to_timestamp(info.created_at));
@@ -814,6 +843,14 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo) -> PbSandboxInfo {
         resources: None,
         expires_at,
         token: info.token,
+        name: info.spec.name,
+        exit_code: info.exit_code,
+        workdir: info.spec.workdir,
+        command_name: info.spec.command.first().cloned().unwrap_or_default(),
+        command: match view {
+            CommandView::Full => info.spec.command,
+            CommandView::Argv0Only => Vec::new(),
+        },
     }
 }
 
