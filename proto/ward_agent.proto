@@ -35,6 +35,7 @@ message Exec {
   map<string, string> env = 3;
   bool tty = 4;                         // run on a pty
   string user = 5;                      // unused until user switching lands
+  bool raw = 6;                         // stream raw Data events (implied by tty)
 }
 
 // Feed bytes to the process's stdin. Empty data closes stdin (EOF).
