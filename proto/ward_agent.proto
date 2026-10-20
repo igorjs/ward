@@ -23,6 +23,8 @@ message Request {
     Stdin stdin = 2;
     Kill kill = 3;
     Ping ping = 4;
+    Resize resize = 5;
+    Signal signal = 6;
   }
 }
 
@@ -31,6 +33,8 @@ message Exec {
   repeated string command = 1;          // argv; command[0] is the program
   string working_dir = 2;               // empty = agent default (/)
   map<string, string> env = 3;
+  bool tty = 4;                         // run on a pty
+  string user = 5;                      // unused until user switching lands
 }
 
 // Feed bytes to the process's stdin. Empty data closes stdin (EOF).
@@ -38,8 +42,20 @@ message Stdin {
   bytes data = 1;
 }
 
-// Request termination of the running process (SIGKILL).
+// Request termination of the running process (SIGKILL). Kept for old
+// callers; new callers send Signal.
 message Kill {}
+
+// Set the pty window size.
+message Resize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+// Deliver a signal to the running process.
+message Signal {
+  int32 signo = 1;
+}
 
 // Readiness probe. Sent as the first and only frame on a connection; the
 // agent answers with one Pong event and closes the connection.
@@ -52,11 +68,24 @@ message Event {
     Line stderr = 2;
     Exited exited = 3;
     Pong pong = 4;
+    Data data = 5;
   }
 }
 
 // Answer to Ping.
 message Pong {}
+
+// Raw output bytes from one stream, with no line framing.
+message Data {
+  Stream stream = 1;
+  bytes data = 2;
+}
+
+enum Stream {
+  STREAM_UNSPECIFIED = 0;
+  STREAM_STDOUT = 1;
+  STREAM_STDERR = 2;
+}
 
 // One line of output (newline already stripped).
 message Line {
@@ -64,7 +93,10 @@ message Line {
 }
 
 // Terminal event: the process exited. `code` is the exit status, or -1 if
-// the process was killed by a signal or produced no code.
+// the process was killed by a signal or produced no code. `wait_status` is
+// the raw wait(2) status: exit code in bits 8..15, terminating signal in
+// bits 0..6.
 message Exited {
   int32 code = 1;
+  int32 wait_status = 2;
 }

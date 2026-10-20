@@ -131,7 +131,10 @@ fn stderr_event(text: String) -> Event {
 
 fn exited_event(code: i32) -> Event {
     Event {
-        kind: Some(event::Kind::Exited(Exited { code })),
+        kind: Some(event::Kind::Exited(Exited {
+            code,
+            ..Default::default()
+        })),
     }
 }
 
@@ -331,6 +334,7 @@ mod tests {
                 command: command.iter().map(|s| s.to_string()).collect(),
                 working_dir: String::new(),
                 env: HashMap::new(),
+                ..Default::default()
             })),
         }
     }
@@ -366,7 +370,7 @@ mod tests {
                 Some(event::Kind::Stdout(l)) => out.push(l.text.clone()),
                 Some(event::Kind::Stderr(l)) => err.push(l.text.clone()),
                 Some(event::Kind::Exited(x)) => code = Some(x.code),
-                Some(event::Kind::Pong(_)) | None => {}
+                Some(event::Kind::Pong(_) | event::Kind::Data(_)) | None => {}
             }
         }
         (out, err, code)
@@ -670,5 +674,111 @@ mod mount_arg_tests {
     #[test]
     fn given_unknown_flag_when_parsed_then_error() {
         assert!(parse_mount_args(args(&["--bogus"])).is_err());
+    }
+
+    const WAIT_STATUS_SIGKILL: i32 = 0x0009;
+    const TEST_ROWS: u32 = 40;
+    const TEST_COLS: u32 = 80;
+    const SIGTERM_NO: i32 = 15;
+
+    fn round_trip<M: Message + Default>(msg: &M) -> M {
+        M::decode(&msg.encode_to_vec()[..]).expect("decode")
+    }
+
+    #[test]
+    fn given_old_line_events_when_new_events_exist_then_old_events_still_parse() {
+        // Arrange
+        let old = [stdout_event("out".into()), stderr_event("err".into())];
+        let data = Event {
+            kind: Some(event::Kind::Data(proto::Data {
+                stream: proto::Stream::Stdout as i32,
+                data: vec![0, 1, 0],
+            })),
+        };
+
+        // Act
+        let decoded: Vec<Event> = old.iter().map(round_trip).collect();
+        let data_back = round_trip(&data);
+
+        // Assert
+        assert_eq!(decoded[0], old[0]);
+        assert_eq!(decoded[1], old[1]);
+        assert_eq!(data_back, data);
+    }
+
+    #[test]
+    fn given_empty_kill_when_round_tripped_then_it_equals_empty_kill() {
+        // Arrange
+        let req = Request {
+            kind: Some(request::Kind::Kill(proto::Kill {})),
+        };
+
+        // Act
+        let back = round_trip(&req);
+
+        // Assert
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn given_clean_and_sigkill_wait_status_when_decoded_then_they_differ() {
+        // Arrange
+        let clean = exited_event(0);
+        let killed = Event {
+            kind: Some(event::Kind::Exited(Exited {
+                code: -1,
+                wait_status: WAIT_STATUS_SIGKILL,
+            })),
+        };
+
+        // Act
+        let (clean, killed) = (round_trip(&clean), round_trip(&killed));
+
+        // Assert
+        let status = |e: Event| match e.kind {
+            Some(event::Kind::Exited(x)) => x.wait_status,
+            other => panic!("expected Exited, got {other:?}"),
+        };
+        assert_eq!(status(clean), 0);
+        assert_eq!(status(killed), WAIT_STATUS_SIGKILL);
+    }
+
+    #[test]
+    fn given_resize_and_signal_requests_when_round_tripped_then_fields_survive() {
+        // Arrange
+        let resize = Request {
+            kind: Some(request::Kind::Resize(proto::Resize {
+                rows: TEST_ROWS,
+                cols: TEST_COLS,
+            })),
+        };
+        let signal = Request {
+            kind: Some(request::Kind::Signal(proto::Signal { signo: SIGTERM_NO })),
+        };
+
+        // Act
+        let (resize_back, signal_back) = (round_trip(&resize), round_trip(&signal));
+
+        // Assert
+        assert_eq!(resize_back, resize);
+        assert_eq!(signal_back, signal);
+    }
+
+    #[test]
+    fn given_exec_with_tty_and_user_when_round_tripped_then_fields_survive() {
+        // Arrange
+        let exec = Exec {
+            command: vec!["sh".into()],
+            tty: true,
+            user: "1000:1000".into(),
+            ..Default::default()
+        };
+
+        // Act
+        let back = round_trip(&exec);
+
+        // Assert
+        assert!(back.tty);
+        assert_eq!(back.user, "1000:1000");
     }
 }
