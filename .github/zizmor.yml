@@ -1,0 +1,9 @@
+rules:
+  # Rolling toolchain tags are the documented release convention of
+  # dtolnay/rust-toolchain, and workflow-hygiene.sh already allows them.
+  unpinned-uses:
+    config:
+      policies:
+        "*": hash-pin
+        dtolnay/rust-toolchain: ref-pin
+        slsa-framework/slsa-github-generator/*: ref-pin
