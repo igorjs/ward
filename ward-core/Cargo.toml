@@ -75,6 +75,9 @@ metrics = "0.24"
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+# ward-agent: end-to-end tests drive the host side of the agent protocol
+# into the real guest handler over an in-memory stream.
+ward-agent = { path = "../ward-agent" }
 # async-trait: integration-test harnesses implement the async VolumeFormatter
 # / Backend traits with a no-op, which requires the macro at test-crate scope.
 async-trait = "0.1"

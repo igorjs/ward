@@ -105,7 +105,8 @@ impl Daemon {
         // panic instead of a flaky ECONNREFUSED later.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if socket.exists() {
+            // The socket file appears at bind, before the daemon accepts.
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 return Self {
                     _data_dir: data_dir,
                     socket,
@@ -209,7 +210,8 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         ensure_hypervisor_entitlement(cmd.get_program());
         let mut daemon = cmd.spawn().expect("spawn priming wardd");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() && Instant::now() < deadline {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         let out = Command::cargo_bin("ward")

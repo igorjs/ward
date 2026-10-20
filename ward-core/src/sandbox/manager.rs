@@ -983,6 +983,7 @@ impl SandboxManager {
                     Some(req.working_dir.clone())
                 },
                 req.env.clone(),
+                crate::backend::ExecMode::default(),
             )
             .await
             .map_err(backend_err)?;
@@ -3471,8 +3472,11 @@ mod tests {
             command: Vec<String>,
             working_dir: Option<String>,
             env: HashMap<String, String>,
+            mode: crate::backend::ExecMode,
         ) -> crate::backend::Result<crate::backend::ProcessHandle> {
-            self.inner.exec(sandbox_id, command, working_dir, env).await
+            self.inner
+                .exec(sandbox_id, command, working_dir, env, mode)
+                .await
         }
         async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
             self.inner.kill_process(sandbox_id, pid).await
