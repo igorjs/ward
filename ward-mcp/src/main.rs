@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ward_core::pb;
-use ward_core::protocol::StreamEventKind;
+use ward_core::protocol::{RawStream, StreamEventKind};
 use ward_runtime::Runtime;
 
 mod rpc;
@@ -391,6 +391,13 @@ impl Server {
                 match ev.kind {
                     StreamEventKind::Stdout => stdout_buf.push_str(&ev.line),
                     StreamEventKind::Stderr => stderr_buf.push_str(&ev.line),
+                    StreamEventKind::Data { stream, bytes } => {
+                        let text = String::from_utf8_lossy(&bytes);
+                        match stream {
+                            RawStream::Stdout => stdout_buf.push_str(&text),
+                            RawStream::Stderr => stderr_buf.push_str(&text),
+                        }
+                    }
                     StreamEventKind::Exit => {
                         exit_code = ev.exit_code;
                         duration_ms = ev.duration_ms;

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::image::{ImageStore, OFFLINE_IMAGES_ENV};
-use super::{Backend, BackendError, ProcessHandle, Result};
+use super::{Backend, BackendError, ExecMode, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
 use crate::egress::EgressProxy;
@@ -682,6 +682,7 @@ impl Backend for KrunvmBackend {
         command: Vec<String>,
         working_dir: Option<String>,
         extra_env: HashMap<String, String>,
+        mode: ExecMode,
     ) -> Result<ProcessHandle> {
         #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
         let env = {
@@ -717,6 +718,7 @@ impl Backend for KrunvmBackend {
                 command,
                 working_dir,
                 env,
+                mode,
             )
             .await
             .map_err(|e| BackendError::Exec(format!("guest agent exec: {e}")))?;
@@ -747,6 +749,7 @@ impl Backend for KrunvmBackend {
                         kind: StreamEventKind::Stdout,
                         line: format!("stub: {cmd_for_log}"),
                         exit_code: None,
+                        wait_status: None,
                         timestamp: std::time::SystemTime::now(),
                         duration_ms: 0,
                     })
@@ -757,6 +760,7 @@ impl Backend for KrunvmBackend {
                         kind: StreamEventKind::Exit,
                         line: String::new(),
                         exit_code: Some(0),
+                        wait_status: Some(0),
                         timestamp: std::time::SystemTime::now(),
                         duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
                     })
@@ -778,6 +782,7 @@ impl Backend for KrunvmBackend {
                 sandbox_id: sandbox_id.to_string(),
                 stdin_tx: Some(stdin_tx),
                 output_rx: Some(output_rx),
+                control_tx: None,
             }
         };
 

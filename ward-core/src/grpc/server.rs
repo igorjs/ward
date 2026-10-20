@@ -736,11 +736,26 @@ impl Ward for WardGrpcServer {
 /// the `r#type` field, not by sniffing the integer.
 fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
     use crate::pb::StreamEventType;
-    use crate::protocol::StreamEventKind;
+    use crate::protocol::{RawStream, StreamEventKind};
+
+    // The pb event carries text lines only, so raw bytes are shown as lossy
+    // UTF-8 here. Attach reads the raw variant directly.
+    let line = match &evt.kind {
+        StreamEventKind::Data { bytes, .. } => String::from_utf8_lossy(bytes).into_owned(),
+        _ => evt.line,
+    };
 
     let r#type = match evt.kind {
-        StreamEventKind::Stdout => StreamEventType::Stdout,
-        StreamEventKind::Stderr => StreamEventType::Stderr,
+        StreamEventKind::Stdout
+        | StreamEventKind::Data {
+            stream: RawStream::Stdout,
+            ..
+        } => StreamEventType::Stdout,
+        StreamEventKind::Stderr
+        | StreamEventKind::Data {
+            stream: RawStream::Stderr,
+            ..
+        } => StreamEventType::Stderr,
         StreamEventKind::Exit => StreamEventType::Exit,
     } as i32;
 
@@ -755,7 +770,7 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
 
     StreamEvent {
         r#type,
-        line: evt.line,
+        line,
         exit_code: evt.exit_code.unwrap_or(0),
         timestamp,
         duration_ms: evt.duration_ms,
@@ -816,6 +831,29 @@ mod tests {
     use crate::sandbox::SandboxManager;
     use crate::volume::VolumeManager;
     use std::path::Path;
+
+    #[test]
+    fn given_raw_stderr_event_when_mapped_to_pb_then_lossy_stderr_line() {
+        // Arrange
+        let evt = crate::protocol::StreamEvent {
+            kind: crate::protocol::StreamEventKind::Data {
+                stream: crate::protocol::RawStream::Stderr,
+                bytes: b"a\xffb".to_vec(),
+            },
+            line: String::new(),
+            exit_code: None,
+            wait_status: None,
+            timestamp: std::time::SystemTime::now(),
+            duration_ms: 0,
+        };
+
+        // Act
+        let pb = stream_event_to_pb(evt);
+
+        // Assert
+        assert_eq!(pb.r#type, crate::pb::StreamEventType::Stderr as i32);
+        assert_eq!(pb.line, "a\u{fffd}b");
+    }
 
     /// Offline image puller: materialises a minimal bin/ rootfs without
     /// touching the network. Mirrors the FakePuller pattern in image.rs

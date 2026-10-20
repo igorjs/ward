@@ -3660,6 +3660,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "uuid",
+ "ward-agent",
  "ward-bundle",
  "ward-net",
  "ward-proto",
