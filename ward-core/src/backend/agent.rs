@@ -121,6 +121,7 @@ where
             command,
             working_dir: working_dir.unwrap_or_default(),
             env,
+            ..Default::default()
         })),
     };
     write_frame(&mut writer, &encode(&exec)).await?;
@@ -296,7 +297,10 @@ mod tests {
 
     fn exited(code: i32) -> Event {
         Event {
-            kind: Some(event::Kind::Exited(Exited { code })),
+            kind: Some(event::Kind::Exited(Exited {
+                code,
+                ..Default::default()
+            })),
         }
     }
 
