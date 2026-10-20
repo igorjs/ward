@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
-use crate::backend::{Backend, BackendError, ExecMode};
+use crate::backend::{Backend, BackendError, ExecMode, ProcessControl, ProcessHandle};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
 use crate::pb::{
@@ -173,14 +173,57 @@ impl OutputBuffer {
 struct MainProcess {
     pid: String,
     output: Arc<OutputBuffer>,
-    /// Held so stdin stays open while no client is attached.
-    _stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
+    /// Held so stdin stays open while no client is attached. Taken to send EOF.
+    stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
+    control_tx: Option<mpsc::Sender<ProcessControl>>,
     /// Raw `wait(2)` status, set once the process ends.
     exit: watch::Receiver<Option<i32>>,
 }
 
 /// Bit position of the exit code inside a raw wait(2) status.
 const WAIT_STATUS_EXIT_SHIFT: i32 = 8;
+const WAIT_STATUS_SIGNAL_MASK: i32 = 0x7f;
+const WAIT_STATUS_EXIT_MASK: i32 = 0xff;
+/// Shells report a process killed by signal N as 128 + N.
+const SIGNAL_EXIT_BASE: i32 = 128;
+
+/// Seconds a stopping sandbox's main process gets to end after SIGTERM.
+const STOP_GRACE_SECONDS: u64 = 10;
+const SIGTERM: i32 = 15;
+const SIGKILL: i32 = 9;
+
+/// Turn a raw `wait(2)` status into the exit code a shell would report.
+pub(crate) fn decode_wait_status(raw: i32) -> i32 {
+    match raw & WAIT_STATUS_SIGNAL_MASK {
+        0 => (raw >> WAIT_STATUS_EXIT_SHIFT) & WAIT_STATUS_EXIT_MASK,
+        signal => SIGNAL_EXIT_BASE + signal,
+    }
+}
+
+/// Channels to a running process.
+pub struct ProcessIo {
+    pub stdin: Option<mpsc::Sender<bytes::Bytes>>,
+    pub control: Option<mpsc::Sender<ProcessControl>>,
+}
+
+/// The output bytes an event carries, if any.
+pub(crate) fn event_chunk(event: &StreamEvent) -> Option<Vec<u8>> {
+    match &event.kind {
+        StreamEventKind::Data { bytes, .. } => Some(bytes.clone()),
+        StreamEventKind::Stdout | StreamEventKind::Stderr => {
+            Some(format!("{}\n", event.line).into_bytes())
+        }
+        StreamEventKind::Exit => None,
+    }
+}
+
+/// Raw `wait(2)` status of an `Exit` event, built from the exit code when the
+/// backend reports no raw status.
+pub(crate) fn event_wait_status(event: &StreamEvent) -> Option<i32> {
+    event
+        .wait_status
+        .or(event.exit_code.map(|code| code << WAIT_STATUS_EXIT_SHIFT))
+}
 
 /// Copy a main process's events into its buffer, then publish its raw wait
 /// status when it ends.
@@ -190,19 +233,84 @@ async fn pump_main_output(
     exit: watch::Sender<Option<i32>>,
 ) {
     while let Some(event) = events.recv().await {
-        match event.kind {
-            StreamEventKind::Data { bytes, .. } => output.push(&bytes),
-            StreamEventKind::Stdout | StreamEventKind::Stderr => {
-                output.push(format!("{}\n", event.line).as_bytes());
-            }
-            StreamEventKind::Exit => {
-                let status = event
-                    .wait_status
-                    .or(event.exit_code.map(|code| code << WAIT_STATUS_EXIT_SHIFT));
-                exit.send_replace(status);
-                return;
-            }
+        if let Some(chunk) = event_chunk(&event) {
+            output.push(&chunk);
+        } else {
+            exit.send_replace(event_wait_status(&event));
+            return;
         }
+    }
+}
+
+async fn persist_meta(store: Option<&MetaStore>, meta: SandboxMeta) -> Result<()> {
+    let Some(store) = store.cloned() else {
+        return Ok(());
+    };
+    let id = meta.id.clone();
+    tokio::task::spawn_blocking(move || store.save(&meta))
+        .await
+        .map_err(|e| ApiError::Internal(format!("persist task for sandbox {id}: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("cannot persist sandbox {id}: {e}")))
+}
+
+/// Write the new state to disk, then adopt it in memory, so a failed write
+/// leaves the entry in its old state.
+async fn commit_meta(
+    store: Option<&MetaStore>,
+    entry: &mut SandboxEntry,
+    status: crate::protocol::SandboxStatus,
+    exit_code: Option<i32>,
+) -> Result<()> {
+    let mut next = entry.meta.clone();
+    next.status = status;
+    next.exit_code = exit_code;
+    persist_meta(store, next.clone()).await?;
+    entry.meta = next;
+    Ok(())
+}
+
+async fn ended_within(exit: &mut watch::Receiver<Option<i32>>, grace: std::time::Duration) -> bool {
+    matches!(
+        tokio::time::timeout(grace, exit.wait_for(Option::is_some)).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Mark a sandbox `exited` once its main process `pid` ends on its own. A
+/// stop in progress records the outcome itself, and a newer run owns the
+/// state, so both are left alone.
+async fn mark_exited_on_main_end(
+    entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
+    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
+    store: Option<MetaStore>,
+    id: String,
+    pid: String,
+    mut exit: watch::Receiver<Option<i32>>,
+) {
+    let Ok(raw) = exit.wait_for(Option::is_some).await.map(|status| *status) else {
+        return;
+    };
+    let Some(code) = raw.map(decode_wait_status) else {
+        return;
+    };
+    let mut entries = entries.write().await;
+    let current = mains.read().await.get(&id).map(|m| m.pid == pid);
+    let Some(entry) = entries.get_mut(&id) else {
+        return;
+    };
+    if current != Some(true) || entry.meta.status != crate::protocol::SandboxStatus::Running {
+        return;
+    }
+    match commit_meta(
+        store.as_ref(),
+        entry,
+        crate::protocol::SandboxStatus::Exited,
+        Some(code),
+    )
+    .await
+    {
+        Ok(()) => tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited"),
+        Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
     }
 }
 
@@ -247,6 +355,8 @@ pub struct SandboxManager {
     mains: Arc<RwLock<HashMap<String, MainProcess>>>,
     /// Bytes kept per main process output buffer.
     output_cap: usize,
+    /// How long `stop` waits for the main process after SIGTERM.
+    stop_grace: std::time::Duration,
     /// On-disk sandbox records. `None` keeps everything in memory.
     store: Option<MetaStore>,
     /// Names claimed by creates that have not yet inserted their entry.
@@ -272,6 +382,7 @@ impl SandboxManager {
             processes: Arc::new(RwLock::new(HashMap::new())),
             mains: Arc::new(RwLock::new(HashMap::new())),
             output_cap: MAIN_OUTPUT_CAP,
+            stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECONDS),
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
@@ -287,6 +398,12 @@ impl SandboxManager {
     #[cfg(all(test, not(feature = "krunvm")))]
     fn with_output_cap(mut self, cap: usize) -> Self {
         self.output_cap = cap;
+        self
+    }
+
+    #[cfg(all(test, not(feature = "krunvm")))]
+    fn with_stop_grace(mut self, grace: std::time::Duration) -> Self {
+        self.stop_grace = grace;
         self
     }
 
@@ -332,23 +449,11 @@ impl SandboxManager {
         status: crate::protocol::SandboxStatus,
         exit_code: Option<i32>,
     ) -> Result<()> {
-        let mut next = entry.meta.clone();
-        next.status = status;
-        next.exit_code = exit_code;
-        self.persist(next.clone()).await?;
-        entry.meta = next;
-        Ok(())
+        commit_meta(self.store.as_ref(), entry, status, exit_code).await
     }
 
     async fn persist(&self, meta: SandboxMeta) -> Result<()> {
-        let Some(store) = self.store.clone() else {
-            return Ok(());
-        };
-        let id = meta.id.clone();
-        tokio::task::spawn_blocking(move || store.save(&meta))
-            .await
-            .map_err(|e| ApiError::Internal(format!("persist task for sandbox {id}: {e}")))?
-            .map_err(|e| ApiError::Internal(format!("cannot persist sandbox {id}: {e}")))
+        persist_meta(self.store.as_ref(), meta).await
     }
 
     /// Bring one reloaded record back into the manager, or delete it if
@@ -874,6 +979,7 @@ impl SandboxManager {
             return Ok(());
         }
         tracing::info!(sandbox_id = %id, "stopping sandbox");
+        let main_code = self.end_main_process(id).await;
         if let Err(e) = self.backend.stop_sandbox(id).await {
             self.mark_failed(id).await;
             return Err(backend_err(e));
@@ -883,10 +989,41 @@ impl SandboxManager {
             .await
             .retain(|_, rec| rec.sandbox_id != id);
         self.broker.deregister_sandbox(id).await;
-        self.set_state(id, crate::protocol::SandboxStatus::Stopped)
-            .await?;
+        match main_code {
+            Some(code) => {
+                self.record_state(id, crate::protocol::SandboxStatus::Stopped, Some(code))
+                    .await?;
+            }
+            None => {
+                self.set_state(id, crate::protocol::SandboxStatus::Stopped)
+                    .await?
+            }
+        }
         tracing::info!(sandbox_id = %id, "sandbox stopped");
         Ok(())
+    }
+
+    /// Ask the main process to end with SIGTERM and force it with SIGKILL
+    /// once the grace period passes. Returns its exit code, or `None` when
+    /// the sandbox has no main process.
+    async fn end_main_process(&self, id: &str) -> Option<i32> {
+        let (control, mut exit) = {
+            let mains = self.mains.read().await;
+            let main = mains.get(id)?;
+            (main.control_tx.clone(), main.exit.clone())
+        };
+        if let Some(control) = &control {
+            let _ = control.send(ProcessControl::Signal(SIGTERM)).await;
+        }
+        if !ended_within(&mut exit, self.stop_grace).await {
+            tracing::warn!(sandbox_id = %id, "main process ignored SIGTERM, forcing it");
+            if let Some(control) = &control {
+                let _ = control.send(ProcessControl::Signal(SIGKILL)).await;
+            }
+            ended_within(&mut exit, self.stop_grace).await;
+        }
+        let raw = (*exit.borrow()).map(decode_wait_status);
+        Some(raw.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL))
     }
 
     async fn start_resolved(&self, id: &str) -> Result<()> {
@@ -949,12 +1086,21 @@ impl SandboxManager {
             tokio::spawn(pump_main_output(events, Arc::clone(&output), exit_tx));
         }
         tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
+        tokio::spawn(mark_exited_on_main_end(
+            Arc::clone(&self.entries),
+            Arc::clone(&self.mains),
+            self.store.clone(),
+            id.to_string(),
+            handle.pid.clone(),
+            exit.clone(),
+        ));
         mains.insert(
             id.to_string(),
             MainProcess {
                 pid: handle.pid,
                 output,
-                _stdin_tx: handle.stdin_tx,
+                stdin_tx: handle.stdin_tx,
+                control_tx: handle.control_tx,
                 exit,
             },
         );
@@ -979,6 +1125,42 @@ impl SandboxManager {
         let mains = self.mains.read().await;
         let main = mains.get(id).ok_or_else(|| no_main_process(id))?;
         Ok(main.output.subscribe())
+    }
+
+    /// Stdin and control channels of the sandbox's main process.
+    pub async fn main_io(&self, id: &str) -> Result<ProcessIo> {
+        let mains = self.mains.read().await;
+        let main = mains.get(id).ok_or_else(|| no_main_process(id))?;
+        Ok(ProcessIo {
+            stdin: main.stdin_tx.clone(),
+            control: main.control_tx.clone(),
+        })
+    }
+
+    /// Drop the manager's hold on the main process's stdin, which sends EOF
+    /// once no attached client holds a sender either.
+    pub async fn close_main_stdin(&self, id: &str) {
+        if let Some(main) = self.mains.write().await.get_mut(id) {
+            main.stdin_tx = None;
+        }
+    }
+
+    /// Start `command` in a running sandbox for an attached client, which owns
+    /// the returned handle. It is not tracked as an exec process.
+    pub async fn spawn_attached(
+        &self,
+        id: &str,
+        command: Vec<String>,
+        workdir: Option<String>,
+        env: HashMap<String, String>,
+        tty: bool,
+    ) -> Result<ProcessHandle> {
+        crate::validate::exec_command(&command)?;
+        let mode = ExecMode { tty, raw: true };
+        self.backend
+            .exec(id, command, workdir, env, mode)
+            .await
+            .map_err(backend_err)
     }
 
     /// Wait for the main process to end and return its raw `wait(2)` status.
@@ -1542,7 +1724,7 @@ fn system_time_to_timestamp(t: std::time::SystemTime) -> prost_types::Timestamp 
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pb::{
         CommunicationMode as PbCommunicationMode, CommunicationPolicy as PbCommunicationPolicy,
@@ -4167,8 +4349,10 @@ mod tests {
             let (stdin_tx, mut stdin_rx) = mpsc::channel::<bytes::Bytes>(16);
             let mut readers = Vec::new();
             let mut child_stdin = None;
+            let mut pty_master = None;
             let mut child = if mode.tty {
                 let (master, slave) = open_pty();
+                pty_master = Some(master.try_clone()?);
                 cmd.stdin(slave.try_clone()?)
                     .stdout(slave.try_clone()?)
                     .stderr(slave);
@@ -4192,6 +4376,30 @@ mod tests {
             };
             drop(cmd);
             let pid = child.id().expect("pid").to_string();
+            let (control_tx, mut control_rx) = mpsc::channel::<ProcessControl>(16);
+            let os_pid = rustix::process::Pid::from_raw(pid.parse().expect("numeric pid"));
+            tokio::spawn(async move {
+                while let Some(control) = control_rx.recv().await {
+                    match (control, os_pid, &pty_master) {
+                        (ProcessControl::Signal(signo), Some(pid), _) => {
+                            let signal = rustix::process::Signal::from_named_raw(signo);
+                            if let Some(signal) = signal {
+                                let _ = rustix::process::kill_process(pid, signal);
+                            }
+                        }
+                        (ProcessControl::Resize { rows, cols }, _, Some(master)) => {
+                            let size = rustix::termios::Winsize {
+                                ws_row: rows as u16,
+                                ws_col: cols as u16,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
+                            };
+                            let _ = rustix::termios::tcsetwinsize(master, size);
+                        }
+                        _ => {}
+                    }
+                }
+            });
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
                 while let Some(chunk) = stdin_rx.recv().await {
@@ -4221,7 +4429,7 @@ mod tests {
                 sandbox_id: sandbox_id.to_string(),
                 stdin_tx: Some(stdin_tx),
                 output_rx: Some(output_rx),
-                control_tx: None,
+                control_tx: Some(control_tx),
             })
         }
 
@@ -4297,10 +4505,12 @@ mod tests {
     const TEST_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[cfg(not(feature = "krunvm"))]
+    const TEST_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+    #[cfg(not(feature = "krunvm"))]
     const HOST_MANAGER_MAX_SANDBOXES: usize = 4;
 
     #[cfg(not(feature = "krunvm"))]
-    fn host_manager(output_cap: usize) -> Arc<SandboxManager> {
+    pub(crate) fn host_manager(output_cap: usize) -> Arc<SandboxManager> {
         use crate::backend::image::ImageStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -4317,12 +4527,17 @@ mod tests {
                 /* allow_host_mounts = */ false,
                 crate::config::NetworkBackendChoice::Smoltcp,
             )
-            .with_output_cap(output_cap),
+            .with_output_cap(output_cap)
+            .with_stop_grace(TEST_STOP_GRACE),
         )
     }
 
     #[cfg(not(feature = "krunvm"))]
-    async fn create_with_command(mgr: &SandboxManager, command: &[&str], tty: bool) -> String {
+    pub(crate) async fn create_with_command(
+        mgr: &SandboxManager,
+        command: &[&str],
+        tty: bool,
+    ) -> String {
         let req = CreateSandboxRequest {
             image: "alpine".into(),
             command: command.iter().map(|part| part.to_string()).collect(),
@@ -4529,5 +4744,132 @@ mod tests {
         // Assert
         let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
         assert_eq!(String::from_utf8(buffered).unwrap(), expected);
+    }
+    // ----- exited state -------------------------------------------------
+
+    #[cfg(not(feature = "krunvm"))]
+    const SIGKILL_EXIT_CODE: i32 = 137;
+    #[cfg(not(feature = "krunvm"))]
+    const SIGTERM_EXIT_CODE: i32 = 143;
+    /// Poll until the sandbox reports `want`.
+    #[cfg(not(feature = "krunvm"))]
+    async fn wait_for_status(mgr: &SandboxManager, id: &str, want: SandboxStatus) {
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        while status_of(mgr, id).await != want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never became {want:?}"
+            );
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn exit_code_of(mgr: &SandboxManager, id: &str) -> Option<i32> {
+        mgr.get(id).await.expect("get").exit_code
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::exit_7("exit 7", 7)]
+    #[case::exit_0("exit 0", 0)]
+    #[case::killed("kill -9 $$", SIGKILL_EXIT_CODE)]
+    #[tokio::test]
+    async fn given_command_that_ends_when_it_ends_then_sandbox_is_exited_with_its_code(
+        #[case] script: &str,
+        #[case] code: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+
+        // Act
+        let id = create_with_command(&mgr, &["sh", "-c", script], false).await;
+
+        // Assert
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_exited_sandbox_when_stopped_then_it_is_stopped_and_keeps_its_code() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 7"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(7));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::terminated("echo up; read x", SIGTERM_EXIT_CODE)]
+    #[case::forced("trap '' TERM; echo up; while :; do read x; done", SIGKILL_EXIT_CODE)]
+    #[tokio::test]
+    async fn given_running_command_when_stopped_then_it_is_stopped_with_the_signal_code(
+        #[case] script: &str,
+        #[case] code: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", script], false).await;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_exited_sandbox_when_restarted_then_code_clears_and_the_new_run_sets_it() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x; exit 5"], false).await;
+        let send_go = |mgr: Arc<SandboxManager>, id: String| async move {
+            let stdin = mgr.main_io(&id).await.expect("io").stdin.expect("stdin");
+            stdin
+                .send(bytes::Bytes::from_static(b"go\n"))
+                .await
+                .expect("send");
+        };
+        send_go(Arc::clone(&mgr), id.clone()).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(5));
+
+        // Act
+        mgr.restart(&id).await.expect("restart");
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Running);
+        assert_eq!(exit_code_of(&mgr, &id).await, None);
+        send_go(Arc::clone(&mgr), id.clone()).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(5));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_command_exited_before_subscribe_when_read_later_then_output_and_status_remain() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo hi; exit 3"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
+        let status = mgr.main_exit_status(&id).await.expect("status");
+
+        // Assert
+        assert_eq!(buffered, b"hi\n");
+        assert_eq!(status, 3 << WAIT_STATUS_EXIT_SHIFT);
     }
 }

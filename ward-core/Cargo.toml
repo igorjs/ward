@@ -79,7 +79,7 @@ tonic-prost-build = "0.14"
 # into the real guest handler over an in-memory stream.
 ward-agent = { path = "../ward-agent" }
 # rustix pty: the test host backend opens real ptys for tty main processes.
-rustix = { version = "1", features = ["pty"] }
+rustix = { version = "1", features = ["pty", "termios"] }
 # async-trait: integration-test harnesses implement the async VolumeFormatter
 # / Backend traits with a no-op, which requires the macro at test-crate scope.
 async-trait = "0.1"

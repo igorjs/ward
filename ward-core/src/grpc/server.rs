@@ -3,9 +3,12 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use tracing::error;
 
+use super::attach;
+use crate::pb::attach_message::Kind;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
     AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest,
@@ -29,7 +32,7 @@ use crate::volume::VolumeManager;
 /// and returning a safe generic message to the client. This prevents internal
 /// implementation details (paths, errno codes, backend types) from leaking
 /// through the API.
-fn api_err_to_status(err: ApiError) -> Status {
+pub(super) fn api_err_to_status(err: ApiError) -> Status {
     match &err {
         ApiError::SandboxNotFound(id) => Status::not_found(format!("sandbox not found: {id}")),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
@@ -606,9 +609,28 @@ impl Ward for WardGrpcServer {
     #[tracing::instrument(name = "rpc.attach", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
     async fn attach(
         &self,
-        _request: Request<tonic::Streaming<AttachMessage>>,
+        request: Request<tonic::Streaming<AttachMessage>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
-        Err(Status::unimplemented("attach is not served yet"))
+        let token = token_from_metadata(&request).to_string();
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("attach stream ended before a start message")
+        })??;
+        let Some(Kind::Start(start)) = first.kind else {
+            return Err(Status::invalid_argument(
+                "first attach message must be start",
+            ));
+        };
+        let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
+        if !start.user.is_empty() {
+            return Err(Status::unimplemented(
+                "attach with a user is not supported yet",
+            ));
+        }
+        let rx = attach::serve(Arc::clone(&self.sandbox), id, start, inbound).await?;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
