@@ -31,10 +31,17 @@ const POLL_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(not(feature = "krunvm"))]
 const NOT_A_TTY: &str = "the input device is not a TTY";
 const DRAIN_BUFFER_BYTES: usize = 256;
+const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
+const DEFAULT_IMAGE: &str = "alpine:3.20";
+
+/// The image real-VM runs use; CI points it at a registry the runner allows.
+fn image() -> String {
+    std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
+}
 
 fn create_sandbox(daemon: &Daemon) -> String {
     let mut cmd = daemon.cli();
-    cmd.args(["create", "alpine:latest"]);
+    cmd.args(["create", &image()]);
     let out = cmd.output().expect("create");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8");
@@ -268,7 +275,7 @@ fn given_a_real_guest_when_run_exits_3_then_the_cli_exits_3() {
 
     let status = daemon
         .cli()
-        .args(["run", "alpine", "sh", "-c", "exit 3"])
+        .args(["run", &image(), "sh", "-c", "exit 3"])
         .status()
         .expect("run");
 
