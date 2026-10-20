@@ -45,7 +45,7 @@ ward logs "$sb" "$pid"
 
 # 4. Tear it down. The microVM exits, libkrun frees its context,
 #    rootfs and overlay are reaped.
-ward remove "$sb"
+ward rm -f "$sb"
 ```
 
 The whole flow is sub-second once the OCI image is cached locally.
@@ -68,7 +68,7 @@ For an agent integrating ward, the contract is:
 | Allocate sandbox | `ward create <image>` (default egress: Deny) | `CreateSandbox` |
 | Run the snippet | `ward exec <sb> -- <cmd>` then `ward logs <sb> <pid>` | `Exec` + `StreamOutput` |
 | Collect output, exit code | Parse `stdout:` / `stderr:` / `exit:` lines | n/a |
-| Tear down | `ward remove <sb>` | `RemoveSandbox` |
+| Tear down | `ward rm -f <sb>` | `RemoveSandbox` |
 
 The ward calls map 1:1 to the gRPC API at `proto/ward.proto`. Until
 the [SDKs](https://github.com/igorjs/ward/issues/39) land, agents either

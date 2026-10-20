@@ -8,7 +8,7 @@
 //! uses — the connector intercepts the connection and routes it to the
 //! socket path we capture in the closure.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use hyper_util::rt::TokioIo;
@@ -17,6 +17,9 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
 use ward_core::pb::ward_client::WardClient;
+use ward_core::pb::{GetSandboxRequest, SandboxInfo, SandboxStatus};
+
+use crate::tokens;
 
 /// Connect to the ward daemon over the given Unix socket path.
 ///
@@ -42,4 +45,53 @@ pub async fn connect(socket_path: &str) -> Result<WardClient<Channel>> {
         .context("connect to ward daemon")?;
 
     Ok(WardClient::new(channel))
+}
+
+/// A sandbox reference resolved to its id, with the token stored under it.
+pub struct Resolved {
+    pub id: String,
+    pub status: SandboxStatus,
+    token: Option<String>,
+}
+
+impl Resolved {
+    /// Pair a sandbox the daemon already described with its stored token.
+    pub fn from_info(token_store: &Path, info: &SandboxInfo) -> Result<Self> {
+        Ok(Self {
+            token: tokens::load(token_store, &info.id)?,
+            id: info.id.clone(),
+            status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
+        })
+    }
+
+    /// True when the CLI token store holds a token for this sandbox.
+    pub fn has_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Wrap `message` in a request carrying this sandbox's token, if any.
+    pub fn request<T>(&self, message: T) -> Result<tonic::Request<T>> {
+        let mut request = tonic::Request::new(message);
+        tokens::attach_token(&mut request, self.token.clone())?;
+        Ok(request)
+    }
+}
+
+/// Resolve a name, id or id prefix to a sandbox id through `GetSandbox`.
+///
+/// The lookup goes out without a token: the store is keyed by id, so the
+/// token can only be loaded after the daemon has said which id the
+/// reference means.
+pub async fn resolve(
+    client: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+) -> Result<Resolved> {
+    let info = client
+        .get_sandbox(GetSandboxRequest {
+            id: reference.to_string(),
+        })
+        .await?
+        .into_inner();
+    Resolved::from_info(token_store, &info)
 }

@@ -136,7 +136,7 @@ fn given_created_sandbox_when_user_removes_it_then_list_no_longer_shows_it() {
     // Act
     daemon
         .cli()
-        .args(["remove", &id])
+        .args(["remove", "-f", &id])
         .assert()
         .success()
         .stdout(predicate::str::contains("removed:"));
@@ -289,7 +289,7 @@ fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() 
         .stderr(predicate::str::contains("limit"));
 
     // Act: remove the first and try again.
-    ward().args(["remove", &first_id]).assert().success();
+    ward().args(["remove", "-f", &first_id]).assert().success();
     let assertion = ward().args(["create", "alpine:replacement"]).assert();
 
     // Assert: success — the removed slot must be available to a new create.

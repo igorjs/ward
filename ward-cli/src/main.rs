@@ -3,6 +3,7 @@
 //! ward – command-line interface to the Ward daemon.
 
 mod client;
+mod lifecycle;
 mod output;
 mod socket;
 mod tokens;
@@ -51,6 +52,9 @@ enum Commands {
     Create {
         /// OCI image reference.
         image: String,
+        /// Name to refer to the sandbox by instead of its ID.
+        #[arg(long)]
+        name: Option<String>,
         /// Environment variables in KEY=VALUE form.
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -148,11 +152,40 @@ enum Commands {
     #[command(subcommand)]
     Snapshot(SnapshotCommands),
 
-    /// Remove a sandbox.
-    Remove {
-        /// Sandbox ID.
-        id: String,
+    /// Stop one or more sandboxes.
+    Stop {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        refs: Vec<String>,
     },
+
+    /// Start one or more stopped sandboxes.
+    Start {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        refs: Vec<String>,
+    },
+
+    /// Restart one or more sandboxes.
+    Restart {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        refs: Vec<String>,
+    },
+
+    /// Remove one or more sandboxes.
+    #[command(alias = "rm")]
+    Remove {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        refs: Vec<String>,
+        /// Remove a running sandbox too.
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Remove every stopped and exited sandbox.
+    Prune,
 
     /// Volume management subcommands.
     #[command(subcommand)]
@@ -279,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Create {
             image,
+            name,
             env,
             mount,
             egress,
@@ -343,6 +377,7 @@ async fn main() -> anyhow::Result<()> {
                     group: comms_group,
                 }),
                 from_snapshot: from_snapshot.clone().unwrap_or_default(),
+                name: name.unwrap_or_default(),
                 ..Default::default()
             };
 
@@ -611,25 +646,38 @@ async fn main() -> anyhow::Result<()> {
             }
         },
 
-        Commands::Remove { id } => {
+        Commands::Stop { refs } => {
             let mut c = client::connect(&socket_path).await?;
-            let token = tokens::load(&token_store, &id)?;
-            let mut request =
-                tonic::Request::new(ward_core::pb::RemoveSandboxRequest { id: id.clone() });
-            tokens::attach_token(&mut request, token)?;
-            c.remove_sandbox(request).await?;
-            // The daemon already removed the sandbox at this point, so a
-            // local store-pruning failure is a warning, not a command
-            // failure: the stale entry is harmless, since the daemon will
-            // reject any later request that still carries its token.
-            if let Err(e) = tokens::remove(&token_store, &id) {
-                eprintln!("warning: could not prune local token store: {e}");
-            }
-            if json {
-                println!("{}", json!({"removed": id}));
-            } else {
-                println!("removed: {id}");
-            }
+            lifecycle::lifecycle(&mut c, &token_store, lifecycle::Action::Stop, &refs, json)
+                .await?;
+        }
+
+        Commands::Start { refs } => {
+            let mut c = client::connect(&socket_path).await?;
+            lifecycle::lifecycle(&mut c, &token_store, lifecycle::Action::Start, &refs, json)
+                .await?;
+        }
+
+        Commands::Restart { refs } => {
+            let mut c = client::connect(&socket_path).await?;
+            lifecycle::lifecycle(
+                &mut c,
+                &token_store,
+                lifecycle::Action::Restart,
+                &refs,
+                json,
+            )
+            .await?;
+        }
+
+        Commands::Remove { refs, force } => {
+            let mut c = client::connect(&socket_path).await?;
+            lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+        }
+
+        Commands::Prune => {
+            let mut c = client::connect(&socket_path).await?;
+            lifecycle::prune(&mut c, &token_store, json).await?;
         }
 
         Commands::Volume(vol_cmd) => match vol_cmd {
@@ -855,5 +903,23 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_rm_alias_with_force_and_two_refs_when_parsed_then_remove_has_both() {
+        // Arrange
+        let args = ["ward", "rm", "-f", "web1", "web2"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Remove { refs, force } => {
+                assert_eq!(refs, ["web1", "web2"]);
+                assert!(force);
+            }
+            other => panic!("expected Remove, got {other:?}"),
+        }
     }
 }
