@@ -14,7 +14,7 @@
 #   1. ward create  spawns a libkrun microVM from the OCI image
 #   2. ward exec    starts the command inside it, returns a pid
 #   3. ward logs    streams stdout / stderr / exit until the pid ends
-#   4. ward remove  tears the microVM down (always; trap on EXIT)
+#   4. ward rm -f   tears the microVM down (always; trap on EXIT)
 #
 # Designed to be the smallest reusable wrapper an AI agent or CI step
 # can shell out to. Customise the resource limits, environment, and
@@ -65,13 +65,13 @@ fi
 log "Sandbox: ${sb}"
 
 # Cleanup trap: whatever happens (successful exit, signal, exec failure)
-# the sandbox is torn down. ward remove is idempotent and returns 0 if
-# the sandbox is already gone (e.g. because the timeout fired before
-# we got here).
+# the sandbox is torn down. ward rm -f removes a running sandbox and
+# fails if it is already gone (e.g. the timeout fired before we got
+# here), so the error is ignored.
 cleanup() {
   local code=$?
   log "Removing sandbox ${sb}"
-  ward remove "${sb}" >/dev/null 2>&1 || true
+  ward rm -f "${sb}" >/dev/null 2>&1 || true
   exit "${code}"
 }
 trap cleanup EXIT INT TERM

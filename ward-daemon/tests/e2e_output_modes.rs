@@ -163,7 +163,7 @@ fn given_remove_with_json_when_run_then_emits_removed_key() {
 
     // Act
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["--json", "remove", &id]).assert();
+    let assertion = cmd.args(["--json", "remove", "-f", &id]).assert();
 
     // Assert: `{"removed": "<id>"}` on one line.
     assertion
