@@ -2,12 +2,12 @@
 
 //! SandboxManager coordinates the backend, egress proxies, and timeout tracking.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
-use crate::backend::{Backend, BackendError};
+use crate::backend::{Backend, BackendError, ExecMode};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
 use crate::pb::{
@@ -119,6 +119,93 @@ struct ProcessRecord {
     stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
 }
 
+/// Bytes of main process output kept per sandbox for `logs` and attach replay.
+const MAIN_OUTPUT_CAP: usize = 1024 * 1024;
+
+/// Live chunks a slow subscriber may lag behind before it loses the oldest.
+const MAIN_OUTPUT_LIVE_CHUNKS: usize = 64;
+
+/// Bounded, memory only copy of a main process's output. Keeps the newest
+/// `cap` bytes and fans new chunks out to live subscribers.
+struct OutputBuffer {
+    cap: usize,
+    state: std::sync::Mutex<BufferState>,
+}
+
+struct BufferState {
+    bytes: VecDeque<u8>,
+    live: broadcast::Sender<bytes::Bytes>,
+}
+
+impl OutputBuffer {
+    fn new(cap: usize) -> Self {
+        let (live, _) = broadcast::channel(MAIN_OUTPUT_LIVE_CHUNKS);
+        Self {
+            cap,
+            state: std::sync::Mutex::new(BufferState {
+                bytes: VecDeque::new(),
+                live,
+            }),
+        }
+    }
+
+    fn push(&self, chunk: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.bytes.extend(chunk);
+        let excess = state.bytes.len().saturating_sub(self.cap);
+        state.bytes.drain(..excess);
+        // No subscribers is the normal case before a client attaches.
+        let _ = state.live.send(bytes::Bytes::copy_from_slice(chunk));
+    }
+
+    /// Everything buffered so far plus a receiver for what follows. Both are
+    /// taken under one lock, so no chunk is missed or repeated.
+    fn subscribe(&self) -> (Vec<u8>, broadcast::Receiver<bytes::Bytes>) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            state.bytes.iter().copied().collect(),
+            state.live.subscribe(),
+        )
+    }
+}
+
+/// The process the daemon spawned from a sandbox's stored command.
+struct MainProcess {
+    pid: String,
+    output: Arc<OutputBuffer>,
+    /// Held so stdin stays open while no client is attached.
+    _stdin_tx: Option<mpsc::Sender<bytes::Bytes>>,
+    /// Raw `wait(2)` status, set once the process ends.
+    exit: watch::Receiver<Option<i32>>,
+}
+
+/// Bit position of the exit code inside a raw wait(2) status.
+const WAIT_STATUS_EXIT_SHIFT: i32 = 8;
+
+/// Copy a main process's events into its buffer, then publish its raw wait
+/// status when it ends.
+async fn pump_main_output(
+    mut events: mpsc::Receiver<StreamEvent>,
+    output: Arc<OutputBuffer>,
+    exit: watch::Sender<Option<i32>>,
+) {
+    while let Some(event) = events.recv().await {
+        match event.kind {
+            StreamEventKind::Data { bytes, .. } => output.push(&bytes),
+            StreamEventKind::Stdout | StreamEventKind::Stderr => {
+                output.push(format!("{}\n", event.line).as_bytes());
+            }
+            StreamEventKind::Exit => {
+                let status = event
+                    .wait_status
+                    .or(event.exit_code.map(|code| code << WAIT_STATUS_EXIT_SHIFT));
+                exit.send_replace(status);
+                return;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
@@ -156,6 +243,10 @@ pub struct SandboxManager {
     /// is bounded by sandbox lifetime and cleaned up when the sandbox
     /// is removed.
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    /// Main process of each sandbox that has a command, keyed by sandbox id.
+    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
+    /// Bytes kept per main process output buffer.
+    output_cap: usize,
     /// On-disk sandbox records. `None` keeps everything in memory.
     store: Option<MetaStore>,
     /// Names claimed by creates that have not yet inserted their entry.
@@ -179,6 +270,8 @@ impl SandboxManager {
             allow_host_mounts,
             network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
+            mains: Arc::new(RwLock::new(HashMap::new())),
+            output_cap: MAIN_OUTPUT_CAP,
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
         }
@@ -188,6 +281,12 @@ impl SandboxManager {
     /// [`restore`](Self::restore).
     pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
         self.store = Some(MetaStore::new(&data_dir));
+        self
+    }
+
+    #[cfg(all(test, not(feature = "krunvm")))]
+    fn with_output_cap(mut self, cap: usize) -> Self {
+        self.output_cap = cap;
         self
     }
 
@@ -319,7 +418,6 @@ impl SandboxManager {
         );
         // No broker registration: a reloaded sandbox is not running, and
         // `start` registers its stored policy.
-        metrics::gauge!("wardd_sandbox_active").increment(1.0);
         tracing::info!(sandbox_id = %id, "reloaded sandbox from disk");
     }
 
@@ -523,7 +621,20 @@ impl SandboxManager {
         // after the entries-insert so we don't leak broker state if the
         // local registration fails — though entries.insert can't actually
         // fail here, the order keeps cleanup symmetric with remove().
-        self.broker.register_sandbox(id, comms).await;
+        self.broker.register_sandbox(id.clone(), comms).await;
+
+        metrics::gauge!("wardd_sandbox_active").increment(1.0);
+
+        if let Err(e) = self.spawn_main(&id).await {
+            if let Err(remove_err) = self.remove(&id).await {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %remove_err,
+                    "remove failed after the main process did not start"
+                );
+            }
+            return Err(e);
+        }
 
         // Metrics: success path. Failure paths (the early `?`s above)
         // already counted via the validate layer; this records the
@@ -609,6 +720,7 @@ impl SandboxManager {
         let broker = Arc::clone(&self.broker);
         let backend = Arc::clone(&self.backend);
         let processes = Arc::clone(&self.processes);
+        let mains = Arc::clone(&self.mains);
         let sandbox_id = id.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
@@ -618,6 +730,7 @@ impl SandboxManager {
                 &broker,
                 &backend,
                 &processes,
+                &mains,
                 &sandbox_id,
                 /* from_timeout = */ true,
             )
@@ -706,6 +819,7 @@ impl SandboxManager {
             &self.broker,
             &self.backend,
             &self.processes,
+            &self.mains,
             id,
             /* from_timeout = */ false,
         )
@@ -786,8 +900,104 @@ impl SandboxManager {
             return Err(backend_err(e));
         }
         self.commit_running_and_register(id, comms).await?;
+        if let Err(e) = self.spawn_main(id).await {
+            self.mark_failed(id).await;
+            return Err(e);
+        }
         tracing::info!(sandbox_id = %id, "sandbox started");
         Ok(())
+    }
+
+    /// Run the stored command as the sandbox's main process, if it has one.
+    /// Output goes to the sandbox's buffer, which survives restarts so a
+    /// later run appends to the earlier one.
+    async fn spawn_main(&self, id: &str) -> Result<()> {
+        let spec = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(id)
+                .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+            entry.meta.options.spec.clone()
+        };
+        if spec.command.is_empty() {
+            return Ok(());
+        }
+        let mode = ExecMode {
+            tty: spec.tty,
+            raw: true,
+        };
+        let workdir = (!spec.workdir.is_empty()).then_some(spec.workdir);
+        let handle = self
+            .backend
+            .exec(id, spec.command, workdir, HashMap::new(), mode)
+            .await
+            .map_err(backend_err)?;
+
+        // Holding the entries lock keeps a concurrent remove from clearing
+        // `mains` before this record lands.
+        let entries = self.entries.read().await;
+        if !entries.contains_key(id) {
+            return Err(ApiError::SandboxNotFound(id.to_string()));
+        }
+        let mut mains = self.mains.write().await;
+        let output = mains
+            .get(id)
+            .map(|m| Arc::clone(&m.output))
+            .unwrap_or_else(|| Arc::new(OutputBuffer::new(self.output_cap)));
+        let (exit_tx, exit) = watch::channel(None);
+        if let Some(events) = handle.output_rx {
+            tokio::spawn(pump_main_output(events, Arc::clone(&output), exit_tx));
+        }
+        tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
+        mains.insert(
+            id.to_string(),
+            MainProcess {
+                pid: handle.pid,
+                output,
+                _stdin_tx: handle.stdin_tx,
+                exit,
+            },
+        );
+        Ok(())
+    }
+
+    /// Id of the sandbox's current main process.
+    pub async fn main_pid(&self, id: &str) -> Result<String> {
+        self.mains
+            .read()
+            .await
+            .get(id)
+            .map(|m| m.pid.clone())
+            .ok_or_else(|| no_main_process(id))
+    }
+
+    /// Output buffered so far, plus a receiver for what follows.
+    pub async fn subscribe_main_output(
+        &self,
+        id: &str,
+    ) -> Result<(Vec<u8>, broadcast::Receiver<bytes::Bytes>)> {
+        let mains = self.mains.read().await;
+        let main = mains.get(id).ok_or_else(|| no_main_process(id))?;
+        Ok(main.output.subscribe())
+    }
+
+    /// Wait for the main process to end and return its raw `wait(2)` status.
+    pub async fn main_exit_status(&self, id: &str) -> Result<i32> {
+        let mut exit = self
+            .mains
+            .read()
+            .await
+            .get(id)
+            .map(|m| m.exit.clone())
+            .ok_or_else(|| no_main_process(id))?;
+        let status = exit.wait_for(Option::is_some).await.map_err(|_| {
+            ApiError::Internal(format!(
+                "main process of sandbox {id} ended without a status"
+            ))
+        })?;
+        status.ok_or_else(|| {
+            ApiError::Internal(format!("main process of sandbox {id} has no status"))
+        })
     }
 
     /// Commit `running` and register the comms policy under one `entries`
@@ -884,6 +1094,7 @@ impl SandboxManager {
         broker: &Arc<Broker>,
         backend: &Arc<dyn Backend>,
         processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
+        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
         id: &str,
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
@@ -900,6 +1111,7 @@ impl SandboxManager {
             .write()
             .await
             .retain(|_, rec| rec.sandbox_id != id);
+        mains.write().await.remove(id);
         broker.deregister_sandbox(id).await;
 
         let result = backend.remove_sandbox(id).await;
@@ -1236,6 +1448,10 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
     }
 }
 
+fn no_main_process(id: &str) -> ApiError {
+    ApiError::InvalidRequest(format!("sandbox {id} has no main process"))
+}
+
 /// The state the manager recorded wins over the backend's: only the
 /// manager knows a boot failed.
 fn recorded_state(
@@ -1334,6 +1550,8 @@ mod tests {
         ResourceLimits as PbResourceLimits,
     };
     use pretty_assertions::assert_eq;
+    #[cfg(not(feature = "krunvm"))]
+    use std::os::unix::ffi::OsStrExt;
 
     /// Offline puller used by test backends so no network calls are made
     /// when manager tests create sandboxes.
@@ -3873,5 +4091,443 @@ mod tests {
         // Assert
         assert_eq!(stopped.id, created.id);
         assert_eq!(stopped.status, SandboxStatus::Stopped as i32);
+    }
+
+    // ----- main process --------------------------------------------------
+
+    /// Backend that keeps the stub's lifecycle but runs `exec` as a real
+    /// host process (on a pty when asked), so the main process tests see
+    /// real output, pids and wait statuses.
+    #[cfg(not(feature = "krunvm"))]
+    struct HostBackend {
+        inner: crate::backend::krunvm::KrunvmBackend,
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    fn stream_event(kind: StreamEventKind, code: Option<i32>, status: Option<i32>) -> StreamEvent {
+        StreamEvent {
+            kind,
+            line: String::new(),
+            exit_code: code,
+            wait_status: status,
+            timestamp: std::time::SystemTime::now(),
+            duration_ms: 0,
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn forward_output(
+        mut source: impl tokio::io::AsyncRead + Unpin,
+        tx: mpsc::Sender<StreamEvent>,
+    ) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        // A pty master reports EIO once the child is gone, which ends it too.
+        while let Ok(n @ 1..) = source.read(&mut buf).await {
+            let kind = StreamEventKind::Data {
+                stream: crate::protocol::RawStream::Stdout,
+                bytes: buf[..n].to_vec(),
+            };
+            if tx.send(stream_event(kind, None, None)).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    fn open_pty() -> (std::fs::File, std::fs::File) {
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let name = ptsname(&master, Vec::new()).expect("ptsname");
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(std::ffi::OsStr::from_bytes(name.to_bytes()))
+            .expect("open slave");
+        (std::fs::File::from(master), slave)
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[async_trait::async_trait]
+    impl Backend for HostBackend {
+        async fn exec(
+            &self,
+            sandbox_id: &str,
+            command: Vec<String>,
+            _working_dir: Option<String>,
+            _env: HashMap<String, String>,
+            mode: ExecMode,
+        ) -> crate::backend::Result<crate::backend::ProcessHandle> {
+            use std::process::Stdio;
+            let mut cmd = tokio::process::Command::new(&command[0]);
+            cmd.args(&command[1..]).kill_on_drop(true);
+            let (output_tx, output_rx) = mpsc::channel(16);
+            let (stdin_tx, mut stdin_rx) = mpsc::channel::<bytes::Bytes>(16);
+            let mut readers = Vec::new();
+            let mut child_stdin = None;
+            let mut child = if mode.tty {
+                let (master, slave) = open_pty();
+                cmd.stdin(slave.try_clone()?)
+                    .stdout(slave.try_clone()?)
+                    .stderr(slave);
+                let child = cmd.spawn()?;
+                readers.push(tokio::spawn(forward_output(
+                    tokio::fs::File::from_std(master),
+                    output_tx.clone(),
+                )));
+                child
+            } else {
+                cmd.stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut child = cmd.spawn()?;
+                child_stdin = child.stdin.take();
+                readers.push(tokio::spawn(forward_output(
+                    child.stdout.take().expect("stdout"),
+                    output_tx.clone(),
+                )));
+                child
+            };
+            drop(cmd);
+            let pid = child.id().expect("pid").to_string();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(chunk) = stdin_rx.recv().await {
+                    match child_stdin.as_mut() {
+                        Some(stdin) if chunk.is_empty() => drop(stdin.shutdown().await),
+                        Some(stdin) => drop(stdin.write_all(&chunk).await),
+                        None => {}
+                    }
+                }
+                // Every sender dropped: the stdin pipe closes.
+            });
+            tokio::spawn(async move {
+                use std::os::unix::process::ExitStatusExt;
+                let status = child.wait().await.expect("wait");
+                for reader in readers {
+                    let _ = reader.await;
+                }
+                let event = stream_event(
+                    StreamEventKind::Exit,
+                    status.code(),
+                    Some(status.into_raw()),
+                );
+                let _ = output_tx.send(event).await;
+            });
+            Ok(crate::backend::ProcessHandle {
+                pid,
+                sandbox_id: sandbox_id.to_string(),
+                stdin_tx: Some(stdin_tx),
+                output_rx: Some(output_rx),
+                control_tx: None,
+            })
+        }
+
+        async fn create_sandbox(
+            &self,
+            id: String,
+            opts: &CreateOpts,
+        ) -> crate::backend::Result<crate::protocol::SandboxInfo> {
+            self.inner.create_sandbox(id, opts).await
+        }
+        async fn get_sandbox(
+            &self,
+            id: &str,
+        ) -> crate::backend::Result<crate::protocol::SandboxInfo> {
+            self.inner.get_sandbox(id).await
+        }
+        async fn list_sandboxes(
+            &self,
+        ) -> crate::backend::Result<Vec<crate::protocol::SandboxInfo>> {
+            self.inner.list_sandboxes().await
+        }
+        async fn remove_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            self.inner.remove_sandbox(id).await
+        }
+        async fn adopt_sandbox(
+            &self,
+            info: crate::protocol::SandboxInfo,
+            opts: CreateOpts,
+            rootfs: std::path::PathBuf,
+        ) -> crate::backend::Result<()> {
+            self.inner.adopt_sandbox(info, opts, rootfs).await
+        }
+        async fn stop_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            self.inner.stop_sandbox(id).await
+        }
+        async fn start_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            self.inner.start_sandbox(id).await
+        }
+        async fn count(&self) -> crate::backend::Result<usize> {
+            self.inner.count().await
+        }
+        async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
+            self.inner.kill_process(sandbox_id, pid).await
+        }
+        async fn create_snapshot(
+            &self,
+            sandbox_id: &str,
+            label: &str,
+        ) -> crate::backend::Result<crate::protocol::SnapshotInfo> {
+            self.inner.create_snapshot(sandbox_id, label).await
+        }
+        async fn restore_snapshot(
+            &self,
+            sandbox_id: &str,
+            snapshot_id: &str,
+        ) -> crate::backend::Result<()> {
+            self.inner.restore_snapshot(sandbox_id, snapshot_id).await
+        }
+        async fn list_snapshots(
+            &self,
+            sandbox_id: &str,
+        ) -> crate::backend::Result<Vec<crate::protocol::SnapshotInfo>> {
+            self.inner.list_snapshots(sandbox_id).await
+        }
+        async fn snapshot_owner(&self, snapshot_id: &str) -> crate::backend::Result<String> {
+            self.inner.snapshot_owner(snapshot_id).await
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    const TEST_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
+    #[cfg(not(feature = "krunvm"))]
+    const TEST_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[cfg(not(feature = "krunvm"))]
+    const HOST_MANAGER_MAX_SANDBOXES: usize = 4;
+
+    #[cfg(not(feature = "krunvm"))]
+    fn host_manager(output_cap: usize) -> Arc<SandboxManager> {
+        use crate::backend::image::ImageStore;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let cache_dir = path.join("cache").join("images");
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+        std::mem::forget(dir);
+        let inner = crate::backend::krunvm::KrunvmBackend::with_image_store_for_test(path, store);
+        let backend: Arc<dyn Backend> = Arc::new(HostBackend { inner });
+        Arc::new(
+            SandboxManager::new(
+                backend,
+                Arc::new(Broker::new()),
+                HOST_MANAGER_MAX_SANDBOXES,
+                /* allow_host_mounts = */ false,
+                crate::config::NetworkBackendChoice::Smoltcp,
+            )
+            .with_output_cap(output_cap),
+        )
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn create_with_command(mgr: &SandboxManager, command: &[&str], tty: bool) -> String {
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: command.iter().map(|part| part.to_string()).collect(),
+            tty,
+            ..Default::default()
+        };
+        mgr.create(req, "").await.expect("create").id
+    }
+
+    /// Poll the buffered output until it equals `expected`.
+    #[cfg(not(feature = "krunvm"))]
+    async fn wait_for_output(mgr: &SandboxManager, id: &str, expected: &str) {
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        loop {
+            let (buffered, _) = mgr.subscribe_main_output(id).await.expect("subscribe");
+            if buffered == expected.as_bytes() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "output {:?} never became {expected:?}",
+                String::from_utf8_lossy(&buffered)
+            );
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stopped_sandbox_with_command_when_started_then_output_holds_a_second_line() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo run"], false).await;
+        wait_for_output(&mgr, &id, "run\n").await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        mgr.start(&id).await.expect("start");
+
+        // Assert
+        wait_for_output(&mgr, &id, "run\nrun\n").await;
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stopped_sandbox_with_command_when_restarted_then_output_holds_a_second_line() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo run"], false).await;
+        wait_for_output(&mgr, &id, "run\n").await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        mgr.restart(&id).await.expect("restart");
+
+        // Assert
+        wait_for_output(&mgr, &id, "run\nrun\n").await;
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::pty(true, "tty\n")]
+    #[case::pipe(false, "notty\n")]
+    #[tokio::test]
+    async fn given_tty_setting_when_command_tests_stdin_then_output_says_which(
+        #[case] tty: bool,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+
+        // Act
+        let id = create_with_command(
+            &mgr,
+            &["sh", "-c", "test -t 0 && echo tty || echo notty"],
+            tty,
+        )
+        .await;
+
+        // Assert: a pty may add a carriage return before the newline.
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        loop {
+            let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
+            let text = String::from_utf8_lossy(&buffered).replace('\r', "");
+            if text == expected {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "got {text:?}");
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_spawned_main_process_when_record_read_then_pid_is_the_childs() {
+        // Arrange: the shell prints its own pid, then waits.
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo $$; read x"], false).await;
+        let pid = mgr.main_pid(&id).await.expect("pid");
+
+        // Act / Assert
+        wait_for_output(&mgr, &id, &format!("{pid}\n")).await;
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_main_process_exits_7_when_bridge_finishes_then_status_is_0x0700() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 7"], false).await;
+
+        // Act
+        let status = mgr.main_exit_status(&id).await.expect("status");
+
+        // Assert
+        assert_eq!(status, 0x0700);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_main_process_killed_when_bridge_finishes_then_status_is_0x0009() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        let pid: i32 = mgr.main_pid(&id).await.unwrap().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+
+        // Act
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("kill");
+        let status = mgr.main_exit_status(&id).await.expect("status");
+
+        // Assert
+        assert_eq!(status, 0x0009);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_cat_main_process_and_no_client_when_polled_then_it_stays_running() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["cat"], false).await;
+
+        // Act / Assert: stdin stays open, so cat never ends.
+        for _ in 0..20 {
+            let info = mgr.get(&id).await.expect("get");
+            assert_eq!(info.status, SandboxStatus::Running as i32);
+            let ended = tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                mgr.main_exit_status(&id),
+            )
+            .await;
+            assert!(ended.is_err(), "cat ended");
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_output_before_attach_when_subscribed_later_then_earlier_and_newer_arrive_in_order()
+     {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let gate_dir = tempfile::tempdir().expect("tempdir");
+        let gate = gate_dir.path().join("go");
+        let script = format!(
+            "echo one; until [ -e {} ]; do sleep 0.05; done; echo two",
+            gate.display()
+        );
+        let id = create_with_command(&mgr, &["sh", "-c", &script], false).await;
+        wait_for_output(&mgr, &id, "one\n").await;
+
+        // Act
+        let (earlier, mut live) = mgr.subscribe_main_output(&id).await.expect("subscribe");
+        std::fs::write(&gate, b"").expect("open the gate");
+        let newer = tokio::time::timeout(TEST_POLL_DEADLINE, live.recv())
+            .await
+            .expect("live output")
+            .expect("open");
+
+        // Assert
+        assert_eq!(earlier, b"one\n");
+        assert_eq!(&newer[..], b"two\n");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::below_cap(7, "0123456")]
+    #[case::at_cap(8, "01234567")]
+    #[case::above_cap(9, "12345678")]
+    #[tokio::test]
+    async fn given_small_buffer_cap_when_output_exceeds_it_then_only_newest_bytes_remain(
+        #[case] written: usize,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        const CAP: usize = 8;
+        let mgr = host_manager(CAP);
+        let text = &"0123456789"[..written];
+
+        // Act
+        let id = create_with_command(&mgr, &["printf", "%s", text], false).await;
+        mgr.main_exit_status(&id).await.expect("status");
+
+        // Assert
+        let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
+        assert_eq!(String::from_utf8(buffered).unwrap(), expected);
     }
 }

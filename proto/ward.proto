@@ -25,6 +25,9 @@ service Ward {
   rpc StreamOutput(StreamOutputRequest) returns (stream StreamEvent);
   rpc WriteStdin(WriteStdinRequest) returns (google.protobuf.Empty);
   rpc KillProcess(KillProcessRequest) returns (google.protobuf.Empty);
+  // Bidirectional stream to a sandbox process. The first client message
+  // must be `start`; the token travels in call metadata.
+  rpc Attach(stream AttachMessage) returns (stream AttachMessage);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -201,6 +204,59 @@ message WriteStdinRequest {
 message KillProcessRequest {
   string sandbox_id = 1;
   string pid = 2;
+}
+
+// One message type for both directions of an Attach stream.
+// Client sends: start, stdin, resize, signal. Server sends: data, exit.
+message AttachMessage {
+  oneof kind {
+    AttachStart start = 1;
+    AttachStdin stdin = 2;
+    AttachResize resize = 3;
+    AttachSignal signal = 4;
+    AttachData data = 5;
+    AttachExit exit = 6;
+  }
+}
+
+enum AttachMode {
+  ATTACH_MODE_UNSPECIFIED = 0;
+  ATTACH_MODE_MAIN_PROCESS = 1;  // attach to the running main process
+  ATTACH_MODE_EXEC = 2;          // start `command` in the sandbox
+}
+
+message AttachStart {
+  string sandbox_id = 1;
+  AttachMode mode = 2;
+  repeated string command = 3;  // exec mode only
+  bool tty = 4;
+  map<string, string> env = 5;
+  string workdir = 6;
+  string user = 7;
+  bool replay = 8;  // read-only: replay buffered output, ignore stdin
+  bool follow = 9;  // keep streaming live output after the replay
+}
+
+message AttachStdin {
+  // An empty `data` is end of input (EOF) and closes the process stdin.
+  bytes data = 1;
+}
+
+message AttachResize {
+  uint32 rows = 1;
+  uint32 cols = 2;
+}
+
+message AttachSignal {
+  int32 signo = 1;
+}
+
+message AttachData {
+  bytes data = 1;
+}
+
+message AttachExit {
+  int32 exit_code = 1;
 }
 
 // ---------------------------------------------------------------------------

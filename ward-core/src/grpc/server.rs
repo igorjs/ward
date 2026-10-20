@@ -8,14 +8,14 @@ use tracing::error;
 
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest,
-    CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse, ExecRequest,
-    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
-    HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo, PublishRequest,
-    RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
-    SandboxInfo, SnapshotInfo, StartRequest, StopRequest, StreamEvent, StreamOutputRequest,
-    SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest,
+    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse,
+    ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest,
+    GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
+    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest,
+    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest, StopRequest,
+    StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -599,6 +599,16 @@ impl Ward for WardGrpcServer {
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
+    }
+
+    type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<AttachMessage, Status>>;
+
+    #[tracing::instrument(name = "rpc.attach", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn attach(
+        &self,
+        _request: Request<tonic::Streaming<AttachMessage>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        Err(Status::unimplemented("attach is not served yet"))
     }
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;

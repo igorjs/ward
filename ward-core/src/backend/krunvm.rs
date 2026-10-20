@@ -63,8 +63,7 @@ const AGENT_FILE_MODE: u32 = 0o755;
 /// the process "exits" and its bookkeeping is eligible for reaping; this
 /// mirrors how an actual process takes measurable wall-clock time to run,
 /// rather than completing before the exec response has even been handled.
-/// Only referenced by the stub (non-krunvm) exec path.
-#[cfg(not(feature = "krunvm"))]
+/// Only referenced by the stub exec path.
 const STUB_EXIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Timeout for connecting to the guest agent over its vsock-bridged Unix
@@ -703,7 +702,9 @@ impl Backend for KrunvmBackend {
         // microVM with the agent listening (see the spec's verification
         // ceiling).
         #[cfg(feature = "krunvm")]
-        let handle = {
+        let handle = if !self.boot_vms {
+            stub_exec_handle(pid, sandbox_id, command)
+        } else {
             let sock = self.agent_socket_path(sandbox_id);
             let stream = connect_agent_socket_with_timeout(
                 tokio::net::UnixStream::connect(&sock),
@@ -734,57 +735,10 @@ impl Backend for KrunvmBackend {
             handle
         };
 
-        // Stub path: a tiny scripted output stream so StreamOutput has
-        // something to deliver end-to-end without a real VM. Tests assert on
-        // this shape.
+        // Stub path: a scripted stream so StreamOutput has something to
+        // deliver end-to-end without a real VM. Tests assert on this shape.
         #[cfg(not(feature = "krunvm"))]
-        let handle = {
-            use crate::protocol::{StreamEvent, StreamEventKind};
-            let (output_tx, output_rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
-            let cmd_for_log = command.first().cloned().unwrap_or_default();
-            tokio::spawn(async move {
-                let started = std::time::SystemTime::now();
-                let _ = output_tx
-                    .send(StreamEvent {
-                        kind: StreamEventKind::Stdout,
-                        line: format!("stub: {cmd_for_log}"),
-                        exit_code: None,
-                        wait_status: None,
-                        timestamp: std::time::SystemTime::now(),
-                        duration_ms: 0,
-                    })
-                    .await;
-                tokio::time::sleep(STUB_EXIT_DELAY).await;
-                let _ = output_tx
-                    .send(StreamEvent {
-                        kind: StreamEventKind::Exit,
-                        line: String::new(),
-                        exit_code: Some(0),
-                        wait_status: Some(0),
-                        timestamp: std::time::SystemTime::now(),
-                        duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
-                    })
-                    .await;
-                // output_tx drops here → channel closes → consumer sees None.
-            });
-
-            // Stdin half: the drain task keeps stdin_rx alive so writes don't
-            // fail with "channel closed"; bytes are discarded.
-            let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
-            tokio::spawn(async move {
-                while let Some(_chunk) = stdin_rx.recv().await {
-                    // discard
-                }
-            });
-
-            ProcessHandle {
-                pid,
-                sandbox_id: sandbox_id.to_string(),
-                stdin_tx: Some(stdin_tx),
-                output_rx: Some(output_rx),
-                control_tx: None,
-            }
-        };
+        let handle = stub_exec_handle(pid, sandbox_id, command);
 
         Ok(handle)
     }
@@ -1388,6 +1342,55 @@ fn write_snapshot_metadata(path: &std::path::Path, info: &SnapshotInfo) -> Resul
 // ---------------------------------------------------------------------------
 // Tests: snapshot behaviour
 // ---------------------------------------------------------------------------
+
+/// A scripted output stream standing in for a guest agent when no VM runs.
+fn stub_exec_handle(pid: String, sandbox_id: &str, command: Vec<String>) -> ProcessHandle {
+    use crate::protocol::{StreamEvent, StreamEventKind};
+    let (output_tx, output_rx) = tokio::sync::mpsc::channel::<StreamEvent>(16);
+    let cmd_for_log = command.first().cloned().unwrap_or_default();
+    tokio::spawn(async move {
+        let started = std::time::SystemTime::now();
+        let _ = output_tx
+            .send(StreamEvent {
+                kind: StreamEventKind::Stdout,
+                line: format!("stub: {cmd_for_log}"),
+                exit_code: None,
+                wait_status: None,
+                timestamp: std::time::SystemTime::now(),
+                duration_ms: 0,
+            })
+            .await;
+        tokio::time::sleep(STUB_EXIT_DELAY).await;
+        let _ = output_tx
+            .send(StreamEvent {
+                kind: StreamEventKind::Exit,
+                line: String::new(),
+                exit_code: Some(0),
+                wait_status: Some(0),
+                timestamp: std::time::SystemTime::now(),
+                duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
+            })
+            .await;
+        // output_tx drops here → channel closes → consumer sees None.
+    });
+
+    // Stdin half: the drain task keeps stdin_rx alive so writes don't
+    // fail with "channel closed"; bytes are discarded.
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+    tokio::spawn(async move {
+        while let Some(_chunk) = stdin_rx.recv().await {
+            // discard
+        }
+    });
+
+    ProcessHandle {
+        pid,
+        sandbox_id: sandbox_id.to_string(),
+        stdin_tx: Some(stdin_tx),
+        output_rx: Some(output_rx),
+        control_tx: None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
