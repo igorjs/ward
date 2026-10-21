@@ -3602,6 +3602,8 @@ dependencies = [
  "clap",
  "hyper-util",
  "pretty_assertions",
+ "prost-types",
+ "rstest",
  "rustix",
  "serde_json",
  "tabled",

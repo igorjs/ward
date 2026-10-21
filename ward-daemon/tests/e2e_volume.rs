@@ -148,7 +148,7 @@ fn given_created_volume_when_user_removes_it_then_list_no_longer_shows_it() {
         .args(["volume", "remove", &id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("removed:"));
+        .stdout(format!("{id}\n"));
 
     // Assert: it no longer appears in `ward volume list`.
     daemon
@@ -204,16 +204,7 @@ fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_messag
         .spawn()
         .expect("spawn wardd");
 
-    // Wait for the socket.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !socket.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !socket.exists() {
-        let _ = wardd.kill();
-        let _ = wardd.wait();
-        panic!("daemon did not bind");
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
         let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
@@ -268,15 +259,7 @@ fn given_volume_cap_reached_when_user_removes_one_then_create_succeeds_again() {
         .spawn()
         .expect("spawn wardd");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !socket.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !socket.exists() {
-        let _ = wardd.kill();
-        let _ = wardd.wait();
-        panic!("daemon did not bind");
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
         let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();

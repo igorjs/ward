@@ -15,6 +15,8 @@
 
 #![cfg(feature = "krunvm")]
 
+mod common;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -55,15 +57,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         .spawn()
         .expect("spawn wardd");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if !socket.exists() {
-        let _ = wardd.kill();
-        let _ = wardd.wait();
-        panic!("wardd did not bind socket within 5s: {}", socket.display());
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
         let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();

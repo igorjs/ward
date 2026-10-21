@@ -191,6 +191,10 @@ const SIGNAL_EXIT_BASE: i32 = 128;
 const STOP_GRACE_SECONDS: u64 = 10;
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
+/// Highest signal number Linux accepts (the last real-time signal).
+const MAX_SIGNAL: i32 = 64;
+/// The pid `kill_process` accepts for the sandbox's main process.
+pub const MAIN_PROCESS_PID: &str = "0";
 
 /// Turn a raw `wait(2)` status into the exit code a shell would report.
 pub(crate) fn decode_wait_status(raw: i32) -> i32 {
@@ -1137,6 +1141,36 @@ impl SandboxManager {
         })
     }
 
+    /// Send `signal` to the main process, or SIGKILL when `signal` is 0.
+    pub async fn signal_main_process(&self, sandbox_id: &str, signal: i32) -> Result<()> {
+        if !(0..=MAX_SIGNAL).contains(&signal) {
+            return Err(ApiError::InvalidRequest(format!(
+                "invalid signal: {signal}"
+            )));
+        }
+        let id = self.resolve(sandbox_id).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            return Err(not_running(&id));
+        }
+        let (control, exit) = {
+            let mains = self.mains.read().await;
+            let main = mains.get(&id).ok_or_else(|| no_main_process(&id))?;
+            let control = main
+                .control_tx
+                .clone()
+                .ok_or_else(|| no_main_process(&id))?;
+            (control, main.exit.clone())
+        };
+        if exit.borrow().is_some() {
+            return Err(not_running(&id));
+        }
+        let signal = if signal == 0 { SIGKILL } else { signal };
+        control
+            .send(ProcessControl::Signal(signal))
+            .await
+            .map_err(|_| ApiError::ProcessNotFound(MAIN_PROCESS_PID.to_string()))
+    }
+
     /// Drop the manager's hold on the main process's stdin, which sends EOF
     /// once no attached client holds a sender either.
     pub async fn close_main_stdin(&self, id: &str) {
@@ -1628,6 +1662,10 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
         pids_max: pb.pids_max,
         timeout_seconds: pb.timeout_seconds,
     }
+}
+
+fn not_running(id: &str) -> ApiError {
+    ApiError::InvalidRequest(format!("sandbox {id} is not running"))
 }
 
 fn no_main_process(id: &str) -> ApiError {
@@ -4788,6 +4826,105 @@ pub(crate) mod tests {
         // Assert
         wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
         assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::default_is_kill(0, SIGKILL_EXIT_CODE)]
+    #[case::term(SIGTERM, SIGTERM_EXIT_CODE)]
+    #[tokio::test]
+    async fn given_running_command_when_main_process_signalled_then_sandbox_exits_with_signal_code(
+        #[case] signal: i32,
+        #[case] code: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        mgr.signal_main_process(&id, signal).await.expect("signal");
+
+        // Assert
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::negative(-1)]
+    #[case::past_max(65)]
+    #[tokio::test]
+    async fn given_signal_out_of_range_when_main_process_signalled_then_invalid_request(
+        #[case] signal: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        let err = mgr
+            .signal_main_process(&id, signal)
+            .await
+            .expect_err("out of range");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
+        assert!(err.to_string().contains("invalid signal"), "{err}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_exited_sandbox_when_main_process_signalled_then_not_running_error() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 0"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        let err = mgr.signal_main_process(&id, 0).await.expect_err("exited");
+
+        // Assert
+        assert!(err.to_string().contains("is not running"), "{err}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stopped_sandbox_when_main_process_signalled_then_not_running_error() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        let err = mgr.signal_main_process(&id, 0).await.expect_err("stopped");
+
+        // Assert
+        assert!(err.to_string().contains("is not running"), "{err}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_sandbox_without_command_when_main_process_signalled_then_no_main_process_error()
+    {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = mgr
+            .create(
+                CreateSandboxRequest {
+                    image: "alpine".into(),
+                    ..Default::default()
+                },
+                "",
+            )
+            .await
+            .expect("create")
+            .id;
+
+        // Act
+        let err = mgr.signal_main_process(&id, 0).await.expect_err("no main");
+
+        // Assert
+        assert!(err.to_string().contains("no main process"), "{err}");
     }
 
     #[cfg(not(feature = "krunvm"))]

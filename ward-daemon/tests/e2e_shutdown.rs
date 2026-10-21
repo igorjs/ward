@@ -14,6 +14,8 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -48,16 +50,7 @@ fn given_running_daemon_with_sandbox_when_sigterm_then_clean_exit() {
         .spawn()
         .expect("spawn wardd");
 
-    // Wait for the socket to appear so we know the daemon is accepting RPCs.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() {
-        if Instant::now() > deadline {
-            let _ = wardd.kill();
-            let _ = wardd.wait();
-            panic!("wardd did not bind {} within 5s", socket.display());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     // Create a sandbox so the teardown loop has something to drain.
     // Default backend is the stub when --features krunvm is off; the
@@ -141,15 +134,7 @@ fn given_running_daemon_without_sandboxes_when_sigint_then_exits_quickly() {
         .spawn()
         .expect("spawn wardd");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !socket.exists() {
-        if Instant::now() > deadline {
-            let _ = wardd.kill();
-            let _ = wardd.wait();
-            panic!("wardd did not bind socket within 5s");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     // Act: send SIGINT.
     use rustix::process::{Pid, Signal};

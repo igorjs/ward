@@ -472,6 +472,7 @@ impl WardClient {
         let req = pb::KillProcessRequest {
             sandbox_id: sandbox_id.into(),
             pid: pid.into(),
+            ..Default::default()
         };
         self.inner.kill_process(attach_token(req, token)?).await?;
         Ok(())

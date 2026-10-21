@@ -21,7 +21,7 @@ use crate::pb::{
     StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
-use crate::sandbox::SandboxManager;
+use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
 use crate::volume::VolumeManager;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +51,20 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
     }
+}
+
+/// Signal that ends an exec process; the backend cannot deliver others.
+const KILL_SIGNAL: i32 = 9;
+
+/// An exec process can only be killed, so any other signal is refused
+/// instead of being silently turned into a kill.
+fn check_signal_supported(pid: &str, signal: i32) -> Result<(), ApiError> {
+    if pid != MAIN_PROCESS_PID && signal != 0 && signal != KILL_SIGNAL {
+        return Err(ApiError::InvalidRequest(format!(
+            "only signal {KILL_SIGNAL} can be sent to an exec process, got {signal}"
+        )));
+    }
+    Ok(())
 }
 
 /// Turn a name, id or id prefix into a full sandbox id. Handlers call this
@@ -366,15 +380,23 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        check_signal_supported(&req.pid, req.signal).map_err(api_err_to_status)?;
         let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
             .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
-        self.sandbox
-            .kill_process(&sandbox_id, &req.pid)
-            .await
-            .map_err(api_err_to_status)?;
+        if req.pid == MAIN_PROCESS_PID {
+            self.sandbox
+                .signal_main_process(&sandbox_id, req.signal)
+                .await
+                .map_err(api_err_to_status)?;
+        } else {
+            self.sandbox
+                .kill_process(&sandbox_id, &req.pid)
+                .await
+                .map_err(api_err_to_status)?;
+        }
         Ok(Response::new(()))
     }
 
@@ -906,6 +928,27 @@ mod tests {
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             Ok(format!("sha256:{hash:016x}"))
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::exec_default("1a2b", 0, true)]
+    #[case::exec_kill("1a2b", 9, true)]
+    #[case::exec_term("1a2b", 15, false)]
+    #[case::main_term("0", 15, true)]
+    fn given_pid_and_signal_when_checked_then_only_kill_is_allowed_for_exec(
+        #[case] pid: &str,
+        #[case] signal: i32,
+        #[case] allowed: bool,
+    ) {
+        // Act
+        let result = check_signal_supported(pid, signal);
+
+        // Assert
+        assert_eq!(result.is_ok(), allowed);
+        if let Err(err) = result {
+            assert!(matches!(err, ApiError::InvalidRequest(_)));
+            assert_eq!(api_err_to_status(err).code(), tonic::Code::InvalidArgument);
         }
     }
 
