@@ -68,8 +68,7 @@ fn create(d: &Daemon, extra: &[&str]) -> String {
     let mut cmd = d.cli();
     cmd.arg("create").args(extra).arg(image());
     let out = run_ok(cmd);
-    assert_eq!(field(&out, "status: "), "running", "create output:\n{out}");
-    field(&out, "id: ")
+    out.trim().to_string()
 }
 
 struct Finished {
@@ -81,7 +80,7 @@ struct Finished {
 /// Start a process and return its pid without waiting.
 fn start(d: &Daemon, id: &str, workdir: Option<&str>, argv: &[&str]) -> String {
     let mut cmd = d.cli();
-    cmd.args(["exec", id]);
+    cmd.args(["exec", "-d", id]);
     if let Some(dir) = workdir {
         cmd.args(["--workdir", dir]);
     }
@@ -233,7 +232,7 @@ fn given_workdir_when_exec_then_command_runs_there() {
 fn given_memory_and_cpus_when_create_then_guest_sees_them() {
     require_vm!();
     let d = Daemon::spawn_vm();
-    let id = create(&d, &["--memory", "256", "--cpus", "2"]);
+    let id = create(&d, &["--memory", "256m", "--cpus", "2"]);
 
     let cpus = sh(&d, &id, "nproc");
     let mem_kb = sh(&d, &id, "awk '/MemTotal/ {print $2}' /proc/meminfo");
@@ -581,21 +580,20 @@ fn given_snapshot_when_restored_into_new_sandbox_then_files_are_present() {
         }),
         "snapshot_id: ",
     );
-    let restored = field(
-        &run_ok({
-            let mut c = d.cli();
-            c.args([
-                "create",
-                "--from-snapshot",
-                &snap,
-                "--source-sandbox",
-                &src,
-                &image(),
-            ]);
-            c
-        }),
-        "id: ",
-    );
+    let restored = run_ok({
+        let mut c = d.cli();
+        c.args([
+            "create",
+            "--from-snapshot",
+            &snap,
+            "--source-sandbox",
+            &src,
+            &image(),
+        ]);
+        c
+    })
+    .trim()
+    .to_string();
 
     let r = exec(&d, &restored, &["cat", "/root/note"]);
     assert_eq!(r.stdout.trim(), "kept");
@@ -608,7 +606,7 @@ fn given_read_write_mount_when_guest_reads_and_writes_then_host_sees_the_changes
     let share = tempfile::tempdir().expect("share dir");
     std::fs::write(share.path().join("in.txt"), "from host").unwrap();
     let spec = format!("{}:/mnt/share", share.path().display());
-    let id = create(&d, &["--mount", &spec]);
+    let id = create(&d, &["--volume", &spec]);
 
     let r = sh(
         &d,
@@ -632,7 +630,7 @@ fn given_read_only_mount_when_guest_writes_then_the_write_fails_and_host_is_unch
     let share = tempfile::tempdir().expect("share dir");
     std::fs::write(share.path().join("in.txt"), "original").unwrap();
     let spec = format!("{}:/mnt/ro:ro", share.path().display());
-    let id = create(&d, &["--mount", &spec]);
+    let id = create(&d, &["--volume", &spec]);
 
     let r = sh(&d, &id, "echo changed > /mnt/ro/in.txt; echo rc=$?");
 

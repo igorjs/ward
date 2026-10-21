@@ -51,6 +51,17 @@ pub async fn attach(
     start: AttachStart,
     forward_stdin: bool,
 ) -> Result<Option<i32>> {
+    attach_to(client, target, start, forward_stdin, &mut std::io::stdout()).await
+}
+
+/// Like [`attach`], writing the output to `out` instead of stdout.
+pub async fn attach_to(
+    client: &mut WardClient<Channel>,
+    target: &Resolved,
+    start: AttachStart,
+    forward_stdin: bool,
+    out: &mut impl Write,
+) -> Result<Option<i32>> {
     let tty = start.tty;
     let replay = start.replay;
     // Raw mode turns Ctrl-C into a byte, so it is only worth it when
@@ -83,12 +94,11 @@ pub async fn attach(
     let request = target.request(ReceiverStream::new(rx))?;
     let streaming = async {
         let mut replies = client.attach(request).await?.into_inner();
-        let mut stdout = std::io::stdout();
         while let Some(reply) = replies.message().await? {
             match reply.kind {
                 Some(Kind::Data(data)) => {
-                    stdout.write_all(&data.data)?;
-                    stdout.flush()?;
+                    out.write_all(&data.data)?;
+                    out.flush()?;
                 }
                 // A log follower reports the output, not the guest's exit code.
                 Some(Kind::Exit(exit)) => return Ok((!replay).then_some(exit.exit_code)),

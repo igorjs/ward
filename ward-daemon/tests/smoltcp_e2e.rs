@@ -75,12 +75,15 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         "create failed: {}",
         String::from_utf8_lossy(&create_out.stderr)
     );
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: resolve a real hostname from inside the guest via the
     // backend's DNS relay.
     let dns_exec = ward()
-        .args(["exec", &id, "--", "getent", "hosts", "example.com"])
+        .args(["exec", "-d", &id, "--", "getent", "hosts", "example.com"])
         .output()
         .expect("exec getent");
     assert!(
@@ -104,6 +107,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
     let tcp_exec = ward()
         .args([
             "exec",
+            "-d",
             &id,
             "--",
             "wget",

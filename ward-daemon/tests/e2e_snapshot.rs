@@ -39,7 +39,10 @@ fn given_existing_sandbox_when_user_runs_snapshot_create_then_prints_snapshot_id
         .args(["create", "alpine:latest"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act
     let mut cmd = daemon.cli();
@@ -103,7 +106,10 @@ fn given_existing_snapshot_when_user_runs_snapshot_restore_then_prints_restored(
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let snap_out = daemon
         .cli()
         .args(["snapshot", "create", &id, "--label", "before"])
@@ -134,7 +140,10 @@ fn given_unknown_snapshot_when_user_runs_snapshot_restore_then_fails_with_not_fo
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act
     let mut cmd = daemon.cli();
@@ -177,7 +186,10 @@ fn given_no_snapshots_when_user_runs_snapshot_list_then_stdout_is_empty() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act
     let out = daemon
@@ -206,7 +218,10 @@ fn given_two_snapshots_when_user_runs_snapshot_list_then_both_appear() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     daemon
         .cli()
         .args(["snapshot", "create", &id, "--label", "first"])

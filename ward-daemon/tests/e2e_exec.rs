@@ -45,11 +45,16 @@ fn given_existing_sandbox_when_user_runs_exec_echo_then_returns_pid_and_running_
         .output()
         .expect("create");
     assert!(create_out.status.success());
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: the user types `ward exec <id> -- echo hello`.
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["exec", &id, "--", "echo", "hello"]).assert();
+    let assertion = cmd
+        .args(["exec", "-d", &id, "--", "echo", "hello"])
+        .assert();
 
     // Assert: success plus pid + status fields scripts can grep.
     assertion
@@ -88,7 +93,10 @@ fn given_existing_sandbox_when_user_runs_python_snippet_then_fails_with_stub_err
         .args(["create", "python:3.12-slim"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act
     let mut cmd = daemon.cli();
@@ -119,7 +127,10 @@ fn given_unsupported_language_when_user_runs_then_fails_with_stub_error() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: "cobol" is not in the runtime table, but the stub (issue #9)
     // rejects the call before that table is ever consulted.
@@ -151,7 +162,10 @@ fn given_invalid_language_name_when_user_runs_then_fails_with_stub_error() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: a dash in the language name would fail the validator regex,
     // but the stub (issue #9) rejects the call before validation runs.
@@ -188,10 +202,13 @@ fn given_exec_when_user_runs_logs_then_streams_stdout_and_exit() {
         .args(["create", "alpine:latest"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", &id, "--", "echo", "hello"])
+        .args(["exec", "-d", &id, "--", "echo", "hello"])
         .output()
         .expect("exec");
     let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
@@ -218,7 +235,10 @@ fn given_invalid_pid_when_user_runs_logs_then_fails_with_clear_error() {
         .args(["create", "alpine:latest"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: 'z' is not hex, so the entity_id validator rejects.
     let mut cmd = daemon.cli();
@@ -263,10 +283,13 @@ fn given_exec_when_user_writes_stdin_then_command_succeeds() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", &id, "--", "cat"])
+        .args(["exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
     let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
@@ -334,10 +357,13 @@ fn given_exec_when_user_runs_kill_then_succeeds_and_subsequent_stdin_fails() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", &id, "--", "cat"])
+        .args(["exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
     let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
@@ -368,7 +394,10 @@ fn given_unknown_pid_when_user_runs_kill_then_fails_with_not_found() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let unknown_pid = "00000000-0000-0000-0000-000000000000";
 
     // Act
@@ -390,7 +419,10 @@ fn given_malformed_pid_when_user_runs_kill_then_fails_with_clear_error() {
         .args(["create", "alpine"])
         .output()
         .expect("create");
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: 'z' is not hex.
     let mut cmd = daemon.cli();

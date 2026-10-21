@@ -12,7 +12,7 @@
 #
 # What this does:
 #   1. ward create  spawns a libkrun microVM from the OCI image
-#   2. ward exec    starts the command inside it, returns a pid
+#   2. ward exec -d starts the command inside it, returns a pid
 #   3. ward logs    streams stdout / stderr / exit until the pid ends
 #   4. ward rm -f   tears the microVM down (always; trap on EXIT)
 #
@@ -55,9 +55,8 @@ command -v awk  >/dev/null 2>&1 || die "awk not found on PATH"
 log "Creating sandbox from ${image} (cpus=${cpus}, mem=${memory_mb}M, timeout=${timeout_s}s, egress=daemon-default-Deny)"
 sb=$(ward create "${image}" \
        --cpus "${cpus}" \
-       --memory "${memory_mb}" \
-       --timeout "${timeout_s}" \
-     | awk '/^id:/{print $2}')
+       --memory "${memory_mb}m" \
+       --timeout "${timeout_s}")
 
 if [[ -z "${sb}" ]]; then
   die "ward create returned no sandbox id"
@@ -76,12 +75,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 2. Exec: launch the command, capture its pid. `sh -c` is a convenience
+# 2. Exec: launch the command detached (-d), capture its pid. `sh -c` is a convenience
 # so callers can pass shell strings; the guest is the trust boundary,
 # not this script. For argv-style invocation drop the wrapper and pass
-# the array directly:  ward exec "$sb" -- prog arg1 arg2
+# the array directly:  ward exec -d "$sb" -- prog arg1 arg2
 log "Executing: ${command}"
-pid=$(ward exec "${sb}" -- sh -c "${command}" | awk '/^pid:/{print $2}')
+pid=$(ward exec -d "${sb}" -- sh -c "${command}" | awk '/^pid:/{print $2}')
 if [[ -z "${pid}" ]]; then
   die "ward exec returned no pid"
 fi

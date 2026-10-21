@@ -54,8 +54,8 @@ Release binaries are built the same way and signed with the hardened runtime. Th
 ```sh
 wardd &                                  # start the daemon
 ward create alpine                       # → sandbox id
-ward exec <id> -- echo "hello from inside"
-ward logs <id> <pid>
+ward exec <id> echo "hello from inside"    # attached, like docker exec
+ward exec -d <id> sleep 60               # → pid, for ward logs <id> <pid>
 ward rm -f <id>
 ```
 
