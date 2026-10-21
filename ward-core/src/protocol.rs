@@ -165,8 +165,17 @@ pub struct StreamEvent {
     pub kind: StreamEventKind,
     pub line: String,
     pub exit_code: Option<i32>,
+    /// Raw `wait(2)` status on an `Exit` event, when the backend reports it.
+    pub wait_status: Option<i32>,
     pub timestamp: SystemTime,
     pub duration_ms: u64,
+}
+
+/// Which output stream a raw chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +183,11 @@ pub enum StreamEventKind {
     Stdout,
     Stderr,
     Exit,
+    /// Unframed output bytes, exactly as the process wrote them.
+    Data {
+        stream: RawStream,
+        bytes: Vec<u8>,
+    },
 }
 
 // ---------------------------------------------------------------------------

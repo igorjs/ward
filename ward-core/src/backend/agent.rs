@@ -17,8 +17,8 @@ use prost::Message;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use super::ProcessHandle;
-use crate::protocol::{StreamEvent, StreamEventKind};
+use super::{ExecMode, ProcessControl, ProcessHandle};
+use crate::protocol::{RawStream, StreamEvent, StreamEventKind};
 
 /// Agent protocol types, generated from `proto/ward_agent.proto`.
 pub mod proto {
@@ -100,6 +100,33 @@ fn now() -> std::time::SystemTime {
     std::time::SystemTime::now()
 }
 
+/// Buffered control requests per process; resize and signal are rare.
+const CONTROL_CHANNEL_CAPACITY: usize = 8;
+
+fn control_request(ctl: ProcessControl) -> request::Kind {
+    match ctl {
+        ProcessControl::Resize { rows, cols } => {
+            request::Kind::Resize(proto::Resize { rows, cols })
+        }
+        ProcessControl::Signal(signo) => request::Kind::Signal(proto::Signal { signo }),
+    }
+}
+
+fn raw_stream(tag: i32) -> Option<RawStream> {
+    match proto::Stream::try_from(tag) {
+        Ok(proto::Stream::Stdout) => Some(RawStream::Stdout),
+        Ok(proto::Stream::Stderr) => Some(RawStream::Stderr),
+        _ => None,
+    }
+}
+
+/// The raw wait status, or `None` when the agent did not report one. An agent
+/// that predates the field leaves it 0 (proto3 default) even for a failed
+/// exit, which must not read as a clean status.
+fn raw_wait_status(code: i32, wait_status: i32) -> Option<i32> {
+    (wait_status != 0 || code == 0).then_some(wait_status)
+}
+
 /// Drive one process over `stream`: send the opening `Exec`, then bridge the
 /// connection to `ProcessHandle` channels. Returns the handle plus a kill
 /// sender the backend stores so `kill_process` can target this connection.
@@ -110,6 +137,7 @@ pub async fn drive_exec<S>(
     command: Vec<String>,
     working_dir: Option<String>,
     env: HashMap<String, String>,
+    mode: ExecMode,
 ) -> std::io::Result<(ProcessHandle, mpsc::Sender<()>)>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -121,6 +149,9 @@ where
             command,
             working_dir: working_dir.unwrap_or_default(),
             env,
+            tty: mode.tty,
+            raw: mode.raw,
+            ..Default::default()
         })),
     };
     write_frame(&mut writer, &encode(&exec)).await?;
@@ -128,10 +159,12 @@ where
     let (output_tx, output_rx) = mpsc::channel::<StreamEvent>(64);
     let (stdin_tx, mut stdin_rx) = mpsc::channel::<bytes::Bytes>(64);
     let (kill_tx, mut kill_rx) = mpsc::channel::<()>(1);
+    let (control_tx, mut control_rx) = mpsc::channel::<ProcessControl>(CONTROL_CHANNEL_CAPACITY);
 
-    // Outbound: forward stdin chunks and a single kill, framing each.
+    // Outbound: forward stdin chunks, control requests and a single kill, framing each.
     tokio::spawn(async move {
         let mut stdin_open = true;
+        let mut control_open = true;
         loop {
             tokio::select! {
                 chunk = stdin_rx.recv(), if stdin_open => match chunk {
@@ -152,6 +185,15 @@ where
                         let _ = write_frame(&mut writer, &encode(&req)).await;
                         stdin_open = false;
                     }
+                },
+                ctl = control_rx.recv(), if control_open => match ctl {
+                    Some(ctl) => {
+                        let req = Request { kind: Some(control_request(ctl)) };
+                        if write_frame(&mut writer, &encode(&req)).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => control_open = false,
                 },
                 k = kill_rx.recv() => {
                     if k.is_some() {
@@ -176,6 +218,7 @@ where
                     kind: StreamEventKind::Stdout,
                     line: l.text,
                     exit_code: None,
+                    wait_status: None,
                     timestamp: now(),
                     duration_ms: 0,
                 },
@@ -183,15 +226,34 @@ where
                     kind: StreamEventKind::Stderr,
                     line: l.text,
                     exit_code: None,
+                    wait_status: None,
                     timestamp: now(),
                     duration_ms: 0,
                 },
+                Some(event::Kind::Data(d)) => {
+                    // An unknown stream tag from a newer agent is dropped.
+                    let Some(stream) = raw_stream(d.stream) else {
+                        continue;
+                    };
+                    StreamEvent {
+                        kind: StreamEventKind::Data {
+                            stream,
+                            bytes: d.data,
+                        },
+                        line: String::new(),
+                        exit_code: None,
+                        wait_status: None,
+                        timestamp: now(),
+                        duration_ms: 0,
+                    }
+                }
                 Some(event::Kind::Exited(x)) => {
                     let _ = output_tx
                         .send(StreamEvent {
                             kind: StreamEventKind::Exit,
                             line: String::new(),
                             exit_code: Some(x.code),
+                            wait_status: raw_wait_status(x.code, x.wait_status),
                             timestamp: now(),
                             duration_ms: started
                                 .elapsed()
@@ -214,6 +276,7 @@ where
         sandbox_id,
         stdin_tx: Some(stdin_tx),
         output_rx: Some(output_rx),
+        control_tx: Some(control_tx),
     };
     Ok((handle, kill_tx))
 }
@@ -251,7 +314,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proto::{Event, Exited, Line, Request, event};
+    use crate::backend::{ExecMode, ProcessControl};
+    use crate::protocol::RawStream;
+    use proto::{Data, Event, Exited, Line, Request, event};
     use tokio::io::{AsyncWriteExt, split};
 
     /// Minimal in-test agent: reads the opening Exec, then plays a scripted
@@ -296,7 +361,10 @@ mod tests {
 
     fn exited(code: i32) -> Event {
         Event {
-            kind: Some(event::Kind::Exited(Exited { code })),
+            kind: Some(event::Kind::Exited(Exited {
+                code,
+                ..Default::default()
+            })),
         }
     }
 
@@ -389,6 +457,7 @@ mod tests {
             vec!["echo".to_string(), "hi".to_string()],
             None,
             HashMap::new(),
+            ExecMode::default(),
         )
         .await
         .expect("drive_exec");
@@ -413,6 +482,7 @@ mod tests {
             vec!["false".to_string()],
             None,
             HashMap::new(),
+            ExecMode::default(),
         )
         .await
         .expect("drive_exec");
@@ -433,6 +503,7 @@ mod tests {
             vec!["cat".to_string()],
             None,
             HashMap::new(),
+            ExecMode::default(),
         )
         .await
         .expect("drive_exec");
@@ -451,5 +522,326 @@ mod tests {
             .find(|e| e.kind == StreamEventKind::Stdout)
             .expect("stdout event");
         assert_eq!(stdout_line.line, "ping");
+    }
+
+    fn data(stream: proto::Stream, bytes: &[u8]) -> Event {
+        Event {
+            kind: Some(event::Kind::Data(Data {
+                stream: stream as i32,
+                data: bytes.to_vec(),
+            })),
+        }
+    }
+
+    /// Fake agent that plays `script`, then records request frames until
+    /// `limit` arrive or the host closes its side.
+    async fn recording_agent<S>(stream: S, script: Vec<Event>, limit: usize) -> Vec<Request>
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut r, mut w) = split(stream);
+        for ev in script {
+            write_frame(&mut w, &encode(&ev)).await.unwrap();
+        }
+        let mut seen = Vec::new();
+        while seen.len() < limit
+            && let Ok(Some(frame)) = read_frame(&mut r).await
+        {
+            seen.push(Request::decode(&frame[..]).unwrap());
+        }
+        seen
+    }
+
+    async fn drive_with(
+        daemon: tokio::io::DuplexStream,
+        mode: ExecMode,
+    ) -> (ProcessHandle, mpsc::Sender<()>) {
+        drive_exec(
+            daemon,
+            "pid-x".to_string(),
+            "sb-1".to_string(),
+            vec!["sh".to_string()],
+            None,
+            HashMap::new(),
+            mode,
+        )
+        .await
+        .expect("drive_exec")
+    }
+
+    #[tokio::test]
+    async fn given_data_events_when_drive_then_raw_events_keep_bytes_and_stream() {
+        // Arrange
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let payload: &[u8] = b"a\0b\xff";
+        tokio::spawn(fake_agent(
+            agent,
+            vec![
+                data(proto::Stream::Stdout, payload),
+                data(proto::Stream::Stderr, b"err"),
+                exited(0),
+            ],
+            false,
+        ));
+
+        // Act
+        let (handle, _kill) = drive_with(
+            daemon,
+            ExecMode {
+                tty: false,
+                raw: true,
+            },
+        )
+        .await;
+        let events = collect(handle.output_rx.unwrap()).await;
+
+        // Assert
+        assert_eq!(
+            events[0].kind,
+            StreamEventKind::Data {
+                stream: RawStream::Stdout,
+                bytes: payload.to_vec()
+            }
+        );
+        assert_eq!(
+            events[1].kind,
+            StreamEventKind::Data {
+                stream: RawStream::Stderr,
+                bytes: b"err".to_vec()
+            }
+        );
+        assert_eq!(events[2].kind, StreamEventKind::Exit);
+    }
+
+    #[tokio::test]
+    async fn given_old_line_events_when_drive_then_still_decoded() {
+        // Arrange
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(fake_agent(agent, vec![stdout("old"), exited(0)], false));
+
+        // Act
+        let (handle, _kill) = drive_with(daemon, ExecMode::default()).await;
+        let events = collect(handle.output_rx.unwrap()).await;
+
+        // Assert
+        assert_eq!(events[0].kind, StreamEventKind::Stdout);
+        assert_eq!(events[0].line, "old");
+    }
+
+    const TEST_ROWS: u32 = 40;
+    const TEST_COLS: u32 = 80;
+
+    #[rstest::rstest]
+    #[case::old_agent_failure(3, 0, None)]
+    #[case::old_agent_signal_death(-1, 0, None)]
+    #[case::clean_exit(0, 0, Some(0))]
+    #[case::raw_status_present(-1, 9, Some(9))]
+    #[tokio::test]
+    async fn given_exited_event_when_drive_then_wait_status_maps_per_agent_version(
+        #[case] code: i32,
+        #[case] wait_status: i32,
+        #[case] expected: Option<i32>,
+    ) {
+        // Arrange
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let ev = Event {
+            kind: Some(event::Kind::Exited(Exited { code, wait_status })),
+        };
+        tokio::spawn(fake_agent(agent, vec![ev], false));
+
+        // Act
+        let (handle, _kill) = drive_with(daemon, ExecMode::default()).await;
+        let events = collect(handle.output_rx.unwrap()).await;
+
+        // Assert
+        assert_eq!(events[0].exit_code, Some(code));
+        assert_eq!(events[0].wait_status, expected);
+    }
+
+    #[tokio::test]
+    async fn given_tty_and_raw_modes_when_drive_then_exec_frame_carries_flags() {
+        for (mode, tty, raw) in [
+            (
+                ExecMode {
+                    tty: true,
+                    raw: false,
+                },
+                true,
+                false,
+            ),
+            (
+                ExecMode {
+                    tty: false,
+                    raw: true,
+                },
+                false,
+                true,
+            ),
+            (ExecMode::default(), false, false),
+        ] {
+            // Arrange
+            let (daemon, agent) = tokio::io::duplex(64 * 1024);
+            let peer = tokio::spawn(recording_agent(agent, vec![], 1));
+
+            // Act
+            let (handle, kill) = drive_with(daemon, mode).await;
+            drop(handle);
+            drop(kill);
+            let seen = peer.await.unwrap();
+
+            // Assert
+            let Some(request::Kind::Exec(exec)) = seen[0].kind.clone() else {
+                panic!("first frame must be Exec");
+            };
+            assert_eq!((exec.tty, exec.raw), (tty, raw));
+        }
+    }
+
+    #[tokio::test]
+    async fn given_control_channel_when_resize_and_signal_sent_then_agent_reads_frames() {
+        // Arrange
+        const SIGTERM: i32 = 15;
+        const EXEC_PLUS_CONTROL_FRAMES: usize = 3;
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(recording_agent(agent, vec![], EXEC_PLUS_CONTROL_FRAMES));
+        let (handle, _kill) = drive_with(
+            daemon,
+            ExecMode {
+                tty: true,
+                raw: false,
+            },
+        )
+        .await;
+        let control = handle.control_tx.clone().expect("control channel");
+
+        // Act
+        control
+            .send(ProcessControl::Resize {
+                rows: TEST_ROWS,
+                cols: TEST_COLS,
+            })
+            .await
+            .unwrap();
+        control.send(ProcessControl::Signal(SIGTERM)).await.unwrap();
+        let seen = peer.await.unwrap();
+
+        // Assert
+        let kinds: Vec<_> = seen.into_iter().filter_map(|r| r.kind).collect();
+        assert!(kinds.contains(&request::Kind::Resize(proto::Resize {
+            rows: TEST_ROWS,
+            cols: TEST_COLS
+        })));
+        assert!(kinds.contains(&request::Kind::Signal(proto::Signal { signo: SIGTERM })));
+    }
+
+    #[tokio::test]
+    async fn given_empty_kill_when_sent_then_agent_reads_kill_frame() {
+        // Arrange
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(recording_agent(agent, vec![], 2));
+        let (_handle, kill) = drive_with(daemon, ExecMode::default()).await;
+
+        // Act
+        kill.send(()).await.unwrap();
+        let seen = peer.await.unwrap();
+
+        // Assert
+        assert!(
+            seen.iter()
+                .any(|r| matches!(r.kind, Some(request::Kind::Kill(_))))
+        );
+    }
+
+    #[cfg(unix)]
+    mod against_real_agent {
+        use super::*;
+
+        const SIGTERM: i32 = 15;
+        const WAIT_STATUS_SIGTERM: i32 = 0x000F;
+        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        /// Connect `drive_exec` to the real agent handler over a duplex stream.
+        async fn drive_real(command: &[&str], mode: ExecMode) -> (ProcessHandle, mpsc::Sender<()>) {
+            let (host, agent) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(ward_agent::handle_connection(agent));
+            let driven = drive_exec(
+                host,
+                "pid-real".to_string(),
+                "sb-1".to_string(),
+                command.iter().map(|s| (*s).to_string()).collect(),
+                None,
+                HashMap::new(),
+                mode,
+            )
+            .await
+            .expect("drive_exec");
+            // The caller keeps the kill sender: dropping it ends the writer.
+            driven
+        }
+
+        #[tokio::test]
+        async fn given_signal_sent_when_child_runs_then_it_ends_with_sigterm_status() {
+            // Arrange
+            let mode = ExecMode {
+                tty: false,
+                raw: true,
+            };
+            let (mut handle, _kill) = drive_real(&["sleep", "30"], mode).await;
+            let control = handle.control_tx.clone().expect("control channel");
+
+            // Act
+            control.send(ProcessControl::Signal(SIGTERM)).await.unwrap();
+            let events =
+                tokio::time::timeout(TEST_TIMEOUT, collect(handle.output_rx.take().unwrap()))
+                    .await
+                    .expect("child ignored the signal");
+
+            // Assert
+            let exit = events.last().expect("exit event");
+            assert_eq!(exit.kind, StreamEventKind::Exit);
+            assert_eq!(exit.wait_status, Some(WAIT_STATUS_SIGTERM));
+        }
+
+        #[tokio::test]
+        async fn given_resize_sent_when_tty_child_runs_stty_then_it_prints_the_new_size() {
+            // Arrange: poll until the resize lands, so the test does not
+            // depend on the order of the stdin and control channels.
+            let size = format!("{TEST_ROWS} {TEST_COLS}");
+            let script =
+                format!("until [ \"$(stty size)\" = \"{size}\" ]; do sleep 0.05; done; stty size");
+            let mode = ExecMode {
+                tty: true,
+                raw: false,
+            };
+            let (mut handle, _kill) = drive_real(&["sh", "-c", &script], mode).await;
+            let control = handle.control_tx.clone().expect("control channel");
+
+            // Act
+            control
+                .send(ProcessControl::Resize {
+                    rows: TEST_ROWS,
+                    cols: TEST_COLS,
+                })
+                .await
+                .unwrap();
+            let events =
+                tokio::time::timeout(TEST_TIMEOUT, collect(handle.output_rx.take().unwrap()))
+                    .await
+                    .expect("resize never reached the pty");
+
+            // Assert
+            let output: Vec<u8> = events
+                .into_iter()
+                .filter_map(|e| match e.kind {
+                    StreamEventKind::Data { bytes, .. } => Some(bytes),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert!(
+                String::from_utf8_lossy(&output).contains(&size),
+                "got {output:?}"
+            );
+        }
     }
 }

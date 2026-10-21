@@ -98,4 +98,87 @@ mod tests {
         assert_eq!(decoded_zero.exit_code, Some(0));
         assert_eq!(decoded_never.exit_code, None);
     }
+
+    mod attach {
+        use super::super::pb::{
+            AttachData, AttachExit, AttachMessage, AttachMode, AttachResize, AttachSignal,
+            AttachStart, AttachStdin, attach_message::Kind,
+        };
+        use prost::Message;
+
+        const SIGTERM: i32 = 15;
+
+        fn round_trip(kind: Kind) -> Kind {
+            let msg = AttachMessage { kind: Some(kind) };
+            AttachMessage::decode(msg.encode_to_vec().as_slice())
+                .expect("attach message must decode")
+                .kind
+                .expect("kind must survive")
+        }
+
+        #[test]
+        fn given_each_attach_member_when_round_tripped_then_member_and_value_match() {
+            // Arrange
+            let members = vec![
+                Kind::Start(AttachStart {
+                    sandbox_id: "sb".into(),
+                    ..Default::default()
+                }),
+                Kind::Stdin(AttachStdin {
+                    data: b"in".to_vec(),
+                }),
+                Kind::Resize(AttachResize { rows: 40, cols: 80 }),
+                Kind::Signal(AttachSignal { signo: SIGTERM }),
+                Kind::Data(AttachData {
+                    data: b"out\0".to_vec(),
+                }),
+                Kind::Exit(AttachExit { exit_code: 7 }),
+            ];
+
+            for member in members {
+                // Act
+                let decoded = round_trip(member.clone());
+
+                // Assert
+                assert_eq!(decoded, member);
+            }
+        }
+
+        #[test]
+        fn given_empty_stdin_when_round_tripped_then_it_stays_an_stdin_member_with_no_bytes() {
+            // Arrange
+            let eof = Kind::Stdin(AttachStdin::default());
+
+            // Act
+            let decoded = round_trip(eof);
+
+            // Assert
+            assert_eq!(decoded, Kind::Stdin(AttachStdin { data: Vec::new() }));
+        }
+
+        #[test]
+        fn given_start_with_every_field_when_round_tripped_then_every_field_has_its_value() {
+            // Arrange
+            let start = AttachStart {
+                sandbox_id: "sb".into(),
+                mode: AttachMode::Exec as i32,
+                command: vec!["sh".into(), "-c".into(), "id".into()],
+                tty: true,
+                env: [("K".to_string(), "V".to_string())].into(),
+                workdir: "/work".into(),
+                user: "1000:1000".into(),
+                replay: true,
+                follow: true,
+            };
+
+            // Act
+            let decoded = match round_trip(Kind::Start(start.clone())) {
+                Kind::Start(s) => s,
+                other => panic!("expected start, got {other:?}"),
+            };
+
+            // Assert
+            assert_eq!(decoded, start);
+        }
+    }
 }

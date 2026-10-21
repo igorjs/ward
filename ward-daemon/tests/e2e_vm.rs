@@ -371,7 +371,7 @@ fn given_sandbox_when_removed_then_only_its_vm_process_stops() {
 
     run_ok({
         let mut c = d.cli();
-        c.args(["remove", &a]);
+        c.args(["remove", "-f", &a]);
         c
     });
 
@@ -395,6 +395,151 @@ fn given_running_vms_when_daemon_is_killed_then_no_vm_process_is_left_behind() {
     wait_until("VM processes to exit", ORPHAN_TIMEOUT, || {
         shims.iter().all(|p| !alive(*p))
     });
+}
+
+fn lifecycle(d: &Daemon, verb: &str, id: &str) {
+    let mut cmd = d.cli();
+    cmd.args([verb, id]);
+    run_ok(cmd);
+}
+
+#[test]
+fn given_running_sandbox_with_file_when_stopped_and_started_then_file_has_identical_bytes() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(
+        sh(&d, &id, "printf 'kept\\000bytes' > /root/note && sync").exit,
+        0
+    );
+
+    lifecycle(&d, "stop", &id);
+    wait_until("the VM process to stop", ORPHAN_TIMEOUT, || {
+        children_of(d.pid(), SHIM_ARG).is_empty()
+    });
+    lifecycle(&d, "start", &id);
+
+    let read = sh(&d, &id, "od -An -c /root/note");
+    assert_eq!(read.exit, 0);
+    assert_eq!(
+        read.stdout.split_whitespace().collect::<Vec<_>>(),
+        ["k", "e", "p", "t", "\\0", "b", "y", "t", "e", "s"]
+    );
+}
+
+#[test]
+fn given_running_sandbox_when_started_then_exactly_one_vm_process_exists() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(children_of(d.pid(), SHIM_ARG).len(), 1);
+
+    lifecycle(&d, "start", &id);
+
+    wait_until("one VM process", ORPHAN_TIMEOUT, || {
+        children_of(d.pid(), SHIM_ARG).len() == 1
+    });
+    assert_eq!(sh(&d, &id, "echo up").stdout.trim(), "up");
+}
+
+#[test]
+fn given_stopped_sandbox_when_stopped_again_then_it_succeeds_and_stays_stopped() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    lifecycle(&d, "stop", &id);
+
+    lifecycle(&d, "stop", &id);
+
+    let listing = run_ok({
+        let mut c = d.cli();
+        c.arg("list");
+        c
+    });
+    let row = listing.lines().find(|l| l.contains(id.as_str()));
+    assert!(row.is_some_and(|r| r.contains("stopped")), "{listing}");
+    assert!(children_of(d.pid(), SHIM_ARG).is_empty());
+}
+
+/// Run the CLI and return its exit success plus stderr.
+fn try_cli(d: &Daemon, args: &[&str]) -> (bool, String) {
+    let out = d.cli().args(args).output().expect("run ward");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn listed(d: &Daemon, id: &str) -> Option<String> {
+    let mut cmd = d.cli();
+    cmd.arg("list");
+    run_ok(cmd)
+        .lines()
+        .find(|l| l.contains(id))
+        .map(str::to_string)
+}
+
+#[test]
+fn given_running_sandbox_with_file_when_restarted_then_it_runs_and_the_file_is_there() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, "echo kept > /root/note && sync").exit, 0);
+
+    lifecycle(&d, "restart", &id);
+
+    assert!(listed(&d, &id).is_some_and(|r| r.contains("running")));
+    assert_eq!(sh(&d, &id, "cat /root/note").stdout.trim(), "kept");
+}
+
+#[test]
+fn given_running_sandbox_when_rm_force_then_the_sandbox_and_its_vm_are_gone() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let mut cmd = d.cli();
+    cmd.args(["rm", "-f", &id]);
+    run_ok(cmd);
+
+    assert_eq!(listed(&d, &id), None);
+    wait_until("the VM process to stop", ORPHAN_TIMEOUT, || {
+        children_of(d.pid(), SHIM_ARG).is_empty()
+    });
+}
+
+#[test]
+fn given_running_sandbox_when_rm_then_it_fails_and_the_sandbox_is_still_running() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let (success, stderr) = try_cli(&d, &["rm", &id]);
+
+    assert!(!success);
+    assert!(
+        stderr.contains("cannot remove a running sandbox"),
+        "{stderr}"
+    );
+    assert!(listed(&d, &id).is_some_and(|r| r.contains("running")));
+    assert_eq!(sh(&d, &id, "echo up").stdout.trim(), "up");
+}
+
+#[test]
+fn given_stopped_and_running_sandbox_when_pruned_then_only_the_stopped_one_is_removed() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let stopped = create(&d, &[]);
+    let running = create(&d, &[]);
+    lifecycle(&d, "stop", &stopped);
+
+    let mut cmd = d.cli();
+    cmd.arg("prune");
+    let printed = run_ok(cmd);
+
+    assert_eq!(printed.trim(), stopped);
+    assert_eq!(listed(&d, &stopped), None);
+    assert!(listed(&d, &running).is_some_and(|r| r.contains("running")));
 }
 
 #[test]

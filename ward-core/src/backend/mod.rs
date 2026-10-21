@@ -29,6 +29,25 @@ pub enum BackendError {
 /// Convenience result alias for backend operations.
 pub type Result<T> = std::result::Result<T, BackendError>;
 
+/// How an exec should run. The default is a plain pipe child that reports
+/// line events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecMode {
+    /// Run the child on a pty.
+    pub tty: bool,
+    /// Report unframed `Data` events instead of lines (implied by `tty`).
+    pub raw: bool,
+}
+
+/// A request to a running process, sent next to stdin and kill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessControl {
+    /// Set the pty window size.
+    Resize { rows: u32, cols: u32 },
+    /// Deliver a signal number to the process.
+    Signal(i32),
+}
+
 /// Handle to a running process inside a sandbox.
 #[derive(Debug)]
 pub struct ProcessHandle {
@@ -39,6 +58,8 @@ pub struct ProcessHandle {
     pub stdin_tx: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
     /// Receiver side for reading combined stdout/stderr events.
     pub output_rx: Option<tokio::sync::mpsc::Receiver<crate::protocol::StreamEvent>>,
+    /// Sender for resize and signal requests, when the backend supports them.
+    pub control_tx: Option<tokio::sync::mpsc::Sender<ProcessControl>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,6 +128,7 @@ pub trait Backend: Send + Sync + 'static {
         command: Vec<String>,
         working_dir: Option<String>,
         env: std::collections::HashMap<String, String>,
+        mode: ExecMode,
     ) -> Result<ProcessHandle>;
 
     async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()>;

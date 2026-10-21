@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
 
+const DAEMON_START_DEADLINE: Duration = Duration::from_secs(30);
+
 /// RAII guard around a running `wardd` subprocess. SIGKILLs the daemon on
 /// drop so failed tests do not leak zombies.
 pub struct Daemon {
@@ -99,13 +101,14 @@ impl Daemon {
 
         let mut child = cmd.spawn().expect("spawn wardd");
 
-        // Poll for socket existence. Daemon takes ~50ms to bind; allow up
-        // to 5s to handle slow CI runners. If the daemon panics during
+        // Poll until the daemon accepts. It binds in ~50ms when idle but
+        // can take seconds on a loaded runner. If the daemon panics during
         // startup, the socket never appears and we surface that as a clear
         // panic instead of a flaky ECONNREFUSED later.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + DAEMON_START_DEADLINE;
         while Instant::now() < deadline {
-            if socket.exists() {
+            // The socket file appears at bind, before the daemon accepts.
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 return Self {
                     _data_dir: data_dir,
                     socket,
@@ -121,16 +124,41 @@ impl Daemon {
         // background processes that outlive cargo.
         let _ = child.kill();
         let _ = child.wait();
-        panic!("wardd did not bind socket within 5s: {}", socket.display());
+        panic!(
+            "wardd did not bind socket within {DAEMON_START_DEADLINE:?}: {}",
+            socket.display()
+        );
     }
 
     /// Build a `Command` for the `ward` CLI pre-configured to talk to this
     /// daemon. Tests add their own subcommand and arguments.
+    #[allow(dead_code)]
     pub fn cli(&self) -> Command {
         let mut cmd = Command::cargo_bin("ward").expect("locate ward binary");
         cmd.env("WARD_SOCKET", &self.socket);
         cmd
     }
+}
+
+/// Connect a gRPC client to the daemon's Unix socket.
+#[allow(dead_code)]
+pub async fn connect(
+    socket: &std::path::Path,
+) -> ward_core::pb::ward_client::WardClient<tonic::transport::Channel> {
+    let socket = socket.to_path_buf();
+    // The URI is a placeholder: the connector below dials the socket.
+    let channel = tonic::transport::Endpoint::try_from("http://[::1]:50051")
+        .expect("endpoint")
+        .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
+            let socket = socket.clone();
+            async move {
+                let stream = tokio::net::UnixStream::connect(socket).await?;
+                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("connect to wardd");
+    ward_core::pb::ward_client::WardClient::new(channel)
 }
 
 impl Drop for Daemon {
@@ -209,7 +237,8 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         ensure_hypervisor_entitlement(cmd.get_program());
         let mut daemon = cmd.spawn().expect("spawn priming wardd");
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() && Instant::now() < deadline {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
         let out = Command::cargo_bin("ward")

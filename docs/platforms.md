@@ -24,7 +24,7 @@ The build needs network access once, to fetch the pinned libkrun release from Gi
 ### Known limitations
 
 - Volumes (`ward volume`) are created as ext4 images but not yet attached to guests; block devices need a libkrun build with block support ([#43](https://github.com/igorjs/ward/issues/43)). Creating a volume also needs `mkfs.ext4` on the host.
-- `ward run` (language snippets) is not implemented. Use `ward exec`, or `ward_run` through ward-mcp.
+- `ward run-code` (language snippets) is not implemented. Use `ward exec`, or `ward_run` through ward-mcp.
 - Bind mounts must point inside the daemon's allowed roots (`/home/`, `/tmp/`, `/var/lib/ward/`) unless `WARD_ALLOW_HOST_MOUNTS=1` is set on the daemon.
 - macOS CI runners cannot start VMs, so the real-VM test suite runs on Linux/KVM in CI and on macOS locally.
 

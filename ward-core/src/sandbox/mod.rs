@@ -2,4 +2,7 @@
 
 mod manager;
 pub mod store;
-pub use manager::SandboxManager;
+#[cfg(all(test, not(feature = "krunvm")))]
+pub(crate) use manager::tests::{create_with_command, host_manager};
+pub use manager::{ProcessIo, SandboxManager};
+pub(crate) use manager::{decode_wait_status, event_chunk, event_wait_status};

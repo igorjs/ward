@@ -35,17 +35,17 @@ pid=$(ward exec "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
         | awk '/^pid:/{print $2}')
 ward logs "$sb" "$pid"
 
-# 3. (Optional) Run a language snippet via `ward run` with the `--code`
-#    string flag. Same exec + logs pattern: pid from `ward run`, then
+# 3. (Optional) Run a language snippet via `ward run-code` with the
+#    `--code` string flag. Same exec + logs pattern: pid from `ward run-code`, then
 #    `ward logs` to drain stdout / stderr / exit.
-pid=$(ward run "$sb" --language python \
+pid=$(ward run-code "$sb" --language python \
         --code 'import os; print(f"hi from pid {os.getpid()}")' \
         | awk '/^pid:/{print $2}')
 ward logs "$sb" "$pid"
 
 # 4. Tear it down. The microVM exits, libkrun frees its context,
 #    rootfs and overlay are reaped.
-ward remove "$sb"
+ward rm -f "$sb"
 ```
 
 The whole flow is sub-second once the OCI image is cached locally.
@@ -68,7 +68,7 @@ For an agent integrating ward, the contract is:
 | Allocate sandbox | `ward create <image>` (default egress: Deny) | `CreateSandbox` |
 | Run the snippet | `ward exec <sb> -- <cmd>` then `ward logs <sb> <pid>` | `Exec` + `StreamOutput` |
 | Collect output, exit code | Parse `stdout:` / `stderr:` / `exit:` lines | n/a |
-| Tear down | `ward remove <sb>` | `RemoveSandbox` |
+| Tear down | `ward rm -f <sb>` | `RemoveSandbox` |
 
 The ward calls map 1:1 to the gRPC API at `proto/ward.proto`. Until
 the [SDKs](https://github.com/igorjs/ward/issues/39) land, agents either

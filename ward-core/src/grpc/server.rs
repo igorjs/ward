@@ -3,19 +3,22 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 use tracing::error;
 
+use super::attach;
+use crate::pb::attach_message::Kind;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest, CreateSnapshotRequest,
-    CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse, ExecRequest,
-    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
-    HealthStatus, KillProcessRequest, ListSandboxesResponse, ListSnapshotsRequest,
-    ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo, PublishRequest,
-    RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
-    SandboxInfo, SnapshotInfo, StartRequest, StopRequest, StreamEvent, StreamOutputRequest,
-    SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest,
+    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse,
+    ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest,
+    GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
+    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest,
+    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest, StopRequest,
+    StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::SandboxManager;
@@ -29,7 +32,7 @@ use crate::volume::VolumeManager;
 /// and returning a safe generic message to the client. This prevents internal
 /// implementation details (paths, errno codes, backend types) from leaking
 /// through the API.
-fn api_err_to_status(err: ApiError) -> Status {
+pub(super) fn api_err_to_status(err: ApiError) -> Status {
     match &err {
         ApiError::SandboxNotFound(id) => Status::not_found(format!("sandbox not found: {id}")),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
@@ -601,6 +604,35 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(()))
     }
 
+    type AttachStream = tokio_stream::wrappers::ReceiverStream<Result<AttachMessage, Status>>;
+
+    #[tracing::instrument(name = "rpc.attach", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn attach(
+        &self,
+        request: Request<tonic::Streaming<AttachMessage>>,
+    ) -> Result<Response<Self::AttachStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("attach stream ended before a start message")
+        })??;
+        let Some(Kind::Start(start)) = first.kind else {
+            return Err(Status::invalid_argument(
+                "first attach message must be start",
+            ));
+        };
+        let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
+        if !start.user.is_empty() {
+            return Err(Status::unimplemented(
+                "attach with a user is not supported yet",
+            ));
+        }
+        let rx = attach::serve(Arc::clone(&self.sandbox), id, start, inbound).await?;
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
 
     #[tracing::instrument(
@@ -736,11 +768,26 @@ impl Ward for WardGrpcServer {
 /// the `r#type` field, not by sniffing the integer.
 fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
     use crate::pb::StreamEventType;
-    use crate::protocol::StreamEventKind;
+    use crate::protocol::{RawStream, StreamEventKind};
+
+    // The pb event carries text lines only, so raw bytes are shown as lossy
+    // UTF-8 here. Attach reads the raw variant directly.
+    let line = match &evt.kind {
+        StreamEventKind::Data { bytes, .. } => String::from_utf8_lossy(bytes).into_owned(),
+        _ => evt.line,
+    };
 
     let r#type = match evt.kind {
-        StreamEventKind::Stdout => StreamEventType::Stdout,
-        StreamEventKind::Stderr => StreamEventType::Stderr,
+        StreamEventKind::Stdout
+        | StreamEventKind::Data {
+            stream: RawStream::Stdout,
+            ..
+        } => StreamEventType::Stdout,
+        StreamEventKind::Stderr
+        | StreamEventKind::Data {
+            stream: RawStream::Stderr,
+            ..
+        } => StreamEventType::Stderr,
         StreamEventKind::Exit => StreamEventType::Exit,
     } as i32;
 
@@ -755,7 +802,7 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
 
     StreamEvent {
         r#type,
-        line: evt.line,
+        line,
         exit_code: evt.exit_code.unwrap_or(0),
         timestamp,
         duration_ms: evt.duration_ms,
@@ -816,6 +863,29 @@ mod tests {
     use crate::sandbox::SandboxManager;
     use crate::volume::VolumeManager;
     use std::path::Path;
+
+    #[test]
+    fn given_raw_stderr_event_when_mapped_to_pb_then_lossy_stderr_line() {
+        // Arrange
+        let evt = crate::protocol::StreamEvent {
+            kind: crate::protocol::StreamEventKind::Data {
+                stream: crate::protocol::RawStream::Stderr,
+                bytes: b"a\xffb".to_vec(),
+            },
+            line: String::new(),
+            exit_code: None,
+            wait_status: None,
+            timestamp: std::time::SystemTime::now(),
+            duration_ms: 0,
+        };
+
+        // Act
+        let pb = stream_event_to_pb(evt);
+
+        // Assert
+        assert_eq!(pb.r#type, crate::pb::StreamEventType::Stderr as i32);
+        assert_eq!(pb.line, "a\u{fffd}b");
+    }
 
     /// Offline image puller: materialises a minimal bin/ rootfs without
     /// touching the network. Mirrors the FakePuller pattern in image.rs

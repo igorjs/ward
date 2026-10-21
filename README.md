@@ -56,8 +56,10 @@ wardd &                                  # start the daemon
 ward create alpine                       # → sandbox id
 ward exec <id> -- echo "hello from inside"
 ward logs <id> <pid>
-ward remove <id>
+ward rm -f <id>
 ```
+
+A sandbox can be named with `ward create --name web alpine` and referred to by name, id or a unique id prefix. `ward stop`, `ward start` and `ward restart` move it through its lifecycle and keep its files. `ward rm` refuses a running sandbox (use `-f`), and `ward prune` removes every stopped sandbox.
 
 ## Hello world (MCP, for agents)
 
