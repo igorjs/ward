@@ -439,7 +439,7 @@ jobs:
           # GHCR is already on the egress allowlist. Docker Hub serves layers
           # from rotating CDN hosts that cannot be pinned.
           WARD_E2E_IMAGE: ghcr.io/linuxcontainers/alpine:3.20
-        run: cargo test -p ward-daemon --features krunvm --test e2e_vm -- --test-threads=2
+        run: cargo test -p ward-daemon --features krunvm --test e2e_vm --test e2e_cli_attach -- --test-threads=2
       - name: Real-VM MCP end-to-end test
         env:
           WARD_E2E_VM: "1"

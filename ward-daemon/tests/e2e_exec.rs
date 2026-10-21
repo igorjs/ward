@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! E2E scenarios for `ward exec`, `ward run`, and `ward logs`.
+//! E2E scenarios for `ward exec`, `ward run-code`, and `ward logs`.
 //!
 //! Simulates a user typing commands at a shell against a real wardd
 //! subprocess. Real VM execution is gated behind the krunvm feature;
@@ -93,7 +93,14 @@ fn given_existing_sandbox_when_user_runs_python_snippet_then_fails_with_stub_err
     // Act
     let mut cmd = daemon.cli();
     let assertion = cmd
-        .args(["run", &id, "--language", "python", "--code", "print('hi')"])
+        .args([
+            "run-code",
+            &id,
+            "--language",
+            "python",
+            "--code",
+            "print('hi')",
+        ])
         .assert();
 
     // Assert: Run is an intentional stub (issue #9); even a valid request
@@ -118,7 +125,14 @@ fn given_unsupported_language_when_user_runs_then_fails_with_stub_error() {
     // rejects the call before that table is ever consulted.
     let mut cmd = daemon.cli();
     let assertion = cmd
-        .args(["run", &id, "--language", "cobol", "--code", "DISPLAY 'hi'"])
+        .args([
+            "run-code",
+            &id,
+            "--language",
+            "cobol",
+            "--code",
+            "DISPLAY 'hi'",
+        ])
         .assert();
 
     // Assert: non-zero exit with the generic stub error, not a
@@ -143,7 +157,14 @@ fn given_invalid_language_name_when_user_runs_then_fails_with_stub_error() {
     // but the stub (issue #9) rejects the call before validation runs.
     let mut cmd = daemon.cli();
     let assertion = cmd
-        .args(["run", &id, "--language", "py-thon", "--code", "print(1)"])
+        .args([
+            "run-code",
+            &id,
+            "--language",
+            "py-thon",
+            "--code",
+            "print(1)",
+        ])
         .assert();
 
     // Assert
@@ -192,16 +213,16 @@ fn given_exec_when_user_runs_logs_then_streams_stdout_and_exit() {
 fn given_invalid_pid_when_user_runs_logs_then_fails_with_clear_error() {
     // Arrange
     let daemon = common::Daemon::spawn();
+    let create_out = daemon
+        .cli()
+        .args(["create", "alpine:latest"])
+        .output()
+        .expect("create");
+    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
 
     // Act: 'z' is not hex, so the entity_id validator rejects.
     let mut cmd = daemon.cli();
-    let assertion = cmd
-        .args([
-            "logs",
-            "00000000-0000-0000-0000-000000000000",
-            "not-hex-zzz",
-        ])
-        .assert();
+    let assertion = cmd.args(["logs", &id, "not-hex-zzz"]).assert();
 
     // Assert: non-zero exit, stderr names the offending field so the
     // user knows what to fix without reading docs.

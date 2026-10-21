@@ -2,13 +2,16 @@
 
 //! ward – command-line interface to the Ward daemon.
 
+mod attach;
 mod client;
+mod docker;
 mod lifecycle;
 mod output;
 mod socket;
+mod terminal;
 mod tokens;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -46,33 +49,40 @@ struct Cli {
     command: Commands,
 }
 
+/// Sandbox settings shared by `create` and `run`.
+#[derive(Debug, Args)]
+struct SandboxOpts {
+    /// Name to refer to the sandbox by instead of its ID.
+    #[arg(long)]
+    name: Option<String>,
+    /// Environment variables in KEY=VALUE form.
+    #[arg(short, long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
+    #[arg(short = 'v', long = "mount", value_name = "SOURCE:TARGET[:ro]")]
+    mount: Vec<String>,
+    /// Outbound network policy: "deny" (default), "allowlist" or "open".
+    #[arg(long, default_value = "deny")]
+    egress: String,
+    /// Host name the sandbox may reach with --egress=allowlist. Repeatable.
+    #[arg(long = "allow-domain", value_name = "DOMAIN")]
+    allow_domain: Vec<String>,
+    /// Memory limit in MiB.
+    #[arg(long, default_value = "512")]
+    memory: u32,
+    /// CPU count.
+    #[arg(long, default_value = "1")]
+    cpus: u32,
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Create a new sandbox.
     Create {
         /// OCI image reference.
         image: String,
-        /// Name to refer to the sandbox by instead of its ID.
-        #[arg(long)]
-        name: Option<String>,
-        /// Environment variables in KEY=VALUE form.
-        #[arg(short, long = "env", value_name = "KEY=VALUE")]
-        env: Vec<String>,
-        /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
-        #[arg(short = 'v', long = "mount", value_name = "SOURCE:TARGET[:ro]")]
-        mount: Vec<String>,
-        /// Outbound network policy: "deny" (default), "allowlist" or "open".
-        #[arg(long, default_value = "deny")]
-        egress: String,
-        /// Host name the sandbox may reach with --egress=allowlist. Repeatable.
-        #[arg(long = "allow-domain", value_name = "DOMAIN")]
-        allow_domain: Vec<String>,
-        /// Memory limit in MiB.
-        #[arg(long, default_value = "512")]
-        memory: u32,
-        /// CPU count.
-        #[arg(long, default_value = "1")]
-        cpus: u32,
+        #[command(flatten)]
+        opts: SandboxOpts,
         /// Timeout in seconds (0 = no timeout).
         #[arg(long, default_value = "0")]
         timeout: u64,
@@ -98,8 +108,11 @@ enum Commands {
     List,
 
     /// Execute a command inside a sandbox.
+    ///
+    /// With -i or -t the command is attached: its output is printed and
+    /// the CLI exits with its exit code.
     Exec {
-        /// Sandbox ID.
+        /// Sandbox name, ID or ID prefix.
         id: String,
         /// Command and arguments.
         #[arg(trailing_var_arg = true, required = true)]
@@ -107,10 +120,45 @@ enum Commands {
         /// Working directory.
         #[arg(short = 'w', long)]
         workdir: Option<String>,
+        /// Environment variables in KEY=VALUE form.
+        #[arg(short, long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Keep stdin open and send it to the command.
+        #[arg(short, long)]
+        interactive: bool,
+        /// Run the command on a pseudo-terminal.
+        #[arg(short, long)]
+        tty: bool,
+    },
+
+    /// Create a sandbox, run a command in it and exit with its exit code.
+    Run {
+        /// OCI image reference.
+        image: String,
+        /// Command and arguments.
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+        #[command(flatten)]
+        opts: SandboxOpts,
+        /// Working directory.
+        #[arg(short = 'w', long)]
+        workdir: Option<String>,
+        /// Keep stdin open and send it to the command.
+        #[arg(short, long)]
+        interactive: bool,
+        /// Run the command on a pseudo-terminal.
+        #[arg(short, long)]
+        tty: bool,
+        /// Remove the sandbox when the command ends.
+        #[arg(long, conflicts_with = "detach")]
+        rm: bool,
+        /// Print the sandbox ID and leave the command running.
+        #[arg(short, long)]
+        detach: bool,
     },
 
     /// Run a language snippet inside a sandbox.
-    Run {
+    RunCode {
         /// Sandbox ID.
         id: String,
         /// Language name (python, node, deno, ruby, go).
@@ -121,12 +169,16 @@ enum Commands {
         code: String,
     },
 
-    /// Stream stdout/stderr from a process.
+    /// Print a sandbox's output, or stream a process by its PID.
     Logs {
-        /// Sandbox ID.
+        /// Sandbox name, ID or ID prefix.
         id: String,
-        /// Process ID returned by exec/run.
-        pid: String,
+        /// Process ID returned by exec. Without it the main process output
+        /// is printed.
+        pid: Option<String>,
+        /// Keep streaming until the main process ends.
+        #[arg(short, long, conflicts_with = "pid")]
+        follow: bool,
     },
 
     /// Write bytes to a process's stdin.
@@ -282,6 +334,68 @@ fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
     })
 }
 
+/// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
+/// themselves contain '=', which matters for tokens, URLs and serialised JSON.
+/// A bare `KEY` takes its value from the host and is dropped when unset,
+/// like Docker's `-e KEY`.
+fn parse_env(pairs: &[String]) -> std::collections::HashMap<String, String> {
+    parse_env_with(pairs, |key| std::env::var(key).ok())
+}
+
+fn parse_env_with(
+    pairs: &[String],
+    host: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, String> {
+    pairs
+        .iter()
+        .filter_map(|s| match s.split_once('=') {
+            Some((k, v)) => Some((k.to_string(), v.to_string())),
+            None => host(s).map(|v| (s.clone(), v)),
+        })
+        .collect()
+}
+
+/// `ward run` has no timeout flag; zero lets the daemon apply its default.
+const DAEMON_DEFAULT_TIMEOUT_SECONDS: u64 = 0;
+
+/// Build the create request for the settings `create` and `run` share.
+fn create_request(
+    image: String,
+    opts: SandboxOpts,
+    timeout_seconds: u64,
+) -> anyhow::Result<ward_core::pb::CreateSandboxRequest> {
+    // Unknown values bail out before the wire so the user gets a clear
+    // local error instead of an opaque InvalidArgument from the daemon.
+    let egress_mode = match opts.egress.as_str() {
+        "deny" => ward_core::pb::EgressMode::Deny,
+        "allowlist" => ward_core::pb::EgressMode::Allowlist,
+        "open" => ward_core::pb::EgressMode::Open,
+        other => anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'"),
+    };
+    let mounts = opts
+        .mount
+        .iter()
+        .map(|spec| parse_mount_spec(spec))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(ward_core::pb::CreateSandboxRequest {
+        image,
+        mounts,
+        egress: Some(ward_core::pb::EgressPolicy {
+            mode: egress_mode as i32,
+            domains: opts.allow_domain,
+        }),
+        resources: Some(ward_core::pb::ResourceLimits {
+            cpus: opts.cpus,
+            memory_mb: opts.memory,
+            pids_max: 0, // 0 == "use daemon default"
+            timeout_seconds,
+        }),
+        env: parse_env(&opts.env),
+        name: opts.name.unwrap_or_default(),
+        ..Default::default()
+    })
+}
+
 /// `--json` / `--no-pretty` accept either the flag or a truthy env
 /// var. clap's built-in `env` for bool fields only accepts the literal
 /// strings `"true"` / `"false"`, which collides with the Unix idiom of
@@ -312,74 +426,25 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Create {
             image,
-            name,
-            env,
-            mount,
-            egress,
-            allow_domain,
-            memory,
-            cpus,
+            opts,
             timeout,
             comms_mode,
             comms_group,
             from_snapshot,
             source_sandbox,
         } => {
-            // Parse KEY=VALUE env strings into a HashMap. Splitting on the
-            // first '=' lets values themselves contain '=', which matters
-            // for tokens, URLs, and serialised JSON.
-            let env_map: std::collections::HashMap<String, String> = env
-                .iter()
-                .filter_map(|s| {
-                    s.split_once('=')
-                        .map(|(k, v)| (k.to_string(), v.to_string()))
-                })
-                .collect();
-
-            // Map the user-facing string to the pb enum. Unknown values
-            // bail out before the wire so the user gets a clear local
-            // error instead of an opaque InvalidArgument from the daemon.
             let comms_mode_pb = match comms_mode.as_str() {
                 "deny" => ward_core::pb::CommunicationMode::Deny,
                 "group" => ward_core::pb::CommunicationMode::Group,
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
-
-            let mounts = mount
-                .iter()
-                .map(|spec| parse_mount_spec(spec))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            let egress_mode = match egress.as_str() {
-                "deny" => ward_core::pb::EgressMode::Deny,
-                "allowlist" => ward_core::pb::EgressMode::Allowlist,
-                "open" => ward_core::pb::EgressMode::Open,
-                other => {
-                    anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'")
-                }
-            };
+            let mut req = create_request(image, opts, timeout)?;
+            req.comms = Some(ward_core::pb::CommunicationPolicy {
+                mode: comms_mode_pb as i32,
+                group: comms_group,
+            });
+            req.from_snapshot = from_snapshot.clone().unwrap_or_default();
             let mut c = client::connect(&socket_path).await?;
-            let req = ward_core::pb::CreateSandboxRequest {
-                image,
-                mounts,
-                egress: Some(ward_core::pb::EgressPolicy {
-                    mode: egress_mode as i32,
-                    domains: allow_domain,
-                }),
-                resources: Some(ward_core::pb::ResourceLimits {
-                    cpus,
-                    memory_mb: memory,
-                    pids_max: 0, // 0 == "use daemon default"
-                    timeout_seconds: timeout,
-                }),
-                env: env_map,
-                comms: Some(ward_core::pb::CommunicationPolicy {
-                    mode: comms_mode_pb as i32,
-                    group: comms_group,
-                }),
-                from_snapshot: from_snapshot.clone().unwrap_or_default(),
-                name: name.unwrap_or_default(),
-                ..Default::default()
-            };
 
             let resp = if let (Some(_), Some(source_sandbox)) = (&from_snapshot, &source_sandbox) {
                 // Restoring from a snapshot requires the source sandbox's
@@ -444,16 +509,29 @@ async fn main() -> anyhow::Result<()> {
             id,
             command,
             workdir,
+            env,
+            interactive,
+            tty,
         } => {
+            if interactive || tty {
+                let spec = docker::ExecSpec {
+                    command,
+                    env: parse_env(&env),
+                    workdir: workdir.unwrap_or_default(),
+                    interactive,
+                    tty,
+                };
+                let code = docker::exec(&socket_path, &token_store, &id, spec).await?;
+                std::process::exit(code);
+            }
             let mut c = client::connect(&socket_path).await?;
-            let token = tokens::load(&token_store, &id)?;
-            let mut request = tonic::Request::new(ward_core::pb::ExecRequest {
-                sandbox_id: id,
+            let target = client::resolve(&mut c, &token_store, &id).await?;
+            let request = target.request(ward_core::pb::ExecRequest {
+                sandbox_id: target.id.clone(),
                 command,
                 working_dir: workdir.unwrap_or_default(),
-                env: Default::default(),
-            });
-            tokens::attach_token(&mut request, token)?;
+                env: parse_env(&env),
+            })?;
             let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`
             // to retrieve streamed output once StreamOutput is implemented.
@@ -465,7 +543,31 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Run { id, language, code } => {
+        Commands::Run {
+            image,
+            command,
+            opts,
+            workdir,
+            interactive,
+            tty,
+            rm,
+            detach,
+        } => {
+            let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
+            request.command = command;
+            request.tty = tty;
+            request.workdir = workdir.unwrap_or_default();
+            let flags = docker::RunFlags {
+                interactive,
+                tty,
+                rm,
+                detach,
+            };
+            let code = docker::run(&socket_path, &token_store, request, flags).await?;
+            std::process::exit(code);
+        }
+
+        Commands::RunCode { id, language, code } => {
             let mut c = client::connect(&socket_path).await?;
             let token = tokens::load(&token_store, &id)?;
             let mut request = tonic::Request::new(ward_core::pb::RunRequest {
@@ -483,18 +585,30 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Logs { id, pid } => {
+        Commands::Logs {
+            id,
+            pid: None,
+            follow,
+        } => {
+            let code = docker::logs(&socket_path, &token_store, &id, follow).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+
+        Commands::Logs {
+            id, pid: Some(pid), ..
+        } => {
             // StreamOutput is a server-streaming RPC. The CLI drains the
             // stream and prints each event with a stable prefix so scripts
             // can grep "stdout:" / "stderr:" / "exit:" without parsing
             // structured output.
             let mut c = client::connect(&socket_path).await?;
-            let token = tokens::load(&token_store, &id)?;
-            let mut request = tonic::Request::new(ward_core::pb::StreamOutputRequest {
-                sandbox_id: id,
+            let target = client::resolve(&mut c, &token_store, &id).await?;
+            let request = target.request(ward_core::pb::StreamOutputRequest {
+                sandbox_id: target.id.clone(),
                 pid,
-            });
-            tokens::attach_token(&mut request, token)?;
+            })?;
             let mut stream = c.stream_output(request).await?.into_inner();
 
             while let Some(evt) = stream.message().await? {
@@ -873,6 +987,21 @@ mod tests {
             (m.source.as_str(), m.target.as_str(), m.readonly),
             ("/tmp/a", "/data", false)
         );
+    }
+
+    #[test]
+    fn given_bare_key_when_parse_env_then_host_value_is_used_or_key_dropped() {
+        // Arrange
+        let pairs = ["SET".to_string(), "UNSET".to_string(), "A=b=c".to_string()];
+        let host = |key: &str| (key == "SET").then(|| "from-host".to_string());
+
+        // Act
+        let env = parse_env_with(&pairs, host);
+
+        // Assert
+        assert_eq!(env.get("SET").map(String::as_str), Some("from-host"));
+        assert!(!env.contains_key("UNSET"));
+        assert_eq!(env.get("A").map(String::as_str), Some("b=c"));
     }
 
     #[test]

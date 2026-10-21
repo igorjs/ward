@@ -35,10 +35,10 @@ pid=$(ward exec "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
         | awk '/^pid:/{print $2}')
 ward logs "$sb" "$pid"
 
-# 3. (Optional) Run a language snippet via `ward run` with the `--code`
-#    string flag. Same exec + logs pattern: pid from `ward run`, then
+# 3. (Optional) Run a language snippet via `ward run-code` with the
+#    `--code` string flag. Same exec + logs pattern: pid from `ward run-code`, then
 #    `ward logs` to drain stdout / stderr / exit.
-pid=$(ward run "$sb" --language python \
+pid=$(ward run-code "$sb" --language python \
         --code 'import os; print(f"hi from pid {os.getpid()}")' \
         | awk '/^pid:/{print $2}')
 ward logs "$sb" "$pid"

@@ -64,6 +64,15 @@ impl Resolved {
         })
     }
 
+    /// Pair a sandbox with the token its create call just returned.
+    pub fn with_token(info: &SandboxInfo, token: String) -> Self {
+        Self {
+            token: Some(token),
+            id: info.id.clone(),
+            status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
+        }
+    }
+
     /// True when the CLI token store holds a token for this sandbox.
     pub fn has_token(&self) -> bool {
         self.token.is_some()

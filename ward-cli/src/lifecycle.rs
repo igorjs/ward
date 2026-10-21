@@ -183,7 +183,7 @@ pub async fn prune(c: &mut WardClient<Channel>, token_store: &Path, json: bool) 
 }
 
 /// Remove a resolved sandbox and drop its token from the store.
-async fn remove_resolved(
+pub async fn remove_resolved(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     target: &Resolved,
