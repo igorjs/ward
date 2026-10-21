@@ -70,7 +70,10 @@ fn given_two_separate_cli_processes_when_second_has_no_stored_token_then_denied(
         .output()
         .expect("create");
     assert!(create_out.status.success());
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // A separate process never saw that create response, so its view of
     // the store is empty.
@@ -103,12 +106,15 @@ fn given_create_then_exec_in_new_process_when_token_persisted_then_succeeds() {
         .output()
         .expect("create");
     assert!(create_out.status.success());
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Act: `ward exec` in a second, independent invocation against the
     // same token store, exactly as a user's two shell commands would.
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["exec", &id, "--", "echo", "hi"]).assert();
+    let assertion = cmd.args(["exec", "-d", &id, "--", "echo", "hi"]).assert();
 
     // Assert: the persisted token authorizes the second process.
     assertion
@@ -133,7 +139,10 @@ fn given_hand_crafted_wrong_token_when_exec_then_permission_denied() {
         .output()
         .expect("create");
     assert!(create_out.status.success());
-    let id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     hand_write_token(&token_store_path(&daemon), &id, "totally-wrong-token");
 
@@ -163,7 +172,10 @@ fn given_create_sandbox_from_snapshot_without_source_token_when_called_then_perm
         .output()
         .expect("create");
     assert!(create_out.status.success());
-    let source_id = extract_field(std::str::from_utf8(&create_out.stdout).unwrap(), "id: ");
+    let source_id = std::str::from_utf8(&create_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
 
     let snapshot_out = daemon
         .cli()

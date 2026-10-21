@@ -8,6 +8,7 @@ mod docker;
 mod inspect;
 mod lifecycle;
 mod output;
+mod resources;
 mod socket;
 mod terminal;
 mod tokens;
@@ -50,6 +51,9 @@ struct Cli {
     command: Commands,
 }
 
+const DEFAULT_MEMORY: &str = "512m";
+const DEFAULT_CPUS: &str = "1";
+
 /// Sandbox settings shared by `create` and `run`.
 #[derive(Debug, Args)]
 struct SandboxOpts {
@@ -60,28 +64,32 @@ struct SandboxOpts {
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
     /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
-    #[arg(short = 'v', long = "mount", value_name = "SOURCE:TARGET[:ro]")]
-    mount: Vec<String>,
+    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    volume: Vec<String>,
     /// Outbound network policy: "deny" (default), "allowlist" or "open".
     #[arg(long, default_value = "deny")]
     egress: String,
     /// Host name the sandbox may reach with --egress=allowlist. Repeatable.
     #[arg(long = "allow-domain", value_name = "DOMAIN")]
     allow_domain: Vec<String>,
-    /// Memory limit in MiB.
-    #[arg(long, default_value = "512")]
-    memory: u32,
-    /// CPU count.
-    #[arg(long, default_value = "1")]
-    cpus: u32,
+    /// Memory limit: bytes, or a number with a k, m, g or t suffix (512m,
+    /// 1.5g). 0 uses the daemon default.
+    #[arg(short = 'm', long, default_value = DEFAULT_MEMORY, value_name = "SIZE")]
+    memory: String,
+    /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
+    #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
+    cpus: String,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Create a new sandbox.
+    /// Create a new sandbox without starting a command, and print its ID.
     Create {
         /// OCI image reference.
         image: String,
+        /// Command and arguments the sandbox runs.
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
         #[command(flatten)]
         opts: SandboxOpts,
         /// Timeout in seconds (0 = no timeout).
@@ -130,8 +138,8 @@ enum Commands {
 
     /// Execute a command inside a sandbox.
     ///
-    /// With -i or -t the command is attached: its output is printed and
-    /// the CLI exits with its exit code.
+    /// The command's output is printed and the CLI exits with its exit
+    /// code. With -d it starts in the background and prints its PID.
     Exec {
         /// Sandbox name, ID or ID prefix.
         id: String,
@@ -150,6 +158,10 @@ enum Commands {
         /// Run the command on a pseudo-terminal.
         #[arg(short, long)]
         tty: bool,
+        /// Start the command in the background and print its PID. Ignores
+        /// -i and -t, since nothing attaches to the command.
+        #[arg(short, long)]
+        detach: bool,
     },
 
     /// Create a sandbox, run a command in it and exit with its exit code.
@@ -200,6 +212,9 @@ enum Commands {
         /// Keep streaming until the main process ends.
         #[arg(short, long, conflicts_with = "pid")]
         follow: bool,
+        /// Number of lines to show from the end of the output, or "all".
+        #[arg(short = 'n', long, default_value = docker::TAIL_ALL, conflicts_with = "pid")]
+        tail: String,
     },
 
     /// Write bytes to a process's stdin.
@@ -344,14 +359,14 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `ward create --mount`.
+/// Parse `SOURCE:TARGET[:ro]` from `--volume`.
 fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (source, target, readonly) = match parts.as_slice() {
         [source, target] => (*source, *target, false),
         [source, target, "ro"] => (*source, *target, true),
         [source, target, "rw"] => (*source, *target, false),
-        _ => anyhow::bail!("--mount expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
+        _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
     };
     Ok(ward_core::pb::Mount {
         source: source.to_string(),
@@ -398,8 +413,14 @@ fn create_request(
         "open" => ward_core::pb::EgressMode::Open,
         other => anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'"),
     };
+    let resources = ward_core::pb::ResourceLimits {
+        cpus: resources::parse_cpus(&opts.cpus)?,
+        memory_mb: resources::parse_memory_mib(&opts.memory)?,
+        pids_max: 0, // 0 == "use daemon default"
+        timeout_seconds,
+    };
     let mounts = opts
-        .mount
+        .volume
         .iter()
         .map(|spec| parse_mount_spec(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -410,12 +431,7 @@ fn create_request(
             mode: egress_mode as i32,
             domains: opts.allow_domain,
         }),
-        resources: Some(ward_core::pb::ResourceLimits {
-            cpus: opts.cpus,
-            memory_mb: opts.memory,
-            pids_max: 0, // 0 == "use daemon default"
-            timeout_seconds,
-        }),
+        resources: Some(resources),
         env: parse_env(&opts.env),
         name: opts.name.unwrap_or_default(),
         ..Default::default()
@@ -438,9 +454,59 @@ fn flag_or_env(flag: bool, env_var: &str) -> bool {
     )
 }
 
+/// Docker's exit code for a failure of the CLI or daemon itself, as opposed
+/// to the exit code of the command that ran.
+const CLI_FAILURE_EXIT_CODE: i32 = 125;
+const GENERIC_FAILURE_EXIT_CODE: i32 = 1;
+
+/// The first positional argument, which names the subcommand. Skips flags and
+/// the value of `--socket`, the one global flag that takes a separate value.
+fn subcommand_name(args: impl IntoIterator<Item = String>) -> Option<String> {
+    let mut args = args.into_iter().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--socket" {
+            args.next();
+        } else if !arg.starts_with('-') {
+            return Some(arg);
+        }
+    }
+    None
+}
+
+/// `run` and `exec` report their own failures as 125, so that scripts can tell
+/// them apart from the exit code of the command they ran.
+fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
+    matches!(subcommand, Some("run" | "exec"))
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+async fn main() {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            let code = if e.use_stderr()
+                && reports_cli_failure_as_125(subcommand_name(std::env::args()).as_deref())
+            {
+                CLI_FAILURE_EXIT_CODE
+            } else {
+                e.exit_code()
+            };
+            let _ = e.print();
+            std::process::exit(code);
+        }
+    };
+    let failure_code = if matches!(cli.command, Commands::Run { .. } | Commands::Exec { .. }) {
+        CLI_FAILURE_EXIT_CODE
+    } else {
+        GENERIC_FAILURE_EXIT_CODE
+    };
+    if let Err(e) = run_cli(cli).await {
+        eprintln!("Error: {e:?}");
+        std::process::exit(failure_code);
+    }
+}
+
+async fn run_cli(cli: Cli) -> anyhow::Result<()> {
     let json = flag_or_env(cli.json, "WARD_JSON");
     let no_pretty = flag_or_env(cli.no_pretty, "WARD_NO_PRETTY");
 
@@ -452,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Create {
             image,
+            command,
             opts,
             timeout,
             comms_mode,
@@ -465,6 +532,7 @@ async fn main() -> anyhow::Result<()> {
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
             let mut req = create_request(image, opts, timeout)?;
+            req.command = command;
             req.comms = Some(ward_core::pb::CommunicationPolicy {
                 mode: comms_mode_pb as i32,
                 group: comms_group,
@@ -483,10 +551,10 @@ async fn main() -> anyhow::Result<()> {
                 c.create_sandbox(req).await?.into_inner()
             };
 
-            // Print before persisting: the sandbox already exists on the
-            // daemon by this point, so the user must see its id and token
-            // even if local persistence below fails, since without the
-            // token no later command can manage or remove the sandbox.
+            // The sandbox already exists on the daemon, and without its
+            // token no later command can manage or remove it, so the token
+            // is shown whenever the store cannot keep it.
+            let saved = tokens::save(&token_store, &resp.id, &resp.token);
             if json {
                 println!(
                     "{}",
@@ -499,18 +567,13 @@ async fn main() -> anyhow::Result<()> {
                     })
                 );
             } else {
-                // One field per line for grep-friendly E2E assertions.
-                println!("id: {}", resp.id);
-                println!("status: {}", status_name(resp.status));
-                println!("image: {}", resp.image);
-                if !resp.ip_address.is_empty() {
-                    println!("ip_address: {}", resp.ip_address);
-                }
-                println!("token: {}", resp.token);
+                println!("{}", resp.id);
             }
-
-            if let Err(e) = tokens::save(&token_store, &resp.id, &resp.token) {
+            if let Err(e) = saved {
                 eprintln!("warning: could not persist token locally: {e}");
+                if !json {
+                    eprintln!("token: {}", resp.token);
+                }
             }
         }
 
@@ -555,8 +618,9 @@ async fn main() -> anyhow::Result<()> {
             env,
             interactive,
             tty,
+            detach,
         } => {
-            if interactive || tty {
+            if !detach {
                 let spec = docker::ExecSpec {
                     command,
                     env: parse_env(&env),
@@ -576,8 +640,7 @@ async fn main() -> anyhow::Result<()> {
                 env: parse_env(&env),
             })?;
             let resp = c.exec(request).await?.into_inner();
-            // pid is the handle the user passes back to `ward logs <id> <pid>`
-            // to retrieve streamed output once StreamOutput is implemented.
+            // pid is the handle the user passes back to `ward logs <id> <pid>`.
             if json {
                 println!("{}", json!({"pid": resp.pid, "status": resp.status}));
             } else {
@@ -632,8 +695,10 @@ async fn main() -> anyhow::Result<()> {
             id,
             pid: None,
             follow,
+            tail,
         } => {
-            let code = docker::logs(&socket_path, &token_store, &id, follow).await?;
+            let tail = docker::parse_tail(&tail)?;
+            let code = docker::logs(&socket_path, &token_store, &id, follow, tail).await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1035,6 +1100,75 @@ mod tests {
         assert_eq!(env.get("SET").map(String::as_str), Some("from-host"));
         assert!(!env.contains_key("UNSET"));
         assert_eq!(env.get("A").map(String::as_str), Some("b=c"));
+    }
+
+    #[test]
+    fn given_global_flags_before_subcommand_when_named_then_subcommand_is_found() {
+        // Arrange
+        let args = ["ward", "--json", "--socket", "run", "exec", "x"].map(String::from);
+
+        // Act
+        let name = subcommand_name(args);
+
+        // Assert
+        assert_eq!(name.as_deref(), Some("exec"));
+        assert!(reports_cli_failure_as_125(name.as_deref()));
+        assert!(!reports_cli_failure_as_125(Some("create")));
+    }
+
+    #[test]
+    fn given_volume_flag_when_create_parsed_then_short_and_long_both_work() {
+        // Arrange
+        let long = ["ward", "create", "alpine", "--volume", "/a:/b"];
+        let short = ["ward", "create", "alpine", "-v", "/a:/b"];
+
+        // Act
+        let parsed = [long, short].map(Cli::try_parse_from);
+
+        // Assert
+        for cli in parsed {
+            match cli.expect("parse").command {
+                Commands::Create { opts, .. } => assert_eq!(opts.volume, ["/a:/b"]),
+                other => panic!("expected Create, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn given_create_with_trailing_command_when_parsed_then_command_is_kept() {
+        // Arrange
+        let args = ["ward", "create", "alpine", "echo", "-n", "hi"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Create { image, command, .. } => {
+                assert_eq!(
+                    (image.as_str(), command),
+                    ("alpine", vec!["echo".into(), "-n".into(), "hi".into()])
+                );
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_docker_sizes_when_create_request_built_then_limits_are_converted() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "create", "alpine", "-m", "2g", "--cpus", "1.5"])
+            .expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let limits = request.resources.expect("resources");
+        assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
     }
 
     #[test]

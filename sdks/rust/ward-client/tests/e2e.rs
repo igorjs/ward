@@ -27,6 +27,9 @@ use tower::service_fn;
 use pb::ward_client::WardClient as PbClient;
 use ward_client::{CreateOptions, EgressMode, WardClient, WardError, pb};
 
+/// Generous so a loaded machine still starts the daemon in time.
+const DAEMON_START_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Resolve the wardd binary path without pulling in ward-daemon as a
 /// dev-dep (which would breach the Apache-2.0 ↔ AGPL boundary
 /// documented in `Cargo.toml`).
@@ -96,11 +99,11 @@ impl Daemon {
 
         let mut child = cmd.spawn().expect("spawn wardd");
 
-        // Poll for socket existence. Daemon binds quickly (~50ms); allow
-        // up to 5s for slow CI runners.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The socket file appears at bind, before the daemon accepts, so
+        // connecting is the real readiness check.
+        let deadline = Instant::now() + DAEMON_START_DEADLINE;
         while Instant::now() < deadline {
-            if socket.exists() {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
                 return Some(Self {
                     _data_dir: data_dir,
                     socket,
@@ -112,7 +115,10 @@ impl Daemon {
 
         let _ = child.kill();
         let _ = child.wait();
-        panic!("wardd did not bind socket within 5s: {}", socket.display());
+        panic!(
+            "wardd did not bind socket within {DAEMON_START_DEADLINE:?}: {}",
+            socket.display()
+        );
     }
 }
 

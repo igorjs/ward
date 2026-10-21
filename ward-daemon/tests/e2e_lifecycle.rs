@@ -29,12 +29,7 @@ fn stderr(out: &Output) -> String {
 fn create(d: &Daemon, extra: &[&str]) -> String {
     let out = run(d, &[&["create"], extra, &["alpine:latest"]].concat());
     assert!(out.status.success(), "create failed: {}", stderr(&out));
-    stdout(&out)
-        .lines()
-        .find_map(|l| l.strip_prefix("id: "))
-        .expect("id line")
-        .trim()
-        .to_string()
+    stdout(&out).trim().to_string()
 }
 
 fn ok(d: &Daemon, args: &[&str]) -> String {

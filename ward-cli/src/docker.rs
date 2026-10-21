@@ -1,9 +1,10 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ward run`, `ward exec -it` and `ward logs`: Docker-style commands that
+//! `ward run`, `ward exec` and `ward logs`: Docker-style commands that
 //! stream a process through Attach and exit with its exit code.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -12,6 +13,8 @@ use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
 use crate::attach::{self, require_exit, require_terminal};
 use crate::client::{self, Resolved};
 use crate::{lifecycle, tokens};
+
+pub const TAIL_ALL: &str = "all";
 
 /// The `ward run` flags that change how the process is attached.
 pub struct RunFlags {
@@ -58,7 +61,7 @@ pub async fn run(
     require_exit(outcome?)
 }
 
-/// What `ward exec -i/-t` runs inside an existing sandbox.
+/// What `ward exec` runs inside an existing sandbox.
 pub struct ExecSpec {
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
@@ -92,7 +95,16 @@ pub async fn exec(
 /// Prints the buffered output of a sandbox's main process, then keeps
 /// following it when `follow` is set. Returns the code to exit with: 0, or
 /// `128 + signo` when a signal ended the follow. The sandbox keeps running.
-pub async fn logs(socket: &str, token_store: &Path, reference: &str, follow: bool) -> Result<i32> {
+pub async fn logs(
+    socket: &str,
+    token_store: &Path,
+    reference: &str,
+    follow: bool,
+    tail: Option<usize>,
+) -> Result<i32> {
+    if follow && tail.is_some() {
+        bail!("--tail cannot be combined with --follow");
+    }
     let mut c = client::connect(socket).await?;
     let target = client::resolve(&mut c, token_store, reference).await?;
     let start = AttachStart {
@@ -103,7 +115,67 @@ pub async fn logs(socket: &str, token_store: &Path, reference: &str, follow: boo
         ..Default::default()
     };
     // No exit status means the output simply ended.
-    Ok(attach::attach(&mut c, &target, start, false)
+    let Some(lines) = tail else {
+        return Ok(attach::attach(&mut c, &target, start, false)
+            .await?
+            .unwrap_or(0));
+    };
+    let mut buffered = Vec::new();
+    let code = attach::attach_to(&mut c, &target, start, false, &mut buffered)
         .await?
-        .unwrap_or(0))
+        .unwrap_or(0);
+    std::io::stdout().write_all(last_lines(&buffered, lines))?;
+    Ok(code)
+}
+
+/// Parses `--tail`: `all` keeps every line, a number keeps that many.
+pub fn parse_tail(value: &str) -> Result<Option<usize>> {
+    if value == TAIL_ALL {
+        return Ok(None);
+    }
+    value
+        .parse()
+        .map(Some)
+        .map_err(|_| anyhow::anyhow!("invalid value '{value}' for --tail: use a number or 'all'"))
+}
+
+/// The last `count` lines of `output`, keeping their line endings.
+fn last_lines(output: &[u8], count: usize) -> &[u8] {
+    let body = output.strip_suffix(b"\n").unwrap_or(output);
+    let mut start = body.len();
+    for _ in 0..count {
+        match body[..start].iter().rposition(|&b| b == b'\n') {
+            Some(newline) => start = newline,
+            None => return output,
+        }
+    }
+    if count == 0 {
+        return &[];
+    }
+    &output[start + 1..]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_tail_values_when_parsed_then_all_is_none_and_numbers_are_counts() {
+        assert_eq!(parse_tail("all").unwrap(), None);
+        assert_eq!(parse_tail("3").unwrap(), Some(3));
+        assert!(parse_tail("-1").is_err());
+        assert!(parse_tail("few").is_err());
+    }
+
+    #[test]
+    fn given_output_when_last_lines_taken_then_only_the_tail_remains() {
+        // Arrange
+        let output = b"a\nb\nc\n";
+
+        // Act and Assert
+        assert_eq!(last_lines(output, 2), b"b\nc\n");
+        assert_eq!(last_lines(output, 9), output);
+        assert_eq!(last_lines(output, 0), b"");
+        assert_eq!(last_lines(b"a\nb", 1), b"b");
+    }
 }
