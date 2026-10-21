@@ -100,6 +100,7 @@ gRPC status codes map naturally:
 | Snapshot not found | `NOT_FOUND` |
 | Process not found | `NOT_FOUND` |
 | Invalid request | `INVALID_ARGUMENT` |
+| Sandbox name already in use | `ALREADY_EXISTS` |
 | Sandbox in Deny comms mode trying to publish/subscribe | `INVALID_ARGUMENT` |
 | Internal error | `INTERNAL` |
 | Not implemented | `UNIMPLEMENTED` |

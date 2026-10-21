@@ -77,7 +77,7 @@ fn given_unknown_sandbox_when_user_runs_snapshot_create_then_fails_with_not_foun
 }
 
 #[test]
-fn given_malformed_sandbox_id_when_user_runs_snapshot_create_then_fails_with_invalid_argument() {
+fn given_malformed_sandbox_id_when_user_runs_snapshot_create_then_fails_with_no_such_container() {
     // Arrange
     let daemon = common::Daemon::spawn();
 
@@ -88,9 +88,9 @@ fn given_malformed_sandbox_id_when_user_runs_snapshot_create_then_fails_with_inv
         .assert();
 
     // Assert
-    assertion
-        .failure()
-        .stderr(predicate::str::contains("sandbox"));
+    assertion.failure().stderr(predicate::str::contains(
+        "Error response from daemon: No such container: not-a-uuid-zzz",
+    ));
 }
 
 // ---------------------------------------------------------------------------

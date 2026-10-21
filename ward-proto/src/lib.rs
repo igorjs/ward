@@ -102,7 +102,7 @@ mod tests {
     mod attach {
         use super::super::pb::{
             AttachData, AttachExit, AttachMessage, AttachMode, AttachResize, AttachSignal,
-            AttachStart, AttachStdin, attach_message::Kind,
+            AttachStart, AttachStdin, AttachStream, attach_message::Kind,
         };
         use prost::Message;
 
@@ -131,6 +131,7 @@ mod tests {
                 Kind::Signal(AttachSignal { signo: SIGTERM }),
                 Kind::Data(AttachData {
                     data: b"out\0".to_vec(),
+                    stream: AttachStream::Stderr.into(),
                 }),
                 Kind::Exit(AttachExit { exit_code: 7 }),
             ];

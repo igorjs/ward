@@ -34,7 +34,10 @@ use crate::volume::VolumeManager;
 /// through the API.
 pub(super) fn api_err_to_status(err: ApiError) -> Status {
     match &err {
-        ApiError::SandboxNotFound(id) => Status::not_found(format!("sandbox not found: {id}")),
+        ApiError::SandboxNotFound(reference) => {
+            Status::not_found(format!("No such container: {reference}"))
+        }
+        ApiError::NameInUse { name, id } => Status::already_exists(name_conflict_message(name, id)),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
@@ -51,6 +54,18 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
     }
+}
+
+/// Docker's wording, so scripts and users that know it recognise the error.
+fn name_conflict_message(name: &str, id: &Option<String>) -> String {
+    let holder = id
+        .as_ref()
+        .map(|id| format!(" by container \"{id}\""))
+        .unwrap_or_default();
+    format!(
+        "Conflict. The container name \"/{name}\" is already in use{holder}. \
+         You have to remove (or rename) that container to be able to reuse that name."
+    )
 }
 
 /// Signal that ends an exec process; the backend cannot deliver others.
@@ -963,6 +978,59 @@ mod tests {
         // Assert
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status.message().contains("aaaa-1") && status.message().contains("aaaa-2"));
+    }
+
+    #[test]
+    fn given_missing_sandbox_when_mapped_then_not_found_in_docker_wording() {
+        // Arrange
+        let err = ApiError::SandboxNotFound("web".into());
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "No such container: web");
+    }
+
+    #[test]
+    fn given_name_held_by_a_sandbox_when_mapped_then_already_exists_in_docker_wording() {
+        // Arrange
+        let err = ApiError::NameInUse {
+            name: "web".into(),
+            id: Some("abc123".into()),
+        };
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            status.message(),
+            "Conflict. The container name \"/web\" is already in use by container \"abc123\". \
+             You have to remove (or rename) that container to be able to reuse that name."
+        );
+    }
+
+    #[test]
+    fn given_name_held_by_a_pending_create_when_mapped_then_message_omits_the_container() {
+        // Arrange
+        let err = ApiError::NameInUse {
+            name: "web".into(),
+            id: None,
+        };
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert!(
+            status
+                .message()
+                .contains("\"/web\" is already in use. You have to remove")
+        );
     }
 
     fn build_test_server() -> WardGrpcServer {

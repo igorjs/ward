@@ -49,8 +49,10 @@ const STDIN_QUEUE_DEPTH: usize = 64;
 /// How long a tty exec's output may keep draining after the child exits.
 const TTY_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Shell convention for "command not found / not executable".
-const EXIT_SPAWN_FAILED: i32 = 127;
+/// Shell and Docker convention: the command was found but cannot be run.
+const EXIT_NOT_INVOKABLE: i32 = 126;
+/// Shell and Docker convention: the command was not found.
+const EXIT_NOT_FOUND: i32 = 127;
 
 /// Exit code reported when there is no real exit status (bad request, or a
 /// child killed by a signal).
@@ -148,6 +150,37 @@ fn data_event(stream: Stream, data: Vec<u8>) -> Event {
             stream: stream as i32,
             data,
         })),
+    }
+}
+
+/// Whether `command` names an existing file, directly or through `PATH`.
+fn command_file_exists(exec: &Exec) -> bool {
+    let command = &exec.command[0];
+    if command.contains('/') {
+        return std::path::Path::new(command).exists();
+    }
+    let path = exec
+        .env
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    std::env::split_paths(&path).any(|dir| dir.join(command).exists())
+}
+
+/// Exit code for a command that could not be started, as a shell reports it.
+/// A missing working directory or script interpreter also surfaces as
+/// `NotFound`, but the command itself was found, so those exit 126.
+fn spawn_failure_exit_code(exec: &Exec, err: &std::io::Error) -> i32 {
+    if err.kind() != std::io::ErrorKind::NotFound {
+        return EXIT_NOT_INVOKABLE;
+    }
+    let workdir_missing =
+        !exec.working_dir.is_empty() && !std::path::Path::new(&exec.working_dir).is_dir();
+    if workdir_missing || command_file_exists(exec) {
+        EXIT_NOT_INVOKABLE
+    } else {
+        EXIT_NOT_FOUND
     }
 }
 
@@ -404,7 +437,9 @@ where
             let _ = event_tx
                 .send(stderr_event(format!("spawn failed: {e}")))
                 .await;
-            let _ = event_tx.send(synthetic_exit_event(EXIT_SPAWN_FAILED)).await;
+            let _ = event_tx
+                .send(synthetic_exit_event(spawn_failure_exit_code(&exec, &e)))
+                .await;
             drop(event_tx);
             let _ = writer_task.await;
             return Ok(());
@@ -580,6 +615,80 @@ mod tests {
             err.iter().any(|l| l.contains("spawn failed")),
             "expected spawn-failure line, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn given_missing_working_dir_when_exec_then_exit_126() {
+        // Arrange
+        let mut req = exec_req(&["echo", "hi"]);
+        if let Some(request::Kind::Exec(exec)) = req.kind.as_mut() {
+            exec.working_dir = "/nonexistent/ward-agent-workdir".into();
+        }
+
+        // Act
+        let events = run(vec![req]).await;
+
+        // Assert
+        let (_out, _err, code) = lines_of(&events);
+        assert_eq!(code, Some(126));
+    }
+
+    #[tokio::test]
+    async fn given_script_with_missing_interpreter_when_exec_then_exit_126() {
+        // Arrange
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ward-agent-nointerp-{}", std::process::id()));
+        std::fs::write(&path, b"#!/nonexistent/interpreter\n").expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        let path_str = path.to_str().expect("utf8 path");
+
+        // Act
+        let events = run(vec![exec_req(&[path_str])]).await;
+
+        // Assert
+        let (_out, _err, code) = lines_of(&events);
+        std::fs::remove_file(&path).expect("remove file");
+        assert_eq!(code, Some(126));
+    }
+
+    #[tokio::test]
+    async fn given_non_executable_file_when_exec_then_exit_126() {
+        // Arrange
+        let path = std::env::temp_dir().join(format!("ward-agent-noexec-{}", std::process::id()));
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write file");
+        let path_str = path.to_str().expect("utf8 path");
+
+        // Act
+        let events = run(vec![exec_req(&[path_str])]).await;
+
+        // Assert
+        let (_out, err, code) = lines_of(&events);
+        std::fs::remove_file(&path).expect("remove file");
+        assert_eq!(code, Some(126));
+        assert!(
+            err.iter().any(|l| l.contains("spawn failed")),
+            "expected spawn-failure line, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_binary_of_the_wrong_format_when_exec_then_exit_126() {
+        // Arrange
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ward-agent-badfmt-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 64]).expect("write file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make executable");
+        let path_str = path.to_str().expect("utf8 path");
+
+        // Act
+        let events = run(vec![exec_req(&[path_str])]).await;
+
+        // Assert
+        let (_out, _err, code) = lines_of(&events);
+        std::fs::remove_file(&path).expect("remove file");
+        assert_eq!(code, Some(126));
     }
 
     #[tokio::test]

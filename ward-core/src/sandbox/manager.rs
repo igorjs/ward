@@ -14,8 +14,8 @@ use crate::pb::{
     ExecRequest, ProcessInfo, RunRequest, SandboxInfo as PbSandboxInfo, SandboxStatus,
 };
 use crate::protocol::{
-    ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, ResourceLimits,
-    StreamEvent, StreamEventKind,
+    ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, OutputChunk,
+    RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
@@ -92,8 +92,11 @@ impl Drop for NameReservation {
     }
 }
 
-fn name_in_use(name: &str) -> ApiError {
-    ApiError::InvalidRequest(format!("sandbox name \"{name}\" is already in use"))
+fn name_in_use(name: &str, id: Option<&str>) -> ApiError {
+    ApiError::NameInUse {
+        name: name.to_string(),
+        id: id.map(str::to_string),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -122,19 +125,25 @@ struct ProcessRecord {
 /// Bytes of main process output kept per sandbox for `logs` and attach replay.
 const MAIN_OUTPUT_CAP: usize = 1024 * 1024;
 
+/// Bookkeeping bytes charged against the cap for every retained chunk, so
+/// many tiny writes cannot hold far more memory than the cap suggests.
+const OUTPUT_CHUNK_OVERHEAD: usize = 64;
+
 /// Live chunks a slow subscriber may lag behind before it loses the oldest.
 const MAIN_OUTPUT_LIVE_CHUNKS: usize = 64;
 
 /// Bounded, memory only copy of a main process's output. Keeps the newest
-/// `cap` bytes and fans new chunks out to live subscribers.
+/// `cap` bytes, with the stream of each chunk, and fans new chunks out to live
+/// subscribers.
 struct OutputBuffer {
     cap: usize,
     state: std::sync::Mutex<BufferState>,
 }
 
 struct BufferState {
-    bytes: VecDeque<u8>,
-    live: broadcast::Sender<bytes::Bytes>,
+    chunks: VecDeque<OutputChunk>,
+    len: usize,
+    live: broadcast::Sender<OutputChunk>,
 }
 
 impl OutputBuffer {
@@ -143,27 +152,40 @@ impl OutputBuffer {
         Self {
             cap,
             state: std::sync::Mutex::new(BufferState {
-                bytes: VecDeque::new(),
+                chunks: VecDeque::new(),
+                len: 0,
                 live,
             }),
         }
     }
 
-    fn push(&self, chunk: &[u8]) {
+    fn push(&self, chunk: OutputChunk) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.bytes.extend(chunk);
-        let excess = state.bytes.len().saturating_sub(self.cap);
-        state.bytes.drain(..excess);
+        state.len += chunk.bytes.len() + OUTPUT_CHUNK_OVERHEAD;
+        state.chunks.push_back(chunk.clone());
+        while state.len > self.cap {
+            let excess = state.len - self.cap;
+            let Some(front) = state.chunks.front_mut() else {
+                break;
+            };
+            if front.bytes.len() > excess {
+                front.bytes = front.bytes.slice(excess..);
+                state.len -= excess;
+            } else {
+                state.len -= front.bytes.len() + OUTPUT_CHUNK_OVERHEAD;
+                state.chunks.pop_front();
+            }
+        }
         // No subscribers is the normal case before a client attaches.
-        let _ = state.live.send(bytes::Bytes::copy_from_slice(chunk));
+        let _ = state.live.send(chunk);
     }
 
     /// Everything buffered so far plus a receiver for what follows. Both are
     /// taken under one lock, so no chunk is missed or repeated.
-    fn subscribe(&self) -> (Vec<u8>, broadcast::Receiver<bytes::Bytes>) {
+    fn subscribe(&self) -> (Vec<OutputChunk>, broadcast::Receiver<OutputChunk>) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         (
-            state.bytes.iter().copied().collect(),
+            state.chunks.iter().cloned().collect(),
             state.live.subscribe(),
         )
     }
@@ -210,13 +232,22 @@ pub struct ProcessIo {
     pub control: Option<mpsc::Sender<ProcessControl>>,
 }
 
-/// The output bytes an event carries, if any.
-pub(crate) fn event_chunk(event: &StreamEvent) -> Option<Vec<u8>> {
+/// The output an event carries, if any.
+pub(crate) fn event_chunk(event: &StreamEvent) -> Option<OutputChunk> {
+    let line = || bytes::Bytes::from(format!("{}\n", event.line));
     match &event.kind {
-        StreamEventKind::Data { bytes, .. } => Some(bytes.clone()),
-        StreamEventKind::Stdout | StreamEventKind::Stderr => {
-            Some(format!("{}\n", event.line).into_bytes())
-        }
+        StreamEventKind::Data { stream, bytes } => Some(OutputChunk {
+            stream: *stream,
+            bytes: bytes::Bytes::copy_from_slice(bytes),
+        }),
+        StreamEventKind::Stdout => Some(OutputChunk {
+            stream: RawStream::Stdout,
+            bytes: line(),
+        }),
+        StreamEventKind::Stderr => Some(OutputChunk {
+            stream: RawStream::Stderr,
+            bytes: line(),
+        }),
         StreamEventKind::Exit => None,
     }
 }
@@ -238,7 +269,7 @@ async fn pump_main_output(
 ) {
     while let Some(event) = events.recv().await {
         if let Some(chunk) = event_chunk(&event) {
-            output.push(&chunk);
+            output.push(chunk);
         } else {
             exit.send_replace(event_wait_status(&event));
             return;
@@ -771,18 +802,19 @@ impl SandboxManager {
             return Ok(None);
         }
         crate::validate::sandbox_name(name)?;
-        let reservation =
-            NameReservation::claim(&self.pending_names, name).ok_or_else(|| name_in_use(name))?;
+        let reservation = NameReservation::claim(&self.pending_names, name)
+            .ok_or_else(|| name_in_use(name, None))?;
         // A create that finished before this claim has released its own, so
         // its name is in `entries` by now.
-        let taken = self
+        let holder = self
             .entries
             .read()
             .await
-            .values()
-            .any(|entry| entry.meta.options.spec.name == name);
-        if taken {
-            return Err(name_in_use(name));
+            .iter()
+            .find(|(_, entry)| entry.meta.options.spec.name == name)
+            .map(|(id, _)| id.clone());
+        if let Some(id) = holder {
+            return Err(name_in_use(name, Some(&id)));
         }
         Ok(Some(reservation))
     }
@@ -1125,7 +1157,7 @@ impl SandboxManager {
     pub async fn subscribe_main_output(
         &self,
         id: &str,
-    ) -> Result<(Vec<u8>, broadcast::Receiver<bytes::Bytes>)> {
+    ) -> Result<(Vec<OutputChunk>, broadcast::Receiver<OutputChunk>)> {
         let mains = self.mains.read().await;
         let main = mains.get(id).ok_or_else(|| no_main_process(id))?;
         Ok(main.output.subscribe())
@@ -3788,7 +3820,7 @@ pub(crate) mod tests {
     async fn given_sandbox_named_web1_when_another_created_with_that_name_then_rejected() {
         // Arrange
         let mgr = build_manager(4);
-        mgr.create(named("web1"), "").await.unwrap();
+        let first = mgr.create(named("web1"), "").await.unwrap();
 
         // Act
         let err = mgr
@@ -3797,7 +3829,9 @@ pub(crate) mod tests {
             .expect_err("duplicate name");
 
         // Assert
-        assert!(matches!(err, ApiError::InvalidRequest(_)));
+        assert!(
+            matches!(&err, ApiError::NameInUse { name, id } if name == "web1" && id.as_deref() == Some(first.id.as_str()))
+        );
         assert_eq!(mgr.list().await.unwrap().len(), 1);
     }
 
@@ -3812,7 +3846,7 @@ pub(crate) mod tests {
         let result = mgr.create(named("web1"), "").await;
 
         // Assert
-        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+        assert!(matches!(result, Err(ApiError::NameInUse { .. })));
     }
 
     #[tokio::test]
@@ -4338,6 +4372,7 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     async fn forward_output(
         mut source: impl tokio::io::AsyncRead + Unpin,
+        stream: RawStream,
         tx: mpsc::Sender<StreamEvent>,
     ) {
         use tokio::io::AsyncReadExt;
@@ -4345,7 +4380,7 @@ pub(crate) mod tests {
         // A pty master reports EIO once the child is gone, which ends it too.
         while let Ok(n @ 1..) = source.read(&mut buf).await {
             let kind = StreamEventKind::Data {
-                stream: crate::protocol::RawStream::Stdout,
+                stream,
                 bytes: buf[..n].to_vec(),
             };
             if tx.send(stream_event(kind, None, None)).await.is_err() {
@@ -4397,6 +4432,7 @@ pub(crate) mod tests {
                 let child = cmd.spawn()?;
                 readers.push(tokio::spawn(forward_output(
                     tokio::fs::File::from_std(master),
+                    RawStream::Stdout,
                     output_tx.clone(),
                 )));
                 child
@@ -4408,6 +4444,12 @@ pub(crate) mod tests {
                 child_stdin = child.stdin.take();
                 readers.push(tokio::spawn(forward_output(
                     child.stdout.take().expect("stdout"),
+                    RawStream::Stdout,
+                    output_tx.clone(),
+                )));
+                readers.push(tokio::spawn(forward_output(
+                    child.stderr.take().expect("stderr"),
+                    RawStream::Stderr,
                     output_tx.clone(),
                 )));
                 child
@@ -4585,19 +4627,106 @@ pub(crate) mod tests {
         mgr.create(req, "").await.expect("create").id
     }
 
+    #[cfg(not(feature = "krunvm"))]
+    pub(crate) fn concat(chunks: &[OutputChunk]) -> Vec<u8> {
+        chunks
+            .iter()
+            .flat_map(|c| c.bytes.iter().copied())
+            .collect()
+    }
+
+    fn chunk(stream: RawStream, text: &str) -> OutputChunk {
+        OutputChunk {
+            stream,
+            bytes: bytes::Bytes::copy_from_slice(text.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn given_chunks_from_both_streams_when_buffered_then_replay_keeps_each_stream() {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP);
+
+        // Act
+        buffer.push(chunk(RawStream::Stdout, "out\n"));
+        buffer.push(chunk(RawStream::Stderr, "err\n"));
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert_eq!(
+            replay,
+            vec![
+                chunk(RawStream::Stdout, "out\n"),
+                chunk(RawStream::Stderr, "err\n")
+            ]
+        );
+    }
+
+    #[test]
+    fn given_output_over_the_cap_when_buffered_then_the_oldest_bytes_go_and_streams_hold() {
+        // Arrange
+        let buffer = OutputBuffer::new(5 + 2 * OUTPUT_CHUNK_OVERHEAD);
+
+        // Act
+        buffer.push(chunk(RawStream::Stdout, "abc"));
+        buffer.push(chunk(RawStream::Stderr, "def"));
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert_eq!(
+            replay,
+            vec![
+                chunk(RawStream::Stdout, "bc"),
+                chunk(RawStream::Stderr, "def")
+            ]
+        );
+    }
+
+    #[test]
+    fn given_many_one_byte_writes_when_buffered_then_retained_chunks_stay_bounded() {
+        // Arrange
+        let cap = 10 * OUTPUT_CHUNK_OVERHEAD;
+        let buffer = OutputBuffer::new(cap);
+
+        // Act
+        for _ in 0..10_000 {
+            buffer.push(chunk(RawStream::Stdout, "x"));
+        }
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert!(replay.len() <= cap / OUTPUT_CHUNK_OVERHEAD);
+    }
+
+    #[tokio::test]
+    async fn given_a_subscriber_when_stderr_is_pushed_then_the_live_chunk_carries_stderr() {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP);
+        let (_, mut live) = buffer.subscribe();
+
+        // Act
+        buffer.push(chunk(RawStream::Stderr, "err\n"));
+
+        // Assert
+        assert_eq!(
+            live.recv().await.unwrap(),
+            chunk(RawStream::Stderr, "err\n")
+        );
+    }
+
     /// Poll the buffered output until it equals `expected`.
     #[cfg(not(feature = "krunvm"))]
     async fn wait_for_output(mgr: &SandboxManager, id: &str, expected: &str) {
         let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
         loop {
             let (buffered, _) = mgr.subscribe_main_output(id).await.expect("subscribe");
-            if buffered == expected.as_bytes() {
+            if concat(&buffered) == expected.as_bytes() {
                 return;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "output {:?} never became {expected:?}",
-                String::from_utf8_lossy(&buffered)
+                String::from_utf8_lossy(&concat(&buffered))
             );
             tokio::time::sleep(TEST_POLL_STEP).await;
         }
@@ -4659,7 +4788,7 @@ pub(crate) mod tests {
         let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
         loop {
             let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
-            let text = String::from_utf8_lossy(&buffered).replace('\r', "");
+            let text = String::from_utf8_lossy(&concat(&buffered)).replace('\r', "");
             if text == expected {
                 return;
             }
@@ -4756,8 +4885,8 @@ pub(crate) mod tests {
             .expect("open");
 
         // Assert
-        assert_eq!(earlier, b"one\n");
-        assert_eq!(&newer[..], b"two\n");
+        assert_eq!(concat(&earlier), b"one\n");
+        assert_eq!(&newer.bytes[..], b"two\n");
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -4771,7 +4900,7 @@ pub(crate) mod tests {
         #[case] expected: &str,
     ) {
         // Arrange
-        const CAP: usize = 8;
+        const CAP: usize = 8 + OUTPUT_CHUNK_OVERHEAD;
         let mgr = host_manager(CAP);
         let text = &"0123456789"[..written];
 
@@ -4781,7 +4910,7 @@ pub(crate) mod tests {
 
         // Assert
         let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
-        assert_eq!(String::from_utf8(buffered).unwrap(), expected);
+        assert_eq!(String::from_utf8(concat(&buffered)).unwrap(), expected);
     }
     // ----- exited state -------------------------------------------------
 
@@ -5006,7 +5135,7 @@ pub(crate) mod tests {
         let status = mgr.main_exit_status(&id).await.expect("status");
 
         // Assert
-        assert_eq!(buffered, b"hi\n");
+        assert_eq!(concat(&buffered), b"hi\n");
         assert_eq!(status, 3 << WAIT_STATUS_EXIT_SHIFT);
     }
 }
