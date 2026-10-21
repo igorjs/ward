@@ -57,21 +57,21 @@ impl Action {
 }
 
 /// Tallies per-reference failures and prints each one to stderr.
-struct Failures {
+pub struct Failures {
     count: usize,
 }
 
 impl Failures {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { count: 0 }
     }
 
-    fn record(&mut self, subject: &str, error: &anyhow::Error) {
+    pub fn record(&mut self, subject: &str, error: &anyhow::Error) {
         self.count += 1;
         eprintln!("error: {subject}: {}", error_text(error));
     }
 
-    fn finish(self, total: usize, did_what: &str) -> Result<()> {
+    pub fn finish(self, total: usize, did_what: &str) -> Result<()> {
         if self.count > 0 {
             anyhow::bail!(
                 "{} of {total} sandboxes could not be {did_what}",
@@ -134,7 +134,7 @@ pub async fn remove(
         .await;
         match result {
             Ok(()) if json => println!("{}", json!({"removed": reference})),
-            Ok(()) => println!("removed: {reference}"),
+            Ok(()) => println!("{reference}"),
             Err(e) => failures.record(reference, &e),
         }
     }

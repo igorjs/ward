@@ -5,6 +5,7 @@
 mod attach;
 mod client;
 mod docker;
+mod inspect;
 mod lifecycle;
 mod output;
 mod socket;
@@ -107,6 +108,26 @@ enum Commands {
     /// List all sandboxes.
     List,
 
+    /// List running sandboxes, or every sandbox with -a.
+    Ps {
+        /// Show sandboxes in every state.
+        #[arg(short, long)]
+        all: bool,
+        /// Print only the sandbox IDs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Output format. Only `json` is supported.
+        #[arg(long, value_parser = ["json"])]
+        format: Option<String>,
+    },
+
+    /// Print low level details of one or more sandboxes as a JSON array.
+    Inspect {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
+
     /// Execute a command inside a sandbox.
     ///
     /// With -i or -t the command is attached: its output is printed and
@@ -192,12 +213,17 @@ enum Commands {
         data: Option<String>,
     },
 
-    /// Signal a process to terminate.
+    /// Signal a process, by default the sandbox's main process.
     Kill {
-        /// Sandbox ID.
-        id: String,
-        /// Process ID returned by exec/run.
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        refs: Vec<String>,
+        /// Process ID returned by exec/run. 0 means the main process.
+        #[arg(long, default_value = ward_core::sandbox::MAIN_PROCESS_PID)]
         pid: String,
+        /// Signal for the main process, by name or number.
+        #[arg(short, long, default_value = "KILL")]
+        signal: String,
     },
 
     /// Snapshot management subcommands.
@@ -505,6 +531,23 @@ async fn main() -> anyhow::Result<()> {
             output::emit_rows(json, no_pretty, &["id", "status", "image"], &rows)?;
         }
 
+        Commands::Ps { all, quiet, format } => {
+            let mut c = client::connect(&socket_path).await?;
+            let options = inspect::PsOptions {
+                all,
+                quiet,
+                json,
+                format_json: format.is_some(),
+                no_pretty,
+            };
+            inspect::ps(&mut c, options).await?;
+        }
+
+        Commands::Inspect { references } => {
+            let mut c = client::connect(&socket_path).await?;
+            inspect::inspect(&mut c, &token_store, &references).await?;
+        }
+
         Commands::Exec {
             id,
             command,
@@ -636,20 +679,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Kill { id, pid } => {
+        Commands::Kill { refs, pid, signal } => {
+            let signal = inspect::parse_signal(&signal)?;
             let mut c = client::connect(&socket_path).await?;
-            let token = tokens::load(&token_store, &id)?;
-            let mut request = tonic::Request::new(ward_core::pb::KillProcessRequest {
-                sandbox_id: id,
-                pid: pid.clone(),
-            });
-            tokens::attach_token(&mut request, token)?;
-            c.kill_process(request).await?;
-            if json {
-                println!("{}", json!({"killed": pid}));
-            } else {
-                println!("killed: {pid}");
-            }
+            inspect::kill(&mut c, &token_store, &refs, &pid, signal, json).await?;
         }
 
         Commands::Stdin { id, pid, data } => {
@@ -844,7 +877,7 @@ async fn main() -> anyhow::Result<()> {
                 if json {
                     println!("{}", json!({"removed": id}));
                 } else {
-                    println!("removed: {id}");
+                    println!("{id}");
                 }
             }
         },
@@ -1032,6 +1065,71 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn given_ps_with_all_flag_when_parsed_then_all_is_set() {
+        // Arrange
+        let args = ["ward", "ps", "-a"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        assert!(matches!(cli.command, Commands::Ps { all: true, .. }));
+    }
+
+    #[test]
+    fn given_ps_with_quiet_and_format_when_parsed_then_both_are_set() {
+        // Arrange
+        let args = ["ward", "ps", "-q", "--format", "json"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        assert!(matches!(
+            cli.command,
+            Commands::Ps { quiet: true, format: Some(f), .. } if f == "json"
+        ));
+    }
+
+    #[test]
+    fn given_kill_with_pid_flag_and_two_refs_when_parsed_then_both_refs_kept() {
+        // Arrange
+        let args = ["ward", "kill", "--pid", "abc", "web1", "web2"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Kill { refs, pid, .. } => assert_eq!(
+                (refs, pid.as_str()),
+                (vec!["web1".into(), "web2".into()], "abc")
+            ),
+            other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_kill_with_signal_and_no_pid_when_parsed_then_pid_is_main_process() {
+        // Arrange
+        let args = ["ward", "kill", "-s", "TERM", "web1"];
+
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Kill { refs, pid, signal } => {
+                assert_eq!(
+                    (refs.as_slice(), pid.as_str(), signal.as_str()),
+                    (["web1".to_string()].as_slice(), "0", "TERM")
+                );
+            }
+            other => panic!("expected Kill, got {other:?}"),
+        }
     }
 
     #[test]

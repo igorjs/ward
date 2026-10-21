@@ -27,6 +27,12 @@ pub fn pretty_tables_enabled(no_pretty: bool) -> bool {
     !no_pretty && std::io::stdout().is_terminal()
 }
 
+/// Header line for tab-separated output. Docker prints it even when piped.
+/// Aligned tables carry their own header, so they return `None`.
+pub fn tsv_header(no_pretty: bool, headers: &[&str]) -> Option<String> {
+    (!pretty_tables_enabled(no_pretty)).then(|| headers.join("\t"))
+}
+
 /// Emit a list result. `headers` names each column; `rows` carries the
 /// values (one inner Vec per row, length must equal `headers.len()`).
 /// In JSON mode: writes one array of `{header: value, ...}` objects.
@@ -96,6 +102,11 @@ fn stringify(v: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn given_no_pretty_when_header_built_then_columns_are_tab_separated() {
+        assert_eq!(tsv_header(true, &["A", "B"]).as_deref(), Some("A\tB"));
+    }
 
     #[test]
     fn given_string_when_stringify_then_drops_quotes() {

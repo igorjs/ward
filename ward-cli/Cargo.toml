@@ -32,6 +32,9 @@ ward-core = { path = "../ward-core" }
 [dev-dependencies]
 # Diff-style assertions for readable failures on multi-field structs.
 pretty_assertions = "1"
+# Timestamps in ps row tests and parameterised cases.
+prost-types = "0.14"
+rstest = "0.26"
 # Terminal tests open their own pty and signal a child process.
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 # Per-test temporary directories for the token store round-trip tests.

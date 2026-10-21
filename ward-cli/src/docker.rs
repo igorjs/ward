@@ -31,7 +31,7 @@ pub async fn run(
     if request.command.is_empty() && !flags.detach {
         bail!("a command is required unless the sandbox runs detached (-d)");
     }
-    require_terminal(flags.tty)?;
+    require_terminal(flags.tty, flags.interactive)?;
     let mut c = client::connect(socket).await?;
     let created = c.create_sandbox(request).await?.into_inner();
     if let Err(e) = tokens::save(token_store, &created.id, &created.token) {
@@ -74,7 +74,7 @@ pub async fn exec(
     reference: &str,
     spec: ExecSpec,
 ) -> Result<i32> {
-    require_terminal(spec.tty)?;
+    require_terminal(spec.tty, spec.interactive)?;
     let mut c = client::connect(socket).await?;
     let target = client::resolve(&mut c, token_store, reference).await?;
     let start = AttachStart {

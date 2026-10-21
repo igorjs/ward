@@ -180,7 +180,7 @@ fn given_running_sandbox_when_rm_force_then_the_sandbox_is_gone() {
     let printed = ok(&d, &["rm", "-f", &id]);
 
     // Assert
-    assert_eq!(printed.trim(), format!("removed: {id}"));
+    assert_eq!(printed.trim(), id);
     assert_eq!(status_of(&d, &id), None);
 }
 
@@ -237,4 +237,80 @@ fn given_stopped_sandbox_without_stored_token_when_prune_then_it_is_skipped_and_
     );
     assert_eq!(status_of(&d, &orphan).as_deref(), Some("stopped"));
     assert_eq!(status_of(&d, &other), None);
+}
+
+#[test]
+fn given_running_sandbox_when_ps_then_header_and_a_row_are_printed() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "web1"]);
+
+    // Act
+    let printed = ok(&d, &["ps"]);
+
+    // Assert
+    let mut lines = printed.lines();
+    assert_eq!(
+        lines.next(),
+        Some("CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tNAMES")
+    );
+    let row: Vec<&str> = lines.next().expect("row").split('\t').collect();
+    assert_eq!(row[0], &id[..12]);
+    assert_eq!(row[1], "alpine:latest");
+    assert!(row[4].starts_with("Up"), "{row:?}");
+    assert_eq!(row[5], "web1");
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn given_running_sandbox_when_ps_format_json_then_one_object_per_line() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "web1"]);
+    create(&d, &["--name", "web2"]);
+
+    // Act
+    let printed = ok(&d, &["ps", "--format", "json"]);
+
+    // Assert
+    let objects: Vec<serde_json::Value> = printed
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("one object per line"))
+        .collect();
+    assert_eq!(objects.len(), 2);
+    let web1 = objects.iter().find(|o| o["Names"] == "web1").expect("web1");
+    assert_eq!(web1["ID"], id[..12]);
+    assert!(web1["CreatedAt"].as_str().unwrap().ends_with("+0000 UTC"));
+    assert!(web1["RunningFor"].as_str().unwrap().ends_with("ago"));
+}
+
+#[test]
+fn given_one_unknown_reference_when_inspect_then_found_entries_print_and_exit_is_nonzero() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "web1"]);
+
+    // Act
+    let out = run(&d, &["inspect", "web1", "missing1"]);
+
+    // Assert
+    assert!(!out.status.success());
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).expect("json array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["Id"], id);
+    assert!(stderr(&out).contains("missing1"), "{}", stderr(&out));
+}
+
+#[test]
+fn given_only_unknown_references_when_inspect_then_empty_array_and_nonzero_exit() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["inspect", "missing1"]);
+
+    // Assert
+    assert!(!out.status.success());
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).expect("json array");
+    assert!(entries.is_empty());
 }

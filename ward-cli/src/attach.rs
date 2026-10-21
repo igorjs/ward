@@ -24,9 +24,10 @@ const NOT_A_TTY: &str = "the input device is not a TTY";
 const STDIN_CHUNK_BYTES: usize = 8192;
 const OUTBOUND_CAPACITY: usize = 16;
 
-/// Fails when `tty` is requested but stdin is not a terminal.
-pub fn require_terminal(tty: bool) -> Result<()> {
-    if tty && !isatty(std::io::stdin()) {
+/// Fails when stdin is attached with a tty (`-it`) but is not a terminal.
+/// Like Docker, `-t` alone does not need a terminal on stdin.
+pub fn require_terminal(tty: bool, interactive: bool) -> Result<()> {
+    if tty && interactive && !isatty(std::io::stdin()) {
         bail!(NOT_A_TTY);
     }
     Ok(())

@@ -303,7 +303,7 @@ fn given_long_running_process_when_killed_then_it_is_gone_from_the_guest() {
 
     run_ok({
         let mut c = d.cli();
-        c.args(["kill", &id, &pid]);
+        c.args(["kill", &id, "--pid", &pid]);
         c
     });
 

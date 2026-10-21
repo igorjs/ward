@@ -86,7 +86,26 @@ fn given_run_with_a_command_when_it_completes_then_its_output_is_printed_and_exi
 
 #[cfg(not(feature = "krunvm"))]
 #[test]
-fn given_run_t_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_message() {
+fn given_run_it_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_message() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["run", "-it", "alpine", "true"])
+        .stdin(Stdio::null())
+        .assert();
+
+    // Assert
+    assertion
+        .failure()
+        .stderr(predicate::str::contains(NOT_A_TTY));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_run_t_without_i_when_stdin_is_not_a_terminal_then_it_runs_like_docker() {
     // Arrange
     let daemon = Daemon::spawn();
 
@@ -98,9 +117,7 @@ fn given_run_t_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_messag
         .assert();
 
     // Assert
-    assertion
-        .failure()
-        .stderr(predicate::str::contains(NOT_A_TTY));
+    assertion.success();
 }
 
 #[cfg(not(feature = "krunvm"))]

@@ -106,6 +106,7 @@ async fn given_no_token_when_kill_process_then_permission_denied() {
         .kill_process(Request::new(KillProcessRequest {
             sandbox_id,
             pid: "11111111-1111-1111-1111-111111111111".into(),
+            ..Default::default()
         }))
         .await
         .expect_err("kill_process without a token must be rejected");
@@ -161,6 +162,7 @@ async fn given_correct_token_when_kill_process_then_ok_or_not_found_for_missing_
         KillProcessRequest {
             sandbox_id: created.id,
             pid: "11111111-1111-1111-1111-111111111111".into(),
+            ..Default::default()
         },
         &created.token,
     );
@@ -355,4 +357,43 @@ async fn given_no_token_when_calling_remaining_gated_handlers_then_all_permissio
             "case {case} should return PermissionDenied, got {status:?}"
         );
     }
+}
+
+#[rstest::rstest]
+#[case::wrong(Some("not-the-real-token"))]
+#[case::empty(Some(""))]
+#[case::missing(None)]
+#[tokio::test]
+async fn given_bad_token_when_main_process_killed_then_permission_denied(
+    #[case] token: Option<&str>,
+) {
+    // Arrange
+    let mut client = common::test_server().await;
+    let sandbox_id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+    let message = KillProcessRequest {
+        sandbox_id,
+        pid: "0".into(),
+        ..Default::default()
+    };
+    let request = match token {
+        Some(token) => common::with_token(message, token),
+        None => Request::new(message),
+    };
+
+    // Act
+    let status = client
+        .kill_process(request)
+        .await
+        .expect_err("kill of the main process with a bad token must be rejected");
+
+    // Assert
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
 }
