@@ -225,7 +225,7 @@ async fn given_sandbox_named_web1_when_get_sandbox_by_name_then_returns_it() {
 }
 
 #[tokio::test]
-async fn given_duplicate_name_when_create_sandbox_then_invalid_argument() {
+async fn given_duplicate_name_when_create_sandbox_then_already_exists() {
     // Arrange
     let mut client = common::test_server().await;
     let request = CreateSandboxRequest {
@@ -242,7 +242,7 @@ async fn given_duplicate_name_when_create_sandbox_then_invalid_argument() {
         .expect_err("duplicate name");
 
     // Assert
-    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(err.code(), Code::AlreadyExists);
 }
 
 // ---------------------------------------------------------------------------

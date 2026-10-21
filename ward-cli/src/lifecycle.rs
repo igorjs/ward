@@ -68,7 +68,10 @@ impl Failures {
 
     pub fn record(&mut self, subject: &str, error: &anyhow::Error) {
         self.count += 1;
-        eprintln!("error: {subject}: {}", error_text(error));
+        match client::daemon_error_line(error) {
+            Some(line) => eprintln!("{line}"),
+            None => eprintln!("error: {subject}: {error:#}"),
+        }
     }
 
     pub fn finish(self, total: usize, did_what: &str) -> Result<()> {
@@ -79,14 +82,6 @@ impl Failures {
             );
         }
         Ok(())
-    }
-}
-
-/// A daemon status shows its message only, without the transport framing.
-fn error_text(error: &anyhow::Error) -> String {
-    match error.downcast_ref::<tonic::Status>() {
-        Some(status) => status.message().to_string(),
-        None => format!("{error:#}"),
     }
 }
 

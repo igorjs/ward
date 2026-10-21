@@ -42,9 +42,67 @@ pub async fn connect(socket_path: &str) -> Result<WardClient<Channel>> {
             }
         }))
         .await
-        .context("connect to ward daemon")?;
+        .map_err(|source| DaemonUnreachable {
+            socket: socket_path.to_string(),
+            source,
+        })?;
 
     Ok(WardClient::new(channel))
+}
+
+/// Docker's prefix for an error the daemon returned.
+const DAEMON_ERROR_PREFIX: &str = "Error response from daemon: ";
+
+/// The daemon could not be reached on its socket.
+#[derive(Debug)]
+pub struct DaemonUnreachable {
+    socket: String,
+    source: tonic::transport::Error,
+}
+
+impl std::fmt::Display for DaemonUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cannot connect to the Ward daemon at {}. Is wardd running?",
+            self.socket
+        )
+    }
+}
+
+impl std::error::Error for DaemonUnreachable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Whether the daemon itself chose this status, as opposed to the transport
+/// or the call machinery producing it.
+fn is_server_status(status: &tonic::Status) -> bool {
+    use tonic::Code;
+    match status.code() {
+        Code::NotFound
+        | Code::AlreadyExists
+        | Code::InvalidArgument
+        | Code::PermissionDenied
+        | Code::FailedPrecondition
+        | Code::ResourceExhausted
+        | Code::Unimplemented => true,
+        Code::Internal => std::error::Error::source(status).is_none(),
+        _ => false,
+    }
+}
+
+/// The line to print for a failure in Docker's wording and without the
+/// transport framing; `None` when the error should print as it is.
+pub fn daemon_error_line(error: &anyhow::Error) -> Option<String> {
+    if let Some(unreachable) = error.downcast_ref::<DaemonUnreachable>() {
+        return Some(unreachable.to_string());
+    }
+    error
+        .downcast_ref::<tonic::Status>()
+        .filter(|status| is_server_status(status))
+        .map(|status| format!("{DAEMON_ERROR_PREFIX}{}", status.message()))
 }
 
 /// A sandbox reference resolved to its id, with the token stored under it.
@@ -103,4 +161,89 @@ pub async fn resolve(
         .await?
         .into_inner();
     Resolved::from_info(token_store, &info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_daemon_status_when_formatted_then_docker_line_without_transport_framing() {
+        // Arrange
+        let error = anyhow::Error::from(tonic::Status::not_found("No such container: web"))
+            .context("resolving web");
+
+        // Act
+        let line = daemon_error_line(&error);
+
+        // Assert
+        assert_eq!(
+            line.as_deref(),
+            Some("Error response from daemon: No such container: web")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::unavailable(tonic::Status::unavailable("gone"))]
+    #[case::cancelled(tonic::Status::cancelled("stop"))]
+    #[case::unknown(tonic::Status::unknown("odd"))]
+    #[case::deadline(tonic::Status::deadline_exceeded("slow"))]
+    #[case::transport_internal(tonic::Status::from_error("boom".into()))]
+    fn given_transport_status_when_formatted_then_no_daemon_prefix(#[case] status: tonic::Status) {
+        // Arrange
+        let error = anyhow::Error::from(status);
+
+        // Act
+        let line = daemon_error_line(&error);
+
+        // Assert
+        assert_eq!(line, None);
+    }
+
+    #[rstest::rstest]
+    #[case::already_exists(tonic::Status::already_exists("in use"))]
+    #[case::invalid(tonic::Status::invalid_argument("bad"))]
+    #[case::denied(tonic::Status::permission_denied("no"))]
+    #[case::precondition(tonic::Status::failed_precondition("state"))]
+    #[case::exhausted(tonic::Status::resource_exhausted("full"))]
+    #[case::unimplemented(tonic::Status::unimplemented("later"))]
+    #[case::internal(tonic::Status::internal("bug"))]
+    fn given_server_status_when_formatted_then_daemon_prefix(#[case] status: tonic::Status) {
+        // Arrange
+        let message = status.message().to_string();
+        let error = anyhow::Error::from(status);
+
+        // Act
+        let line = daemon_error_line(&error);
+
+        // Assert
+        assert_eq!(line, Some(format!("{DAEMON_ERROR_PREFIX}{message}")));
+    }
+
+    #[tokio::test]
+    async fn given_missing_socket_when_connect_then_cannot_connect_line() {
+        // Arrange
+        let socket = "/nonexistent/ward.sock";
+
+        // Act
+        let error = connect(socket).await.expect_err("no daemon");
+
+        // Assert
+        assert_eq!(
+            daemon_error_line(&error).as_deref(),
+            Some("Cannot connect to the Ward daemon at /nonexistent/ward.sock. Is wardd running?")
+        );
+    }
+
+    #[test]
+    fn given_local_failure_when_formatted_then_no_daemon_line() {
+        // Arrange
+        let error = anyhow::anyhow!("cannot read the token store");
+
+        // Act
+        let line = daemon_error_line(&error);
+
+        // Assert
+        assert_eq!(line, None);
+    }
 }

@@ -15,8 +15,8 @@ use tracing::{info, warn};
 use super::server::api_err_to_status;
 use crate::backend::ProcessControl;
 use crate::pb::attach_message::Kind;
-use crate::pb::{AttachData, AttachExit, AttachMessage, AttachMode, AttachStart};
-use crate::protocol::StreamEvent;
+use crate::pb::{AttachData, AttachExit, AttachMessage, AttachMode, AttachStart, AttachStream};
+use crate::protocol::{OutputChunk, RawStream, StreamEvent};
 use crate::sandbox::{
     ProcessIo, SandboxManager, decode_wait_status, event_chunk, event_wait_status,
 };
@@ -109,11 +109,18 @@ fn run(
     });
 }
 
-async fn send_data(tx: &Outbound, data: Vec<u8>) -> bool {
-    if data.is_empty() {
+async fn send_data(tx: &Outbound, chunk: OutputChunk) -> bool {
+    if chunk.bytes.is_empty() {
         return true;
     }
-    let kind = Kind::Data(AttachData { data });
+    let stream = match chunk.stream {
+        RawStream::Stdout => AttachStream::Stdout,
+        RawStream::Stderr => AttachStream::Stderr,
+    };
+    let kind = Kind::Data(AttachData {
+        data: chunk.bytes.to_vec(),
+        stream: stream.into(),
+    });
     tx.send(Ok(AttachMessage { kind: Some(kind) }))
         .await
         .is_ok()
@@ -137,7 +144,12 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
         Ok(subscription) => subscription,
         Err(e) => return send_error(&tx, api_err_to_status(e)).await,
     };
-    if !send_data(&tx, buffered).await || buffer_only {
+    for chunk in buffered {
+        if !send_data(&tx, chunk).await {
+            return;
+        }
+    }
+    if buffer_only {
         return;
     }
     let exit = manager.main_exit_status(&id);
@@ -147,7 +159,7 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
             _ = tx.closed() => return,
             chunk = live.recv() => match chunk {
                 Ok(chunk) => {
-                    if !send_data(&tx, chunk.to_vec()).await {
+                    if !send_data(&tx, chunk).await {
                         return;
                     }
                 }
@@ -161,7 +173,7 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
                 loop {
                     match live.try_recv() {
                         Ok(chunk) => {
-                            if !send_data(&tx, chunk.to_vec()).await {
+                            if !send_data(&tx, chunk).await {
                                 return;
                             }
                         }
@@ -320,11 +332,20 @@ mod tests {
 
     /// Read replies until the exit code arrives or the stream ends.
     async fn collect(replies: &mut Replies) -> (String, Option<i32>) {
-        let mut text = Vec::new();
+        let (out, err, code) = collect_streams(replies).await;
+        (out + &err, code)
+    }
+
+    /// Read replies to the end, keeping stdout and stderr apart.
+    async fn collect_streams(replies: &mut Replies) -> (String, String, Option<i32>) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
         let read = async {
             while let Some(reply) = replies.recv().await {
                 match reply.expect("reply").kind {
-                    Some(Kind::Data(data)) => text.extend(data.data),
+                    Some(Kind::Data(data)) if data.stream == AttachStream::Stderr as i32 => {
+                        err.extend(data.data)
+                    }
+                    Some(Kind::Data(data)) => out.extend(data.data),
                     Some(Kind::Exit(exit)) => return Some(exit.exit_code),
                     _ => {}
                 }
@@ -334,7 +355,11 @@ mod tests {
         let code = tokio::time::timeout(TEST_DEADLINE, read)
             .await
             .expect("stream ended in time");
-        (String::from_utf8_lossy(&text).into_owned(), code)
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+            code,
+        )
     }
 
     /// Read replies until the text holds `expected`.
@@ -592,6 +617,49 @@ mod tests {
 
         // Assert: the stream ended with the buffer and no exit code.
         assert_eq!((text.as_str(), code), ("one\n", None));
+    }
+
+    #[tokio::test]
+    async fn given_exec_writing_to_both_streams_when_attached_then_they_stay_apart() {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["cat"], false).await;
+        let start = AttachStart {
+            sandbox_id: id.clone(),
+            mode: AttachMode::Exec as i32,
+            command: vec!["sh".into(), "-c".into(), "echo out; echo err >&2".into()],
+            ..Default::default()
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+
+        // Assert
+        let (out, err, code) = collect_streams(&mut replies).await;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("out\n", "err\n", Some(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_main_process_that_wrote_to_both_streams_when_replayed_then_they_stay_apart() {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo out; echo err >&2"], false).await;
+        let exited = mgr.main_exit_status(&id).await;
+        assert!(exited.is_ok());
+        let start = AttachStart {
+            replay: true,
+            ..main_start(&id)
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+
+        // Assert
+        let (out, err, _) = collect_streams(&mut replies).await;
+        assert_eq!((out.as_str(), err.as_str()), ("out\n", "err\n"));
     }
 
     #[tokio::test]

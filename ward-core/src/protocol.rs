@@ -178,6 +178,13 @@ pub enum RawStream {
     Stderr,
 }
 
+/// A piece of process output and the stream it was written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub stream: RawStream,
+    pub bytes: bytes::Bytes,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEventKind {
     Stdout,
@@ -299,6 +306,9 @@ pub enum ApiError {
     Backend(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// `id` is unknown while the other sandbox is still being created.
+    #[error("sandbox name \"{name}\" is already in use")]
+    NameInUse { name: String, id: Option<String> },
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("ambiguous sandbox reference: {0}")]

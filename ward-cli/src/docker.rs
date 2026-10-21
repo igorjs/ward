@@ -4,11 +4,10 @@
 //! stream a process through Attach and exit with its exit code.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
+use ward_core::pb::{AttachMode, AttachStart, AttachStream, CreateSandboxRequest};
 
 use crate::attach::{self, require_exit, require_terminal};
 use crate::client::{self, Resolved};
@@ -120,12 +119,37 @@ pub async fn logs(
             .await?
             .unwrap_or(0));
     };
-    let mut buffered = Vec::new();
-    let code = attach::attach_to(&mut c, &target, start, false, &mut buffered)
-        .await?
-        .unwrap_or(0);
-    std::io::stdout().write_all(last_lines(&buffered, lines))?;
+    let mut chunks = Vec::new();
+    let code = attach::attach_with(&mut c, &target, start, false, |stream, bytes| {
+        chunks.push((stream, bytes.to_vec()));
+        Ok(())
+    })
+    .await?
+    .unwrap_or(0);
+    for (stream, bytes) in tail_chunks(&chunks, lines) {
+        attach::write_to_terminal(stream, bytes)?;
+    }
     Ok(code)
+}
+
+/// The parts of `chunks` that make up their last `lines` lines, each paired
+/// with the stream it came from.
+fn tail_chunks(chunks: &[(AttachStream, Vec<u8>)], lines: usize) -> Vec<(AttachStream, &[u8])> {
+    let all: Vec<u8> = chunks
+        .iter()
+        .flat_map(|(_, bytes)| bytes)
+        .copied()
+        .collect();
+    let mut skip = all.len() - last_lines(&all, lines).len();
+    let mut kept = Vec::new();
+    for (stream, bytes) in chunks {
+        let dropped = skip.min(bytes.len());
+        skip -= dropped;
+        if dropped < bytes.len() {
+            kept.push((*stream, &bytes[dropped..]));
+        }
+    }
+    kept
 }
 
 /// Parses `--tail`: `all` keeps every line, a number keeps that many.
@@ -165,6 +189,27 @@ mod tests {
         assert_eq!(parse_tail("3").unwrap(), Some(3));
         assert!(parse_tail("-1").is_err());
         assert!(parse_tail("few").is_err());
+    }
+
+    #[test]
+    fn given_mixed_streams_when_tailed_then_each_kept_part_keeps_its_stream() {
+        // Arrange
+        let chunks = vec![
+            (AttachStream::Stdout, b"a\nb".to_vec()),
+            (AttachStream::Stderr, b"\nc\n".to_vec()),
+        ];
+
+        // Act
+        let kept = tail_chunks(&chunks, 2);
+
+        // Assert
+        assert_eq!(
+            kept,
+            vec![
+                (AttachStream::Stdout, &b"b"[..]),
+                (AttachStream::Stderr, &b"\nc\n"[..]),
+            ]
+        );
     }
 
     #[test]

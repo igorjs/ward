@@ -87,7 +87,9 @@ fn given_two_separate_cli_processes_when_second_has_no_stored_token_then_denied(
     // tell which resource was involved.
     assertion
         .failure()
-        .stderr(predicate::str::contains("permission"))
+        .stderr(predicate::str::contains(
+            "Error response from daemon: token does not match",
+        ))
         .stderr(predicate::str::contains(&id));
 }
 
@@ -153,7 +155,9 @@ fn given_hand_crafted_wrong_token_when_exec_then_permission_denied() {
     // Assert: the daemon rejects the wrong token itself.
     assertion
         .failure()
-        .stderr(predicate::str::contains("permission"))
+        .stderr(predicate::str::contains(
+            "Error response from daemon: token does not match",
+        ))
         .stderr(predicate::str::contains(&id));
 }
 
@@ -208,6 +212,8 @@ fn given_create_sandbox_from_snapshot_without_source_token_when_called_then_perm
     // Assert: denied, naming the source sandbox whose token was missing.
     assertion
         .failure()
-        .stderr(predicate::str::contains("permission"))
+        .stderr(predicate::str::contains(
+            "Error response from daemon: token does not match",
+        ))
         .stderr(predicate::str::contains(&source_id));
 }

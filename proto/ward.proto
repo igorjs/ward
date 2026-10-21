@@ -256,6 +256,14 @@ message AttachSignal {
 
 message AttachData {
   bytes data = 1;
+  // Which stream the bytes came from. Absent or 0 means stdout, so a client
+  // or server that predates this field keeps its behavior.
+  AttachStream stream = 2;
+}
+
+enum AttachStream {
+  ATTACH_STREAM_STDOUT = 0;
+  ATTACH_STREAM_STDERR = 1;
 }
 
 message AttachExit {

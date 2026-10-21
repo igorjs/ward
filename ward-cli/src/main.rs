@@ -501,7 +501,10 @@ async fn main() {
         GENERIC_FAILURE_EXIT_CODE
     };
     if let Err(e) = run_cli(cli).await {
-        eprintln!("Error: {e:?}");
+        match client::daemon_error_line(&e) {
+            Some(line) => eprintln!("{line}"),
+            None => eprintln!("Error: {e:?}"),
+        }
         std::process::exit(failure_code);
     }
 }
