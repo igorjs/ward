@@ -256,6 +256,8 @@ const MAX_SIGNAL: i32 = 64;
 /// The pid `kill_process` accepts for the sandbox's main process.
 pub const MAIN_PROCESS_PID: &str = "0";
 
+/// How often `wait` looks at the recorded state.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 /// One reading of a running sandbox's resource use.
@@ -1565,6 +1567,57 @@ impl SandboxManager {
             Ok(status) if status != crate::protocol::SandboxStatus::Running => not_running(id),
             _ => backend_err(error),
         }
+    }
+
+    /// Block until the sandbox's main process has ended or the sandbox has
+    /// stopped, and return the exit code. A sandbox without a main process
+    /// reports 0 once it is stopped. A sandbox that ends and is removed
+    /// before the next look still reports the code its process left, and one
+    /// removed while running reports the SIGKILL code its `die` event carries.
+    pub async fn wait(&self, reference: &str) -> Result<i32> {
+        use crate::protocol::SandboxStatus as State;
+        let id = self.resolve(reference).await?;
+        let mut live: Option<watch::Receiver<Option<i32>>> = None;
+        loop {
+            let recorded = self
+                .entries
+                .read()
+                .await
+                .get(&id)
+                .map(|entry| (entry.meta.status.clone(), entry.meta.exit_code));
+            let Some((status, exit_code)) = recorded else {
+                let Some(exit) = live else {
+                    return Err(ApiError::SandboxNotFound(id));
+                };
+                let raw = *exit.borrow();
+                return Ok(raw.map_or(SIGNAL_EXIT_BASE + SIGKILL, decode_wait_status));
+            };
+            match status {
+                State::Exited | State::Stopped => return Ok(exit_code.unwrap_or(0)),
+                State::Failed => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "Container {id} failed to start"
+                    )));
+                }
+                State::Running => {
+                    // An earlier run's receiver already holds its status, so
+                    // only one still waiting belongs to the current run.
+                    if live.is_none() {
+                        live = self.running_main_exit(&id).await;
+                    }
+                }
+                State::Creating | State::Stopping => {}
+            }
+            tokio::time::sleep(WAIT_POLL).await;
+        }
+    }
+
+    /// The exit watch of the sandbox's main process, if it is still running.
+    async fn running_main_exit(&self, id: &str) -> Option<watch::Receiver<Option<i32>>> {
+        let mains = self.mains.read().await;
+        let exit = mains.get(id)?.exit.clone();
+        let running = exit.borrow().is_none();
+        running.then_some(exit)
     }
 
     async fn copy_target(&self, sandbox_id: &str, path: &str) -> Result<String> {
@@ -6232,6 +6285,90 @@ pub(crate) mod tests {
             matches!(&err, ApiError::InvalidRequest(m) if *m == want),
             "{err:?}"
         );
+    }
+
+    /// Wait on `id` in a task and return its handle.
+    #[cfg(not(feature = "krunvm"))]
+    fn spawn_wait(mgr: &Arc<SandboxManager>, id: &str) -> tokio::task::JoinHandle<Result<i32>> {
+        let (mgr, id) = (Arc::clone(mgr), id.to_string());
+        tokio::spawn(async move { mgr.wait(&id).await })
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn send_line(mgr: &SandboxManager, id: &str, line: &'static [u8]) {
+        let stdin = mgr.main_io(id).await.expect("io").stdin.expect("stdin");
+        stdin
+            .send(bytes::Bytes::from_static(line))
+            .await
+            .expect("send");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::auto_remove(true)]
+    #[case::kept(false)]
+    #[tokio::test]
+    async fn given_a_command_that_exits_4_when_waited_then_4_is_returned_even_if_it_is_removed(
+        #[case] auto_remove: bool,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sh".into(), "-c".into(), "read x; exit 4".into()],
+            auto_remove,
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        let waiter = spawn_wait(&mgr, &id);
+
+        // Act
+        send_line(&mgr, &id, b"go\n").await;
+        let got = waiter.await.expect("join").expect("wait");
+
+        // Assert
+        assert_eq!(got, 4);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_sandbox_without_command_when_waited_then_it_returns_0_only_after_stop() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[], false).await;
+        let mut waiter = tokio::spawn({
+            let (mgr, id) = (Arc::clone(&mgr), id.clone());
+            async move { (mgr.wait(&id).await, status_of(&mgr, &id).await) }
+        });
+        let early = tokio::time::timeout(WAIT_POLL * 3, &mut waiter).await;
+        assert!(early.is_err(), "wait returned while the sandbox ran");
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        let (code, status_at_return) = waiter.await.expect("join");
+
+        // Assert
+        assert_eq!(code.expect("wait"), 0);
+        assert_eq!(status_at_return, SandboxStatus::Stopped);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_an_exited_sandbox_restarted_to_exit_m_when_waited_then_m_is_returned() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x; exit $x"], false).await;
+        send_line(&mgr, &id, b"5\n").await;
+        assert_eq!(mgr.wait(&id).await.expect("first wait"), 5);
+        mgr.restart(&id).await.expect("restart");
+        let waiter = spawn_wait(&mgr, &id);
+
+        // Act
+        send_line(&mgr, &id, b"9\n").await;
+        let got = waiter.await.expect("join").expect("wait");
+
+        // Assert
+        assert_eq!(got, 9);
     }
 
     #[cfg(not(feature = "krunvm"))]
