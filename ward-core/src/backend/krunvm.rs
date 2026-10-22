@@ -1134,30 +1134,15 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
         opts.mode(0o600);
     }
     let file = opts.open(archive).map_err(BackendError::Io)?;
-    let mut builder = tar::Builder::new(file);
-    // Store symlinks as symlinks. Following them fails on the dangling links
-    // every distro rootfs has and would copy host files a link points at.
-    builder.follow_symlinks(false);
-    if rootfs.is_dir() {
-        builder
-            .append_dir_all(".", rootfs)
-            .map_err(|e| BackendError::Internal(format!("archive rootfs: {e}")))?;
-    }
-    builder
-        .finish()
-        .map_err(|e| BackendError::Internal(format!("finish archive: {e}")))?;
-    drop(builder);
+    crate::archive::pack_dir(rootfs, file)
+        .map_err(|e| BackendError::Internal(format!("archive rootfs: {e}")))?;
     Ok(std::fs::metadata(archive).map_err(BackendError::Io)?.len())
 }
 
 /// Replace `dest` with the contents of a rootfs archive.
 ///
-/// SEC-001: bare `tar::Archive::unpack` follows on-disk symlinks and can
-/// write entries outside `dest` (e.g. an archive containing a `etc ->
-/// /etc` symlink followed by files under `etc/cron.d/`). We enumerate
-/// entries explicitly, reject absolute paths, parent-traversal, and
-/// unsafe symlink/hardlink targets, then use `entry.unpack_in(dest)`
-/// (which re-validates each path against the destination root).
+/// SEC-001: entry containment, link checks and setuid stripping live in
+/// the shared `archive` module (snapshot policy).
 ///
 /// SEC-014: stage into a sibling temp dir and atomically rename on
 /// success so a partial extract does not leave `dest` half-populated.
@@ -1175,75 +1160,15 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
     std::fs::create_dir_all(&staging).map_err(BackendError::Io)?;
 
     let file = std::fs::File::open(archive).map_err(BackendError::Io)?;
-    let mut ar = tar::Archive::new(file);
-    // set_overwrite(true): tar crate replaces existing destination files
-    // instead of erroring (safe here because we extract into a fresh
-    // staging dir). set_preserve_permissions(false): drop setuid/setgid
-    // bits from tar headers. Combined with per-entry path validation
-    // below and `unpack_in` (which enforces destination containment),
-    // the extract cannot write outside `staging`.
-    ar.set_overwrite(true);
-    ar.set_preserve_permissions(false);
-
-    // Wrap the per-entry loop so we can clean up `staging` on ANY error
-    // path (including unpack_in failures) without repeating the call
-    // site at every `?`.
-    let extract_result = (|| -> Result<()> {
-        for entry in ar
-            .entries()
-            .map_err(|e| BackendError::Internal(format!("read archive: {e}")))?
-        {
-            let mut entry =
-                entry.map_err(|e| BackendError::Internal(format!("read entry: {e}")))?;
-            let path = entry
-                .path()
-                .map_err(|e| BackendError::Internal(format!("entry path: {e}")))?
-                .into_owned();
-            // Reject absolute paths and any traversal component.
-            if path.is_absolute()
-                || path.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                })
-            {
-                return Err(BackendError::Internal(format!(
-                    "snapshot archive contains unsafe path: {}",
-                    path.display()
-                )));
-            }
-            // Hardlinks resolve on the host, so their targets must stay inside
-            // the staging dir. Symlinks resolve inside the guest, where
-            // absolute and `..` targets are normal (`var/run -> /run`).
-            // Writing a later entry through a symlink is stopped by
-            // `unpack_in`, which refuses paths that leave the staging dir.
-            if entry.header().entry_type() == tar::EntryType::Link {
-                let link = entry
-                    .link_name()
-                    .map_err(|e| BackendError::Internal(format!("link target: {e}")))?
-                    .ok_or_else(|| BackendError::Internal("link entry missing target".into()))?
-                    .into_owned();
-                if link.is_absolute()
-                    || link
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return Err(BackendError::Internal(format!(
-                        "snapshot archive contains unsafe hardlink target: {}",
-                        link.display()
-                    )));
-                }
-            }
-            entry.unpack_in(&staging).map_err(|e| {
-                BackendError::Internal(format!("extract entry {}: {e}", path.display()))
-            })?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = extract_result {
+    let unpacked = crate::archive::unpack(
+        file,
+        &staging,
+        crate::archive::Policy::Snapshot,
+        &crate::archive::Limits::snapshot(),
+    );
+    if let Err(e) = unpacked {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+        return Err(BackendError::Internal(format!("snapshot archive: {e}")));
     }
 
     // SEC-014: atomic swap. Each supported platform uses its native

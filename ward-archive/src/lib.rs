@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! Safe tar unpacking shared by snapshots and file copy.
+//! Safe tar packing and unpacking shared by snapshots and file copy.
 //!
 //! Every archive is untrusted. Both policies reject absolute paths, `..`,
 //! hardlinks that leave the root and writes through symlinks, and both
@@ -14,12 +14,15 @@
 //! stream is read, before the tar crate buffers their bodies.
 
 use std::cell::RefCell;
-use std::io::{self, Read};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use rustix::fs::{self, Mode, OFlags};
+use rustix::fs::{self, AtFlags, Dir, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 /// Most entries an archive may hold.
@@ -42,13 +45,22 @@ pub const MAX_EXTENDED_HEADER_BYTES: u64 = 1024 * 1024;
 pub const SNAPSHOT_MAX_ENTRIES: u64 = 2_000_000;
 /// Most bytes a restored rootfs may hold (64 GiB).
 pub const SNAPSHOT_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-/// A rootfs file may be as large as the whole rootfs.
+/// A rootfs file may be as large as the whole rootfs, because packing it
+/// applies no per-file cap.
 pub const SNAPSHOT_MAX_FILE_BYTES: u64 = SNAPSHOT_MAX_TOTAL_BYTES;
 /// Deepest restored path: far past what `PATH_MAX` lets a guest create.
 pub const SNAPSHOT_MAX_DEPTH: usize = 4096;
 
 /// Mode bits that make a file run with another user or group.
 const SETID_MODE_BITS: u32 = 0o6000;
+/// Symlink permissions are not used on Linux, which reports them as 0o777.
+const SYMLINK_MODE: u32 = 0o777;
+/// Opens a regular file for packing: never follows a symlink and never
+/// blocks on a fifo swapped in after the type check.
+const FILE_OPEN_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NONBLOCK);
 /// Mode bits a snapshot restore keeps: permissions plus the sticky bit.
 const RESTORED_MODE_BITS: u32 = 0o1777;
 
@@ -150,8 +162,258 @@ pub fn unpack<R: Read>(reader: R, dest: &Path, policy: Policy, limits: &Limits) 
     scan(reader, policy, limits, Some(dest))
 }
 
+/// Pack the directory `src` into `writer`, storing symlinks as symlinks.
+///
+/// Following them would fail on dangling links and copy host files a link
+/// points at. The tree is walked through directory descriptors and every
+/// entry is opened without following symlinks, so one the guest swaps in
+/// mid-walk is skipped instead of read. Sockets, fifos and device nodes are
+/// skipped, as the copy policy would refuse them. A missing `src` yields an
+/// empty archive.
+pub fn pack_dir<W: Write>(src: &Path, writer: W) -> Result<W> {
+    let caps = PackCaps {
+        entries: SNAPSHOT_MAX_ENTRIES,
+        bytes: SNAPSHOT_MAX_TOTAL_BYTES,
+        depth: SNAPSHOT_MAX_DEPTH,
+    };
+    pack_dir_with(src, writer, caps, &|_| {})
+}
+
+/// Ceilings on what one pack may write, so hardlinks or holes in the source
+/// cannot expand into an unbounded archive.
+struct PackCaps {
+    entries: u64,
+    bytes: u64,
+    depth: usize,
+}
+
+/// `pack_dir` with a hook called with each entry name after its type is read
+/// and before it is opened, so tests can swap the entry in that window.
+fn pack_dir_with<W: Write>(
+    src: &Path,
+    writer: W,
+    caps: PackCaps,
+    before_open: &dyn Fn(&Path),
+) -> Result<W> {
+    let mut builder = new_builder(writer);
+    let root = match fs::open(
+        src,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Some(File::from(fd)),
+        Err(Errno::NOENT | Errno::NOTDIR) => None,
+        Err(errno) => return Err(os_error(errno)),
+    };
+    if let Some(root) = root {
+        let name = Path::new(".");
+        append_dir_header(&mut builder, &root, name)?;
+        let mut walk = Walk {
+            caps,
+            before_open,
+            entries: 0,
+            bytes: 0,
+        };
+        append_tree(&mut builder, &OwnedFd::from(root), name, &mut walk, 0)?;
+    }
+    Ok(builder.into_inner()?)
+}
+
+/// Pack the single file `src` into `writer` under the entry name `name`.
+///
+/// A symlink at `src` is refused. The size is read once at open. A file that
+/// grows is cut at that size, and one that shrinks fails the pack instead of
+/// producing a corrupt tar.
+pub fn pack_file<W: Write>(src: &Path, name: &Path, writer: W) -> Result<W> {
+    let mut builder = new_builder(writer);
+    let fd = fs::open(src, FILE_OPEN_FLAGS, Mode::empty()).map_err(os_error)?;
+    let file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        let message = format!("not a regular file: {}", src.display());
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message).into());
+    }
+    append_file(&mut builder, file, &meta, name)?;
+    Ok(builder.into_inner()?)
+}
+
+fn new_builder<W: Write>(writer: W) -> tar::Builder<W> {
+    let mut builder = tar::Builder::new(writer);
+    builder.follow_symlinks(false);
+    // Sparse headers are a GNU extension the copy policy would refuse.
+    builder.sparse(false);
+    builder
+}
+
 fn os_error(errno: Errno) -> ArchiveError {
     ArchiveError::Io(errno.into())
+}
+
+/// State of one pack walk: its ceilings and what it has written so far.
+struct Walk<'a> {
+    caps: PackCaps,
+    before_open: &'a dyn Fn(&Path),
+    entries: u64,
+    bytes: u64,
+}
+
+impl Walk<'_> {
+    /// Counts one entry of `bytes` body bytes against the ceilings.
+    fn admit(&mut self, bytes: u64) -> Result<()> {
+        self.entries += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.entries > self.caps.entries {
+            return Err(limit("entry count", self.caps.entries));
+        }
+        if self.bytes > self.caps.bytes {
+            return Err(limit("total size", self.caps.bytes));
+        }
+        Ok(())
+    }
+}
+
+fn append_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &OwnedFd,
+    name: &Path,
+    walk: &mut Walk<'_>,
+    depth: usize,
+) -> Result<()> {
+    for child in list_names(dir)? {
+        let entry_name = name.join(&child);
+        let stat = match fs::statat(dir, &child, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) => continue,
+            Err(errno) => return Err(os_error(errno)),
+        };
+        (walk.before_open)(&entry_name);
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                if let Some(sub) = open_child(dir, &child, flags)?
+                    && sub.metadata()?.is_dir()
+                {
+                    if depth >= walk.caps.depth {
+                        return Err(limit("path depth", walk.caps.depth as u64));
+                    }
+                    walk.admit(0)?;
+                    append_dir_header(builder, &sub, &entry_name)?;
+                    append_tree(builder, &OwnedFd::from(sub), &entry_name, walk, depth + 1)?;
+                }
+            }
+            FileType::Symlink => {
+                walk.admit(0)?;
+                append_symlink(builder, dir, &child, &stat, &entry_name)?;
+            }
+            FileType::RegularFile => {
+                if let Some(file) = open_child(dir, &child, FILE_OPEN_FLAGS)? {
+                    let meta = file.metadata()?;
+                    if meta.is_file() {
+                        walk.admit(meta.len())?;
+                        append_file(builder, file, &meta, &entry_name)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Names in `dir`, read up front so no directory stream stays open while the
+/// walk descends.
+fn list_names(dir: &OwnedFd) -> Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(dir).map_err(os_error)? {
+        let entry = entry.map_err(os_error)?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Opens `name` under `dir`, or returns `None` when it vanished or became a
+/// symlink or another type since it was listed.
+fn open_child(dir: &OwnedFd, name: &OsStr, flags: OFlags) -> Result<Option<File>> {
+    match fs::openat(dir, name, flags, Mode::empty()) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(Errno::LOOP | Errno::NOENT | Errno::NOTDIR | Errno::NXIO) => Ok(None),
+        Err(errno) => Err(os_error(errno)),
+    }
+}
+
+fn append_dir_header<W: Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &File,
+    name: &Path,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(&dir.metadata()?);
+    builder.append_data(&mut header, name, io::empty())?;
+    Ok(())
+}
+
+fn append_symlink<W: Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &OwnedFd,
+    child: &OsStr,
+    stat: &fs::Stat,
+    name: &Path,
+) -> Result<()> {
+    let target = match fs::readlinkat(dir, child, Vec::new()) {
+        Ok(target) => target,
+        // No longer a symlink, or gone: skip it like any other swapped entry.
+        Err(Errno::INVAL | Errno::NOENT) => return Ok(()),
+        Err(errno) => return Err(os_error(errno)),
+    };
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_mode(SYMLINK_MODE);
+    header.set_uid(stat.st_uid.into());
+    header.set_gid(stat.st_gid.into());
+    header.set_mtime(u64::try_from(stat.st_mtime).unwrap_or(0));
+    header.set_size(0);
+    builder.append_link(&mut header, name, OsStr::from_bytes(target.to_bytes()))?;
+    Ok(())
+}
+
+fn append_file<W: Write>(
+    builder: &mut tar::Builder<W>,
+    file: File,
+    meta: &std::fs::Metadata,
+    name: &Path,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(meta);
+    header.set_size(meta.len());
+    let body = ExactReader {
+        inner: file.take(meta.len()),
+        path: name.display().to_string(),
+    };
+    builder.append_data(&mut header, name, body)?;
+    Ok(())
+}
+
+/// Yields exactly the bytes its `take` promises, and fails when the file
+/// ends early so a shrunken file cannot produce a short body.
+struct ExactReader<R> {
+    inner: io::Take<R>,
+    path: String,
+}
+
+impl<R: Read> Read for ExactReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 && self.inner.limit() > 0 && !buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("file shrank while it was packed: {}", self.path),
+            ));
+        }
+        Ok(n)
+    }
 }
 
 /// Where the guard leaves the reason it refused the stream.
@@ -947,15 +1209,116 @@ mod tests {
         assert!(matches!(result, Err(ArchiveError::ForbiddenType(_))));
     }
 
+    /// Length of the file with holes, in bytes.
+    const HOLE_BYTES: u64 = 1024 * 1024;
+    /// Length of the file packed while it changes, large enough to span reads.
+    const ORIGINAL_BYTES: usize = 1024 * 1024;
+
+    /// How the file changes once packing has started.
+    #[derive(Clone, Copy)]
+    enum Change {
+        Grow,
+        Shrink,
+    }
+
+    /// Packs a file whose on-disk length changes after the size is read,
+    /// by swapping the contents from inside the writer.
+    fn pack_changing(change: Change) -> (tempfile::TempDir, Result<Vec<u8>>) {
+        struct Swap {
+            out: Vec<u8>,
+            path: PathBuf,
+            change: Change,
+            swapped: bool,
+        }
+        impl Write for Swap {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                if !self.swapped && self.out.len() >= BLOCK_SIZE {
+                    self.swapped = true;
+                    let bytes = match self.change {
+                        Change::Grow => vec![b'g'; 2 * ORIGINAL_BYTES],
+                        Change::Shrink => vec![b's'; 10],
+                    };
+                    std::fs::write(&self.path, bytes)?;
+                }
+                self.out.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, vec![b'o'; ORIGINAL_BYTES]).unwrap();
+        let swap = Swap {
+            out: Vec::new(),
+            path: path.clone(),
+            change,
+            swapped: false,
+        };
+        let result = pack_file(&path, Path::new("f"), swap).map(|s| s.out);
+        (dir, result)
+    }
+
+    #[test]
+    fn given_a_file_that_grows_while_packed_when_read_back_then_the_tar_holds_the_original_size() {
+        // Arrange / Act
+        let (_dir, packed) = pack_changing(Change::Grow);
+
+        // Assert
+        let (dest, result) = run(&packed.unwrap(), Policy::Copy, &Limits::default());
+        result.unwrap();
+        assert_eq!(
+            std::fs::metadata(dest.path().join("f")).unwrap().len(),
+            ORIGINAL_BYTES as u64
+        );
+    }
+
+    #[test]
+    fn given_a_file_that_shrinks_while_packed_when_packing_then_it_fails_with_a_clear_error() {
+        // Arrange / Act
+        let (_dir, packed) = pack_changing(Change::Shrink);
+
+        // Assert
+        let message = packed.unwrap_err().to_string();
+        assert!(message.contains("shrank"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_a_dir_with_a_socket_and_a_file_with_holes_when_packed_then_the_copy_policy_accepts_it()
+    {
+        // Arrange
+        let src = tempfile::tempdir().unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(src.path().join("sock")).unwrap();
+        let holes = src.path().join("holes");
+        let file = std::fs::File::create(&holes).unwrap();
+        file.set_len(HOLE_BYTES).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&file, b"tail", HOLE_BYTES).unwrap();
+
+        // Act
+        let packed = pack_dir(src.path(), Vec::new()).unwrap();
+        let (dest, result) = run(&packed, Policy::Copy, &Limits::default());
+
+        // Assert
+        result.unwrap();
+        assert!(!dest.path().join("sock").exists());
+        let restored = std::fs::read(dest.path().join("holes")).unwrap();
+        assert_eq!(restored.len() as u64, HOLE_BYTES + 4);
+        assert!(restored.ends_with(b"tail"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn given_a_sticky_directory_when_restored_with_the_snapshot_policy_then_the_sticky_bit_stays() {
         // Arrange
         use std::os::unix::fs::PermissionsExt;
-        let packed = build(vec![
-            (header("tmp", tar::EntryType::Directory, 0o1777, 0), vec![]),
-            file("tmp/f", 1),
-        ]);
+        let src = tempfile::tempdir().unwrap();
+        let tmp = src.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        std::fs::write(tmp.join("f"), b"x").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let packed = pack_dir(src.path(), Vec::new()).unwrap();
 
         // Act
         let (dest, result) = run(&packed, Policy::Snapshot, &Limits::snapshot());
@@ -967,6 +1330,107 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o7777, 0o1777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_a_tree_with_a_dangling_symlink_when_packed_and_unpacked_then_the_link_is_kept() {
+        // Arrange
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("f"), b"data").unwrap();
+        std::os::unix::fs::symlink("/nowhere", src.path().join("l")).unwrap();
+
+        // Act
+        let packed = pack_dir(src.path(), Vec::new()).unwrap();
+        let (dest, result) = run(&packed, Policy::Snapshot, &Limits::default());
+
+        // Assert
+        result.unwrap();
+        assert_eq!(std::fs::read(dest.path().join("f")).unwrap(), b"data");
+        assert_eq!(
+            std::fs::read_link(dest.path().join("l")).unwrap(),
+            Path::new("/nowhere")
+        );
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::file(false)]
+    #[case::directory(true)]
+    fn given_an_entry_swapped_for_a_symlink_after_listing_when_packed_then_the_outside_content_is_not_archived(
+        #[case] is_dir: bool,
+    ) {
+        // Arrange
+        let base = tempfile::tempdir().unwrap();
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"top-secret").unwrap();
+        let src = base.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        if is_dir {
+            std::fs::create_dir(src.join("victim")).unwrap();
+        } else {
+            std::fs::write(src.join("victim"), b"inside").unwrap();
+        }
+        let target = if is_dir {
+            outside.clone()
+        } else {
+            outside.join("secret")
+        };
+        let swap = |name: &Path| {
+            if name.ends_with("victim") {
+                let victim = src.join("victim");
+                if is_dir {
+                    std::fs::remove_dir(&victim).unwrap();
+                } else {
+                    std::fs::remove_file(&victim).unwrap();
+                }
+                std::os::unix::fs::symlink(&target, &victim).unwrap();
+            }
+        };
+
+        // Act
+        let packed = pack_dir_with(&src, Vec::new(), caps(u64::MAX, u64::MAX, 8), &swap).unwrap();
+
+        // Assert
+        let (dest, result) = run(&packed, Policy::Snapshot, &Limits::default());
+        result.unwrap();
+        assert!(!dest.path().join("victim").exists(), "swapped entry kept");
+        assert!(!packed.windows(10).any(|w| w == b"top-secret"));
+    }
+
+    fn caps(entries: u64, bytes: u64, depth: usize) -> PackCaps {
+        PackCaps {
+            entries,
+            bytes,
+            depth,
+        }
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    #[case::entries(caps(2, u64::MAX, 8), "entry count")]
+    #[case::bytes(caps(u64::MAX, 5, 8), "total size")]
+    #[case::depth(caps(u64::MAX, u64::MAX, 1), "path depth")]
+    fn given_a_tree_past_a_pack_cap_when_packed_then_it_fails_with_a_limit_error(
+        #[case] caps: PackCaps,
+        #[case] what: &str,
+    ) {
+        // Arrange
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("a/b")).unwrap();
+        std::fs::write(src.path().join("a/b/f"), b"123456").unwrap();
+        std::fs::write(src.path().join("g"), b"x").unwrap();
+
+        // Act
+        let result = pack_dir_with(src.path(), Vec::new(), caps, &|_| {});
+
+        // Assert
+        assert!(
+            matches!(result, Err(ArchiveError::LimitExceeded { what: w, .. }) if w == what),
+            "{:?}",
+            result.err()
+        );
     }
 
     #[cfg(unix)]
