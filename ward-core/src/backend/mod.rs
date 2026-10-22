@@ -22,6 +22,8 @@ pub enum BackendError {
     Exec(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidArgument(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -49,6 +51,13 @@ pub enum ProcessControl {
     Resize { rows: u32, cols: u32 },
     /// Deliver a signal number to the process.
     Signal(i32),
+}
+
+/// The processes of a sandbox: one row per process, one field per title.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessTable {
+    pub titles: Vec<String>,
+    pub rows: Vec<Vec<String>>,
 }
 
 /// Handle to a running process inside a sandbox.
@@ -160,6 +169,12 @@ pub trait Backend: Send + Sync + 'static {
         sandbox_id: &str,
         path: &str,
     ) -> Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>;
+
+    // -- Introspection --------------------------------------------------
+
+    /// List the processes running inside the guest, as `ps` with `ps_args`
+    /// would. The guest refuses options it does not support.
+    async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<ProcessTable>;
 
     // -- Snapshots ------------------------------------------------------
 

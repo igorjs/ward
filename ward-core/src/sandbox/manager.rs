@@ -33,6 +33,7 @@ type Result<T> = std::result::Result<T, ApiError>;
 fn backend_err(e: BackendError) -> ApiError {
     match e {
         BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
+        BackendError::InvalidArgument(message) => ApiError::InvalidRequest(message),
         other => ApiError::Backend(other.to_string()),
     }
 }
@@ -1440,6 +1441,20 @@ impl SandboxManager {
         Ok(copy::checked_relay(source, limits, target))
     }
 
+    /// List the processes of a running sandbox. `ps_args` are the options
+    /// `docker top` passes to `ps`; the guest agent checks them.
+    pub async fn top(
+        &self,
+        sandbox_id: &str,
+        ps_args: &[String],
+    ) -> Result<crate::backend::ProcessTable> {
+        let id = self.resolve(sandbox_id).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            return Err(not_running(&id));
+        }
+        self.backend.top(&id, ps_args).await.map_err(backend_err)
+    }
+
     async fn copy_target(&self, sandbox_id: &str, path: &str) -> Result<String> {
         crate::validate::guest_path(path)?;
         let id = self.resolve(sandbox_id).await?;
@@ -1989,7 +2004,7 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
 }
 
 fn not_running(id: &str) -> ApiError {
-    ApiError::InvalidRequest(format!("sandbox {id} is not running"))
+    ApiError::InvalidRequest(format!("Container {id} is not running"))
 }
 
 fn no_main_process(id: &str) -> ApiError {
@@ -4402,6 +4417,13 @@ pub(crate) mod tests {
         {
             self.inner.copy_from(sandbox_id, path).await
         }
+        async fn top(
+            &self,
+            sandbox_id: &str,
+            ps_args: &[String],
+        ) -> crate::backend::Result<crate::backend::ProcessTable> {
+            self.inner.top(sandbox_id, ps_args).await
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -5018,6 +5040,21 @@ pub(crate) mod tests {
         ) -> crate::backend::Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>
         {
             self.inner.copy_from(sandbox_id, path).await
+        }
+        async fn top(
+            &self,
+            _sandbox_id: &str,
+            ps_args: &[String],
+        ) -> crate::backend::Result<crate::backend::ProcessTable> {
+            if ps_args.iter().any(|a| a == TOP_REFUSED_ARG) {
+                return Err(crate::backend::BackendError::InvalidArgument(
+                    TOP_REFUSAL.into(),
+                ));
+            }
+            Ok(crate::backend::ProcessTable {
+                titles: vec!["PID".into(), "CMD".into()],
+                rows: vec![vec![TOP_PID.into(), TOP_CMD.into()]],
+            })
         }
         async fn create_snapshot(
             &self,
@@ -5909,5 +5946,66 @@ pub(crate) mod tests {
         // Assert
         assert_eq!(concat(&buffered), b"hi\n");
         assert_eq!(status, 3 << WAIT_STATUS_EXIT_SHIFT);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_PID: &str = "42";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_CMD: &str = "sleep 600";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_REFUSED_ARG: &str = "--sort=pid";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_REFUSAL: &str = "unsupported ps option: --sort=pid";
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_top_then_the_guest_table_is_returned() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        let table = mgr.top(&id, &[]).await.expect("top");
+
+        // Assert
+        assert_eq!(table.titles, ["PID", "CMD"]);
+        assert_eq!(table.rows, [[TOP_PID, TOP_CMD]]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_stopped_sandbox_when_top_then_docker_not_running_error() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        let err = mgr.top(&id, &[]).await.expect_err("not running");
+
+        // Assert
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if *m == format!("Container {id} is not running"))
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_backend_that_refuses_the_ps_options_when_top_then_invalid_request() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        let err = mgr
+            .top(&id, &[TOP_REFUSED_ARG.to_string()])
+            .await
+            .expect_err("refused");
+
+        // Assert
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if m == TOP_REFUSAL),
+            "{err:?}"
+        );
     }
 }

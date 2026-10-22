@@ -29,6 +29,7 @@ message Request {
     GetArchive get_archive = 8;
     ArchiveChunk archive_chunk = 9;
     ArchiveEnd archive_end = 10;
+    Top top = 11;
   }
 }
 
@@ -77,6 +78,8 @@ message Event {
     ArchiveChunk archive_chunk = 6;
     ArchiveDone archive_done = 7;
     ArchiveError archive_error = 8;
+    Processes processes = 9;
+    TopError top_error = 10;
   }
 }
 
@@ -111,6 +114,30 @@ message ArchiveDone {}
 // Agent -> daemon: the transfer failed; the message says why.
 message ArchiveError {
   string message = 1;
+}
+
+// Must be the first and only frame on a connection. The agent answers with
+// one Processes event built from the guest's /proc, or a TopError when it
+// refuses ps_args, then closes.
+message Top {
+  // ps-style options, empty for `ps -ef`.
+  repeated string ps_args = 1;
+}
+
+// Agent -> daemon: the ps_args of a Top are not supported.
+message TopError {
+  string message = 1;
+}
+
+// Agent -> daemon: the guest's processes, one row per process, each row with
+// one field per title.
+message Processes {
+  repeated string titles = 1;
+  repeated ProcessRow rows = 2;
+}
+
+message ProcessRow {
+  repeated string fields = 1;
 }
 
 // Answer to Ping.

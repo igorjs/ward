@@ -14,6 +14,7 @@ mod resources;
 mod socket;
 mod terminal;
 mod tokens;
+mod top;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -321,6 +322,20 @@ enum Commands {
         /// Accepted for `docker cp` scripts; `ward cp` prints no progress.
         #[arg(short = 'q', long)]
         quiet: bool,
+    },
+
+    /// List the processes of a running sandbox, as `docker top` does.
+    ///
+    /// Options after the sandbox are ps-style: none (as `ps -ef`), aux, axu,
+    /// -e, -A, -f, -ef, -Af, -o or -eo with a column list (pid, ppid, uid,
+    /// user, comm, args, cmd, time, stime, tty, stat, vsz, rss, pcpu, pmem,
+    /// c), -u USER and -p PID. Times are UTC.
+    Top {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// Options for `ps`.
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        ps_args: Vec<String>,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -967,6 +982,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             cp::run(&socket_path, &token_store, &src, &dest, follow_link).await?;
         }
 
+        Commands::Top { reference, ps_args } => {
+            top::run(&socket_path, &token_store, &reference, ps_args, json).await?;
+        }
+
         Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
@@ -1364,6 +1383,27 @@ mod tests {
                 );
             }
             other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::none(&["ward", "top", "web1"], &[])]
+    #[case::ef(&["ward", "top", "web1", "-ef"], &["-ef"])]
+    #[case::aux(&["ward", "top", "web1", "aux"], &["aux"])]
+    fn given_top_with_ps_options_when_parsed_then_they_follow_the_sandbox(
+        #[case] args: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Top { reference, ps_args } => {
+                assert_eq!(reference, "web1");
+                assert_eq!(ps_args, expected);
+            }
+            other => panic!("expected Top, got {other:?}"),
         }
     }
 

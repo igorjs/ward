@@ -27,7 +27,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs", "pty", "termios", "process"] }
+rustix = { version = "1", features = ["fs", "pty", "termios", "process", "param"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"

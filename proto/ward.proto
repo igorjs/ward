@@ -36,6 +36,9 @@ service Ward {
   // checks each entry before it forwards any byte from that entry's header
   // on; a refused tar ends the stream with an error.
   rpc CopyFrom(CopyFromRequest) returns (stream CopyFromChunk);
+  // List the processes of a running sandbox, like `docker top`. The token
+  // travels in call metadata.
+  rpc Top(TopRequest) returns (TopResponse);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -336,6 +339,29 @@ message CopyFromRequest {
 
 message CopyFromChunk {
   bytes data = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Top messages
+// ---------------------------------------------------------------------------
+
+message TopRequest {
+  string sandbox_id = 1;
+  // ps-style options as `docker top` takes them: none (`-ef`), aux, axu, -e,
+  // -A, -f, -ef, -Af, -o/-eo LIST (pid, ppid, uid, user, comm, args, cmd,
+  // time, stime, tty, stat, vsz, rss, pcpu, pmem, c), -u USER, -p PID. Times
+  // are UTC. Any other option is refused with INVALID_ARGUMENT.
+  repeated string ps_args = 2;
+}
+
+message TopResponse {
+  repeated string titles = 1;
+  repeated TopProcess processes = 2;
+}
+
+// One process, with one field per title.
+message TopProcess {
+  repeated string fields = 1;
 }
 
 // ---------------------------------------------------------------------------

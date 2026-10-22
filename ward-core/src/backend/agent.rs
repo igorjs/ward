@@ -420,6 +420,38 @@ where
     }
 }
 
+/// Ask the agent for the guest's process table, as `ps` with `ps_args`.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` when the agent refuses `ps_args`, and an
+/// error if the connection fails or the agent answers with anything else.
+pub async fn top<S>(stream: S, ps_args: &[String]) -> super::Result<super::ProcessTable>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::Top(proto::Top {
+            ps_args: ps_args.to_vec(),
+        })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    let frame = read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::Processes(list))) => Ok(super::ProcessTable {
+            titles: list.titles,
+            rows: list.rows.into_iter().map(|row| row.fields).collect(),
+        }),
+        Ok(Some(event::Kind::TopError(refusal))) => {
+            Err(super::BackendError::InvalidArgument(refusal.message))
+        }
+        _ => Err(protocol_error("agent answered a Top with another event").into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,6 +983,88 @@ mod tests {
                 String::from_utf8_lossy(&output).contains(&size),
                 "got {output:?}"
             );
+        }
+    }
+
+    const TOP_ARGS: [&str; 2] = ["-o", "pid"];
+    const REFUSAL: &str = "unsupported ps option: -x";
+
+    fn top_args() -> Vec<String> {
+        TOP_ARGS.map(String::from).to_vec()
+    }
+
+    /// Fake guest for `top`: reads the opening frame, then sends `reply`.
+    async fn top_guest<S>(stream: S, reply: Option<Event>)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut r, mut w) = split(stream);
+        let frame = read_frame(&mut r).await.unwrap().expect("top frame");
+        let req = Request::decode(&frame[..]).unwrap();
+        let Some(request::Kind::Top(top)) = req.kind else {
+            panic!("expected a Top frame");
+        };
+        assert_eq!(top.ps_args, TOP_ARGS);
+        if let Some(event) = reply {
+            write_frame(&mut w, &encode(&event)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_guest_process_list_when_top_then_titles_and_rows_come_back() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let list = proto::Processes {
+            titles: vec!["PID".into(), "CMD".into()],
+            rows: vec![proto::ProcessRow {
+                fields: vec!["7".into(), "sleep 600".into()],
+            }],
+        };
+        let reply = Event {
+            kind: Some(event::Kind::Processes(list)),
+        };
+        tokio::spawn(top_guest(guest, Some(reply)));
+
+        // Act
+        let table = top(daemon, &top_args()).await.expect("top");
+
+        // Assert
+        assert_eq!(table.titles, ["PID", "CMD"]);
+        assert_eq!(table.rows, [["7", "sleep 600"]]);
+    }
+
+    #[rstest::rstest]
+    #[case::other_event(Some(event::Kind::Pong(proto::Pong {})), true)]
+    #[case::hang_up(None, true)]
+    #[case::refusal(
+        Some(event::Kind::TopError(proto::TopError { message: REFUSAL.into() })),
+        false
+    )]
+    #[tokio::test]
+    async fn given_a_guest_that_does_not_list_when_top_then_error(
+        #[case] reply: Option<event::Kind>,
+        #[case] protocol_failure: bool,
+    ) {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(top_guest(
+            guest,
+            reply.map(|kind| Event { kind: Some(kind) }),
+        ));
+
+        // Act
+        let err = top(daemon, &top_args()).await.expect_err("no list");
+
+        // Assert
+        use crate::backend::BackendError;
+        match err {
+            BackendError::Io(e) if protocol_failure => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            }
+            BackendError::InvalidArgument(message) if !protocol_failure => {
+                assert_eq!(message, REFUSAL);
+            }
+            other => panic!("unexpected error: {other:?}"),
         }
     }
 }
