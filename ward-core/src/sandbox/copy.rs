@@ -44,6 +44,7 @@ impl GuestTarget {
     pub(super) fn backend_failure(&self, e: BackendError) -> ApiError {
         match e {
             BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
+            BackendError::InvalidArgument(detail) => ApiError::InvalidRequest(detail),
             BackendError::Exec(detail) if detail.contains(MISSING_PATH_TEXT) => self.missing(),
             BackendError::Exec(detail) => ApiError::InvalidRequest(detail),
             other => ApiError::Backend(other.to_string()),

@@ -19,8 +19,8 @@ use crate::pb::{
     ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
     Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
     RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest,
-    StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest,
-    TopResponse, VolumeInfo, WriteStdinRequest,
+    StatsRequest, StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest,
+    TopProcess, TopRequest, TopResponse, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -794,6 +794,29 @@ impl Ward for WardGrpcServer {
                 .into_iter()
                 .map(|fields| TopProcess { fields })
                 .collect(),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.stats",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn stats(
+        &self,
+        request: Request<StatsRequest>,
+    ) -> Result<Response<StatsResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let stats = self.sandbox.stats(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(StatsResponse {
+            cpu_nanos: stats.cpu_nanos,
+            online_cpus: stats.online_cpus,
+            mem_used_bytes: stats.mem_used_bytes,
+            mem_limit_bytes: stats.mem_limit_bytes,
+            pids: stats.pids,
+            read_at: Some(prost_types::Timestamp::from(stats.read_at)),
         }))
     }
 

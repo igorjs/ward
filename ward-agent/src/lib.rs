@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 
 mod archive;
 mod pty;
+mod stats;
 mod top;
 
 #[allow(clippy::doc_lazy_continuation)]
@@ -212,7 +213,7 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
 /// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream, and
-/// `Top` lists the guest's processes.
+/// `Top` lists the guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -251,10 +252,14 @@ where
             let mut writer = writer;
             return answer_top(&top.ps_args, &mut writer).await;
         }
+        Some(request::Kind::Stats(_)) => {
+            let mut writer = writer;
+            return answer_stats(Path::new(PROC_ROOT), &mut writer).await;
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive, GetArchive or Top",
+                "first frame must be Exec, Ping, PutArchive, GetArchive, Top or Stats",
             ));
         }
     };
@@ -275,6 +280,16 @@ async fn answer_top<W: AsyncWrite + Unpin>(
         Err(message) => event::Kind::TopError(proto::TopError { message }),
     };
     let event = Event { kind: Some(kind) };
+    write_frame(writer, &encode_event(&event)).await
+}
+
+async fn answer_stats<W: AsyncWrite + Unpin>(
+    proc_root: &Path,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let event = Event {
+        kind: Some(event::Kind::StatsSample(stats::sample(proc_root)?)),
+    };
     write_frame(writer, &encode_event(&event)).await
 }
 
@@ -423,7 +438,8 @@ async fn apply_request(
         | request::Kind::GetArchive(_)
         | request::Kind::ArchiveChunk(_)
         | request::Kind::ArchiveEnd(_)
-        | request::Kind::Top(_) => {}
+        | request::Kind::Top(_)
+        | request::Kind::Stats(_) => {}
     }
 }
 
@@ -622,7 +638,8 @@ mod tests {
                     | event::Kind::ArchiveDone(_)
                     | event::Kind::ArchiveError(_)
                     | event::Kind::Processes(_)
-                    | event::Kind::TopError(_),
+                    | event::Kind::TopError(_)
+                    | event::Kind::StatsSample(_),
                 )
                 | None => {}
             }

@@ -711,6 +711,11 @@ impl Backend for KrunvmBackend {
         super::agent::top(stream, ps_args).await
     }
 
+    async fn stats(&self, sandbox_id: &str) -> Result<super::GuestStats> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::stats(stream).await
+    }
+
     /// Exec a command inside a running sandbox.
     #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
     async fn exec(
@@ -866,7 +871,7 @@ impl KrunvmBackend {
             .await
             .map_err(|e| BackendError::Internal(e.to_string()));
         }
-        Err(BackendError::Exec(
+        Err(BackendError::InvalidArgument(
             "this needs a sandbox booted as a microVM".into(),
         ))
     }

@@ -761,3 +761,37 @@ fn given_a_running_guest_process_when_top_then_one_row_has_its_pid_and_command()
     assert_eq!(rows.len(), 1, "{out}");
     assert_eq!(rows[0][7..], ["sleep", "31337"]);
 }
+
+const GUEST_BUSY_SECONDS: u64 = 2;
+
+/// One `ward stats --no-stream` reading: a counter from its JSON object.
+fn stat(d: &Daemon, id: &str, key: &str) -> u64 {
+    let mut cmd = d.cli();
+    cmd.args(["--json", "stats", "--no-stream", id]);
+    let value: serde_json::Value = serde_json::from_str(run_ok(cmd).trim()).expect("stats json");
+    value[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no {key} in {value}"))
+}
+
+#[test]
+fn given_a_guest_busy_loop_when_stats_read_twice_then_cpu_time_grew_within_wall_time_times_cpus() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    let started = Instant::now();
+    let before = stat(&d, &id, "CPUNanos");
+
+    let busy = format!(
+        "end=$(( $(date +%s) + {GUEST_BUSY_SECONDS} )); while [ $(date +%s) -lt $end ]; do :; done"
+    );
+    assert_eq!(sh(&d, &id, &busy).exit, 0);
+    let grew = stat(&d, &id, "CPUNanos") - before;
+
+    let ceiling = started.elapsed().as_nanos() * u128::from(stat(&d, &id, "OnlineCPUs"));
+    assert!(grew > 0, "cpu time did not grow");
+    assert!(
+        u128::from(grew) <= ceiling,
+        "{grew} ns of cpu over {ceiling}"
+    );
+}

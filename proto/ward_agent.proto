@@ -30,6 +30,7 @@ message Request {
     ArchiveChunk archive_chunk = 9;
     ArchiveEnd archive_end = 10;
     Top top = 11;
+    Stats stats = 12;
   }
 }
 
@@ -80,6 +81,7 @@ message Event {
     ArchiveError archive_error = 8;
     Processes processes = 9;
     TopError top_error = 10;
+    StatsSample stats_sample = 11;
   }
 }
 
@@ -138,6 +140,21 @@ message Processes {
 
 message ProcessRow {
   repeated string fields = 1;
+}
+
+// Must be the first and only frame on a connection. The agent answers with
+// one StatsSample read from the guest's /proc, then closes.
+message Stats {}
+
+// Agent -> daemon: guest-wide counters at one instant.
+message StatsSample {
+  // Cumulative CPU time all processes have used, in nanoseconds.
+  uint64 cpu_nanos = 1;
+  uint32 online_cpus = 2;
+  uint64 mem_total_bytes = 3;
+  // Memory that can be given to a process without swapping.
+  uint64 mem_available_bytes = 4;
+  uint32 pids = 5;
 }
 
 // Answer to Ping.

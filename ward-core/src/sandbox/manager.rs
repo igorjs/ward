@@ -253,6 +253,19 @@ const MAX_SIGNAL: i32 = 64;
 /// The pid `kill_process` accepts for the sandbox's main process.
 pub const MAIN_PROCESS_PID: &str = "0";
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// One reading of a running sandbox's resource use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxStats {
+    pub cpu_nanos: u64,
+    pub online_cpus: u32,
+    pub mem_used_bytes: u64,
+    pub mem_limit_bytes: u64,
+    pub pids: u32,
+    pub read_at: std::time::SystemTime,
+}
+
 /// Turn a raw `wait(2)` status into the exit code a shell would report.
 pub(crate) fn decode_wait_status(raw: i32) -> i32 {
     match raw & WAIT_STATUS_SIGNAL_MASK {
@@ -1453,6 +1466,52 @@ impl SandboxManager {
             return Err(not_running(&id));
         }
         self.backend.top(&id, ps_args).await.map_err(backend_err)
+    }
+
+    /// Read the resource use of a running sandbox. The limit is the
+    /// configured memory, or the guest's total memory when none is set.
+    pub async fn stats(&self, sandbox_id: &str) -> Result<SandboxStats> {
+        let id = self.resolve(sandbox_id).await?;
+        let memory_mb = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+            if entry.meta.status != crate::protocol::SandboxStatus::Running {
+                return Err(not_running(&id));
+            }
+            entry.meta.options.resources.memory_mb
+        };
+        // Stamped before the call so the time matches the counters read.
+        let read_at = std::time::SystemTime::now();
+        let guest = match self.backend.stats(&id).await {
+            Ok(guest) => guest,
+            Err(e) => return Err(self.stats_failure(&id, e).await),
+        };
+        let configured = u64::from(memory_mb).saturating_mul(BYTES_PER_MIB);
+        Ok(SandboxStats {
+            cpu_nanos: guest.cpu_nanos,
+            online_cpus: guest.online_cpus,
+            mem_used_bytes: guest
+                .mem_total_bytes
+                .saturating_sub(guest.mem_available_bytes),
+            mem_limit_bytes: if configured > 0 {
+                configured
+            } else {
+                guest.mem_total_bytes
+            },
+            pids: guest.pids,
+            read_at,
+        })
+    }
+
+    /// A sandbox that stopped while it was being read is not running, not a
+    /// backend failure.
+    async fn stats_failure(&self, id: &str, error: BackendError) -> ApiError {
+        match self.recorded_status(id).await {
+            Ok(status) if status != crate::protocol::SandboxStatus::Running => not_running(id),
+            _ => backend_err(error),
+        }
     }
 
     async fn copy_target(&self, sandbox_id: &str, path: &str) -> Result<String> {
@@ -4424,6 +4483,12 @@ pub(crate) mod tests {
         ) -> crate::backend::Result<crate::backend::ProcessTable> {
             self.inner.top(sandbox_id, ps_args).await
         }
+        async fn stats(
+            &self,
+            sandbox_id: &str,
+        ) -> crate::backend::Result<crate::backend::GuestStats> {
+            self.inner.stats(sandbox_id).await
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -5056,6 +5121,12 @@ pub(crate) mod tests {
                 rows: vec![vec![TOP_PID.into(), TOP_CMD.into()]],
             })
         }
+        async fn stats(
+            &self,
+            _sandbox_id: &str,
+        ) -> crate::backend::Result<crate::backend::GuestStats> {
+            Ok(STATS_GUEST)
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -5085,6 +5156,15 @@ pub(crate) mod tests {
     const TEST_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(100);
     #[cfg(not(feature = "krunvm"))]
     const TEST_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    #[cfg(not(feature = "krunvm"))]
+    const STATS_GUEST: crate::backend::GuestStats = crate::backend::GuestStats {
+        cpu_nanos: 3_000_000_000,
+        online_cpus: 2,
+        mem_total_bytes: 512 * BYTES_PER_MIB,
+        mem_available_bytes: 112 * BYTES_PER_MIB,
+        pids: 9,
+    };
 
     #[cfg(not(feature = "krunvm"))]
     const TEST_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -6005,6 +6085,86 @@ pub(crate) mod tests {
         // Assert
         assert!(
             matches!(&err, ApiError::InvalidRequest(m) if m == TOP_REFUSAL),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::none_configured(0, STATS_GUEST.mem_total_bytes)]
+    #[case::configured(256, 256 * BYTES_PER_MIB)]
+    #[tokio::test]
+    async fn given_a_memory_setting_when_stats_then_used_memory_and_the_limit_follow_it(
+        #[case] memory_mb: u32,
+        #[case] limit: u64,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sh".into(), "-c".into(), "read x".into()],
+            resources: Some(PbResourceLimits {
+                memory_mb,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        let stats = mgr.stats(&id).await.expect("stats");
+
+        // Assert
+        assert_eq!(stats.mem_limit_bytes, limit);
+        assert_eq!(stats.mem_used_bytes, 400 * BYTES_PER_MIB);
+        assert_eq!(stats.cpu_nanos, STATS_GUEST.cpu_nanos);
+        assert_eq!(stats.pids, STATS_GUEST.pids);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::stopped_meanwhile(true)]
+    #[case::still_running(false)]
+    #[tokio::test]
+    async fn given_a_backend_failure_when_stats_then_a_stopped_sandbox_is_not_running(
+        #[case] stop: bool,
+    ) {
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        if stop {
+            mgr.stop(&id).await.expect("stop");
+        }
+
+        let err = mgr
+            .stats_failure(&id, BackendError::Exec("agent hung up".into()))
+            .await;
+
+        assert_eq!(matches!(err, ApiError::InvalidRequest(_)), stop, "{err:?}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_sandbox_that_is_not_a_microvm_when_stats_then_an_invalid_request() {
+        let mgr = build_manager(2);
+        let id = mgr.create(create_req("alpine"), "").await.unwrap().id;
+
+        let err = mgr.stats(&id).await.expect_err("no agent");
+
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_stopped_sandbox_when_stats_then_docker_not_running_error() {
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        let err = mgr.stats(&id).await.expect_err("not running");
+
+        let want = format!("Container {id} is not running");
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if *m == want),
             "{err:?}"
         );
     }

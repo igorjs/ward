@@ -452,6 +452,41 @@ where
     }
 }
 
+/// How long the agent has to answer a Stats before the poll gives up.
+const STATS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the agent for the guest's CPU, memory and process counters.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or the agent answers with
+/// anything but a sample.
+pub async fn stats<S>(stream: S) -> super::Result<super::GuestStats>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::Stats(proto::Stats {})),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    let reply = tokio::time::timeout(STATS_REPLY_TIMEOUT, read_frame(&mut reader))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "agent did not answer"))?;
+    let frame =
+        reply?.ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::StatsSample(sample))) => Ok(super::GuestStats {
+            cpu_nanos: sample.cpu_nanos,
+            online_cpus: sample.online_cpus,
+            mem_total_bytes: sample.mem_total_bytes,
+            mem_available_bytes: sample.mem_available_bytes,
+            pids: sample.pids,
+        }),
+        _ => Err(protocol_error("agent answered a Stats with another event").into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1100,45 @@ mod tests {
                 assert_eq!(message, REFUSAL);
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::sample(Some(event::Kind::StatsSample(proto::StatsSample {
+        online_cpus: 2,
+        pids: 7,
+        ..Default::default()
+    })))]
+    #[case::other_event(Some(event::Kind::Pong(proto::Pong {})))]
+    #[case::hang_up(None)]
+    #[tokio::test]
+    async fn given_a_guest_reply_when_stats_then_a_sample_or_invalid_data(
+        #[case] reply: Option<event::Kind>,
+    ) {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let is_sample = matches!(reply, Some(event::Kind::StatsSample(_)));
+        tokio::spawn(async move {
+            let (mut r, mut w) = split(guest);
+            let frame = read_frame(&mut r).await.unwrap().expect("stats frame");
+            let req = Request::decode(&frame[..]).unwrap();
+            assert!(matches!(req.kind, Some(request::Kind::Stats(_))));
+            if let Some(kind) = reply {
+                let event = Event { kind: Some(kind) };
+                write_frame(&mut w, &encode(&event)).await.unwrap();
+            }
+        });
+
+        // Act
+        let result = stats(daemon).await;
+
+        // Assert
+        match result {
+            Ok(got) if is_sample => assert_eq!((got.online_cpus, got.pids), (2, 7)),
+            Err(crate::backend::BackendError::Io(e)) if !is_sample => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 }
