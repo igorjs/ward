@@ -14,6 +14,7 @@
 //! stream is read, before the tar crate buffers their bodies.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -159,7 +160,29 @@ struct Totals {
 /// Entries before a failing one stay on disk, so callers that need all or
 /// nothing unpack into a staging directory.
 pub fn unpack<R: Read>(reader: R, dest: &Path, policy: Policy, limits: &Limits) -> Result<()> {
-    scan(reader, policy, limits, Some(dest))
+    scan(reader, policy, limits, Some(dest), &mut |_| {})
+}
+
+/// Check `reader` against `policy` and `limits` without writing anything.
+///
+/// It refuses what [`unpack`] would, including a write or hardlink through an
+/// earlier symlink entry, which `unpack` stops at write time instead. It
+/// reads only as far as the entry being checked, so a caller that relays the
+/// stream can hold each block back until the entries in it have passed.
+pub fn validate<R: Read>(reader: R, policy: Policy, limits: &Limits) -> Result<()> {
+    validate_with_progress(reader, policy, limits, |_| {})
+}
+
+/// Like [`validate`], and after each entry passes it calls `passed` with the
+/// stream offset up to which the archive is known to be sound: the end of
+/// that entry's header and body. A relay may forward bytes below it.
+pub fn validate_with_progress<R: Read>(
+    reader: R,
+    policy: Policy,
+    limits: &Limits,
+    mut passed: impl FnMut(u64),
+) -> Result<()> {
+    scan(reader, policy, limits, None, &mut passed)
 }
 
 /// Pack the directory `src` into `writer`, storing symlinks as symlinks.
@@ -419,7 +442,13 @@ impl<R: Read> Read for ExactReader<R> {
 /// Where the guard leaves the reason it refused the stream.
 type Verdict = Rc<RefCell<Option<ArchiveError>>>;
 
-fn scan<R: Read>(reader: R, policy: Policy, limits: &Limits, dest: Option<&Path>) -> Result<()> {
+fn scan<R: Read>(
+    reader: R,
+    policy: Policy,
+    limits: &Limits,
+    dest: Option<&Path>,
+    passed: &mut dyn FnMut(u64),
+) -> Result<()> {
     let verdict = Verdict::default();
     let guard = HeaderGuard::new(reader, policy == Policy::Copy, Rc::clone(&verdict));
     let blame = |e: io::Error| verdict.borrow_mut().take().unwrap_or(ArchiveError::Io(e));
@@ -432,12 +461,17 @@ fn scan<R: Read>(reader: R, policy: Policy, limits: &Limits, dest: Option<&Path>
     archive.set_preserve_permissions(false);
     let mut totals = Totals::default();
     let mut dir_modes: Vec<DirMode> = Vec::new();
+    let mut symlinks = SymlinkTrail::default();
     for entry in archive.entries().map_err(blame)? {
         let mut entry = entry.map_err(blame)?;
         let path = entry.path()?.into_owned();
         let shown = path.display().to_string();
         check_entry(&entry, &path, policy, limits, &mut totals)?;
-        let Some(dest) = dest else { continue };
+        let Some(dest) = dest else {
+            symlinks.check(&entry, &path)?;
+            passed(entry.raw_file_position().saturating_add(entry.size()));
+            continue;
+        };
         let kind = entry.header().entry_type();
         let mode = entry.header().mode()? & RESTORED_MODE_BITS;
         if kind == tar::EntryType::Link {
@@ -466,6 +500,63 @@ fn scan<R: Read>(reader: R, policy: Policy, limits: &Limits, dest: Option<&Path>
         dir.apply()?;
     }
     Ok(())
+}
+
+/// Symlink entries seen so far, so a scan with no destination can refuse a
+/// later entry that would be written or linked through one.
+#[derive(Default)]
+struct SymlinkTrail {
+    links: HashSet<PathBuf>,
+}
+
+impl SymlinkTrail {
+    fn check<R: Read>(&mut self, entry: &tar::Entry<'_, R>, path: &Path) -> Result<()> {
+        let path = normal_components(path);
+        if self.crosses_symlink(&path) {
+            return Err(ArchiveError::UnsafePath(path.display().to_string()));
+        }
+        match entry.header().entry_type() {
+            tar::EntryType::Symlink => self.record(&path),
+            tar::EntryType::Link => {
+                if let Some(target) = entry.link_name()? {
+                    let target = normal_components(&target);
+                    if self.crosses_symlink(&target) {
+                        return Err(ArchiveError::UnsafeLink(target.display().to_string()));
+                    }
+                    // A hardlink to a symlink is a symlink once unpacked.
+                    if self.links.contains(&fold_case(&target)) {
+                        self.record(&path);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, path: &Path) {
+        self.links.insert(fold_case(path));
+    }
+
+    /// Whether a proper ancestor of `path` is a symlink entry.
+    fn crosses_symlink(&self, path: &Path) -> bool {
+        let path = fold_case(path);
+        path.ancestors().skip(1).any(|a| self.links.contains(a))
+    }
+}
+
+fn normal_components(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| matches!(c, Component::Normal(_)))
+        .collect()
+}
+
+/// Lowercased, because a case-insensitive host filesystem resolves `A/x`
+/// through a symlink named `a`.
+fn fold_case(path: &Path) -> PathBuf {
+    path.components()
+        .map(|c| c.as_os_str().to_ascii_lowercase())
+        .collect()
 }
 
 /// A directory whose mode is applied after its children are written. It is
@@ -1079,12 +1170,87 @@ mod tests {
         let hostile = build(vec![file("../evil", 1)]);
 
         // Act
-        let ok = scan(Cursor::new(clean), Policy::Copy, &Limits::default(), None);
-        let bad = scan(Cursor::new(hostile), Policy::Copy, &Limits::default(), None);
+        let ok = scan(
+            Cursor::new(clean),
+            Policy::Copy,
+            &Limits::default(),
+            None,
+            &mut |_| {},
+        );
+        let bad = scan(
+            Cursor::new(hostile),
+            Policy::Copy,
+            &Limits::default(),
+            None,
+            &mut |_| {},
+        );
 
         // Assert
         assert!(ok.is_ok());
         assert!(matches!(bad, Err(ArchiveError::UnsafePath(_))));
+    }
+
+    #[rstest]
+    fn given_a_hostile_tar_when_validated_then_it_is_rejected(
+        #[values(
+            Hostile::ParentDir,
+            Hostile::Absolute,
+            Hostile::SymlinkThenWrite,
+            Hostile::HardlinkParent,
+            Hostile::HardlinkAbsolute,
+            Hostile::HardlinkThroughSymlink
+        )]
+        kind: Hostile,
+    ) {
+        // Arrange
+        let tar = hostile_tar(kind, Path::new("/outside"));
+
+        // Act
+        let result = validate(Cursor::new(tar), Policy::Copy, &Limits::default());
+
+        // Assert
+        assert!(result.is_err(), "{kind:?} was accepted");
+    }
+
+    #[rstest]
+    #[case::hardlink_to_symlink(vec![
+        ("s", tar::EntryType::Symlink, "/outside"),
+        ("h", tar::EntryType::Link, "s"),
+    ], "h/evil")]
+    #[case::case_folded_symlink(vec![("A", tar::EntryType::Symlink, "/outside")], "a/x")]
+    fn given_a_write_through_a_recorded_link_when_validated_then_it_is_rejected(
+        #[case] links: Vec<(&str, tar::EntryType, &str)>,
+        #[case] written: &str,
+    ) {
+        // Arrange
+        let mut entries: Vec<_> = links
+            .into_iter()
+            .map(|(name, kind, target)| (link_header(name, kind, target), vec![]))
+            .collect();
+        entries.push(file(written, 1));
+        let tar = build(entries);
+
+        // Act
+        let result = validate(Cursor::new(tar), Policy::Copy, &Limits::default());
+
+        // Assert
+        assert!(matches!(result, Err(ArchiveError::UnsafePath(_))));
+    }
+
+    #[test]
+    fn given_a_symlink_to_a_sibling_when_validated_then_a_clean_tree_passes() {
+        // Arrange
+        let tar = build(vec![
+            file("d/a", 1),
+            (link_header("d/l", tar::EntryType::Symlink, "a"), vec![]),
+            file("d/b", 1),
+        ]);
+
+        // Act
+        let result = validate(Cursor::new(tar), Policy::Copy, &Limits::default());
+
+        // Assert
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1103,8 +1269,15 @@ mod tests {
             Policy::Snapshot,
             &Limits::snapshot(),
             None,
+            &mut |_| {},
         );
-        let copy = scan(Cursor::new(&tar), Policy::Copy, &Limits::default(), None);
+        let copy = scan(
+            Cursor::new(&tar),
+            Policy::Copy,
+            &Limits::default(),
+            None,
+            &mut |_| {},
+        );
 
         // Assert
         assert!(!matches!(snapshot, Err(ArchiveError::LimitExceeded { .. })));

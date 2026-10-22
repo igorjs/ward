@@ -679,6 +679,33 @@ impl Backend for KrunvmBackend {
             .ok_or_else(|| BackendError::NotFound(snapshot_id.to_string()))
     }
 
+    async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::put_archive(stream, path.to_string(), chunks)
+            .await
+            .map_err(|e| match e.kind() {
+                // The agent answered with a refusal; anything else is transport.
+                std::io::ErrorKind::Other => BackendError::Exec(format!("copy into sandbox: {e}")),
+                _ => BackendError::Io(e),
+            })
+    }
+
+    async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(super::COPY_CHANNEL_CAPACITY);
+        tokio::spawn(super::agent::get_archive(stream, path.to_string(), tx));
+        Ok(rx)
+    }
+
     /// Exec a command inside a running sandbox.
     #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
     async fn exec(
@@ -819,6 +846,26 @@ async fn install_guest_agent(rootfs: &std::path::Path) -> Result<()> {
 }
 
 impl KrunvmBackend {
+    /// Connect to the sandbox's guest agent. Without a booted VM there is
+    /// no agent, so file copy is unavailable.
+    #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
+    async fn agent_stream(&self, sandbox_id: &str) -> Result<tokio::net::UnixStream> {
+        #[cfg(feature = "krunvm")]
+        if self.boot_vms {
+            let sock = self.agent_socket_path(sandbox_id);
+            return connect_agent_socket_with_timeout(
+                tokio::net::UnixStream::connect(&sock),
+                &sock,
+                AGENT_CONNECT_TIMEOUT,
+            )
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()));
+        }
+        Err(BackendError::Exec(
+            "file copy needs a sandbox booted as a microVM".into(),
+        ))
+    }
+
     /// Host-side Unix socket path bridging to the sandbox's agent vsock.
     ///
     /// Lives in a short per-user directory because `sockaddr_un` paths are

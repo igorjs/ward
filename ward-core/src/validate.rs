@@ -17,6 +17,8 @@ const MAX_VOLUME_SIZE_MB: u32 = 1_048_576; // 1 TiB
 
 /// Maximum sizes for cross-sandbox communication primitives.
 const MAX_TOPIC_LEN: usize = 128;
+/// Longest path Linux accepts (`PATH_MAX`).
+const MAX_GUEST_PATH_LEN: usize = 4096;
 const MAX_GROUP_LEN: usize = 64;
 
 /// Longest sandbox name, and so the longest name, id or id prefix a lookup
@@ -315,6 +317,22 @@ pub fn sandbox_reference(reference: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validate a path inside a sandbox that a file copy names: absolute, no
+/// NUL byte, and within the length Linux accepts.
+pub fn guest_path(path: &str) -> Result<(), ApiError> {
+    if !path.starts_with('/') {
+        return Err(ApiError::InvalidRequest(
+            "sandbox path must be absolute".into(),
+        ));
+    }
+    if path.len() > MAX_GUEST_PATH_LEN || path.contains('\0') {
+        return Err(ApiError::InvalidRequest(format!(
+            "sandbox path must be at most {MAX_GUEST_PATH_LEN} bytes with no NUL"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate an exec command is non-empty.
 pub fn exec_command(command: &[String]) -> Result<(), ApiError> {
     if command.is_empty() {
@@ -432,6 +450,24 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::root("/", true)]
+    #[case::nested("/var/data", true)]
+    #[case::empty("", false)]
+    #[case::relative("data/x", false)]
+    #[case::nul("/a\0b", false)]
+    #[case::too_long(&format!("/{}", "a".repeat(MAX_GUEST_PATH_LEN)), false)]
+    fn given_a_sandbox_path_when_validated_then_only_a_sound_absolute_path_passes(
+        #[case] path: &str,
+        #[case] accepted: bool,
+    ) {
+        // Act
+        let result = guest_path(path);
+
+        // Assert
+        assert_eq!(result.is_ok(), accepted);
+    }
 
     // ----- SEC-020 mount allowlist + sensitive-path boundaries -------------
 
