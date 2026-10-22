@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
 
 use crate::attach::{self, require_exit, require_terminal};
@@ -31,9 +31,6 @@ pub async fn run(
     request: CreateSandboxRequest,
     flags: RunFlags,
 ) -> Result<i32> {
-    if request.command.is_empty() && !flags.detach {
-        bail!("a command is required unless the sandbox runs detached (-d)");
-    }
     require_terminal(flags.tty, flags.interactive)?;
     let mut c = client::connect(socket).await?;
     let created = c.create_sandbox(request).await?.into_inner();

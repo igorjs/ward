@@ -219,11 +219,22 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
 
 /// Docker shaped `inspect` entry for one sandbox.
 fn inspect_value(info: &SandboxInfo) -> Value {
+    let entrypoint_len = info.entrypoint.len();
     let cmd: Vec<&str> = if info.command.is_empty() {
-        vec![info.command_name.as_str()]
+        // A sandbox with no main process has an empty command name.
+        Some(info.command_name.as_str())
+            .filter(|name| !name.is_empty())
+            .into_iter()
+            .collect()
     } else {
-        info.command.iter().map(String::as_str).collect()
+        info.command
+            .iter()
+            .skip(entrypoint_len)
+            .map(String::as_str)
+            .collect()
     };
+    // Docker reports an unset entrypoint as null.
+    let entrypoint = (entrypoint_len > 0).then_some(&info.entrypoint);
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
@@ -234,7 +245,13 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "StartedAt": state_time(&info.started_at),
             "FinishedAt": state_time(&info.finished_at),
         },
-        "Config": {"Image": info.image, "Cmd": cmd},
+        "Config": {
+            "Image": info.image,
+            "Cmd": cmd,
+            "Entrypoint": entrypoint,
+            "WorkingDir": info.workdir,
+            "User": info.user,
+        },
     })
 }
 
@@ -504,9 +521,58 @@ mod tests {
                     "StartedAt": "0001-01-01T00:00:00Z",
                     "FinishedAt": "0001-01-01T00:00:00Z",
                 },
-                "Config": {"Image": "alpine", "Cmd": ["sh"]},
+                "Config": {
+                    "Image": "alpine",
+                    "Cmd": ["sh"],
+                    "Entrypoint": null,
+                    "WorkingDir": "",
+                    "User": "",
+                },
             })
         );
+    }
+
+    #[test]
+    fn given_entrypoint_and_workdir_when_inspected_then_config_splits_entrypoint_from_cmd() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.entrypoint = vec!["/entry".into()];
+        sandbox.command = vec!["/entry".into(), "serve".into()];
+        sandbox.workdir = "/app".into();
+
+        // Act
+        let config = inspect_value(&sandbox)["Config"].clone();
+
+        // Assert
+        assert_eq!(config["Entrypoint"], json!(["/entry"]));
+        assert_eq!(config["Cmd"], json!(["serve"]));
+        assert_eq!(config["WorkingDir"], "/app");
+    }
+
+    #[test]
+    fn given_sandbox_without_main_process_when_inspected_then_cmd_is_empty() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.command_name = String::new();
+
+        // Act
+        let config = inspect_value(&sandbox)["Config"].clone();
+
+        // Assert
+        assert_eq!(config["Cmd"], json!([]));
+    }
+
+    #[test]
+    fn given_image_user_when_inspected_then_config_shows_it() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.user = "app".into();
+
+        // Act
+        let config = inspect_value(&sandbox)["Config"].clone();
+
+        // Assert
+        assert_eq!(config["User"], "app");
     }
 
     #[rstest::rstest]

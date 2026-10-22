@@ -945,12 +945,14 @@ mod tests {
             &self,
             reference: &str,
             dest: &Path,
-        ) -> Result<String, crate::backend::BackendError> {
+        ) -> Result<crate::backend::image::PulledImage, crate::backend::BackendError> {
             std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(format!("sha256:{hash:016x}"))
+            Ok(crate::backend::image::PulledImage::without_config(format!(
+                "sha256:{hash:016x}"
+            )))
         }
     }
 
