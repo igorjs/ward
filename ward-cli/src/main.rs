@@ -6,6 +6,7 @@ mod attach;
 mod client;
 mod cp;
 mod docker;
+mod events;
 mod inspect;
 mod lifecycle;
 mod log_output;
@@ -363,6 +364,30 @@ enum Commands {
         format: Option<String>,
         /// Sandbox names, IDs or ID prefixes.
         references: Vec<String>,
+    },
+
+    /// Stream sandbox events: create, start, die, stop and destroy.
+    ///
+    /// The daemon answers without a sandbox token, like `ward ps`, and keeps
+    /// only the last 1024 events in memory, destroyed sandboxes included and
+    /// none across a restart. --since replays from that history. --filter
+    /// takes type, event, container or name (a name or ID prefix), image and
+    /// label (an attribute, as key or key=value). --format takes a Go
+    /// template over .Type .Action .Status .ID .From .Scope .Time .TimeNano
+    /// .Actor.ID .Actor.Attributes.<key>, or json.
+    Events {
+        /// Replay events from this time: a duration, timestamp or Unix seconds.
+        #[arg(long)]
+        since: Option<String>,
+        /// Stop streaming at this time.
+        #[arg(long)]
+        until: Option<String>,
+        /// Only events matching name=value. Repeatable.
+        #[arg(short, long)]
+        filter: Vec<String>,
+        /// Go template for each event.
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -1028,6 +1053,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_trunc,
             };
             stats::run(&socket_path, &token_store, &references, options).await?;
+        }
+
+        Commands::Events {
+            since,
+            until,
+            filter,
+            format,
+        } => {
+            let options = events::Options {
+                since,
+                until,
+                filters: filter,
+                format,
+                json,
+            };
+            events::run(&socket_path, options).await?;
         }
 
         Commands::Prune => {

@@ -70,7 +70,7 @@ impl Template {
         let Some(name) = action.strip_prefix(FIELD_PREFIX) else {
             bail!("unsupported action {{{{{action}}}}} in --format");
         };
-        match columns.iter().find(|(field, _)| *field == name) {
+        match columns.iter().find(|(field, _)| names_field(field, name)) {
             Some((_, title)) => Ok(Part::Field {
                 name: name.to_string(),
                 title,
@@ -106,6 +106,12 @@ impl Template {
             .collect();
         align(&lines)
     }
+}
+
+/// A column ending in `.` stands for every key under it, such as
+/// `Actor.Attributes.` for `Actor.Attributes.name`.
+fn names_field(column: &str, name: &str) -> bool {
+    column == name || (column.ends_with('.') && name.starts_with(column))
 }
 
 /// Lines of cells as columns padded to their longest cell. The last column
