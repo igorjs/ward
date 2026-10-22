@@ -3582,6 +3582,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-archive"
+version = "0.1.0"
+dependencies = [
+ "rstest",
+ "rustix",
+ "tar",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ward-bundle"
 version = "0.1.0"
 dependencies = [
