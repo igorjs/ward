@@ -210,7 +210,7 @@ const WAIT_STATUS_EXIT_MASK: i32 = 0xff;
 const SIGNAL_EXIT_BASE: i32 = 128;
 
 /// Seconds a stopping sandbox's main process gets to end after SIGTERM.
-const STOP_GRACE_SECONDS: u64 = 10;
+pub const STOP_GRACE_SECONDS: u64 = 10;
 const SIGTERM: i32 = 15;
 const SIGKILL: i32 = 9;
 /// Highest signal number Linux accepts (the last real-time signal).
@@ -297,6 +297,7 @@ async fn commit_meta(
     exit_code: Option<i32>,
 ) -> Result<()> {
     let mut next = entry.meta.clone();
+    stamp_times(&mut next, &status, std::time::SystemTime::now());
     next.status = status;
     next.exit_code = exit_code;
     persist_meta(store, next.clone()).await?;
@@ -304,11 +305,44 @@ async fn commit_meta(
     Ok(())
 }
 
-async fn ended_within(exit: &mut watch::Receiver<Option<i32>>, grace: std::time::Duration) -> bool {
-    matches!(
-        tokio::time::timeout(grace, exit.wait_for(Option::is_some)).await,
-        Ok(Ok(_))
-    )
+/// Record the start and finish times a move to `next` implies.
+fn stamp_times(
+    meta: &mut SandboxMeta,
+    next: &crate::protocol::SandboxStatus,
+    now: std::time::SystemTime,
+) {
+    use crate::protocol::SandboxStatus as State;
+    match next {
+        State::Running
+            if meta.status != State::Running && !meta.options.spec.command.is_empty() =>
+        {
+            meta.started_at = Some(now);
+        }
+        State::Exited => meta.finished_at = Some(now),
+        State::Stopped => {
+            meta.finished_at.get_or_insert(now);
+        }
+        _ => {}
+    }
+}
+
+/// Wait for the main process to end. `None` waits without limit.
+async fn ended_within(
+    exit: &mut watch::Receiver<Option<i32>>,
+    grace: Option<std::time::Duration>,
+) -> bool {
+    let ended = exit.wait_for(Option::is_some);
+    match grace {
+        Some(grace) => matches!(tokio::time::timeout(grace, ended).await, Ok(Ok(_))),
+        None => ended.await.is_ok(),
+    }
+}
+
+/// What the daemon needs to remove a sandbox whose main process ended.
+struct AutoRemove {
+    broker: Arc<Broker>,
+    backend: Arc<dyn Backend>,
+    processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
 }
 
 /// Mark a sandbox `exited` once its main process `pid` ends on its own. A
@@ -321,6 +355,7 @@ async fn mark_exited_on_main_end(
     id: String,
     pid: String,
     mut exit: watch::Receiver<Option<i32>>,
+    auto_remove: Option<AutoRemove>,
 ) {
     let Ok(raw) = exit.wait_for(Option::is_some).await.map(|status| *status) else {
         return;
@@ -328,24 +363,69 @@ async fn mark_exited_on_main_end(
     let Some(code) = raw.map(decode_wait_status) else {
         return;
     };
-    let mut entries = entries.write().await;
-    let current = mains.read().await.get(&id).map(|m| m.pid == pid);
-    let Some(entry) = entries.get_mut(&id) else {
-        return;
-    };
-    if current != Some(true) || entry.meta.status != crate::protocol::SandboxStatus::Running {
-        return;
-    }
-    match commit_meta(
-        store.as_ref(),
-        entry,
-        crate::protocol::SandboxStatus::Exited,
-        Some(code),
-    )
-    .await
     {
-        Ok(()) => tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited"),
-        Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
+        let mut entries = entries.write().await;
+        let current = mains.read().await.get(&id).map(|m| m.pid == pid);
+        let Some(entry) = entries.get_mut(&id) else {
+            return;
+        };
+        if current != Some(true) || entry.meta.status != crate::protocol::SandboxStatus::Running {
+            return;
+        }
+        match commit_meta(
+            store.as_ref(),
+            entry,
+            crate::protocol::SandboxStatus::Exited,
+            Some(code),
+        )
+        .await
+        {
+            Ok(()) => tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited"),
+            Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
+        }
+    }
+    // The status is published and attached readers hold their own buffer
+    // subscriptions, so removing now cannot cut their output short.
+    if let Some(auto) = auto_remove {
+        auto_remove_ended(&entries, &mains, &auto, &id, &pid).await;
+    }
+}
+
+/// Remove sandbox `id` if it is still exited from the run that `pid` was.
+/// A start since the exit was recorded owns the sandbox now, so it stays.
+async fn auto_remove_ended(
+    entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
+    mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+    auto: &AutoRemove,
+    id: &str,
+    pid: &str,
+) {
+    let removed = {
+        let mut entries = entries.write().await;
+        let exited = entries
+            .get(id)
+            .is_some_and(|entry| entry.meta.status == crate::protocol::SandboxStatus::Exited);
+        let same_run = mains.read().await.get(id).is_some_and(|m| m.pid == pid);
+        if !(exited && same_run) {
+            tracing::info!(sandbox_id = %id, "sandbox started again, keeping it");
+            return;
+        }
+        SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
+    };
+    let result = SandboxManager::finish_cleanup(
+        removed,
+        &auto.broker,
+        &auto.backend,
+        &auto.processes,
+        mains,
+        id,
+    )
+    .await;
+    match result {
+        Ok(()) => {
+            tracing::info!(sandbox_id = %id, "auto-removed sandbox after its main process ended")
+        }
+        Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot auto-remove sandbox"),
     }
 }
 
@@ -492,7 +572,8 @@ impl SandboxManager {
     }
 
     /// Bring one reloaded record back into the manager, or delete it if
-    /// its wall-time limit has already passed.
+    /// its wall-time limit has already passed or it is an auto-remove
+    /// sandbox that is no longer running.
     async fn adopt_persisted(&self, meta: SandboxMeta) {
         let Some(store) = self.store.clone() else {
             return;
@@ -504,16 +585,24 @@ impl SandboxManager {
         let now = std::time::SystemTime::now();
         let expires_at = (timeout_seconds > 0).then(|| created_at + limit);
         let remaining = expires_at.map(|at| at.duration_since(now).ok());
-        if remaining == Some(None) {
-            tracing::info!(sandbox_id = %id, "removing reloaded sandbox past its timeout");
+        let expired = remaining == Some(None);
+        let finished_auto_remove =
+            meta.options.spec.auto_remove && meta.status != crate::protocol::SandboxStatus::Running;
+        if expired || finished_auto_remove {
+            let reason = if expired {
+                "past its timeout"
+            } else {
+                "that was set to auto-remove"
+            };
+            tracing::info!(sandbox_id = %id, "removing reloaded sandbox {reason}");
             let doomed = id.clone();
             match tokio::task::spawn_blocking(move || store.delete(&doomed)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
-                    tracing::warn!(sandbox_id = %id, error = %e, "cannot remove expired sandbox");
+                    tracing::warn!(sandbox_id = %id, error = %e, "cannot remove reloaded sandbox");
                 }
                 Err(e) => {
-                    tracing::warn!(sandbox_id = %id, error = %e, "expired sandbox removal task failed");
+                    tracing::warn!(sandbox_id = %id, error = %e, "reloaded sandbox removal task failed");
                 }
             }
             return;
@@ -535,6 +624,8 @@ impl SandboxManager {
             token: String::new(),
             spec: meta.options.spec.clone(),
             exit_code: meta.exit_code,
+            started_at: meta.started_at,
+            finished_at: meta.finished_at,
         };
         if let Err(e) = self
             .backend
@@ -670,6 +761,7 @@ impl SandboxManager {
                 command: req.command.clone(),
                 workdir: req.workdir.clone(),
                 tty: req.tty,
+                auto_remove: req.auto_remove,
             },
         };
 
@@ -722,8 +814,11 @@ impl SandboxManager {
             created_at: info.created_at,
             status: info.status.clone(),
             exit_code: None,
+            started_at: (!opts.spec.command.is_empty()).then_some(info.created_at),
+            finished_at: None,
             token_hash: hash_token(&token),
         };
+        info.started_at = meta.started_at;
         if let Err(e) = self.persist(meta.clone()).await {
             if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
                 tracing::warn!(
@@ -975,9 +1070,33 @@ impl SandboxManager {
     /// Stop a sandbox: the VM goes away and the rootfs stays. Stopping a
     /// stopped sandbox succeeds without doing anything.
     pub async fn stop(&self, reference: &str) -> Result<PbSandboxInfo> {
+        self.stop_within(reference, None).await
+    }
+
+    /// Like [`stop`](Self::stop), with the seconds the main process gets
+    /// after SIGTERM: `None` keeps the default, 0 forces it at once and a
+    /// negative value waits as long as it takes.
+    pub async fn stop_within(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+    ) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
-        self.stop_resolved(&id).await?;
-        self.info(&id, CommandView::Full).await
+        self.stop_resolved(&id, self.grace_period(grace_seconds))
+            .await?;
+        let info = self.info(&id, CommandView::Full).await?;
+        if self.is_auto_remove(&id).await {
+            self.remove(&id).await?;
+        }
+        Ok(info)
+    }
+
+    async fn is_auto_remove(&self, id: &str) -> bool {
+        self.entries
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.meta.options.spec.auto_remove)
     }
 
     /// Boot a stopped, exited or failed sandbox again. Starting a running
@@ -991,10 +1110,21 @@ impl SandboxManager {
     /// Stop, then start. A failed sandbox has no VM to stop, so it only
     /// starts.
     pub async fn restart(&self, reference: &str) -> Result<PbSandboxInfo> {
+        self.restart_within(reference, None).await
+    }
+
+    /// Like [`restart`](Self::restart), with the stop grace of
+    /// [`stop_within`](Self::stop_within).
+    pub async fn restart_within(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+    ) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
         let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
         if !failed {
-            self.stop_resolved(&id).await?;
+            self.stop_resolved(&id, self.grace_period(grace_seconds))
+                .await?;
         }
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
@@ -1009,13 +1139,23 @@ impl SandboxManager {
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))
     }
 
-    async fn stop_resolved(&self, id: &str) -> Result<()> {
+    /// The wait after SIGTERM a request asks for. `None` means no limit.
+    fn grace_period(&self, grace_seconds: Option<i32>) -> Option<std::time::Duration> {
+        match grace_seconds {
+            None => Some(self.stop_grace),
+            Some(seconds) => u64::try_from(seconds)
+                .ok()
+                .map(std::time::Duration::from_secs),
+        }
+    }
+
+    async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
         if !self.begin_stop(id).await? {
             tracing::info!(sandbox_id = %id, "sandbox already stopped");
             return Ok(());
         }
         tracing::info!(sandbox_id = %id, "stopping sandbox");
-        let main_code = self.end_main_process(id).await;
+        let main_code = self.end_main_process(id, grace).await;
         if let Err(e) = self.backend.stop_sandbox(id).await {
             self.mark_failed(id).await;
             return Err(backend_err(e));
@@ -1042,7 +1182,7 @@ impl SandboxManager {
     /// Ask the main process to end with SIGTERM and force it with SIGKILL
     /// once the grace period passes. Returns its exit code, or `None` when
     /// the sandbox has no main process.
-    async fn end_main_process(&self, id: &str) -> Option<i32> {
+    async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> Option<i32> {
         let (control, mut exit) = {
             let mains = self.mains.read().await;
             let main = mains.get(id)?;
@@ -1051,12 +1191,12 @@ impl SandboxManager {
         if let Some(control) = &control {
             let _ = control.send(ProcessControl::Signal(SIGTERM)).await;
         }
-        if !ended_within(&mut exit, self.stop_grace).await {
+        if !ended_within(&mut exit, grace).await {
             tracing::warn!(sandbox_id = %id, "main process ignored SIGTERM, forcing it");
             if let Some(control) = &control {
                 let _ = control.send(ProcessControl::Signal(SIGKILL)).await;
             }
-            ended_within(&mut exit, self.stop_grace).await;
+            ended_within(&mut exit, Some(self.stop_grace)).await;
         }
         let raw = (*exit.borrow()).map(decode_wait_status);
         Some(raw.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL))
@@ -1129,6 +1269,11 @@ impl SandboxManager {
             id.to_string(),
             handle.pid.clone(),
             exit.clone(),
+            spec.auto_remove.then(|| AutoRemove {
+                broker: Arc::clone(&self.broker),
+                backend: Arc::clone(&self.backend),
+                processes: Arc::clone(&self.processes),
+            }),
         ));
         mains.insert(
             id.to_string(),
@@ -1346,15 +1491,31 @@ impl SandboxManager {
         id: &str,
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
-        let removed = if let Some(entry) = entries.write().await.remove(id) {
-            if !from_timeout && let Some(handle) = entry.timeout_handle {
-                handle.abort();
-            }
-            true
-        } else {
-            false
-        };
+        let removed = Self::detach_entry(entries.write().await.remove(id), from_timeout);
+        Self::finish_cleanup(removed, broker, backend, processes, mains, id).await
+    }
 
+    /// Stop the removed entry's timer unless that timer is the caller.
+    /// Returns whether there was an entry.
+    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> bool {
+        let Some(entry) = entry else {
+            return false;
+        };
+        if !from_timeout && let Some(handle) = entry.timeout_handle {
+            handle.abort();
+        }
+        true
+    }
+
+    /// Drop everything tied to a sandbox whose entry has left `entries`.
+    async fn finish_cleanup(
+        removed: bool,
+        broker: &Arc<Broker>,
+        backend: &Arc<dyn Backend>,
+        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
+        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+        id: &str,
+    ) -> std::result::Result<(), BackendError> {
         processes
             .write()
             .await
@@ -1713,6 +1874,8 @@ fn recorded_state(
     if let Some(entry) = entries.get(&info.id) {
         info.status = entry.meta.status.clone();
         info.exit_code = entry.meta.exit_code;
+        info.started_at = entry.meta.started_at;
+        info.finished_at = entry.meta.finished_at;
     }
     info
 }
@@ -1764,6 +1927,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         token: info.token,
         name: info.spec.name,
         exit_code: info.exit_code,
+        started_at: info.started_at.map(system_time_to_timestamp),
+        finished_at: info.finished_at.map(system_time_to_timestamp),
         workdir: info.spec.workdir,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         command: match view {
@@ -3596,6 +3761,19 @@ pub(crate) mod tests {
 
     /// Write a stopped sandbox record with a fixed id so a restart loads it.
     fn seed_sandbox(path: &std::path::Path, id: &str, name: &str) {
+        let spec = crate::protocol::SandboxSpec {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        seed_record(path, id, spec, ProtoStatus::Stopped);
+    }
+
+    fn seed_record(
+        path: &std::path::Path,
+        id: &str,
+        spec: crate::protocol::SandboxSpec,
+        status: ProtoStatus,
+    ) {
         let meta = SandboxMeta {
             id: id.to_string(),
             options: crate::protocol::CreateOpts {
@@ -3607,14 +3785,13 @@ pub(crate) mod tests {
                 env: Default::default(),
                 from_snapshot: None,
                 comms: Default::default(),
-                spec: crate::protocol::SandboxSpec {
-                    name: name.to_string(),
-                    ..Default::default()
-                },
+                spec,
             },
             created_at: std::time::SystemTime::now(),
-            status: ProtoStatus::Stopped,
+            status,
             exit_code: None,
+            started_at: None,
+            finished_at: None,
             token_hash: hash_token(SEED_TOKEN),
         };
         MetaStore::new(path).save(&meta).unwrap();
@@ -3645,6 +3822,35 @@ pub(crate) mod tests {
             panic!("expected AmbiguousReference, got {err:?}");
         };
         assert!(msg.contains(ID_A) && msg.contains(ID_A2), "got: {msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::exited(ProtoStatus::Exited)]
+    #[case::stopped(ProtoStatus::Stopped)]
+    #[tokio::test]
+    async fn given_finished_auto_remove_record_when_restored_then_it_is_removed(
+        #[case] status: ProtoStatus,
+    ) {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let spec = crate::protocol::SandboxSpec {
+            name: "gone".into(),
+            auto_remove: true,
+            ..Default::default()
+        };
+        seed_record(tmp.path(), ID_A, spec, status);
+
+        // Act
+        let mgr = restart(tmp.path()).await;
+
+        // Assert
+        assert!(matches!(
+            mgr.get(ID_A).await,
+            Err(ApiError::SandboxNotFound(_))
+        ));
+        assert!(MetaStore::new(tmp.path()).load_all().is_empty());
+        assert_eq!(mgr.entries.read().await.len(), 0);
+        assert_eq!(mgr.create_semaphore.available_permits(), 4);
     }
 
     #[tokio::test]
@@ -4955,6 +5161,231 @@ pub(crate) mod tests {
         // Assert
         wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
         assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_auto_remove_when_main_process_ends_then_sandbox_is_removed() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["true".into()],
+            auto_remove: true,
+            ..Default::default()
+        };
+
+        // Act
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Assert
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        while mgr.get(&id).await.is_ok() {
+            assert!(std::time::Instant::now() < deadline, "never removed");
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+        assert!(matches!(
+            mgr.remove(&id).await,
+            Err(ApiError::SandboxNotFound(_))
+        ));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_command_that_ends_when_restarted_then_times_follow_the_runs() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 7"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        let first = mgr.get(&id).await.expect("get");
+
+        // Act
+        let restarted = mgr.restart(&id).await.expect("restart");
+
+        // Assert
+        let timestamp = |t: &prost_types::Timestamp| (t.seconds, t.nanos);
+        let first_start = timestamp(&first.started_at.expect("first started_at"));
+        let first_finish = timestamp(&first.finished_at.expect("first finished_at"));
+        let second_start = timestamp(&restarted.started_at.expect("second started_at"));
+        assert_ne!(second_start, first_start);
+        assert!(second_start >= first_finish);
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        let second = mgr.get(&id).await.expect("get");
+        assert!(timestamp(&second.finished_at.expect("second finished_at")) >= second_start);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_finished_sandbox_when_restarted_then_it_keeps_the_previous_finish_time() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "sleep 5"], false).await;
+        mgr.stop_within(&id, Some(0)).await.expect("stop");
+        let stopped = mgr.get(&id).await.expect("get");
+
+        // Act
+        let restarted = mgr.start(&id).await.expect("start");
+
+        // Assert
+        assert_eq!(restarted.finished_at, stopped.finished_at);
+        assert!(restarted.finished_at.is_some());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::with_command(&["sleep", "5"], true)]
+    #[case::without_command(&[], false)]
+    #[tokio::test]
+    async fn given_command_or_not_when_created_then_started_at_is_set_only_with_a_command(
+        #[case] command: &[&str],
+        #[case] has_started_at: bool,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: command.iter().map(|part| part.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // Act
+        let created = mgr.create(req, "").await.expect("create");
+
+        // Assert
+        let got = mgr.get(&created.id).await.expect("get");
+        assert_eq!(created.started_at.is_some(), has_started_at);
+        assert_eq!(created.started_at, got.started_at);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_sandbox_without_command_when_started_again_then_started_at_stays_unset() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        let started = mgr.start(&id).await.expect("start");
+
+        // Assert
+        assert!(started.started_at.is_none());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::auto_remove(true)]
+    #[case::kept(false)]
+    #[tokio::test]
+    async fn given_running_sandbox_when_stopped_then_only_auto_remove_removes_it(
+        #[case] auto_remove: bool,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sleep".into(), "30".into()],
+            auto_remove,
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        let stopped = mgr.stop_within(&id, Some(0)).await.expect("stop");
+
+        // Assert
+        assert_eq!(stopped.status, SandboxStatus::Stopped as i32);
+        assert_eq!(mgr.get(&id).await.is_ok(), !auto_remove);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_auto_remove_sandbox_when_restarted_then_it_is_kept_running() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sleep".into(), "30".into()],
+            auto_remove: true,
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        let restarted = mgr.restart_within(&id, Some(0)).await.expect("restart");
+
+        // Assert
+        assert_eq!(restarted.status, SandboxStatus::Running as i32);
+        assert!(mgr.get(&id).await.is_ok());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_sandbox_started_again_after_its_run_ended_when_auto_remove_runs_then_it_stays() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 0"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        let ended_pid = mgr.main_pid(&id).await.expect("main pid");
+        mgr.start(&id).await.expect("start again");
+        let auto = AutoRemove {
+            broker: Arc::clone(&mgr.broker),
+            backend: Arc::clone(&mgr.backend),
+            processes: Arc::clone(&mgr.processes),
+        };
+
+        // Act
+        auto_remove_ended(&mgr.entries, &mgr.mains, &auto, &id, &ended_pid).await;
+
+        // Assert
+        assert!(mgr.get(&id).await.is_ok());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::default(None, Some(TEST_STOP_GRACE))]
+    #[case::immediate(Some(0), Some(std::time::Duration::ZERO))]
+    #[case::seconds(Some(30), Some(std::time::Duration::from_secs(30)))]
+    #[case::forever(Some(-1), None)]
+    fn given_requested_grace_when_resolved_then_default_zero_seconds_or_unlimited(
+        #[case] requested: Option<i32>,
+        #[case] want: Option<std::time::Duration>,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+
+        // Act and Assert
+        assert_eq!(mgr.grace_period(requested), want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_term_ignoring_command_when_stopped_with_zero_grace_then_it_is_killed_at_once() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(
+            &mgr,
+            &[
+                "sh",
+                "-c",
+                "trap '' TERM; echo up; while :; do read x; done",
+            ],
+            false,
+        )
+        .await;
+        wait_for_output(&mgr, &id, "up\n").await;
+        let started = std::time::Instant::now();
+
+        // Act
+        mgr.stop_within(&id, Some(0)).await.expect("stop");
+
+        // Assert
+        assert!(started.elapsed() < TEST_STOP_GRACE);
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(SIGKILL_EXIT_CODE));
     }
 
     #[cfg(not(feature = "krunvm"))]

@@ -31,6 +31,9 @@ pub struct SandboxSpec {
     pub command: Vec<String>,
     pub workdir: String,
     pub tty: bool,
+    /// Remove the sandbox when its main process ends.
+    #[serde(default)]
+    pub auto_remove: bool,
 }
 
 /// A filesystem bind-mount passed into a sandbox.
@@ -115,6 +118,10 @@ pub struct SandboxInfo {
     pub spec: SandboxSpec,
     /// `None` until the main process has exited.
     pub exit_code: Option<i32>,
+    /// When the main process last started, if it ever did.
+    pub started_at: Option<SystemTime>,
+    /// When the main process last ended, if it did.
+    pub finished_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

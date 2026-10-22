@@ -363,6 +363,8 @@ impl Backend for KrunvmBackend {
             token: String::new(),
             spec: opts.spec.clone(),
             exit_code: None,
+            started_at: None,
+            finished_at: None,
         };
 
         #[cfg(feature = "krunvm")]

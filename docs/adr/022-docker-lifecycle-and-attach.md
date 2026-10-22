@@ -27,7 +27,7 @@ Ward sandboxes are create-and-destroy only. The CLI should work like Docker's: s
    | failed | boot, start or stop failed | removing, creating (retry start) |
 
    - `start` moves a stopped or exited sandbox back through `creating`. There is no starting state.
-   - `stop` sends SIGTERM to the main process through the agent, waits `STOP_GRACE_SECONDS` (10), then ends the VM. A main process that ends while the sandbox is `stopping` is recorded as `stopped`, never `exited`. `exit_code` is 143 on SIGTERM and 137 if forced.
+   - `stop` sends SIGTERM to the main process through the agent, waits `STOP_GRACE_SECONDS` (10, or the request's `grace_seconds`: 0 forces at once, a negative value waits without limit), then ends the VM. A main process that ends while the sandbox is `stopping` is recorded as `stopped`, never `exited`. `exit_code` is 143 on SIGTERM and 137 if forced.
    - The VM stays up in `exited`. `start` or `restart` there first ends the VM host process, so only one exists.
    - A sandbox created without a command has no main process, never becomes `exited`, and `wait` returns 0 after it stops.
    - Old clients treat unknown states as not running. New enum values only append.

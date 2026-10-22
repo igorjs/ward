@@ -70,6 +70,8 @@ message CreateSandboxRequest {
   repeated string command = 10;  // main process argv; empty means none
   string workdir = 11;
   bool tty = 12;
+  // Remove the sandbox once its main process ends.
+  bool auto_remove = 13;
 }
 
 message GetSandboxRequest {
@@ -83,6 +85,9 @@ message RemoveSandboxRequest {
 // `id` is a sandbox name, id or unique id prefix.
 message StopRequest {
   string id = 1;
+  // Seconds to wait after SIGTERM before SIGKILL. Absent means 10, 0 kills
+  // at once, a negative value waits without limit.
+  optional int32 grace_seconds = 2;
 }
 
 message StartRequest {
@@ -91,6 +96,8 @@ message StartRequest {
 
 message RestartRequest {
   string id = 1;
+  // Same meaning as StopRequest.grace_seconds.
+  optional int32 grace_seconds = 2;
 }
 
 message ListSandboxesResponse {
@@ -115,6 +122,9 @@ message SandboxInfo {
   string command_name = 12;
   // Full argv, which can hold secrets. Filled only for a caller with a valid token.
   repeated string command = 13;
+  // Absent until the main process has started or ended.
+  google.protobuf.Timestamp started_at = 14;
+  google.protobuf.Timestamp finished_at = 15;
 }
 
 enum SandboxStatus {
