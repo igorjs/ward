@@ -29,7 +29,13 @@ pub struct SandboxSpec {
     pub name: String,
     /// Main process argv. Empty means the sandbox has no main process.
     pub command: Vec<String>,
+    /// Length of the `command` prefix that came from an image Entrypoint.
+    #[serde(default)]
+    pub entrypoint_len: usize,
     pub workdir: String,
+    /// The image's `User`, recorded though the guest does not apply it.
+    #[serde(default)]
+    pub user: String,
     pub tty: bool,
     /// Remove the sandbox when its main process ends.
     #[serde(default)]

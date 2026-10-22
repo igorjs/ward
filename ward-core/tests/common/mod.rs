@@ -46,12 +46,14 @@ impl ImagePuller for FakePuller {
         &self,
         reference: &str,
         dest: &Path,
-    ) -> Result<String, ward_core::backend::BackendError> {
+    ) -> Result<ward_core::backend::image::PulledImage, ward_core::backend::BackendError> {
         std::fs::create_dir_all(dest.join("bin")).map_err(ward_core::backend::BackendError::Io)?;
         let hash: u64 = reference
             .bytes()
             .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        Ok(format!("sha256:{hash:016x}"))
+        Ok(ward_core::backend::image::PulledImage::without_config(
+            format!("sha256:{hash:016x}"),
+        ))
     }
 }
 

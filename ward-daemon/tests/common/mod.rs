@@ -42,14 +42,21 @@ impl Daemon {
     /// is accepting connections. Panics with a helpful message on timeout.
     #[allow(dead_code)]
     pub fn spawn() -> Self {
-        Self::spawn_inner(false)
+        Self::spawn_inner(false, None)
+    }
+
+    /// Like [`Daemon::spawn`] but every image reports `config_json`, a JSON
+    /// image config, as if the registry had sent it.
+    #[allow(dead_code)]
+    pub fn spawn_with_image_config(config_json: &str) -> Self {
+        Self::spawn_inner(false, Some(config_json))
     }
 
     /// Like [`Daemon::spawn`] but images are really pulled and sandboxes
     /// really boot as microVMs. Needs a `krunvm` build and a hypervisor.
     #[allow(dead_code)]
     pub fn spawn_vm() -> Self {
-        Self::spawn_inner(true)
+        Self::spawn_inner(true, None)
     }
 
     /// Process id of the daemon.
@@ -67,7 +74,7 @@ impl Daemon {
         }
     }
 
-    fn spawn_inner(real_vms: bool) -> Self {
+    fn spawn_inner(real_vms: bool, image_config: Option<&str>) -> Self {
         let data_dir = tempfile::tempdir().expect("create temp dir");
         let socket = data_dir.path().join("ward.sock");
         let log = data_dir.path().join("wardd.log");
@@ -97,6 +104,9 @@ impl Daemon {
             cmd.env("WARD_ALLOW_HOST_MOUNTS", "1");
         } else {
             cmd.env("WARD_OCI_OFFLINE", "1");
+            if let Some(config) = image_config {
+                cmd.env("WARD_OCI_OFFLINE_CONFIG", config);
+            }
         }
 
         let mut child = cmd.spawn().expect("spawn wardd");

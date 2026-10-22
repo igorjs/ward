@@ -172,6 +172,37 @@ fn given_image_when_create_then_guest_boots_real_linux_kernel() {
 }
 
 #[test]
+fn given_image_with_default_command_when_run_without_command_then_it_starts_and_exits_zero() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+
+    let mut cmd = d.cli();
+    cmd.args(["run", &image()]);
+    let out = cmd.output().expect("run ward");
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {:?}", out.stderr);
+}
+
+#[test]
+fn given_entrypoint_flag_when_run_with_arguments_then_the_entrypoint_runs_them() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+
+    let mut cmd = d.cli();
+    cmd.args([
+        "run",
+        "--entrypoint",
+        "echo",
+        &image(),
+        "from",
+        "entrypoint",
+    ]);
+    let out = run_ok(cmd);
+
+    assert_eq!(out, "from entrypoint\n");
+}
+
+#[test]
 fn given_running_sandbox_when_exec_echo_then_stdout_and_zero_exit() {
     require_vm!();
     let d = Daemon::spawn_vm();

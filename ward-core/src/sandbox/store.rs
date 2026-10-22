@@ -210,6 +210,8 @@ mod tests {
                     workdir: "/srv".into(),
                     tty: true,
                     auto_remove: false,
+                    entrypoint_len: 0,
+                    user: String::new(),
                 },
             },
             created_at: SystemTime::now(),

@@ -97,7 +97,7 @@ enum Commands {
         /// OCI image reference.
         image: String,
         /// Command and arguments the sandbox runs.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
         #[command(flatten)]
         opts: SandboxOpts,
@@ -178,10 +178,13 @@ enum Commands {
         /// OCI image reference.
         image: String,
         /// Command and arguments.
-        #[arg(trailing_var_arg = true)]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
         #[command(flatten)]
         opts: SandboxOpts,
+        /// Replace the image entrypoint. An empty value clears it.
+        #[arg(long)]
+        entrypoint: Option<String>,
         /// Working directory.
         #[arg(short = 'w', long)]
         workdir: Option<String>,
@@ -676,6 +679,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             image,
             command,
             opts,
+            entrypoint,
             workdir,
             interactive,
             tty,
@@ -684,6 +688,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         } => {
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
             request.command = command;
+            request.use_image_config = true;
+            request.entrypoint = entrypoint;
+            request.require_command = true;
             request.tty = tty;
             request.workdir = workdir.unwrap_or_default();
             // A detached run has no client to remove it, so the daemon does.
@@ -1210,6 +1217,27 @@ mod tests {
         // Assert
         let limits = request.resources.expect("resources");
         assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
+    }
+
+    #[test]
+    fn given_create_when_request_built_then_image_config_is_not_used() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "create", "alpine"]).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert!(!request.use_image_config);
+        assert_eq!(request.entrypoint, None);
+    }
+
+    #[test]
+    fn given_create_with_entrypoint_flag_when_parsed_then_clap_error() {
+        assert!(Cli::try_parse_from(["ward", "create", "--entrypoint", "/x", "alpine"]).is_err());
     }
 
     #[test]

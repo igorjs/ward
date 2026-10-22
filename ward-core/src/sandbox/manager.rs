@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
+use crate::backend::image::ImageConfig;
 use crate::backend::{Backend, BackendError, ExecMode, ProcessControl, ProcessHandle};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
@@ -17,6 +18,7 @@ use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, OutputChunk,
     RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
+use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -98,6 +100,9 @@ fn name_in_use(name: &str, id: Option<&str>) -> ApiError {
         id: id.map(str::to_string),
     }
 }
+
+/// Docker's wording when neither the request nor the image names a command.
+const NO_COMMAND_MESSAGE: &str = "no command specified";
 
 // ---------------------------------------------------------------------------
 // Per-process tracking entry
@@ -694,6 +699,46 @@ impl SandboxManager {
     // Lifecycle
     // -----------------------------------------------------------------------
 
+    /// The main process, working directory and environment for `req`, taking
+    /// the image config into account when the request asks for it.
+    async fn resolve_launch(&self, req: &crate::pb::CreateSandboxRequest) -> Result<Launch> {
+        // A clone keeps the source's command, so its image is not consulted.
+        let consult_image = req.use_image_config && req.from_snapshot.is_empty();
+        let image = if consult_image && !req.image.is_empty() {
+            self.backend
+                .image_config(&req.image)
+                .await
+                .map_err(backend_err)?
+        } else {
+            ImageConfig::default()
+        };
+        // Without the opt in, the request alone decides, as before.
+        let entrypoint = req
+            .use_image_config
+            .then_some(req.entrypoint.as_deref())
+            .flatten();
+        let launch = launch::resolve(
+            &image,
+            Overrides {
+                entrypoint,
+                args: &req.command,
+                workdir: &req.workdir,
+                env: &req.env,
+            },
+        );
+        if !launch.user.is_empty() {
+            tracing::warn!(
+                image = %req.image,
+                user = %launch.user,
+                "image user is not applied; commands run as the guest default"
+            );
+        }
+        if req.require_command && launch.command.is_empty() {
+            return Err(ApiError::InvalidRequest(NO_COMMAND_MESSAGE.to_string()));
+        }
+        Ok(launch)
+    }
+
     /// Create a new sandbox. `presented_token` is only consulted when
     /// `req.from_snapshot` is set: it must match the token of the sandbox
     /// that owns the snapshot, so cloning a sandbox from its snapshot
@@ -750,7 +795,11 @@ impl SandboxManager {
 
         let id = uuid::Uuid::new_v4().to_string();
 
-        let egress_policy = req.egress.map(pb_egress_to_protocol).unwrap_or_default();
+        let egress_policy = req
+            .egress
+            .clone()
+            .map(pb_egress_to_protocol)
+            .unwrap_or_default();
 
         // SEC-ALLOWLIST: only the smoltcp backend's Stack enforces
         // EgressMode::Allowlist on the datapath (its per-flow guard).
@@ -768,42 +817,13 @@ impl SandboxManager {
             )));
         }
 
-        let resources = req
-            .resources
-            .map(pb_resources_to_protocol)
-            .unwrap_or_default();
-
-        let comms = req.comms.map(pb_comms_to_protocol).unwrap_or_default();
-
-        let opts = CreateOpts {
-            image: req.image.clone(),
-            mounts,
-            volume_ids: req.volume_ids.clone(),
-            egress: egress_policy.clone(),
-            resources,
-            env: req.env.clone(),
-            from_snapshot: if req.from_snapshot.is_empty() {
-                None
-            } else {
-                Some(req.from_snapshot.clone())
-            },
-            comms: comms.clone(),
-            spec: crate::protocol::SandboxSpec {
-                name: req.name.clone(),
-                command: req.command.clone(),
-                workdir: req.workdir.clone(),
-                tty: req.tty,
-                auto_remove: req.auto_remove,
-            },
-        };
-
         // Cloning a sandbox from a snapshot requires the snapshot owner's
         // token, otherwise any caller could clone any other sandbox's
         // state by guessing or observing a snapshot id.
-        if let Some(ref from_id) = opts.from_snapshot {
+        if !req.from_snapshot.is_empty() {
             let owner_id = self
                 .backend
-                .snapshot_owner(from_id)
+                .snapshot_owner(&req.from_snapshot)
                 .await
                 .map_err(snapshot_backend_err)?;
             self.authorize(&owner_id, presented_token).await?;
@@ -826,6 +846,40 @@ impl SandboxManager {
                     current, self.max_sandboxes,
                 ))
             })?;
+
+        // Last, so a rejected request never pulls an image.
+        let launch = self.resolve_launch(&req).await?;
+
+        let resources = req
+            .resources
+            .map(pb_resources_to_protocol)
+            .unwrap_or_default();
+
+        let comms = req.comms.map(pb_comms_to_protocol).unwrap_or_default();
+
+        let opts = CreateOpts {
+            image: req.image.clone(),
+            mounts,
+            volume_ids: req.volume_ids.clone(),
+            egress: egress_policy.clone(),
+            resources,
+            env: launch.env,
+            from_snapshot: if req.from_snapshot.is_empty() {
+                None
+            } else {
+                Some(req.from_snapshot.clone())
+            },
+            comms: comms.clone(),
+            spec: crate::protocol::SandboxSpec {
+                name: req.name.clone(),
+                command: launch.command,
+                entrypoint_len: launch.entrypoint_len,
+                workdir: launch.workdir,
+                user: launch.user,
+                tty: req.tty,
+                auto_remove: req.auto_remove,
+            },
+        };
 
         let mut info = self
             .backend
@@ -1962,7 +2016,18 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         started_at: info.started_at.map(system_time_to_timestamp),
         finished_at: info.finished_at.map(system_time_to_timestamp),
         workdir: info.spec.workdir,
+        user: info.spec.user,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
+        entrypoint: match view {
+            CommandView::Full => info
+                .spec
+                .command
+                .iter()
+                .take(info.spec.entrypoint_len)
+                .cloned()
+                .collect(),
+            CommandView::Argv0Only => Vec::new(),
+        },
         command: match view {
             CommandView::Full => info.spec.command,
             CommandView::Argv0Only => Vec::new(),
@@ -2013,12 +2078,14 @@ pub(crate) mod tests {
             &self,
             reference: &str,
             dest: &std::path::Path,
-        ) -> crate::backend::Result<String> {
+        ) -> crate::backend::Result<crate::backend::image::PulledImage> {
             std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(format!("sha256:{hash:016x}"))
+            Ok(crate::backend::image::PulledImage::without_config(format!(
+                "sha256:{hash:016x}"
+            )))
         }
     }
 
@@ -2040,12 +2107,20 @@ pub(crate) mod tests {
         max_sandboxes: usize,
         network_backend: crate::config::NetworkBackendChoice,
     ) -> Arc<SandboxManager> {
+        build_manager_with_puller(max_sandboxes, network_backend, Arc::new(FakePuller))
+    }
+
+    fn build_manager_with_puller(
+        max_sandboxes: usize,
+        network_backend: crate::config::NetworkBackendChoice,
+        puller: Arc<dyn crate::backend::image::ImagePuller>,
+    ) -> Arc<SandboxManager> {
         use crate::backend::image::ImageStore;
         use crate::backend::krunvm::KrunvmBackend;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
         let cache_dir = path.join("cache").join("images");
-        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
+        let store = Arc::new(ImageStore::with_puller(cache_dir, 64, puller));
         std::mem::forget(dir);
         let backend: Arc<dyn Backend> =
             Arc::new(KrunvmBackend::with_image_store_for_test(path, store));
@@ -2418,6 +2493,81 @@ pub(crate) mod tests {
         // Assert: list() never echoes any stored token back.
         assert_eq!(listed.len(), 2);
         assert!(listed.iter().all(|info| info.token.is_empty()));
+    }
+
+    // ----- image config resolution ----------------------------------------
+
+    /// Records every reference it is asked to pull.
+    #[derive(Debug, Default)]
+    struct RecordingPuller {
+        pulled: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingPuller {
+        fn pulled(&self) -> Vec<String> {
+            self.pulled.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::image::ImagePuller for RecordingPuller {
+        async fn pull(
+            &self,
+            reference: &str,
+            dest: &std::path::Path,
+        ) -> crate::backend::Result<crate::backend::image::PulledImage> {
+            self.pulled.lock().unwrap().push(reference.to_string());
+            FakePuller.pull(reference, dest).await
+        }
+    }
+
+    fn build_recording_manager(
+        max_sandboxes: usize,
+    ) -> (Arc<SandboxManager>, Arc<RecordingPuller>) {
+        let puller = Arc::new(RecordingPuller::default());
+        let mgr = build_manager_with_puller(
+            max_sandboxes,
+            crate::config::NetworkBackendChoice::Smoltcp,
+            Arc::clone(&puller) as Arc<dyn crate::backend::image::ImagePuller>,
+        );
+        (mgr, puller)
+    }
+
+    #[tokio::test]
+    async fn given_snapshot_clone_when_create_with_image_config_then_image_is_not_pulled() {
+        // Arrange
+        let (mgr, puller) = build_recording_manager(4);
+        let source = mgr.create(create_req("alpine"), "").await.unwrap();
+        let snap = mgr.create_snapshot(&source.id, "label").await.unwrap();
+        let req = CreateSandboxRequest {
+            from_snapshot: snap.snapshot_id,
+            use_image_config: true,
+            ..create_req("busybox")
+        };
+
+        // Act
+        mgr.create(req, &source.token).await.expect("clone");
+
+        // Assert
+        assert_eq!(puller.pulled(), vec!["alpine".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn given_sandbox_cap_reached_when_create_with_image_config_then_image_is_not_pulled() {
+        // Arrange
+        let (mgr, puller) = build_recording_manager(1);
+        mgr.create(create_req("alpine"), "").await.unwrap();
+        let req = CreateSandboxRequest {
+            use_image_config: true,
+            ..create_req("busybox")
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("over the cap");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
+        assert_eq!(puller.pulled(), vec!["alpine".to_string()]);
     }
 
     // ----- from_snapshot token gate ---------------------------------------

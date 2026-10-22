@@ -72,6 +72,16 @@ message CreateSandboxRequest {
   bool tty = 12;
   // Remove the sandbox once its main process ends.
   bool auto_remove = 13;
+  // Start from the image config like `docker run`: the image Entrypoint and
+  // Cmd fill in what `command` leaves out, and its WorkingDir and Env fill in
+  // `workdir` and `env`. Without it only the fields given here apply.
+  bool use_image_config = 14;
+  // Replaces the image Entrypoint. Present but empty clears it. When set, the
+  // image Cmd is ignored unless `command` is given. Needs use_image_config.
+  optional string entrypoint = 15;
+  // Fail when no command results from the request and the image config.
+  // Needs use_image_config.
+  bool require_command = 16;
 }
 
 message GetSandboxRequest {
@@ -125,6 +135,11 @@ message SandboxInfo {
   // Absent until the main process has started or ended.
   google.protobuf.Timestamp started_at = 14;
   google.protobuf.Timestamp finished_at = 15;
+  // Leading part of `command` that came from an Entrypoint. Filled like
+  // `command`.
+  repeated string entrypoint = 16;
+  // The image's User. Recorded for display: the guest does not apply it.
+  string user = 17;
 }
 
 enum SandboxStatus {

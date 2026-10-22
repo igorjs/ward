@@ -93,6 +93,12 @@ pub trait Backend: Send + Sync + 'static {
         opts: &crate::protocol::CreateOpts,
     ) -> Result<crate::protocol::SandboxInfo>;
 
+    /// The runtime config of `image`, pulling it first when needed. Backends
+    /// that do not read images report an empty config.
+    async fn image_config(&self, _image: &str) -> Result<image::ImageConfig> {
+        Ok(image::ImageConfig::default())
+    }
+
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
 
     async fn list_sandboxes(&self) -> Result<Vec<crate::protocol::SandboxInfo>>;
