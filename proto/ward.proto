@@ -42,6 +42,10 @@ service Ward {
   // One reading of a running sandbox's resource use, like one frame of
   // `docker stats`. The token travels in call metadata.
   rpc Stats(StatsRequest) returns (StatsResponse);
+  // Block until the sandbox's main process ends or the sandbox stops, then
+  // return its exit code, like `docker wait`. The token travels in call
+  // metadata.
+  rpc Wait(WaitRequest) returns (WaitResponse);
   // Lifecycle events of every sandbox, like `docker events`. Replays the
   // recent history from `since`, then streams live until `until`. Like
   // ListSandboxes it needs no sandbox token: it carries only ids, names,
@@ -374,7 +378,7 @@ message TopProcess {
 }
 
 // ---------------------------------------------------------------------------
-// Stats messages
+// Stats and wait messages
 // ---------------------------------------------------------------------------
 
 message StatsRequest {
@@ -392,6 +396,15 @@ message StatsResponse {
   uint32 pids = 5;
   // When the daemon took the reading, for working out rates between two.
   google.protobuf.Timestamp read_at = 6;
+}
+
+message WaitRequest {
+  string sandbox_id = 1;
+}
+
+message WaitResponse {
+  // The main process's exit code, or 0 for a sandbox without a command.
+  int32 exit_code = 1;
 }
 
 // ---------------------------------------------------------------------------

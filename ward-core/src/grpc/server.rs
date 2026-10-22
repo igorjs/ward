@@ -21,7 +21,7 @@ use crate::pb::{
     RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
     SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
     StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
-    WriteStdinRequest,
+    WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -826,6 +826,19 @@ impl Ward for WardGrpcServer {
             pids: stats.pids,
             read_at: Some(prost_types::Timestamp::from(stats.read_at)),
         }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.wait",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let exit_code = self.sandbox.wait(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(WaitResponse { exit_code }))
     }
 
     type EventsStream = tokio_stream::wrappers::ReceiverStream<Result<PbSandboxEvent, Status>>;

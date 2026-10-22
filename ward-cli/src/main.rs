@@ -18,6 +18,7 @@ mod template;
 mod terminal;
 mod tokens;
 mod top;
+mod wait;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -363,6 +364,15 @@ enum Commands {
         #[arg(long)]
         format: Option<String>,
         /// Sandbox names, IDs or ID prefixes.
+        references: Vec<String>,
+    },
+
+    /// Block until sandboxes stop, then print their exit codes.
+    ///
+    /// A sandbox without a command reports 0 once it is stopped.
+    Wait {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
         references: Vec<String>,
     },
 
@@ -1053,6 +1063,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_trunc,
             };
             stats::run(&socket_path, &token_store, &references, options).await?;
+        }
+
+        Commands::Wait { references } => {
+            wait::run(&socket_path, &token_store, &references, json).await?;
         }
 
         Commands::Events {
