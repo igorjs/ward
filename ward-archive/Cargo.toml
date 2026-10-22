@@ -1,0 +1,22 @@
+[package]
+name = "ward-archive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Safe tar unpacking, shared by the host and the guest agent.
+# Kept tiny so the agent binary stays cheap to bake into a rootfs.
+
+[dependencies]
+rustix = { version = "1", features = ["fs"] }
+tar = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+rstest = "0.26"
+tempfile = "3"
+
+[lints]
+workspace = true

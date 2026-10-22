@@ -6,6 +6,7 @@ ward-core/     Library crate: protocol types, Backend trait, libkrun FFI,
 ward-daemon/   wardd binary: gRPC server over Unix socket, hosts the manager.
 ward-cli/      ward binary: thin CLI client over the same gRPC.
 ward-agent/    Guest-side init binary + vsock RPC protocol (boot integration: #9).
+ward-archive/  Safe tar pack and unpack shared by snapshots and file copy.
 ward-proto/    Protobuf types + tonic gRPC stubs for the daemon's public wire
                protocol; Apache-2.0 boundary crate shared by the AGPL
                workspace and the SDKs.
