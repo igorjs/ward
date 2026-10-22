@@ -185,11 +185,13 @@ pub enum RawStream {
     Stderr,
 }
 
-/// A piece of process output and the stream it was written to.
+/// A piece of process output, the stream it was written to and its arrival time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputChunk {
     pub stream: RawStream,
     pub bytes: bytes::Bytes,
+    /// When the daemon received the bytes.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

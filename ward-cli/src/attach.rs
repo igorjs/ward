@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use rustix::termios::isatty;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
@@ -26,6 +27,21 @@ use crate::terminal::{self, ExitSignals, RawModeGuard};
 const NOT_A_TTY: &str = "the input device is not a TTY";
 const STDIN_CHUNK_BYTES: usize = 8192;
 const OUTBOUND_CAPACITY: usize = 16;
+
+/// A piece of output with the stream it came from and, when the daemon sent
+/// one, the time it arrived.
+pub struct Chunk<'a> {
+    pub stream: AttachStream,
+    pub bytes: &'a [u8],
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// What an attach stream hands to its sink.
+pub enum Output<'a> {
+    Data(Chunk<'a>),
+    /// The buffered output is complete; anything after is live.
+    ReplayEnd,
+}
 
 /// Fails when stdin is attached with a tty (`-it`) but is not a terminal.
 /// Like Docker, `-t` alone does not need a terminal on stdin.
@@ -54,7 +70,11 @@ pub async fn attach(
     start: AttachStart,
     forward_stdin: bool,
 ) -> Result<Option<i32>> {
-    attach_with(client, target, start, forward_stdin, write_to_terminal).await
+    let sink = |output: Output| match output {
+        Output::Data(chunk) => write_to_terminal(chunk.stream, chunk.bytes),
+        Output::ReplayEnd => Ok(()),
+    };
+    attach_with(client, target, start, forward_stdin, sink).await
 }
 
 /// Writes a chunk to stdout, or to stderr when the process wrote it there.
@@ -84,13 +104,13 @@ fn write_flushed(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Like [`attach`], handing every output chunk to `sink` with its stream.
+/// Like [`attach`], handing every output chunk and the replay end to `sink`.
 pub async fn attach_with(
     client: &mut WardClient<Channel>,
     target: &Resolved,
     start: AttachStart,
     forward_stdin: bool,
-    mut sink: impl FnMut(AttachStream, &[u8]) -> std::io::Result<()>,
+    mut sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
     let tty = start.tty;
     let replay = start.replay;
@@ -140,15 +160,23 @@ pub async fn attach_with(
 async fn relay_replies(
     mut replies: impl Stream<Item = Result<AttachMessage, tonic::Status>> + Unpin,
     replay: bool,
-    sink: &mut impl FnMut(AttachStream, &[u8]) -> std::io::Result<()>,
+    sink: &mut impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
     while let Some(reply) = replies.next().await {
         match reply?.kind {
             Some(Kind::Data(data)) => {
                 // An unknown value, from a newer server, reads as stdout.
                 let stream = AttachStream::try_from(data.stream).unwrap_or_default();
-                sink(stream, &data.data)?;
+                let at = data.timestamp.and_then(|t| {
+                    DateTime::from_timestamp(t.seconds, u32::try_from(t.nanos).unwrap_or_default())
+                });
+                sink(Output::Data(Chunk {
+                    stream,
+                    bytes: &data.data,
+                    at,
+                }))?;
             }
+            Some(Kind::ReplayEnd(_)) => sink(Output::ReplayEnd)?,
             // A log follower reports the output, not the guest's exit code.
             Some(Kind::Exit(exit)) => return Ok((!replay).then_some(exit.exit_code)),
             _ => {}
@@ -245,6 +273,7 @@ mod tests {
             kind: Some(Kind::Data(AttachData {
                 stream: stream as i32,
                 data: text.as_bytes().to_vec(),
+                timestamp: None,
             })),
         })
     }
@@ -262,7 +291,10 @@ mod tests {
             exit,
         ]);
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        let mut sink = |stream, bytes: &[u8]| write_to(&mut stdout, &mut stderr, stream, bytes);
+        let mut sink = |output: Output| match output {
+            Output::Data(c) => write_to(&mut stdout, &mut stderr, c.stream, c.bytes),
+            Output::ReplayEnd => Ok(()),
+        };
 
         // Act
         let code = relay_replies(replies, false, &mut sink).await.unwrap();

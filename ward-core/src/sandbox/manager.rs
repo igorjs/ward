@@ -129,6 +129,10 @@ const MAIN_OUTPUT_CAP: usize = 1024 * 1024;
 /// many tiny writes cannot hold far more memory than the cap suggests.
 const OUTPUT_CHUNK_OVERHEAD: usize = 64;
 
+/// Largest retained chunk a same millisecond write may still be merged into,
+/// which bounds the copy each write pays.
+const OUTPUT_MERGE_LIMIT: usize = 4096;
+
 /// Live chunks a slow subscriber may lag behind before it loses the oldest.
 const MAIN_OUTPUT_LIVE_CHUNKS: usize = 64;
 
@@ -160,9 +164,29 @@ impl OutputBuffer {
     }
 
     fn push(&self, chunk: OutputChunk) {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.len += chunk.bytes.len() + OUTPUT_CHUNK_OVERHEAD;
-        state.chunks.push_back(chunk.clone());
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = &mut *guard;
+        // Same stream and same millisecond: one chunk, so a burst of tiny
+        // writes does not pay the per chunk overhead each time.
+        let merged = match state.chunks.back_mut() {
+            Some(back)
+                if back.stream == chunk.stream
+                    && same_millisecond(back.at, chunk.at)
+                    && back.bytes.len() < OUTPUT_MERGE_LIMIT =>
+            {
+                let mut joined = Vec::with_capacity(back.bytes.len() + chunk.bytes.len());
+                joined.extend_from_slice(&back.bytes);
+                joined.extend_from_slice(&chunk.bytes);
+                back.bytes = bytes::Bytes::from(joined);
+                state.len += chunk.bytes.len();
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            state.len += chunk.bytes.len() + OUTPUT_CHUNK_OVERHEAD;
+            state.chunks.push_back(chunk.clone());
+        }
         while state.len > self.cap {
             let excess = state.len - self.cap;
             let Some(front) = state.chunks.front_mut() else {
@@ -189,6 +213,10 @@ impl OutputBuffer {
             state.live.subscribe(),
         )
     }
+}
+
+fn same_millisecond(a: chrono::DateTime<chrono::Utc>, b: chrono::DateTime<chrono::Utc>) -> bool {
+    a.timestamp_millis() == b.timestamp_millis()
 }
 
 /// The process the daemon spawned from a sandbox's stored command.
@@ -235,18 +263,22 @@ pub struct ProcessIo {
 /// The output an event carries, if any.
 pub(crate) fn event_chunk(event: &StreamEvent) -> Option<OutputChunk> {
     let line = || bytes::Bytes::from(format!("{}\n", event.line));
+    let at = chrono::Utc::now();
     match &event.kind {
         StreamEventKind::Data { stream, bytes } => Some(OutputChunk {
             stream: *stream,
             bytes: bytes::Bytes::copy_from_slice(bytes),
+            at,
         }),
         StreamEventKind::Stdout => Some(OutputChunk {
             stream: RawStream::Stdout,
             bytes: line(),
+            at,
         }),
         StreamEventKind::Stderr => Some(OutputChunk {
             stream: RawStream::Stderr,
             bytes: line(),
+            at,
         }),
         StreamEventKind::Exit => None,
     }
@@ -4841,11 +4873,93 @@ pub(crate) mod tests {
             .collect()
     }
 
+    const TEST_EPOCH_MILLIS: i64 = 1_800_000_000_000;
+
+    fn millis(offset: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp_millis(TEST_EPOCH_MILLIS + offset).expect("valid time")
+    }
+
     fn chunk(stream: RawStream, text: &str) -> OutputChunk {
+        chunk_at(stream, text, millis(0))
+    }
+
+    fn chunk_at(stream: RawStream, text: &str, at: chrono::DateTime<chrono::Utc>) -> OutputChunk {
         OutputChunk {
             stream,
             bytes: bytes::Bytes::copy_from_slice(text.as_bytes()),
+            at,
         }
+    }
+
+    #[test]
+    fn given_a_burst_of_one_byte_writes_in_one_millisecond_when_buffered_then_chunks_stay_few_and_fast()
+     {
+        // Arrange
+        const WRITES: usize = 200_000;
+        const TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP * 4);
+        let started = std::time::Instant::now();
+
+        // Act
+        for _ in 0..WRITES {
+            buffer.push(chunk_at(RawStream::Stdout, "x", millis(1)));
+        }
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert!(
+            replay.len() <= WRITES / OUTPUT_MERGE_LIMIT + 1,
+            "{}",
+            replay.len()
+        );
+        assert_eq!(replay.iter().map(|c| c.bytes.len()).sum::<usize>(), WRITES);
+        assert!(started.elapsed() < TIME_BUDGET, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn given_chunks_in_different_milliseconds_when_buffered_then_each_keeps_its_arrival_time() {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP);
+
+        // Act
+        buffer.push(chunk_at(RawStream::Stdout, "a\n", millis(1)));
+        buffer.push(chunk_at(RawStream::Stdout, "b\n", millis(2)));
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert_eq!(
+            replay.iter().map(|c| c.at).collect::<Vec<_>>(),
+            vec![millis(1), millis(2)]
+        );
+    }
+
+    #[test]
+    fn given_same_stream_chunks_in_one_millisecond_when_buffered_then_they_merge_and_the_live_copy_stays_whole()
+     {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP);
+        let (_, mut live) = buffer.subscribe();
+
+        // Act
+        buffer.push(chunk_at(RawStream::Stdout, "a", millis(5)));
+        buffer.push(chunk_at(RawStream::Stdout, "b", millis(5)));
+        buffer.push(chunk_at(RawStream::Stderr, "c", millis(5)));
+
+        // Assert
+        let (replay, _) = buffer.subscribe();
+        assert_eq!(
+            replay,
+            vec![
+                chunk_at(RawStream::Stdout, "ab", millis(5)),
+                chunk_at(RawStream::Stderr, "c", millis(5)),
+            ]
+        );
+        assert_eq!(
+            live.try_recv().unwrap(),
+            chunk_at(RawStream::Stdout, "a", millis(5))
+        );
+        let state = buffer.state.lock().unwrap();
+        assert_eq!(state.len, 3 + 2 * OUTPUT_CHUNK_OVERHEAD);
     }
 
     #[test]

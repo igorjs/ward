@@ -32,6 +32,9 @@ const POLL_DEADLINE: Duration = Duration::from_secs(30);
 const NOT_A_TTY: &str = "the input device is not a TTY";
 #[cfg(not(feature = "krunvm"))]
 const DOCKER_CLI_FAILURE: i32 = 125;
+/// `2026-10-22T10:00:00.123456789Z`
+#[cfg(not(feature = "krunvm"))]
+const RFC3339_NANOS_LEN: usize = 30;
 const DRAIN_BUFFER_BYTES: usize = 256;
 const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
 const DEFAULT_IMAGE: &str = "alpine:3.20";
@@ -430,4 +433,63 @@ fn given_a_real_guest_when_run_exits_3_then_the_cli_exits_3() {
         .expect("run");
 
     assert_eq!(status.code(), Some(3));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_logs_f_with_tail_and_timestamps_when_the_process_printed_then_the_line_is_stamped_and_the_tail_of_a_finished_sandbox_prints()
+ {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "stamped-logs", "alpine", "echo"]);
+    assert!(cmd.output().expect("run -d").status.success());
+
+    // Act
+    let text = logs_until(
+        &daemon,
+        &["logs", "-f", "--tail", "1", "-t", "stamped-logs"],
+        "stub: echo",
+    );
+
+    // Assert
+    let line = text.lines().next().expect("one line");
+    let (stamp, rest) = line.split_once(' ').expect("stamp then text");
+    assert_eq!(stamp.len(), RFC3339_NANOS_LEN, "{line}");
+    assert!(stamp.ends_with('Z') && stamp.contains('T'), "{line}");
+    assert_eq!(rest, "stub: echo");
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_logs_since_in_the_future_or_an_invalid_value_when_run_then_old_output_is_hidden_or_it_fails()
+ {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "since-logs", "alpine", "echo"]);
+    assert!(cmd.output().expect("run -d").status.success());
+    logs_until(&daemon, &["logs", "since-logs"], "stub: echo");
+
+    // Act
+    let hidden = daemon
+        .cli()
+        .args(["logs", "--since", "2999-01-01T00:00:00Z", "since-logs"])
+        .output()
+        .expect("logs");
+    let shown = daemon
+        .cli()
+        .args(["logs", "--since", "1h", "since-logs"])
+        .output()
+        .expect("logs");
+    let invalid = daemon
+        .cli()
+        .args(["logs", "--since", "soon", "since-logs"])
+        .output()
+        .expect("logs");
+
+    // Assert
+    assert!(hidden.status.success() && hidden.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("stub: echo"));
+    assert!(!invalid.status.success());
 }

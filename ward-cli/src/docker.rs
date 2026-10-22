@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
-use ward_core::pb::{AttachMode, AttachStart, AttachStream, CreateSandboxRequest};
+use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
 
 use crate::attach::{self, require_exit, require_terminal};
 use crate::client::{self, Resolved};
+use crate::log_output::{LogOptions, LogPrinter, Printable};
 use crate::{lifecycle, tokens};
 
 pub const TAIL_ALL: &str = "all";
@@ -99,11 +100,8 @@ pub async fn logs(
     token_store: &Path,
     reference: &str,
     follow: bool,
-    tail: Option<usize>,
+    options: LogOptions,
 ) -> Result<i32> {
-    if follow && tail.is_some() {
-        bail!("--tail cannot be combined with --follow");
-    }
     let mut c = client::connect(socket).await?;
     let target = client::resolve(&mut c, token_store, reference).await?;
     let start = AttachStart {
@@ -113,43 +111,21 @@ pub async fn logs(
         follow,
         ..Default::default()
     };
+    let mut printer = LogPrinter::new(options);
     // No exit status means the output simply ended.
-    let Some(lines) = tail else {
-        return Ok(attach::attach(&mut c, &target, start, false)
-            .await?
-            .unwrap_or(0));
-    };
-    let mut chunks = Vec::new();
-    let code = attach::attach_with(&mut c, &target, start, false, |stream, bytes| {
-        chunks.push((stream, bytes.to_vec()));
-        Ok(())
+    let code = attach::attach_with(&mut c, &target, start, false, |output| {
+        print_all(printer.accept(output))
     })
     .await?
     .unwrap_or(0);
-    for (stream, bytes) in tail_chunks(&chunks, lines) {
-        attach::write_to_terminal(stream, bytes)?;
-    }
+    print_all(printer.finish())?;
     Ok(code)
 }
 
-/// The parts of `chunks` that make up their last `lines` lines, each paired
-/// with the stream it came from.
-fn tail_chunks(chunks: &[(AttachStream, Vec<u8>)], lines: usize) -> Vec<(AttachStream, &[u8])> {
-    let all: Vec<u8> = chunks
-        .iter()
-        .flat_map(|(_, bytes)| bytes)
-        .copied()
-        .collect();
-    let mut skip = all.len() - last_lines(&all, lines).len();
-    let mut kept = Vec::new();
-    for (stream, bytes) in chunks {
-        let dropped = skip.min(bytes.len());
-        skip -= dropped;
-        if dropped < bytes.len() {
-            kept.push((*stream, &bytes[dropped..]));
-        }
-    }
-    kept
+fn print_all(printables: Vec<Printable>) -> std::io::Result<()> {
+    printables
+        .into_iter()
+        .try_for_each(|(stream, bytes)| attach::write_to_terminal(stream, &bytes))
 }
 
 /// Parses `--tail`: `all` keeps every line, a number keeps that many.
@@ -163,22 +139,6 @@ pub fn parse_tail(value: &str) -> Result<Option<usize>> {
         .map_err(|_| anyhow::anyhow!("invalid value '{value}' for --tail: use a number or 'all'"))
 }
 
-/// The last `count` lines of `output`, keeping their line endings.
-fn last_lines(output: &[u8], count: usize) -> &[u8] {
-    let body = output.strip_suffix(b"\n").unwrap_or(output);
-    let mut start = body.len();
-    for _ in 0..count {
-        match body[..start].iter().rposition(|&b| b == b'\n') {
-            Some(newline) => start = newline,
-            None => return output,
-        }
-    }
-    if count == 0 {
-        return &[];
-    }
-    &output[start + 1..]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,38 +149,5 @@ mod tests {
         assert_eq!(parse_tail("3").unwrap(), Some(3));
         assert!(parse_tail("-1").is_err());
         assert!(parse_tail("few").is_err());
-    }
-
-    #[test]
-    fn given_mixed_streams_when_tailed_then_each_kept_part_keeps_its_stream() {
-        // Arrange
-        let chunks = vec![
-            (AttachStream::Stdout, b"a\nb".to_vec()),
-            (AttachStream::Stderr, b"\nc\n".to_vec()),
-        ];
-
-        // Act
-        let kept = tail_chunks(&chunks, 2);
-
-        // Assert
-        assert_eq!(
-            kept,
-            vec![
-                (AttachStream::Stdout, &b"b"[..]),
-                (AttachStream::Stderr, &b"\nc\n"[..]),
-            ]
-        );
-    }
-
-    #[test]
-    fn given_output_when_last_lines_taken_then_only_the_tail_remains() {
-        // Arrange
-        let output = b"a\nb\nc\n";
-
-        // Act and Assert
-        assert_eq!(last_lines(output, 2), b"b\nc\n");
-        assert_eq!(last_lines(output, 9), output);
-        assert_eq!(last_lines(output, 0), b"");
-        assert_eq!(last_lines(b"a\nb", 1), b"b");
     }
 }

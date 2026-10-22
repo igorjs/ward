@@ -15,7 +15,9 @@ use tracing::{info, warn};
 use super::server::api_err_to_status;
 use crate::backend::ProcessControl;
 use crate::pb::attach_message::Kind;
-use crate::pb::{AttachData, AttachExit, AttachMessage, AttachMode, AttachStart, AttachStream};
+use crate::pb::{
+    AttachData, AttachExit, AttachMessage, AttachMode, AttachReplayEnd, AttachStart, AttachStream,
+};
 use crate::protocol::{OutputChunk, RawStream, StreamEvent};
 use crate::sandbox::{
     ProcessIo, SandboxManager, decode_wait_status, event_chunk, event_wait_status,
@@ -120,7 +122,22 @@ async fn send_data(tx: &Outbound, chunk: OutputChunk) -> bool {
     let kind = Kind::Data(AttachData {
         data: chunk.bytes.to_vec(),
         stream: stream.into(),
+        timestamp: Some(prost_types::Timestamp {
+            seconds: chunk.at.timestamp(),
+            nanos: chunk
+                .at
+                .timestamp_subsec_nanos()
+                .try_into()
+                .unwrap_or_default(),
+        }),
     });
+    tx.send(Ok(AttachMessage { kind: Some(kind) }))
+        .await
+        .is_ok()
+}
+
+async fn send_replay_end(tx: &Outbound) -> bool {
+    let kind = Kind::ReplayEnd(AttachReplayEnd {});
     tx.send(Ok(AttachMessage { kind: Some(kind) }))
         .await
         .is_ok()
@@ -149,7 +166,7 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
             return;
         }
     }
-    if buffer_only {
+    if !send_replay_end(&tx).await || buffer_only {
         return;
     }
     let exit = manager.main_exit_status(&id);
@@ -285,7 +302,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::pb::{AttachResize, AttachSignal, AttachStdin};
+    use crate::pb::{AttachReplayEnd as ReplayEnd, AttachResize, AttachSignal, AttachStdin};
     use crate::sandbox::{create_with_command, host_manager};
 
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -594,18 +611,27 @@ mod tests {
         assert!(echoed.is_err(), "cat received the ignored stdin");
     }
 
+    async fn wait_for_buffered_output(mgr: &SandboxManager, id: &str) {
+        let buffered = async {
+            loop {
+                let (buffered, _) = mgr.subscribe_main_output(id).await.expect("subscribe");
+                if !buffered.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(POLL_STEP).await;
+            }
+        };
+        tokio::time::timeout(TEST_DEADLINE, buffered)
+            .await
+            .expect("main process output was never buffered");
+    }
+
     #[tokio::test]
     async fn given_replay_without_follow_when_attached_then_buffer_arrives_and_stream_ends() {
         // Arrange
         let mgr = host_manager(OUTPUT_CAP);
         let id = create_with_command(&mgr, &["sh", "-c", "echo one; exec cat"], false).await;
-        loop {
-            let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
-            if !buffered.is_empty() {
-                break;
-            }
-            tokio::time::sleep(POLL_STEP).await;
-        }
+        wait_for_buffered_output(&mgr, &id).await;
         let start = AttachStart {
             replay: true,
             ..main_start(&id)
@@ -617,6 +643,33 @@ mod tests {
 
         // Assert: the stream ended with the buffer and no exit code.
         assert_eq!((text.as_str(), code), ("one\n", None));
+    }
+
+    #[tokio::test]
+    async fn given_buffered_output_when_replayed_with_follow_then_the_marker_follows_the_buffer_and_data_is_stamped()
+     {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo one; exec cat"], false).await;
+        wait_for_buffered_output(&mgr, &id).await;
+        let start = AttachStart {
+            replay: true,
+            follow: true,
+            ..main_start(&id)
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+        let first = replies.recv().await.expect("open").expect("reply");
+        let second = replies.recv().await.expect("open").expect("reply");
+
+        // Assert
+        let Some(Kind::Data(data)) = first.kind else {
+            panic!("expected data first, got {first:?}");
+        };
+        assert_eq!(data.data, b"one\n");
+        assert!(data.timestamp.is_some_and(|t| t.seconds > 0));
+        assert_eq!(second.kind, Some(Kind::ReplayEnd(ReplayEnd {})));
     }
 
     #[tokio::test]
