@@ -111,11 +111,29 @@ fn duration_text(seconds: i64) -> String {
     }
 }
 
-/// Docker style status: `Up 5 minutes`, `Exited (7)`, `Created`.
-fn status_text(info: &SandboxInfo, uptime_seconds: i64) -> String {
+/// Seconds from `time` to `now_seconds`, never negative.
+fn seconds_since(time: &Option<prost_types::Timestamp>, now_seconds: i64) -> Option<i64> {
+    time.as_ref().map(|t| (now_seconds - t.seconds).max(0))
+}
+
+/// Docker style status: `Up 5 minutes`, `Exited (7) 5 minutes ago`, `Created`.
+/// `Up` counts from the last start, falling back to the creation time for
+/// records that predate it. `Exited` counts from the finish and shows only the
+/// code when there is none.
+fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
+    let since_created = seconds_since(&info.created_at, now_seconds).unwrap_or_default();
     match SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified) {
-        SandboxStatus::Running => format!("Up {}", duration_text(uptime_seconds)),
-        SandboxStatus::Exited => format!("Exited ({})", info.exit_code.unwrap_or_default()),
+        SandboxStatus::Running => {
+            let uptime = seconds_since(&info.started_at, now_seconds).unwrap_or(since_created);
+            format!("Up {}", duration_text(uptime))
+        }
+        SandboxStatus::Exited => {
+            let code = info.exit_code.unwrap_or_default();
+            match seconds_since(&info.finished_at, now_seconds) {
+                Some(ago) => format!("Exited ({code}) {} ago", duration_text(ago)),
+                None => format!("Exited ({code})"),
+            }
+        }
         SandboxStatus::Creating => "Created".to_string(),
         SandboxStatus::Stopped => "Stopped".to_string(),
         SandboxStatus::Failed => "Failed".to_string(),
@@ -127,11 +145,7 @@ fn status_text(info: &SandboxInfo, uptime_seconds: i64) -> String {
 /// One `ps` row. Only argv[0] of the command is shown, since arguments can
 /// hold secrets.
 pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
-    let elapsed = info
-        .created_at
-        .as_ref()
-        .map(|t| (now_seconds - t.seconds).max(0))
-        .unwrap_or_default();
+    let elapsed = seconds_since(&info.created_at, now_seconds).unwrap_or_default();
     let created = format!("{} ago", duration_text(elapsed));
     let short_id: String = info.id.chars().take(SHORT_ID_LEN).collect();
     vec![
@@ -139,7 +153,7 @@ pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
         Value::String(info.image.clone()),
         Value::String(info.command_name.clone()),
         Value::String(created),
-        Value::String(status_text(info, elapsed)),
+        Value::String(status_text(info, now_seconds)),
         Value::String(info.name.clone()),
     ]
 }
@@ -147,9 +161,7 @@ pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
 /// One `ps --format json` object, keyed as Docker names the fields.
 pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
     let created = info.created_at.as_ref().map(|t| t.seconds);
-    let elapsed = created
-        .map(|c| (now_seconds - c).max(0))
-        .unwrap_or_default();
+    let elapsed = seconds_since(&info.created_at, now_seconds).unwrap_or_default();
     let short_id: String = info.id.chars().take(SHORT_ID_LEN).collect();
     json!({
         "ID": short_id,
@@ -157,7 +169,7 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Command": info.command_name,
         "CreatedAt": created.map(created_at_text),
         "RunningFor": format!("{} ago", duration_text(elapsed)),
-        "Status": status_text(info, elapsed),
+        "Status": status_text(info, now_seconds),
         "Names": info.name,
     })
 }
@@ -219,6 +231,8 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "State": {
             "Status": status_name(info.status),
             "ExitCode": info.exit_code.unwrap_or_default(),
+            "StartedAt": state_time(&info.started_at),
+            "FinishedAt": state_time(&info.finished_at),
         },
         "Config": {"Image": info.image, "Cmd": cmd},
     })
@@ -270,6 +284,26 @@ fn rfc3339(seconds: i64) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         c.year, c.month, c.day, c.hour, c.minute, c.second
     )
+}
+
+/// What Docker prints for a state time that was never set.
+const UNSET_TIME: &str = "0001-01-01T00:00:00Z";
+const NANOS_DIGITS: usize = 9;
+
+/// Docker's RFC3339Nano: the fraction drops its trailing zeros, and an unset
+/// time is the zero time.
+fn state_time(time: &Option<prost_types::Timestamp>) -> String {
+    let Some(t) = time else {
+        return UNSET_TIME.to_string();
+    };
+    let whole = rfc3339(t.seconds);
+    let fraction = format!("{:0width$}", t.nanos, width = NANOS_DIGITS);
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        return whole;
+    }
+    let date = whole.trim_end_matches('Z');
+    format!("{date}.{fraction}Z")
 }
 
 /// Docker's `CreatedAt` layout, for example `2024-02-29 00:00:00 +0000 UTC`.
@@ -464,7 +498,12 @@ mod tests {
                 "Id": "0123456789abcdef0123",
                 "Name": "/web1",
                 "Created": "1970-01-12T13:44:40Z",
-                "State": {"Status": "exited", "ExitCode": 7},
+                "State": {
+                    "Status": "exited",
+                    "ExitCode": 7,
+                    "StartedAt": "0001-01-01T00:00:00Z",
+                    "FinishedAt": "0001-01-01T00:00:00Z",
+                },
                 "Config": {"Image": "alpine", "Cmd": ["sh"]},
             })
         );
@@ -495,7 +534,7 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::running(SandboxStatus::Running, None, "Up 5 minutes")]
+    #[case::running(SandboxStatus::Running, None, "Up 2 minutes")]
     #[case::exited(SandboxStatus::Exited, Some(143), "Exited (143)")]
     #[case::creating(SandboxStatus::Creating, None, "Created")]
     #[case::stopped(SandboxStatus::Stopped, None, "Stopped")]
@@ -504,7 +543,52 @@ mod tests {
         #[case] exit_code: Option<i32>,
         #[case] want: &str,
     ) {
-        assert_eq!(status_text(&info(status, exit_code), 300), want);
+        assert_eq!(status_text(&info(status, exit_code), NOW), want);
+    }
+
+    #[test]
+    fn given_restarted_sandbox_when_status_built_then_up_counts_from_started_at() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.started_at = Some(prost_types::Timestamp {
+            seconds: NOW - 60,
+            nanos: 0,
+        });
+
+        // Act
+        let status = status_text(&sandbox, NOW);
+
+        // Assert
+        assert_eq!(status, "Up About a minute");
+    }
+
+    #[test]
+    fn given_finished_sandbox_when_status_built_then_exited_counts_from_finished_at() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Exited, Some(7));
+        sandbox.finished_at = Some(prost_types::Timestamp {
+            seconds: NOW - 300,
+            nanos: 0,
+        });
+
+        // Act
+        let status = status_text(&sandbox, NOW);
+
+        // Assert
+        assert_eq!(status, "Exited (7) 5 minutes ago");
+    }
+
+    #[rstest::rstest]
+    #[case::unset(None, "0001-01-01T00:00:00Z")]
+    #[case::whole_second(Some((0, 0)), "1970-01-01T00:00:00Z")]
+    #[case::trimmed_fraction(Some((0, 120_000_000)), "1970-01-01T00:00:00.12Z")]
+    #[case::full_fraction(Some((0, 1)), "1970-01-01T00:00:00.000000001Z")]
+    fn given_state_time_when_formatted_then_rfc3339_nano(
+        #[case] time: Option<(i64, i32)>,
+        #[case] want: &str,
+    ) {
+        let time = time.map(|(seconds, nanos)| prost_types::Timestamp { seconds, nanos });
+        assert_eq!(state_time(&time), want);
     }
 
     #[rstest::rstest]

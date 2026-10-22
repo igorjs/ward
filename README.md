@@ -59,7 +59,7 @@ ward exec -d <id> sleep 60               # → pid, for ward logs <id> <pid>
 ward rm -f <id>
 ```
 
-A sandbox can be named with `ward create --name web alpine` and referred to by name, id or a unique id prefix. `ward stop`, `ward start` and `ward restart` move it through its lifecycle and keep its files. `ward rm` refuses a running sandbox (use `-f`), and `ward prune` removes every stopped sandbox.
+A sandbox can be named with `ward create --name web alpine` and referred to by name, id or a unique id prefix. `ward stop`, `ward start` and `ward restart` move it through its lifecycle and keep its files; `ward stop -t 30` waits up to 30 seconds for SIGTERM to work (default 10, `-t 0` kills at once, `-t -1` waits forever). `ward run -d --rm` removes the sandbox when its command ends. `ward rm` refuses a running sandbox (use `-f`), and `ward prune` removes every stopped sandbox.
 
 ## Hello world (MCP, for agents)
 

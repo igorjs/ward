@@ -63,9 +63,21 @@ async fn call(
         }};
     }
     match rpc {
-        Rpc::Stop => send!(stop, StopRequest { id }),
+        Rpc::Stop => send!(
+            stop,
+            StopRequest {
+                id,
+                ..Default::default()
+            }
+        ),
         Rpc::Start => send!(start, StartRequest { id }),
-        Rpc::Restart => send!(restart, RestartRequest { id }),
+        Rpc::Restart => send!(
+            restart,
+            RestartRequest {
+                id,
+                ..Default::default()
+            }
+        ),
     }
 }
 

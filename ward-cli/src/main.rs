@@ -54,6 +54,14 @@ struct Cli {
 const DEFAULT_MEMORY: &str = "512m";
 const DEFAULT_CPUS: &str = "1";
 
+/// Help for `--time` on `stop` and `restart`.
+fn stop_time_help() -> String {
+    format!(
+        "Seconds to wait for the main process after SIGTERM before SIGKILL (default {}, 0 kills at once, -1 waits forever).",
+        ward_core::sandbox::STOP_GRACE_SECONDS
+    )
+}
+
 /// Sandbox settings shared by `create` and `run`.
 #[derive(Debug, Args)]
 struct SandboxOpts {
@@ -183,7 +191,7 @@ enum Commands {
         #[arg(short, long)]
         tty: bool,
         /// Remove the sandbox when the command ends.
-        #[arg(long, conflicts_with = "detach")]
+        #[arg(long)]
         rm: bool,
         /// Print the sandbox ID and leave the command running.
         #[arg(short, long)]
@@ -250,6 +258,8 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         refs: Vec<String>,
+        #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
+        time: Option<i32>,
     },
 
     /// Start one or more stopped sandboxes.
@@ -264,6 +274,8 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         refs: Vec<String>,
+        #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
+        time: Option<i32>,
     },
 
     /// Remove one or more sandboxes.
@@ -666,6 +678,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             request.command = command;
             request.tty = tty;
             request.workdir = workdir.unwrap_or_default();
+            // A detached run has no client to remove it, so the daemon does.
+            request.auto_remove = rm && detach;
             let flags = docker::RunFlags {
                 interactive,
                 tty,
@@ -861,25 +875,33 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         },
 
-        Commands::Stop { refs } => {
+        Commands::Stop { refs, time } => {
             let mut c = client::connect(&socket_path).await?;
-            lifecycle::lifecycle(&mut c, &token_store, lifecycle::Action::Stop, &refs, json)
-                .await?;
+            let action = lifecycle::Action::Stop;
+            lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
         }
 
         Commands::Start { refs } => {
             let mut c = client::connect(&socket_path).await?;
-            lifecycle::lifecycle(&mut c, &token_store, lifecycle::Action::Start, &refs, json)
-                .await?;
+            lifecycle::lifecycle(
+                &mut c,
+                &token_store,
+                lifecycle::Action::Start,
+                &refs,
+                None,
+                json,
+            )
+            .await?;
         }
 
-        Commands::Restart { refs } => {
+        Commands::Restart { refs, time } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
                 &token_store,
                 lifecycle::Action::Restart,
                 &refs,
+                time,
                 json,
             )
             .await?;
@@ -1267,6 +1289,58 @@ mod tests {
             }
             other => panic!("expected Kill, got {other:?}"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(&["ward", "stop", "web1"], None)]
+    #[case::zero(&["ward", "stop", "-t", "0", "web1"], Some(0))]
+    #[case::forever(&["ward", "stop", "--time", "-1", "web1"], Some(-1))]
+    #[case::timeout_alias(&["ward", "stop", "--timeout", "7", "web1"], Some(7))]
+    fn given_stop_time_when_parsed_then_grace_is_none_or_the_number(
+        #[case] args: &[&str],
+        #[case] want: Option<i32>,
+    ) {
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Stop { time, .. } => assert_eq!(time, want),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::short(&["ward", "restart", "-t", "5", "web1"])]
+    #[case::timeout_alias(&["ward", "restart", "--timeout", "5", "web1"])]
+    fn given_restart_time_when_parsed_then_it_carries_the_grace(#[case] args: &[&str]) {
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Restart { time, .. } => assert_eq!(time, Some(5)),
+            other => panic!("expected Restart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_stop_time_help_when_built_then_it_names_the_core_default_grace() {
+        // Act
+        let help = stop_time_help();
+
+        // Assert
+        let default = format!("default {}", ward_core::sandbox::STOP_GRACE_SECONDS);
+        assert!(help.contains(&default), "got: {help}");
+    }
+
+    #[test]
+    fn given_rm_with_detach_when_parsed_then_both_flags_are_accepted() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "run", "-d", "--rm", "alpine", "true"]);
+
+        // Assert
+        assert!(cli.is_ok());
     }
 
     #[test]

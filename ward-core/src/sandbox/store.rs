@@ -29,6 +29,10 @@ pub struct SandboxMeta {
     pub created_at: SystemTime,
     pub status: SandboxStatus,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub started_at: Option<SystemTime>,
+    #[serde(default)]
+    pub finished_at: Option<SystemTime>,
     /// Hex SHA-256 of the capability token. The token itself is never stored.
     pub token_hash: String,
 }
@@ -205,11 +209,14 @@ mod tests {
                     command: vec!["sh".into(), "-c".into(), "echo hi".into()],
                     workdir: "/srv".into(),
                     tty: true,
+                    auto_remove: false,
                 },
             },
             created_at: SystemTime::now(),
             status,
             exit_code: None,
+            started_at: None,
+            finished_at: None,
             token_hash: hash_token(TOKEN),
         }
     }
