@@ -42,6 +42,12 @@ service Ward {
   // One reading of a running sandbox's resource use, like one frame of
   // `docker stats`. The token travels in call metadata.
   rpc Stats(StatsRequest) returns (StatsResponse);
+  // Lifecycle events of every sandbox, like `docker events`. Replays the
+  // recent history from `since`, then streams live until `until`. Like
+  // ListSandboxes it needs no sandbox token: it carries only ids, names,
+  // images and event kinds. The history holds the last 1024 events, those of
+  // destroyed sandboxes included.
+  rpc Events(EventsRequest) returns (stream SandboxEvent);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -386,6 +392,30 @@ message StatsResponse {
   uint32 pids = 5;
   // When the daemon took the reading, for working out rates between two.
   google.protobuf.Timestamp read_at = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Event messages
+// ---------------------------------------------------------------------------
+
+message EventsRequest {
+  // Replay events from this time. Unset replays none. Only a bounded recent
+  // history is kept in memory, so older events are not available.
+  google.protobuf.Timestamp since = 1;
+  // End the stream at this time. Unset streams until the client hangs up.
+  google.protobuf.Timestamp until = 2;
+}
+
+message SandboxEvent {
+  // create, start, die, stop or destroy.
+  string action = 1;
+  string sandbox_id = 2;
+  google.protobuf.Timestamp at = 3;
+  // image, name and, for die, exitCode.
+  map<string, string> attributes = 4;
+  // Events this reader missed just before this one because it read too
+  // slowly. Zero when none.
+  uint64 dropped = 5;
 }
 
 // ---------------------------------------------------------------------------

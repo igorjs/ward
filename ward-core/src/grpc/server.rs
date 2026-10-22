@@ -14,13 +14,14 @@ use crate::pb::ward_server::Ward;
 use crate::pb::{
     AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk, CopyFromRequest,
     CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
-    EgressLogEntry, EgressLogResponse, ExecRequest, GetCommunicationLogRequest,
+    EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, GetCommunicationLogRequest,
     GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
     ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
     Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
-    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest,
-    StatsRequest, StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest,
-    TopProcess, TopRequest, TopResponse, VolumeInfo, WriteStdinRequest,
+    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
+    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
+    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
+    WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -106,6 +107,13 @@ async fn authorized_id(
 
 /// Largest data frame a `CopyTo` client may send, as the proto documents.
 const MAX_COPY_DATA_BYTES: usize = crate::backend::agent::ARCHIVE_CHUNK_BYTES;
+
+/// Events queued for one `Events` client before its bridge task waits for it.
+const EVENT_STREAM_BUFFER: usize = 16;
+/// Attribute names Docker uses on container events.
+const EVENT_IMAGE_ATTRIBUTE: &str = "image";
+const EVENT_NAME_ATTRIBUTE: &str = "name";
+const EVENT_EXIT_CODE_ATTRIBUTE: &str = "exitCode";
 
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
 
@@ -820,6 +828,26 @@ impl Ward for WardGrpcServer {
         }))
     }
 
+    type EventsStream = tokio_stream::wrappers::ReceiverStream<Result<PbSandboxEvent, Status>>;
+
+    #[tracing::instrument(name = "rpc.events", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn events(
+        &self,
+        request: Request<EventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        let req = request.into_inner();
+        let since = req.since.map(event_time).transpose()?;
+        let until = req.until.map(event_time).transpose()?;
+        let reader = self.sandbox.events().subscribe(since);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(EVENT_STREAM_BUFFER);
+        // A client that reads slowly stalls only this task. The manager
+        // never waits, and the reader reports what it missed.
+        tokio::spawn(forward_events(reader, until, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
+    }
+
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
 
     #[tracing::instrument(
@@ -993,6 +1021,65 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
         exit_code: evt.exit_code.unwrap_or(0),
         timestamp,
         duration_ms: evt.duration_ms,
+    }
+}
+
+fn event_time(ts: prost_types::Timestamp) -> Result<std::time::SystemTime, Status> {
+    std::time::SystemTime::try_from(ts)
+        .map_err(|_| Status::invalid_argument("event time is out of range"))
+}
+
+/// Send events to `out` until `until` passes or the client hangs up.
+async fn forward_events(
+    mut reader: crate::sandbox::events::EventReader,
+    until: Option<std::time::SystemTime>,
+    out: tokio::sync::mpsc::Sender<Result<PbSandboxEvent, Status>>,
+) {
+    let deadline = until.map(|until| {
+        let left = until
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        tokio::time::Instant::now() + left
+    });
+    let expired = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expired);
+    loop {
+        // `closed` notices a client that hung up while no event arrives.
+        let next = tokio::select! {
+            () = out.closed() => return,
+            () = &mut expired => return,
+            next = reader.next() => next,
+        };
+        let Some(delivered) = next else { return };
+        if until.is_some_and(|until| delivered.event.at > until) {
+            return;
+        }
+        if out.send(Ok(event_to_pb(delivered))).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn event_to_pb(delivered: crate::sandbox::events::Delivered) -> PbSandboxEvent {
+    let event = delivered.event;
+    let mut attributes = std::collections::HashMap::from([
+        (EVENT_IMAGE_ATTRIBUTE.to_string(), event.image),
+        (EVENT_NAME_ATTRIBUTE.to_string(), event.name),
+    ]);
+    if let Some(code) = event.exit_code {
+        attributes.insert(EVENT_EXIT_CODE_ATTRIBUTE.to_string(), code.to_string());
+    }
+    PbSandboxEvent {
+        action: event.action.as_str().to_string(),
+        sandbox_id: event.sandbox_id,
+        at: system_time_to_pb(event.at),
+        attributes,
+        dropped: delivered.dropped,
     }
 }
 
@@ -1295,5 +1382,27 @@ mod tests {
             bad.is_empty(),
             "every instrumented span must use the `rpc.<method>` name prefix; offenders: {bad:?}"
         );
+    }
+
+    #[test]
+    fn given_an_idle_events_client_when_it_hangs_up_then_the_forwarder_ends() {
+        // Arrange
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let log = crate::sandbox::events::EventLog::default();
+            let (out, rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(forward_events(log.subscribe(None), None, out));
+            tokio::task::yield_now().await;
+
+            // Act
+            drop(rx);
+
+            // Assert
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            assert!(ended.is_ok(), "forwarder outlived its client");
+        });
     }
 }

@@ -13,8 +13,8 @@ use tonic::{Code, Request, Status};
 
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{
-    CreateSandboxRequest, GetSandboxRequest, RestartRequest, SandboxInfo, SandboxStatus,
-    StartRequest, StopRequest,
+    CreateSandboxRequest, EventsRequest, GetSandboxRequest, RestartRequest, SandboxInfo,
+    SandboxStatus, StartRequest, StopRequest,
 };
 
 const SANDBOX_NAME: &str = "web1";
@@ -254,4 +254,41 @@ async fn given_stopped_sandbox_after_daemon_restart_when_start_with_wrong_token_
 
     // Assert
     assert_eq!(status.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn given_a_sandbox_created_stopped_and_removed_when_events_are_read_then_they_come_in_order()
+{
+    // Arrange
+    let mut client = common::test_server().await;
+    let mut events = client
+        .events(EventsRequest::default())
+        .await
+        .expect("events")
+        .into_inner();
+    let info = create_named(&mut client, SANDBOX_NAME).await;
+    let stop = StopRequest {
+        id: info.id.clone(),
+        ..Default::default()
+    };
+    let stop = common::with_token(stop, &info.token);
+    client.stop(stop).await.expect("stop");
+    let remove = common::with_token(
+        ward_core::pb::RemoveSandboxRequest {
+            id: info.id.clone(),
+        },
+        &info.token,
+    );
+    client.remove_sandbox(remove).await.expect("remove");
+
+    // Act
+    let mut actions = Vec::new();
+    for _ in 0..5 {
+        let event = events.message().await.expect("stream").expect("event");
+        assert_eq!(event.sandbox_id, info.id);
+        actions.push(event.action);
+    }
+
+    // Assert
+    assert_eq!(actions, ["create", "start", "die", "stop", "destroy"]);
 }

@@ -19,6 +19,7 @@ use crate::protocol::{
     RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
 use crate::sandbox::copy;
+use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
@@ -243,6 +244,8 @@ const WAIT_STATUS_SIGNAL_MASK: i32 = 0x7f;
 const WAIT_STATUS_EXIT_MASK: i32 = 0xff;
 /// Shells report a process killed by signal N as 128 + N.
 const SIGNAL_EXIT_BASE: i32 = 128;
+/// Exit code Docker reports when a command cannot be run.
+const EXEC_FAILED_EXIT: i32 = 126;
 
 /// Seconds a stopping sandbox's main process gets to end after SIGTERM.
 pub const STOP_GRACE_SECONDS: u64 = 10;
@@ -390,24 +393,36 @@ async fn ended_within(
     }
 }
 
-/// What the daemon needs to remove a sandbox whose main process ended.
-struct AutoRemove {
+/// The shared handles a background task needs to tear a sandbox down and
+/// report what happened to it.
+#[derive(Clone)]
+struct Teardown {
+    entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
+    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
     broker: Arc<Broker>,
     backend: Arc<dyn Backend>,
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    events: EventLog,
+}
+
+fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
+    let event = SandboxEvent::new(action, meta);
+    match code {
+        Some(code) => event.with_exit_code(code),
+        None => event,
+    }
 }
 
 /// Mark a sandbox `exited` once its main process `pid` ends on its own. A
 /// stop in progress records the outcome itself, and a newer run owns the
 /// state, so both are left alone.
 async fn mark_exited_on_main_end(
-    entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
-    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
+    teardown: Teardown,
     store: Option<MetaStore>,
     id: String,
     pid: String,
     mut exit: watch::Receiver<Option<i32>>,
-    auto_remove: Option<AutoRemove>,
+    auto_remove: bool,
 ) {
     let Ok(raw) = exit.wait_for(Option::is_some).await.map(|status| *status) else {
         return;
@@ -416,8 +431,8 @@ async fn mark_exited_on_main_end(
         return;
     };
     {
-        let mut entries = entries.write().await;
-        let current = mains.read().await.get(&id).map(|m| m.pid == pid);
+        let mut entries = teardown.entries.write().await;
+        let current = teardown.mains.read().await.get(&id).map(|m| m.pid == pid);
         let Some(entry) = entries.get_mut(&id) else {
             return;
         };
@@ -432,47 +447,42 @@ async fn mark_exited_on_main_end(
         )
         .await
         {
-            Ok(()) => tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited"),
+            Ok(()) => {
+                tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited");
+                let died = SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                teardown.events.emit(died);
+            }
             Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
         }
     }
     // The status is published and attached readers hold their own buffer
     // subscriptions, so removing now cannot cut their output short.
-    if let Some(auto) = auto_remove {
-        auto_remove_ended(&entries, &mains, &auto, &id, &pid).await;
+    if auto_remove {
+        auto_remove_ended(&teardown, &id, &pid).await;
     }
 }
 
 /// Remove sandbox `id` if it is still exited from the run that `pid` was.
 /// A start since the exit was recorded owns the sandbox now, so it stays.
-async fn auto_remove_ended(
-    entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
-    mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
-    auto: &AutoRemove,
-    id: &str,
-    pid: &str,
-) {
+async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
     let removed = {
-        let mut entries = entries.write().await;
+        let mut entries = teardown.entries.write().await;
         let exited = entries
             .get(id)
             .is_some_and(|entry| entry.meta.status == crate::protocol::SandboxStatus::Exited);
-        let same_run = mains.read().await.get(id).is_some_and(|m| m.pid == pid);
+        let same_run = teardown
+            .mains
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|m| m.pid == pid);
         if !(exited && same_run) {
             tracing::info!(sandbox_id = %id, "sandbox started again, keeping it");
             return;
         }
         SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
     };
-    let result = SandboxManager::finish_cleanup(
-        removed,
-        &auto.broker,
-        &auto.backend,
-        &auto.processes,
-        mains,
-        id,
-    )
-    .await;
+    let result = SandboxManager::finish_cleanup(removed, teardown, id).await;
     match result {
         Ok(()) => {
             tracing::info!(sandbox_id = %id, "auto-removed sandbox after its main process ended")
@@ -528,6 +538,7 @@ pub struct SandboxManager {
     store: Option<MetaStore>,
     /// Names claimed by creates that have not yet inserted their entry.
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
+    events: EventLog,
 }
 
 impl SandboxManager {
@@ -552,7 +563,62 @@ impl SandboxManager {
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECONDS),
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            events: EventLog::default(),
         }
+    }
+
+    /// Lifecycle events of every sandbox, for `Events` readers.
+    pub fn events(&self) -> &EventLog {
+        &self.events
+    }
+
+    fn teardown(&self) -> Teardown {
+        Teardown {
+            entries: Arc::clone(&self.entries),
+            mains: Arc::clone(&self.mains),
+            broker: Arc::clone(&self.broker),
+            backend: Arc::clone(&self.backend),
+            processes: Arc::clone(&self.processes),
+            events: self.events.clone(),
+        }
+    }
+
+    /// Report `action` for sandbox `id`. A sandbox that is gone has nothing
+    /// to report.
+    async fn emit_event(&self, id: &str, action: EventAction, exit_code: Option<i32>) {
+        // Emitting under the lock orders the event before a later removal.
+        let entries = self.entries.read().await;
+        if let Some(entry) = entries.get(id) {
+            self.events
+                .emit(event_with_code(action, &entry.meta, exit_code));
+        }
+    }
+
+    /// Report `action` from a record taken earlier, for a sandbox that may
+    /// have been removed meanwhile.
+    async fn emit_for(&self, meta: &SandboxMeta, action: EventAction, exit_code: Option<i32>) {
+        let _entries = self.entries.read().await;
+        self.events.emit(event_with_code(action, meta, exit_code));
+    }
+
+    /// Report `die` for a sandbox that was running and no longer is.
+    async fn emit_die_if_was_running(
+        &self,
+        meta: &SandboxMeta,
+        before: &crate::protocol::SandboxStatus,
+        exit_code: i32,
+    ) {
+        // An exited sandbox already reported its `die`.
+        if *before == crate::protocol::SandboxStatus::Running {
+            self.emit_for(meta, EventAction::Die, Some(exit_code)).await;
+        }
+    }
+
+    /// Record that the main process could not start and report its `die`.
+    async fn fail_main_start(&self, id: &str) {
+        self.mark_failed(id).await;
+        self.emit_event(id, EventAction::Die, Some(EXEC_FAILED_EXIT))
+            .await;
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -961,7 +1027,12 @@ impl SandboxManager {
 
         metrics::gauge!("wardd_sandbox_active").increment(1.0);
 
+        // Before the main process starts, so its `die` cannot come first.
+        self.emit_event(&id, EventAction::Create, None).await;
+        self.emit_event(&id, EventAction::Start, None).await;
+
         if let Err(e) = self.spawn_main(&id).await {
+            self.fail_main_start(&id).await;
             if let Err(remove_err) = self.remove(&id).await {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -1053,25 +1124,13 @@ impl SandboxManager {
     /// purge, broker deregistration, and the active-gauge decrement,
     /// match the user-initiated remove path exactly.
     fn spawn_timeout(&self, id: &str, after: std::time::Duration) -> tokio::task::JoinHandle<()> {
-        let entries = Arc::clone(&self.entries);
-        let broker = Arc::clone(&self.broker);
-        let backend = Arc::clone(&self.backend);
-        let processes = Arc::clone(&self.processes);
-        let mains = Arc::clone(&self.mains);
+        let teardown = self.teardown();
         let sandbox_id = id.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
             tracing::info!(sandbox_id = %sandbox_id, "sandbox timeout reached, removing");
-            if let Err(e) = Self::cleanup_sandbox_inner(
-                &entries,
-                &broker,
-                &backend,
-                &processes,
-                &mains,
-                &sandbox_id,
-                /* from_timeout = */ true,
-            )
-            .await
+            if let Err(e) =
+                Self::cleanup_sandbox_inner(&teardown, &sandbox_id, /* from_timeout = */ true).await
             {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
@@ -1151,17 +1210,9 @@ impl SandboxManager {
     pub async fn remove(&self, id: &str) -> Result<()> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
-        Self::cleanup_sandbox_inner(
-            &self.entries,
-            &self.broker,
-            &self.backend,
-            &self.processes,
-            &self.mains,
-            id,
-            /* from_timeout = */ false,
-        )
-        .await
-        .map_err(backend_err)
+        Self::cleanup_sandbox_inner(&self.teardown(), id, /* from_timeout = */ false)
+            .await
+            .map_err(backend_err)
     }
 
     // -----------------------------------------------------------------------
@@ -1251,14 +1302,17 @@ impl SandboxManager {
     }
 
     async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
-        if !self.begin_stop(id).await? {
+        let Some((before, meta)) = self.begin_stop(id).await? else {
             tracing::info!(sandbox_id = %id, "sandbox already stopped");
             return Ok(());
-        }
+        };
         tracing::info!(sandbox_id = %id, "stopping sandbox");
         let main_code = self.end_main_process(id, grace).await;
+        let died_with = main_code.unwrap_or(0);
         if let Err(e) = self.backend.stop_sandbox(id).await {
             self.mark_failed(id).await;
+            self.emit_die_if_was_running(&meta, &before, died_with)
+                .await;
             return Err(backend_err(e));
         }
         self.processes
@@ -1277,6 +1331,9 @@ impl SandboxManager {
             }
         }
         tracing::info!(sandbox_id = %id, "sandbox stopped");
+        self.emit_die_if_was_running(&meta, &before, died_with)
+            .await;
+        self.emit_for(&meta, EventAction::Stop, None).await;
         Ok(())
     }
 
@@ -1314,8 +1371,9 @@ impl SandboxManager {
             return Err(backend_err(e));
         }
         self.commit_running_and_register(id, comms).await?;
+        self.emit_event(id, EventAction::Start, None).await;
         if let Err(e) = self.spawn_main(id).await {
-            self.mark_failed(id).await;
+            self.fail_main_start(id).await;
             return Err(e);
         }
         tracing::info!(sandbox_id = %id, "sandbox started");
@@ -1364,17 +1422,12 @@ impl SandboxManager {
         }
         tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
         tokio::spawn(mark_exited_on_main_end(
-            Arc::clone(&self.entries),
-            Arc::clone(&self.mains),
+            self.teardown(),
             self.store.clone(),
             id.to_string(),
             handle.pid.clone(),
             exit.clone(),
-            spec.auto_remove.then(|| AutoRemove {
-                broker: Arc::clone(&self.broker),
-                backend: Arc::clone(&self.backend),
-                processes: Arc::clone(&self.processes),
-            }),
+            spec.auto_remove,
         ));
         mains.insert(
             id.to_string(),
@@ -1617,22 +1670,26 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Move a running or exited sandbox to `stopping`. `false` means it is
-    /// already stopped and there is nothing to do.
-    async fn begin_stop(&self, id: &str) -> Result<bool> {
+    /// Move a running or exited sandbox to `stopping` and return the state it
+    /// left. `None` means it is already stopped and there is nothing to do.
+    async fn begin_stop(
+        &self,
+        id: &str,
+    ) -> Result<Option<(crate::protocol::SandboxStatus, SandboxMeta)>> {
         use crate::protocol::SandboxStatus as State;
         let mut entries = self.entries.write().await;
         let entry = entries
             .get_mut(id)
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        match entry.meta.status {
-            State::Stopped => return Ok(false),
-            State::Running | State::Exited => {}
+        let before = match entry.meta.status {
+            State::Stopped => return Ok(None),
+            State::Running | State::Exited => entry.meta.status.clone(),
             ref other => return Err(wrong_state(id, other, "stop")),
-        }
+        };
         let exit_code = entry.meta.exit_code;
+        let meta = entry.meta.clone();
         self.commit(entry, State::Stopping, exit_code).await?;
-        Ok(true)
+        Ok(Some((before, meta)))
     }
 
     /// Move a stopped, exited or failed sandbox to `creating` and clear its
@@ -1688,50 +1745,52 @@ impl SandboxManager {
     /// sandbox does not get torn down a second time when the timer
     /// later fires.
     async fn cleanup_sandbox_inner(
-        entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
-        broker: &Arc<Broker>,
-        backend: &Arc<dyn Backend>,
-        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
-        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+        teardown: &Teardown,
         id: &str,
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
-        let removed = Self::detach_entry(entries.write().await.remove(id), from_timeout);
-        Self::finish_cleanup(removed, broker, backend, processes, mains, id).await
+        let removed = Self::detach_entry(teardown.entries.write().await.remove(id), from_timeout);
+        Self::finish_cleanup(removed, teardown, id).await
     }
 
     /// Stop the removed entry's timer unless that timer is the caller.
-    /// Returns whether there was an entry.
-    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> bool {
-        let Some(entry) = entry else {
-            return false;
-        };
+    /// Returns the removed sandbox's record, if there was an entry.
+    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> Option<SandboxMeta> {
+        let entry = entry?;
         if !from_timeout && let Some(handle) = entry.timeout_handle {
             handle.abort();
         }
-        true
+        Some(entry.meta)
     }
 
     /// Drop everything tied to a sandbox whose entry has left `entries`.
     async fn finish_cleanup(
-        removed: bool,
-        broker: &Arc<Broker>,
-        backend: &Arc<dyn Backend>,
-        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
-        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+        removed: Option<SandboxMeta>,
+        teardown: &Teardown,
         id: &str,
     ) -> std::result::Result<(), BackendError> {
-        processes
+        teardown
+            .processes
             .write()
             .await
             .retain(|_, rec| rec.sandbox_id != id);
-        mains.write().await.remove(id);
-        broker.deregister_sandbox(id).await;
+        teardown.mains.write().await.remove(id);
+        teardown.broker.deregister_sandbox(id).await;
 
-        let result = backend.remove_sandbox(id).await;
-        if removed {
+        let result = teardown.backend.remove_sandbox(id).await;
+        if let Some(meta) = removed {
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
+            // Removing a running sandbox kills it, as `docker rm -f` does.
+            if meta.status == crate::protocol::SandboxStatus::Running {
+                let code = meta.exit_code.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL);
+                teardown
+                    .events
+                    .emit(SandboxEvent::new(EventAction::Die, &meta).with_exit_code(code));
+            }
+            teardown
+                .events
+                .emit(SandboxEvent::new(EventAction::Destroy, &meta));
         }
         result
     }
@@ -4891,6 +4950,7 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     struct HostBackend {
         inner: crate::backend::krunvm::KrunvmBackend,
+        fail_stop: bool,
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -5079,6 +5139,11 @@ pub(crate) mod tests {
             self.inner.adopt_sandbox(info, opts, rootfs).await
         }
         async fn stop_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            if self.fail_stop {
+                return Err(crate::backend::BackendError::Internal(
+                    "stop refused".into(),
+                ));
+            }
             self.inner.stop_sandbox(id).await
         }
         async fn start_sandbox(&self, id: &str) -> crate::backend::Result<()> {
@@ -5173,6 +5238,11 @@ pub(crate) mod tests {
 
     #[cfg(not(feature = "krunvm"))]
     pub(crate) fn host_manager(output_cap: usize) -> Arc<SandboxManager> {
+        host_manager_with(output_cap, /* fail_stop = */ false)
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    fn host_manager_with(output_cap: usize, fail_stop: bool) -> Arc<SandboxManager> {
         use crate::backend::image::ImageStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -5180,7 +5250,7 @@ pub(crate) mod tests {
         let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(dir);
         let inner = crate::backend::krunvm::KrunvmBackend::with_image_store_for_test(path, store);
-        let backend: Arc<dyn Backend> = Arc::new(HostBackend { inner });
+        let backend: Arc<dyn Backend> = Arc::new(HostBackend { inner, fail_stop });
         Arc::new(
             SandboxManager::new(
                 backend,
@@ -5790,14 +5860,9 @@ pub(crate) mod tests {
         wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
         let ended_pid = mgr.main_pid(&id).await.expect("main pid");
         mgr.start(&id).await.expect("start again");
-        let auto = AutoRemove {
-            broker: Arc::clone(&mgr.broker),
-            backend: Arc::clone(&mgr.backend),
-            processes: Arc::clone(&mgr.processes),
-        };
 
         // Act
-        auto_remove_ended(&mgr.entries, &mgr.mains, &auto, &id, &ended_pid).await;
+        auto_remove_ended(&mgr.teardown(), &id, &ended_pid).await;
 
         // Assert
         assert!(mgr.get(&id).await.is_ok());
@@ -6167,5 +6232,207 @@ pub(crate) mod tests {
             matches!(&err, ApiError::InvalidRequest(m) if *m == want),
             "{err:?}"
         );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn next_actions(
+        reader: &mut crate::sandbox::events::EventReader,
+        count: usize,
+    ) -> Vec<(EventAction, Option<i32>)> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let next = tokio::time::timeout(TEST_POLL_DEADLINE, reader.next())
+                .await
+                .expect("event in time")
+                .expect("event");
+            out.push((next.event.action, next.event.exit_code));
+        }
+        out
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_short_command_when_created_ended_stopped_and_removed_then_events_come_in_order()
+     {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let mut reader = mgr.events().subscribe(None);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 3"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        mgr.remove(&id).await.expect("remove");
+        let got = next_actions(&mut reader, 5).await;
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(3)),
+            (EventAction::Stop, None),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_stopped_then_die_comes_before_stop() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        let got = next_actions(&mut reader, 4).await;
+
+        // Assert
+        let actions: Vec<EventAction> = got.iter().map(|(action, _)| *action).collect();
+        assert_eq!(
+            actions,
+            [
+                EventAction::Create,
+                EventAction::Start,
+                EventAction::Die,
+                EventAction::Stop
+            ]
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn history(mgr: &SandboxManager, count: usize) -> Vec<(EventAction, Option<i32>)> {
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+        next_actions(&mut reader, count).await
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_force_removed_then_die_137_comes_before_destroy() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        mgr.remove(&id).await.expect("remove");
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(137)),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(history(&mgr, 4).await, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_its_timeout_expires_then_die_comes_before_destroy() {
+        // Arrange
+        let mgr = build_manager(1);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            resources: Some(PbResourceLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        mgr.create(req, "").await.expect("create");
+
+        // Assert
+        let got = history(&mgr, 4).await;
+        assert_eq!(got[2], (EventAction::Die, Some(137)));
+        assert_eq!(got[3].0, EventAction::Destroy);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_command_that_cannot_run_when_created_then_start_die_126_and_destroy_follow() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["/nonexistent/ward-test-command".into()],
+            ..Default::default()
+        };
+
+        // Act
+        mgr.create(req, "").await.expect_err("exec fails");
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(126)),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(history(&mgr, 4).await, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_command_that_vanished_when_restarted_then_the_failed_run_ends_with_die_126() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let id = create_with_command(&mgr, &[script.to_str().unwrap()], false).await;
+        mgr.stop(&id).await.expect("stop");
+        drop(dir);
+
+        // Act
+        mgr.start(&id).await.expect_err("exec fails");
+
+        // Assert
+        let got = history(&mgr, 6).await;
+        assert_eq!(
+            &got[4..],
+            [(EventAction::Start, None), (EventAction::Die, Some(126))]
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_backend_that_cannot_stop_when_stopping_then_die_is_reported_for_the_failed_sandbox()
+     {
+        // Arrange
+        let mgr = host_manager_with(MAIN_OUTPUT_CAP, /* fail_stop = */ true);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        mgr.stop(&id).await.expect_err("stop refused");
+
+        // Assert
+        let got = history(&mgr, 3).await;
+        assert_eq!(got[2].0, EventAction::Die);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_removed_sandbox_when_an_earlier_record_reports_then_the_event_is_kept() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        let meta = mgr.entries.read().await.get(&id).unwrap().meta.clone();
+        mgr.remove(&id).await.expect("remove");
+
+        // Act
+        mgr.emit_for(&meta, EventAction::Stop, None).await;
+
+        // Assert
+        let got = history(&mgr, 5).await;
+        assert_eq!(got[4].0, EventAction::Stop);
     }
 }
