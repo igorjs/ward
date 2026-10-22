@@ -1,3 +1,5 @@
+// Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
+
 //! Guest process listing read from `/proc`, so no `ps` binary is needed.
 //!
 //! Times are shown in UTC: the guest has no local time zone to offer.
