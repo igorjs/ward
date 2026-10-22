@@ -16,7 +16,7 @@ use ward_core::pb::{
     CreateSandboxRequest, CreateSnapshotRequest, ExecRequest, GetCommunicationLogRequest,
     GetEgressLogRequest, GetSandboxRequest, KillProcessRequest, ListSnapshotsRequest,
     PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest, StreamOutputRequest,
-    SubscribeRequest, WriteStdinRequest,
+    SubscribeRequest, TopRequest, WriteStdinRequest,
 };
 
 #[tokio::test]
@@ -396,4 +396,36 @@ async fn given_bad_token_when_main_process_killed_then_permission_denied(
 
     // Assert
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_top_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let top = TopRequest {
+            sandbox_id: id.clone(),
+            ps_args: Vec::new(),
+        };
+        let request = match token {
+            Some(token) => common::with_token(top, token),
+            None => Request::new(top),
+        };
+
+        // Act
+        let status = client.top(request).await.expect_err("top must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
 }

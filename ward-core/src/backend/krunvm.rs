@@ -706,6 +706,11 @@ impl Backend for KrunvmBackend {
         Ok(rx)
     }
 
+    async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<super::ProcessTable> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::top(stream, ps_args).await
+    }
+
     /// Exec a command inside a running sandbox.
     #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
     async fn exec(
@@ -862,7 +867,7 @@ impl KrunvmBackend {
             .map_err(|e| BackendError::Internal(e.to_string()));
         }
         Err(BackendError::Exec(
-            "file copy needs a sandbox booted as a microVM".into(),
+            "this needs a sandbox booted as a microVM".into(),
         ))
     }
 

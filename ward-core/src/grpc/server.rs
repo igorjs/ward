@@ -19,7 +19,8 @@ use crate::pb::{
     ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
     Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
     RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest,
-    StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest,
+    TopResponse, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -770,6 +771,30 @@ impl Ward for WardGrpcServer {
             .map_err(api_err_to_status)
         });
         Ok(Response::new(Box::pin(chunks)))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.top",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn top(&self, request: Request<TopRequest>) -> Result<Response<TopResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let table = self
+            .sandbox
+            .top(&id, &req.ps_args)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(TopResponse {
+            titles: table.titles,
+            processes: table
+                .rows
+                .into_iter()
+                .map(|fields| TopProcess { fields })
+                .collect(),
+        }))
     }
 
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;

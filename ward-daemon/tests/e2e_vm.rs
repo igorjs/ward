@@ -731,3 +731,33 @@ fn given_open_egress_when_guest_targets_cloud_metadata_address_then_it_is_blocke
 
     assert_eq!(status, "");
 }
+
+#[test]
+fn given_a_running_guest_process_when_top_then_one_row_has_its_pid_and_command() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    start(&d, &id, None, &["sleep", "31337"]);
+    let guest_pid = sh(&d, &id, "pgrep -f '[s]leep 31337'")
+        .stdout
+        .trim()
+        .to_string();
+
+    let mut cmd = d.cli();
+    cmd.args(["top", &id]);
+    let out = run_ok(cmd);
+
+    let header = out.lines().next().expect("header");
+    assert_eq!(
+        header.split_whitespace().collect::<Vec<_>>(),
+        ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"]
+    );
+    let rows: Vec<Vec<&str>> = out
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.get(1) == Some(&guest_pid.as_str()))
+        .collect();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0][7..], ["sleep", "31337"]);
+}

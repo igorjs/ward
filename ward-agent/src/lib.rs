@@ -9,6 +9,7 @@
 //! frames inbound and `Data` (or legacy line) and `Exited` frames outbound.
 
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 
 use prost::Message;
@@ -19,6 +20,7 @@ use tokio::task::JoinHandle;
 
 mod archive;
 mod pty;
+mod top;
 
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
@@ -26,6 +28,12 @@ pub mod proto {
 }
 
 use proto::{Data, Event, Exec, Exited, Line, Pong, Request, Stream, event, request};
+
+/// Where the guest kernel exposes process state.
+const PROC_ROOT: &str = "/proc";
+
+/// The guest's user database, used to name process owners.
+const PASSWD_PATH: &str = "/etc/passwd";
 
 /// Frames larger than this are rejected as malformed, protecting the agent
 /// from a hostile or buggy peer that advertises a huge length.
@@ -203,7 +211,8 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
-/// answers `Pong`, and `PutArchive` and `GetArchive` transfer a tar stream.
+/// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream, and
+/// `Top` lists the guest's processes.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -238,15 +247,35 @@ where
             let mut writer = writer;
             return archive::get(scope, &get.path, &mut writer).await;
         }
+        Some(request::Kind::Top(top)) => {
+            let mut writer = writer;
+            return answer_top(&top.ps_args, &mut writer).await;
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive or GetArchive",
+                "first frame must be Exec, Ping, PutArchive, GetArchive or Top",
             ));
         }
     };
 
     run_process(exec, reader, writer).await
+}
+
+async fn answer_top<W: AsyncWrite + Unpin>(
+    ps_args: &[String],
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let kind = match top::Query::parse(ps_args) {
+        Ok(query) => event::Kind::Processes(top::list(
+            Path::new(PROC_ROOT),
+            Path::new(PASSWD_PATH),
+            &query,
+        )?),
+        Err(message) => event::Kind::TopError(proto::TopError { message }),
+    };
+    let event = Event { kind: Some(kind) };
+    write_frame(writer, &encode_event(&event)).await
 }
 
 /// The child's I/O endpoints, plain pipes or a pty, behind one shape.
@@ -393,7 +422,8 @@ async fn apply_request(
         | request::Kind::PutArchive(_)
         | request::Kind::GetArchive(_)
         | request::Kind::ArchiveChunk(_)
-        | request::Kind::ArchiveEnd(_) => {}
+        | request::Kind::ArchiveEnd(_)
+        | request::Kind::Top(_) => {}
     }
 }
 
@@ -590,7 +620,9 @@ mod tests {
                     | event::Kind::Data(_)
                     | event::Kind::ArchiveChunk(_)
                     | event::Kind::ArchiveDone(_)
-                    | event::Kind::ArchiveError(_),
+                    | event::Kind::ArchiveError(_)
+                    | event::Kind::Processes(_)
+                    | event::Kind::TopError(_),
                 )
                 | None => {}
             }
