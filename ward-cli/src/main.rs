@@ -7,6 +7,7 @@ mod client;
 mod docker;
 mod inspect;
 mod lifecycle;
+mod log_output;
 mod output;
 mod resources;
 mod socket;
@@ -223,6 +224,13 @@ enum Commands {
         /// Number of lines to show from the end of the output, or "all".
         #[arg(short = 'n', long, default_value = docker::TAIL_ALL, conflicts_with = "pid")]
         tail: String,
+        /// Only output at or after this time: a duration such as 10m or
+        /// 1h30m, or an RFC3339 timestamp.
+        #[arg(long, conflicts_with = "pid")]
+        since: Option<String>,
+        /// Prefix every line with its RFC3339 arrival time.
+        #[arg(short = 't', long, conflicts_with = "pid")]
+        timestamps: bool,
     },
 
     /// Write bytes to a process's stdin.
@@ -713,9 +721,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             pid: None,
             follow,
             tail,
+            since,
+            timestamps,
         } => {
-            let tail = docker::parse_tail(&tail)?;
-            let code = docker::logs(&socket_path, &token_store, &id, follow, tail).await?;
+            let options = log_output::LogOptions {
+                tail: docker::parse_tail(&tail)?,
+                since: since
+                    .map(|value| log_output::parse_since(&value, chrono::Utc::now()))
+                    .transpose()?,
+                timestamps,
+            };
+            let code = docker::logs(&socket_path, &token_store, &id, follow, options).await?;
             if code != 0 {
                 std::process::exit(code);
             }

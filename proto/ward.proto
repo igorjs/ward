@@ -229,6 +229,7 @@ message AttachMessage {
     AttachSignal signal = 4;
     AttachData data = 5;
     AttachExit exit = 6;
+    AttachReplayEnd replay_end = 7;
   }
 }
 
@@ -269,7 +270,13 @@ message AttachData {
   // Which stream the bytes came from. Absent or 0 means stdout, so a client
   // or server that predates this field keeps its behavior.
   AttachStream stream = 2;
+  // When the daemon received the bytes. Absent when the server predates it.
+  google.protobuf.Timestamp timestamp = 3;
 }
+
+// Sent once on a main process attach, after the buffered output and before
+// any live output, so a client knows where the replay ends.
+message AttachReplayEnd {}
 
 enum AttachStream {
   ATTACH_STREAM_STDOUT = 0;

@@ -120,6 +120,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "ward daemon starting"
     );
 
+    // Register the shutdown handlers first: once the socket is bound,
+    // clients (and tests) treat the daemon as ready.
+    let shutdown_signals = ShutdownSignals::register()?;
+
     // Remove a stale socket file from a previous run. Done before
     // Runtime::from_config so that a failure to remove surfaces here,
     // not after the (more expensive) manager wiring.
@@ -161,17 +165,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(socket = %cfg.socket_path.display(), "listening");
 
-    // Graceful shutdown on SIGTERM / SIGINT.
-    let shutdown = async {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received SIGINT, shutting down");
-            }
-            _ = sigterm() => {
-                tracing::info!("received SIGTERM, shutting down");
-            }
-        }
-    };
+    // Graceful shutdown on SIGTERM / SIGINT. The handlers were registered
+    // before the socket was bound, so a client that connects is always
+    // talking to a daemon that handles both signals.
+    let shutdown = shutdown_signals.wait();
 
     // SEC-009 + SEC-015: cap concurrency at two levels.
     // - concurrency_limit_per_connection caps in-flight streams per
@@ -246,18 +243,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resolves when SIGTERM is received (Unix only).
-#[cfg(unix)]
-async fn sigterm() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut stream = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    stream.recv().await;
+/// SIGINT and SIGTERM listeners, registered up front.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(not(unix))]
-async fn sigterm() {
-    // On non-Unix platforms, SIGTERM is not available; this future never resolves.
-    std::future::pending::<()>().await;
+impl ShutdownSignals {
+    #[cfg(unix)]
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn register() -> std::io::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Resolves when either signal arrives.
+    #[cfg(unix)]
+    async fn wait(mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => tracing::info!("received SIGINT, shutting down"),
+            _ = self.terminate.recv() => tracing::info!("received SIGTERM, shutting down"),
+        }
+    }
+
+    /// Ctrl-C is the only shutdown signal on other platforms.
+    #[cfg(not(unix))]
+    async fn wait(self) {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("received Ctrl-C, shutting down");
+    }
 }
 
 /// Pure-function form of the global concurrency cap so unit tests can
