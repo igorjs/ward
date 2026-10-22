@@ -83,7 +83,7 @@ ps -o user,pid,comm -p $!
 
 # 3. Confirm sandboxes work without sudo
 ward create alpine
-# id: ...
+# the sandbox id
 ```
 
 If any of these surprise you (e.g. `wardd` started but won't create a sandbox because of permission denied), see [`docs/platforms.md`](platforms.md) for platform-specific debugging.

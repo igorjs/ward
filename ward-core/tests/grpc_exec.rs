@@ -655,6 +655,7 @@ async fn given_exec_when_kill_process_then_returns_empty_ok() {
             KillProcessRequest {
                 sandbox_id: s.id.clone(),
                 pid: proc.pid,
+                ..Default::default()
             },
             &s.token,
         ))
@@ -695,6 +696,7 @@ async fn given_killed_pid_when_write_stdin_then_not_found() {
             KillProcessRequest {
                 sandbox_id: s.id.clone(),
                 pid: proc.pid.clone(),
+                ..Default::default()
             },
             &s.token,
         ))
@@ -728,6 +730,7 @@ async fn given_unknown_pid_when_kill_process_then_not_found() {
         .kill_process(KillProcessRequest {
             sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
             pid: "00000000-0000-0000-0000-000000000000".into(),
+            ..Default::default()
         })
         .await
         .expect_err("unknown pid");
@@ -746,6 +749,7 @@ async fn given_malformed_pid_when_kill_process_then_invalid_argument() {
         .kill_process(KillProcessRequest {
             sandbox_id: "00000000-0000-0000-0000-000000000000".into(),
             pid: "not-hex-zzz".into(),
+            ..Default::default()
         })
         .await
         .expect_err("malformed pid");

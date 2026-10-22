@@ -61,6 +61,76 @@ pub struct CacheMeta {
     pub size_bytes: u64,
     pub last_used_at: chrono::DateTime<chrono::Utc>,
     pub layer_count: usize,
+    /// `None` for entries cached before the config was kept.
+    #[serde(default)]
+    pub config: Option<ImageConfig>,
+}
+
+/// The parts of an OCI image config a sandbox's main process starts from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageConfig {
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    #[serde(default)]
+    pub working_dir: String,
+    /// Recorded for later use: the guest does not switch user yet.
+    #[serde(default)]
+    pub user: String,
+    /// `KEY=VALUE` entries.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+/// The `config` object of an OCI image config blob. Registries send `null`
+/// for unset lists.
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct RawRuntimeConfig {
+    entrypoint: Option<Vec<String>>,
+    cmd: Option<Vec<String>>,
+    working_dir: Option<String>,
+    user: Option<String>,
+    env: Option<Vec<String>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RawImageConfigBlob {
+    config: Option<RawRuntimeConfig>,
+}
+
+impl ImageConfig {
+    /// Read the runtime config out of an OCI image config blob.
+    pub fn from_blob(blob: &[u8]) -> Result<Self> {
+        let parsed: RawImageConfigBlob = serde_json::from_slice(blob)
+            .map_err(|e| BackendError::Image(format!("image config is not valid JSON: {e}")))?;
+        let raw = parsed.config.unwrap_or_default();
+        Ok(Self {
+            entrypoint: raw.entrypoint.unwrap_or_default(),
+            cmd: raw.cmd.unwrap_or_default(),
+            working_dir: raw.working_dir.unwrap_or_default(),
+            user: raw.user.unwrap_or_default(),
+            env: raw.env.unwrap_or_default(),
+        })
+    }
+}
+
+/// What a pull produced: the manifest digest and the image's runtime config.
+#[derive(Debug, Clone)]
+pub struct PulledImage {
+    pub digest: String,
+    pub config: ImageConfig,
+}
+
+impl PulledImage {
+    pub fn without_config(digest: String) -> Self {
+        Self {
+            digest,
+            config: ImageConfig::default(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -68,14 +138,14 @@ pub struct CacheMeta {
 // ---------------------------------------------------------------------------
 
 /// Pulls an image reference and materialises its rootfs into `dest`,
-/// returning the manifest digest.
+/// returning the manifest digest and the image's runtime config.
 ///
 /// This is the seam between the cache bookkeeping (`ImageStore`) and the
 /// registry protocol (`OciPuller`). Tests inject a fake so cache, list,
 /// remove, and traversal behaviour can be exercised offline.
 #[async_trait::async_trait]
 pub trait ImagePuller: Send + Sync + std::fmt::Debug {
-    async fn pull(&self, reference: &str, dest: &Path) -> Result<String>;
+    async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage>;
 }
 
 /// Real puller: talks to an OCI registry over HTTPS, then unpacks each
@@ -85,7 +155,7 @@ pub struct OciPuller;
 
 #[async_trait::async_trait]
 impl ImagePuller for OciPuller {
-    async fn pull(&self, reference: &str, dest: &Path) -> Result<String> {
+    async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage> {
         // WARD_OCI_OFFLINE=1: skip the real registry pull and materialise a
         // minimal synthetic rootfs (a `bin/` directory). Set by e2e test
         // harnesses that spawn wardd in an egress-blocked environment (e.g.
@@ -103,7 +173,10 @@ impl ImagePuller for OciPuller {
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            return Ok(format!("sha256:{hash:016x}"));
+            return Ok(PulledImage {
+                digest: format!("sha256:{hash:016x}"),
+                config: offline_image_config()?,
+            });
         }
 
         use oci_client::manifest;
@@ -164,6 +237,7 @@ impl ImagePuller for OciPuller {
         let image = pull_with_retry(&client, &image_ref, &auth, accepted, reference).await?;
 
         let layer_count = image.layers.len();
+        let config = ImageConfig::from_blob(&image.config.data)?;
 
         // Layers are applied bottom-up in manifest order; each is a tar
         // diff over the accumulated filesystem. Consuming `image.layers`
@@ -180,7 +254,24 @@ impl ImagePuller for OciPuller {
         }
 
         let _ = layer_count; // available for future meta.json enrichment
-        Ok(image.digest.unwrap_or_else(|| "sha256:unknown".to_string()))
+        Ok(PulledImage {
+            digest: image.digest.unwrap_or_else(|| "sha256:unknown".to_string()),
+            config,
+        })
+    }
+}
+
+/// Debug builds only: JSON `ImageConfig` that offline pulls report, so tests
+/// can give a synthetic image a command. Unset means an empty config.
+#[cfg(debug_assertions)]
+const OFFLINE_CONFIG_ENV: &str = "WARD_OCI_OFFLINE_CONFIG";
+
+#[cfg(debug_assertions)]
+fn offline_image_config() -> Result<ImageConfig> {
+    match std::env::var(OFFLINE_CONFIG_ENV) {
+        Ok(json) => serde_json::from_str(&json)
+            .map_err(|e| BackendError::Image(format!("{OFFLINE_CONFIG_ENV} is invalid: {e}"))),
+        Err(_) => Ok(ImageConfig::default()),
     }
 }
 
@@ -598,16 +689,22 @@ impl ImageStore {
     /// On cache hit the `meta.json::last_used_at` timestamp is refreshed so
     /// LRU eviction keeps recently-used entries alive.
     pub async fn ensure(&self, reference: &str) -> Result<PathBuf> {
-        // Fast path: already on disk.
-        if let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? {
-            meta.last_used_at = chrono::Utc::now();
-            write_meta_json(&entry_dir.join("meta.json"), &meta)?;
-            return Ok(entry_dir.join("rootfs"));
-        }
+        Ok(self.ensure_entry(reference, false).await?.0)
+    }
 
-        // Slow path: pull into a temp dir, move to final location on success.
-        let temp_name = format!(".tmp-{}", uuid::Uuid::new_v4());
-        let temp_dir = self.cache_dir.join(&temp_name);
+    /// The runtime config of `reference`, pulling the image on a cache miss
+    /// and again when the cached entry predates the config.
+    pub async fn config(&self, reference: &str) -> Result<ImageConfig> {
+        let (_, meta) = self.ensure_entry(reference, true).await?;
+        Ok(meta.config.unwrap_or_default())
+    }
+
+    /// Pull `reference` into a fresh temp dir inside the cache. The caller
+    /// moves or removes the returned dir.
+    async fn pull_into_temp(&self, reference: &str) -> Result<(PathBuf, PulledImage)> {
+        let temp_dir = self
+            .cache_dir
+            .join(format!(".tmp-{}", uuid::Uuid::new_v4()));
         let temp_rootfs = temp_dir.join("rootfs");
 
         // Ensure cache_dir exists before creating the temp dir inside it.
@@ -618,15 +715,39 @@ impl ImageStore {
             .await
             .map_err(BackendError::Io)?;
 
-        let digest = match self.puller.pull(reference, &temp_rootfs).await {
-            Ok(d) => d,
+        match self.puller.pull(reference, &temp_rootfs).await {
+            Ok(pulled) => Ok((temp_dir, pulled)),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&temp_dir);
-                return Err(e);
+                Err(e)
             }
-        };
+        }
+    }
 
-        let size_bytes = dir_size_bytes(&temp_rootfs).unwrap_or(0);
+    /// The cache entry for `reference` as it is after this call, pulled if
+    /// absent. With `need_config`, an entry that has no config yet is
+    /// refreshed from the registry, keeping its layers.
+    async fn ensure_entry(
+        &self,
+        reference: &str,
+        need_config: bool,
+    ) -> Result<(PathBuf, CacheMeta)> {
+        // Fast path: already on disk.
+        if let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? {
+            if need_config && meta.config.is_none() {
+                let (temp_dir, pulled) = self.pull_into_temp(reference).await?;
+                let _ = std::fs::remove_dir_all(&temp_dir);
+                meta.config = Some(pulled.config);
+            }
+            meta.last_used_at = chrono::Utc::now();
+            write_meta_json(&entry_dir.join("meta.json"), &meta)?;
+            return Ok((entry_dir.join("rootfs"), meta));
+        }
+
+        // Slow path: pull into a temp dir, move to final location on success.
+        let (temp_dir, PulledImage { digest, config }) = self.pull_into_temp(reference).await?;
+
+        let size_bytes = dir_size_bytes(&temp_dir.join("rootfs")).unwrap_or(0);
         let entry_name = digest_to_dir_name(&digest);
         let entry_dir = self.cache_dir.join(&entry_name);
 
@@ -644,13 +765,14 @@ impl ImageStore {
             size_bytes,
             last_used_at: chrono::Utc::now(),
             layer_count: 0,
+            config: Some(config),
         };
         write_meta_json(&entry_dir.join("meta.json"), &meta)?;
 
         // Evict LRU entries if the cache count now exceeds the configured bound.
         self.run_lru_eviction()?;
 
-        Ok(entry_dir.join("rootfs"))
+        Ok((entry_dir.join("rootfs"), meta))
     }
 
     /// Materialize the image rootfs for `reference` into `dest` (the
@@ -845,14 +967,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImagePuller for FakePuller {
-        async fn pull(&self, reference: &str, dest: &Path) -> Result<String> {
+        async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage> {
             std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
             // Deterministic but reference-specific digest so each distinct
             // image tag gets its own cache entry directory.
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(format!("sha256:{hash:016x}"))
+            Ok(PulledImage {
+                digest: format!("sha256:{hash:016x}"),
+                config: fake_config(),
+            })
+        }
+    }
+
+    fn fake_config() -> ImageConfig {
+        ImageConfig {
+            entrypoint: vec!["/entry".to_string()],
+            cmd: vec!["/bin/sh".to_string()],
+            working_dir: "/app".to_string(),
+            user: "nobody".to_string(),
+            env: vec!["PATH=/bin".to_string()],
         }
     }
 
@@ -967,7 +1102,7 @@ mod tests {
 
         #[async_trait::async_trait]
         impl ImagePuller for OnceOnlyPuller {
-            async fn pull(&self, _reference: &str, dest: &Path) -> Result<String> {
+            async fn pull(&self, _reference: &str, dest: &Path) -> Result<PulledImage> {
                 let mut guard = self.called.lock().unwrap();
                 assert!(
                     !*guard,
@@ -975,7 +1110,7 @@ mod tests {
                 );
                 *guard = true;
                 std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
-                Ok("sha256:onlyonce".to_string())
+                Ok(PulledImage::without_config("sha256:onlyonce".to_string()))
             }
         }
 
@@ -989,6 +1124,105 @@ mod tests {
         store.ensure("alpine:latest").await.expect("first ensure");
         // Second call: cache hit - puller must NOT fire (else OnceOnlyPuller panics).
         store.ensure("alpine:latest").await.expect("second ensure");
+    }
+
+    // ----- image config ---------------------------------------------------
+
+    #[tokio::test]
+    async fn given_pulled_image_when_config_then_returns_the_pulled_config() {
+        let (store, _tmp) = store_in_tempdir();
+
+        let config = store.config("alpine:latest").await.expect("config");
+
+        assert_eq!(config, fake_config());
+    }
+
+    #[tokio::test]
+    async fn given_cached_image_when_config_again_then_config_survives_the_cache_hit() {
+        let (store, _tmp) = store_in_tempdir();
+        store.ensure("alpine:latest").await.expect("ensure");
+
+        let config = store.config("alpine:latest").await.expect("config");
+
+        assert_eq!(config, fake_config());
+    }
+
+    const OLD_FORMAT_META: &str = r#"{"image_ref":"alpine:latest","digest":"sha256:old",
+        "size_bytes":1,"last_used_at":"2026-01-01T00:00:00Z","layer_count":0}"#;
+
+    #[test]
+    fn given_meta_json_without_config_when_parsed_then_config_is_unknown() {
+        let meta: CacheMeta = serde_json::from_str(OLD_FORMAT_META).expect("parse old meta");
+
+        assert_eq!(meta.config, None);
+    }
+
+    /// Writes a cache entry the way a release without image configs did.
+    fn seed_old_format_entry(cache_dir: &Path) -> PathBuf {
+        let entry_dir = cache_dir.join("sha256-old");
+        std::fs::create_dir_all(entry_dir.join("rootfs/bin")).expect("create rootfs");
+        std::fs::write(entry_dir.join("rootfs/kept"), b"layer").expect("write layer file");
+        std::fs::write(entry_dir.join("meta.json"), OLD_FORMAT_META).expect("write meta");
+        entry_dir
+    }
+
+    #[tokio::test]
+    async fn given_old_format_cache_entry_when_config_then_image_is_pulled_to_fill_it() {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let entry_dir = seed_old_format_entry(tmp.path());
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 64, Arc::new(FakePuller));
+
+        // Act
+        let config = store.config("alpine:latest").await.expect("config");
+
+        // Assert
+        assert_eq!(config, fake_config());
+        assert!(entry_dir.join("rootfs/kept").exists(), "layers are kept");
+        let again = store.config("alpine:latest").await.expect("config again");
+        assert_eq!(again, fake_config());
+    }
+
+    #[tokio::test]
+    async fn given_old_format_cache_entry_when_ensure_then_no_pull_happens() {
+        // Arrange
+        #[derive(Debug)]
+        struct NeverPuller;
+
+        #[async_trait::async_trait]
+        impl ImagePuller for NeverPuller {
+            async fn pull(&self, _reference: &str, _dest: &Path) -> Result<PulledImage> {
+                panic!("a request that needs no config must not pull");
+            }
+        }
+        let tmp = TempDir::new().expect("tempdir");
+        seed_old_format_entry(tmp.path());
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 64, Arc::new(NeverPuller));
+
+        // Act
+        let rootfs = store.ensure("alpine:latest").await.expect("ensure");
+
+        // Assert
+        assert!(rootfs.join("kept").exists());
+    }
+
+    #[test]
+    fn given_oci_config_blob_when_parsed_then_runtime_fields_are_read() {
+        let blob = br#"{"architecture":"arm64","config":{"Cmd":["/bin/sh"],
+            "Entrypoint":null,"WorkingDir":"/w","User":"u","Env":["A=1"]}}"#;
+
+        let config = ImageConfig::from_blob(blob).expect("parse blob");
+
+        assert_eq!(
+            config,
+            ImageConfig {
+                entrypoint: vec![],
+                cmd: vec!["/bin/sh".to_string()],
+                working_dir: "/w".to_string(),
+                user: "u".to_string(),
+                env: vec!["A=1".to_string()],
+            }
+        );
     }
 
     // ----- LRU eviction --------------------------------------------------

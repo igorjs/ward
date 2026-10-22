@@ -7,14 +7,18 @@ use std::io::{Read, Write};
 use std::os::fd::AsFd;
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use rustix::termios::isatty;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
 use ward_core::pb::attach_message::Kind;
 use ward_core::pb::ward_client::WardClient;
-use ward_core::pb::{AttachMessage, AttachResize, AttachSignal, AttachStart, AttachStdin};
+use ward_core::pb::{
+    AttachMessage, AttachResize, AttachSignal, AttachStart, AttachStdin, AttachStream,
+};
 
 use crate::client::Resolved;
 use crate::terminal::{self, ExitSignals, RawModeGuard};
@@ -24,9 +28,25 @@ const NOT_A_TTY: &str = "the input device is not a TTY";
 const STDIN_CHUNK_BYTES: usize = 8192;
 const OUTBOUND_CAPACITY: usize = 16;
 
-/// Fails when `tty` is requested but stdin is not a terminal.
-pub fn require_terminal(tty: bool) -> Result<()> {
-    if tty && !isatty(std::io::stdin()) {
+/// A piece of output with the stream it came from and, when the daemon sent
+/// one, the time it arrived.
+pub struct Chunk<'a> {
+    pub stream: AttachStream,
+    pub bytes: &'a [u8],
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// What an attach stream hands to its sink.
+pub enum Output<'a> {
+    Data(Chunk<'a>),
+    /// The buffered output is complete; anything after is live.
+    ReplayEnd,
+}
+
+/// Fails when stdin is attached with a tty (`-it`) but is not a terminal.
+/// Like Docker, `-t` alone does not need a terminal on stdin.
+pub fn require_terminal(tty: bool, interactive: bool) -> Result<()> {
+    if tty && interactive && !isatty(std::io::stdin()) {
         bail!(NOT_A_TTY);
     }
     Ok(())
@@ -49,6 +69,48 @@ pub async fn attach(
     target: &Resolved,
     start: AttachStart,
     forward_stdin: bool,
+) -> Result<Option<i32>> {
+    let sink = |output: Output| match output {
+        Output::Data(chunk) => write_to_terminal(chunk.stream, chunk.bytes),
+        Output::ReplayEnd => Ok(()),
+    };
+    attach_with(client, target, start, forward_stdin, sink).await
+}
+
+/// Writes a chunk to stdout, or to stderr when the process wrote it there.
+pub fn write_to_terminal(stream: AttachStream, bytes: &[u8]) -> std::io::Result<()> {
+    write_to(
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+        stream,
+        bytes,
+    )
+}
+
+fn write_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    stream: AttachStream,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    match stream {
+        AttachStream::Stdout => write_flushed(stdout, bytes),
+        AttachStream::Stderr => write_flushed(stderr, bytes),
+    }
+}
+
+fn write_flushed(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// Like [`attach`], handing every output chunk and the replay end to `sink`.
+pub async fn attach_with(
+    client: &mut WardClient<Channel>,
+    target: &Resolved,
+    start: AttachStart,
+    forward_stdin: bool,
+    mut sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
     let tty = start.tty;
     let replay = start.replay;
@@ -81,20 +143,8 @@ pub async fn attach(
 
     let request = target.request(ReceiverStream::new(rx))?;
     let streaming = async {
-        let mut replies = client.attach(request).await?.into_inner();
-        let mut stdout = std::io::stdout();
-        while let Some(reply) = replies.message().await? {
-            match reply.kind {
-                Some(Kind::Data(data)) => {
-                    stdout.write_all(&data.data)?;
-                    stdout.flush()?;
-                }
-                // A log follower reports the output, not the guest's exit code.
-                Some(Kind::Exit(exit)) => return Ok((!replay).then_some(exit.exit_code)),
-                _ => {}
-            }
-        }
-        Ok(None)
+        let replies = client.attach(request).await?.into_inner();
+        relay_replies(replies, replay, &mut sink).await
     };
     // `tx` lives to here, so the client half stays open until the end.
     let outcome = tokio::select! {
@@ -103,6 +153,36 @@ pub async fn attach(
     };
     drop(tx);
     outcome
+}
+
+/// Hands every output chunk to `sink` until the stream ends or reports an
+/// exit code.
+async fn relay_replies(
+    mut replies: impl Stream<Item = Result<AttachMessage, tonic::Status>> + Unpin,
+    replay: bool,
+    sink: &mut impl FnMut(Output) -> std::io::Result<()>,
+) -> Result<Option<i32>> {
+    while let Some(reply) = replies.next().await {
+        match reply?.kind {
+            Some(Kind::Data(data)) => {
+                // An unknown value, from a newer server, reads as stdout.
+                let stream = AttachStream::try_from(data.stream).unwrap_or_default();
+                let at = data.timestamp.and_then(|t| {
+                    DateTime::from_timestamp(t.seconds, u32::try_from(t.nanos).unwrap_or_default())
+                });
+                sink(Output::Data(Chunk {
+                    stream,
+                    bytes: &data.data,
+                    at,
+                }))?;
+            }
+            Some(Kind::ReplayEnd(_)) => sink(Output::ReplayEnd)?,
+            // A log follower reports the output, not the guest's exit code.
+            Some(Kind::Exit(exit)) => return Ok((!replay).then_some(exit.exit_code)),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 fn enter_raw_mode() -> Result<RawModeGuard> {
@@ -181,4 +261,47 @@ fn forward_stdin_bytes(tx: mpsc::Sender<AttachMessage>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ward_core::pb::{AttachData, AttachExit};
+
+    fn data(stream: AttachStream, text: &str) -> Result<AttachMessage, tonic::Status> {
+        Ok(AttachMessage {
+            kind: Some(Kind::Data(AttachData {
+                stream: stream as i32,
+                data: text.as_bytes().to_vec(),
+                timestamp: None,
+            })),
+        })
+    }
+
+    #[tokio::test]
+    async fn given_mixed_replies_when_relayed_then_each_stream_reaches_its_writer() {
+        // Arrange
+        let exit = Ok(AttachMessage {
+            kind: Some(Kind::Exit(AttachExit { exit_code: 3 })),
+        });
+        let replies = tokio_stream::iter(vec![
+            data(AttachStream::Stdout, "out1"),
+            data(AttachStream::Stderr, "err1"),
+            data(AttachStream::Stdout, "out2"),
+            exit,
+        ]);
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut sink = |output: Output| match output {
+            Output::Data(c) => write_to(&mut stdout, &mut stderr, c.stream, c.bytes),
+            Output::ReplayEnd => Ok(()),
+        };
+
+        // Act
+        let code = relay_replies(replies, false, &mut sink).await.unwrap();
+
+        // Assert
+        assert_eq!(code, Some(3));
+        assert_eq!(stdout, b"out1out2");
+        assert_eq!(stderr, b"err1");
+    }
 }

@@ -3599,9 +3599,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "clap",
  "hyper-util",
  "pretty_assertions",
+ "prost-types",
+ "rstest",
  "rustix",
  "serde_json",
  "tabled",

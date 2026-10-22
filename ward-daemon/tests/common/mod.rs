@@ -42,14 +42,21 @@ impl Daemon {
     /// is accepting connections. Panics with a helpful message on timeout.
     #[allow(dead_code)]
     pub fn spawn() -> Self {
-        Self::spawn_inner(false)
+        Self::spawn_inner(false, None)
+    }
+
+    /// Like [`Daemon::spawn`] but every image reports `config_json`, a JSON
+    /// image config, as if the registry had sent it.
+    #[allow(dead_code)]
+    pub fn spawn_with_image_config(config_json: &str) -> Self {
+        Self::spawn_inner(false, Some(config_json))
     }
 
     /// Like [`Daemon::spawn`] but images are really pulled and sandboxes
     /// really boot as microVMs. Needs a `krunvm` build and a hypervisor.
     #[allow(dead_code)]
     pub fn spawn_vm() -> Self {
-        Self::spawn_inner(true)
+        Self::spawn_inner(true, None)
     }
 
     /// Process id of the daemon.
@@ -67,7 +74,7 @@ impl Daemon {
         }
     }
 
-    fn spawn_inner(real_vms: bool) -> Self {
+    fn spawn_inner(real_vms: bool, image_config: Option<&str>) -> Self {
         let data_dir = tempfile::tempdir().expect("create temp dir");
         let socket = data_dir.path().join("ward.sock");
         let log = data_dir.path().join("wardd.log");
@@ -97,37 +104,20 @@ impl Daemon {
             cmd.env("WARD_ALLOW_HOST_MOUNTS", "1");
         } else {
             cmd.env("WARD_OCI_OFFLINE", "1");
+            if let Some(config) = image_config {
+                cmd.env("WARD_OCI_OFFLINE_CONFIG", config);
+            }
         }
 
         let mut child = cmd.spawn().expect("spawn wardd");
 
-        // Poll until the daemon accepts. It binds in ~50ms when idle but
-        // can take seconds on a loaded runner. If the daemon panics during
-        // startup, the socket never appears and we surface that as a clear
-        // panic instead of a flaky ECONNREFUSED later.
-        let deadline = Instant::now() + DAEMON_START_DEADLINE;
-        while Instant::now() < deadline {
-            // The socket file appears at bind, before the daemon accepts.
-            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
-                return Self {
-                    _data_dir: data_dir,
-                    socket,
-                    child: Some(child),
-                    log,
-                };
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        wait_until_accepting(&socket, &mut child);
+        Self {
+            _data_dir: data_dir,
+            socket,
+            child: Some(child),
+            log,
         }
-
-        // Reap the zombie before panicking — clippy's zombie_processes
-        // lint flags this and rightly so: a failed test must not leak
-        // background processes that outlive cargo.
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!(
-            "wardd did not bind socket within {DAEMON_START_DEADLINE:?}: {}",
-            socket.display()
-        );
     }
 
     /// Build a `Command` for the `ward` CLI pre-configured to talk to this
@@ -138,6 +128,27 @@ impl Daemon {
         cmd.env("WARD_SOCKET", &self.socket);
         cmd
     }
+}
+
+/// Poll until the daemon at `socket` accepts connections. The socket file
+/// appears at bind, before the daemon accepts, so connecting is the real
+/// readiness check. On timeout the child is reaped so a failed test does
+/// not leak a background process, then this panics.
+#[allow(dead_code)]
+pub fn wait_until_accepting(socket: &std::path::Path, child: &mut Child) {
+    let deadline = Instant::now() + DAEMON_START_DEADLINE;
+    while Instant::now() < deadline {
+        if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!(
+        "wardd did not bind socket within {DAEMON_START_DEADLINE:?}: {}",
+        socket.display()
+    );
 }
 
 /// Connect a gRPC client to the daemon's Unix socket.

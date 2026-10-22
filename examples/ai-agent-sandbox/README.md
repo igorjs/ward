@@ -23,15 +23,16 @@ Both ship with the [installer](../../install.sh) or `cargo build --release`.
 ```sh
 # 1. Create a fresh sandbox from an OCI image. Egress defaults to Deny
 #    at the daemon level when no policy is supplied, so the sandbox is
-#    network-isolated out of the box. The CLI prints one field per line;
-#    awk picks the id off the first line.
-sb=$(ward create alpine:latest | awk '/^id:/{print $2}')
+#    network-isolated out of the box. Like `docker create`, the CLI
+#    prints only the sandbox id.
+sb=$(ward create alpine:latest)
 echo "sandbox: $sb"
 
-# 2. Run untrusted code in it. `ward exec` returns immediately with a pid;
+# 2. Run untrusted code in it. `ward exec -d` returns immediately with a pid;
 #    output streams from `ward logs <id> <pid>` once the process has run
-#    (or in parallel for long-running commands).
-pid=$(ward exec "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
+#    (or in parallel for long-running commands). Without -d, `ward exec`
+#    would stay attached and print the output itself, like `docker exec`.
+pid=$(ward exec -d "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
         | awk '/^pid:/{print $2}')
 ward logs "$sb" "$pid"
 
@@ -66,7 +67,7 @@ For an agent integrating ward, the contract is:
 | Receive untrusted code from LLM | Buffer the snippet | n/a |
 | Choose isolation policy | Pick image, egress, resources | n/a |
 | Allocate sandbox | `ward create <image>` (default egress: Deny) | `CreateSandbox` |
-| Run the snippet | `ward exec <sb> -- <cmd>` then `ward logs <sb> <pid>` | `Exec` + `StreamOutput` |
+| Run the snippet | `ward exec -d <sb> -- <cmd>` then `ward logs <sb> <pid>` | `Exec` + `StreamOutput` |
 | Collect output, exit code | Parse `stdout:` / `stderr:` / `exit:` lines | n/a |
 | Tear down | `ward rm -f <sb>` | `RemoveSandbox` |
 
@@ -111,7 +112,7 @@ so you can copy it as the basis for your agent's wrapper.
 The script uses `sh -c "$command"` inside the guest as a convenience
 so callers can pass shell strings. The guest is the trust boundary,
 not the script; if you'd rather avoid the in-guest shell, drop the
-`sh -c` wrapper and pass argv directly (`ward exec "$sb" -- prog arg1 arg2`).
+`sh -c` wrapper and pass argv directly (`ward exec -d "$sb" -- prog arg1 arg2`).
 
 ## What ward gives you that Docker doesn't
 

@@ -13,17 +13,12 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
 // ---------------------------------------------------------------------------
-// Helper: parse `id: <uuid>` out of `ward create` stdout for use in later
+// Helper: take the bare sandbox id from `ward create` stdout for use in later
 // commands (`ward remove <id>`).
 // ---------------------------------------------------------------------------
 
 fn extract_id(stdout: &str) -> String {
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix("id: ") {
-            return rest.trim().to_string();
-        }
-    }
-    panic!("no `id:` line in stdout:\n{stdout}");
+    stdout.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -39,13 +34,10 @@ fn given_running_daemon_when_user_creates_sandbox_then_command_succeeds_and_prin
     let mut cmd = daemon.cli();
     let assertion = cmd.args(["create", "alpine:latest"]).assert();
 
-    // Assert: exit 0 plus the three required output lines so scripts can
-    // grep individual fields without parsing structured output.
+    // Assert: exit 0 and only the bare id, like `docker create`.
     assertion
         .success()
-        .stdout(predicate::str::contains("id:"))
-        .stdout(predicate::str::contains("status: running"))
-        .stdout(predicate::str::contains("image: alpine:latest"));
+        .stdout(predicate::str::is_match("^[0-9a-f-]{36}\\n$").unwrap());
 }
 
 #[test]
@@ -139,7 +131,7 @@ fn given_created_sandbox_when_user_removes_it_then_list_no_longer_shows_it() {
         .args(["remove", "-f", &id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("removed:"));
+        .stdout(format!("{id}\n"));
 
     // Assert: list no longer mentions the ID.
     daemon
@@ -193,16 +185,7 @@ fn given_max_sandboxes_is_two_when_user_creates_third_then_fails_with_limit_mess
         .spawn()
         .expect("spawn wardd");
 
-    // Wait for the socket to appear.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !socket.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !socket.exists() {
-        let _ = wardd.kill();
-        let _ = wardd.wait();
-        panic!("daemon did not bind");
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
         let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
@@ -252,15 +235,7 @@ fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() 
         .spawn()
         .expect("spawn wardd");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !socket.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if !socket.exists() {
-        let _ = wardd.kill();
-        let _ = wardd.wait();
-        panic!("daemon did not bind");
-    }
+    common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
         let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
@@ -274,12 +249,7 @@ fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() 
         .output()
         .expect("create");
     assert!(first.status.success());
-    let first_id = std::str::from_utf8(&first.stdout)
-        .unwrap()
-        .lines()
-        .find_map(|l| l.strip_prefix("id: ").map(str::trim))
-        .expect("id line")
-        .to_string();
+    let first_id = extract_id(std::str::from_utf8(&first.stdout).unwrap());
 
     ward().args(["create", "alpine:2"]).assert().success();
     ward()
@@ -293,7 +263,9 @@ fn given_sandbox_cap_reached_when_user_removes_one_then_create_succeeds_again() 
     let assertion = ward().args(["create", "alpine:replacement"]).assert();
 
     // Assert: success — the removed slot must be available to a new create.
-    assertion.success().stdout(predicate::str::contains("id: "));
+    assertion
+        .success()
+        .stdout(predicate::str::is_match("^[0-9a-f-]{36}\\n$").unwrap());
 
     let _ = wardd.kill();
     let _ = wardd.wait();

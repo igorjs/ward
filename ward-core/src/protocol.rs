@@ -29,8 +29,17 @@ pub struct SandboxSpec {
     pub name: String,
     /// Main process argv. Empty means the sandbox has no main process.
     pub command: Vec<String>,
+    /// Length of the `command` prefix that came from an image Entrypoint.
+    #[serde(default)]
+    pub entrypoint_len: usize,
     pub workdir: String,
+    /// The image's `User`, recorded though the guest does not apply it.
+    #[serde(default)]
+    pub user: String,
     pub tty: bool,
+    /// Remove the sandbox when its main process ends.
+    #[serde(default)]
+    pub auto_remove: bool,
 }
 
 /// A filesystem bind-mount passed into a sandbox.
@@ -115,6 +124,10 @@ pub struct SandboxInfo {
     pub spec: SandboxSpec,
     /// `None` until the main process has exited.
     pub exit_code: Option<i32>,
+    /// When the main process last started, if it ever did.
+    pub started_at: Option<SystemTime>,
+    /// When the main process last ended, if it did.
+    pub finished_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -176,6 +189,15 @@ pub struct StreamEvent {
 pub enum RawStream {
     Stdout,
     Stderr,
+}
+
+/// A piece of process output, the stream it was written to and its arrival time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub stream: RawStream,
+    pub bytes: bytes::Bytes,
+    /// When the daemon received the bytes.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +321,9 @@ pub enum ApiError {
     Backend(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// `id` is unknown while the other sandbox is still being created.
+    #[error("sandbox name \"{name}\" is already in use")]
+    NameInUse { name: String, id: Option<String> },
     #[error("permission denied: {0}")]
     PermissionDenied(String),
     #[error("ambiguous sandbox reference: {0}")]

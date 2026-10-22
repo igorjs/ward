@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! E2E scenarios for `ward run`, `ward exec -it` and `ward logs` over Attach.
+//! E2E scenarios for `ward run`, `ward exec` and `ward logs` over Attach.
 //!
 //! The stub backend prints `stub: <argv0>` and exits 0 for every command, so
 //! exit codes other than 0 are only checked against a real guest
@@ -30,6 +30,11 @@ const POLL_STEP: Duration = Duration::from_millis(100);
 const POLL_DEADLINE: Duration = Duration::from_secs(30);
 #[cfg(not(feature = "krunvm"))]
 const NOT_A_TTY: &str = "the input device is not a TTY";
+#[cfg(not(feature = "krunvm"))]
+const DOCKER_CLI_FAILURE: i32 = 125;
+/// `2026-10-22T10:00:00.123456789Z`
+#[cfg(not(feature = "krunvm"))]
+const RFC3339_NANOS_LEN: usize = 30;
 const DRAIN_BUFFER_BYTES: usize = 256;
 const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
 const DEFAULT_IMAGE: &str = "alpine:3.20";
@@ -45,11 +50,7 @@ fn create_sandbox(daemon: &Daemon) -> String {
     let out = cmd.output().expect("create");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8");
-    stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("id: "))
-        .expect("id line")
-        .to_string()
+    stdout.trim().to_string()
 }
 
 #[cfg(not(feature = "krunvm"))]
@@ -86,7 +87,26 @@ fn given_run_with_a_command_when_it_completes_then_its_output_is_printed_and_exi
 
 #[cfg(not(feature = "krunvm"))]
 #[test]
-fn given_run_t_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_message() {
+fn given_run_it_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_message() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["run", "-it", "alpine", "true"])
+        .stdin(Stdio::null())
+        .assert();
+
+    // Assert
+    assertion
+        .failure()
+        .stderr(predicate::str::contains(NOT_A_TTY));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_run_t_without_i_when_stdin_is_not_a_terminal_then_it_runs_like_docker() {
     // Arrange
     let daemon = Daemon::spawn();
 
@@ -98,9 +118,7 @@ fn given_run_t_when_stdin_is_not_a_terminal_then_it_fails_with_the_docker_messag
         .assert();
 
     // Assert
-    assertion
-        .failure()
-        .stderr(predicate::str::contains(NOT_A_TTY));
+    assertion.success();
 }
 
 #[cfg(not(feature = "krunvm"))]
@@ -197,8 +215,143 @@ fn given_a_named_sandbox_when_plain_exec_runs_then_the_name_is_resolved() {
     let mut cmd = daemon.cli();
     let assertion = cmd.args(["exec", "by-name", "echo"]).assert();
 
+    // Assert: attached like `docker exec`, so the output is streamed.
+    assertion
+        .success()
+        .stdout(predicate::str::contains("stub: echo"))
+        .stdout(predicate::str::contains("pid:").not());
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_exec_d_when_it_runs_then_it_prints_the_pid_and_status_and_exits_zero() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "detached-exec", "alpine", "true"]);
+    assert!(cmd.output().expect("run -d").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["exec", "-d", "detached-exec", "echo"]).assert();
+
+    // Assert
+    assertion
+        .success()
+        .stdout(predicate::str::contains("pid:"))
+        .stdout(predicate::str::contains("status:"));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_exec_dit_when_it_runs_then_it_is_detached_and_prints_the_pid() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "detached-it", "alpine", "true"]);
+    assert!(cmd.output().expect("run -d").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["exec", "-dit", "detached-it", "echo"]).assert();
+
     // Assert
     assertion.success().stdout(predicate::str::contains("pid:"));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_an_unknown_sandbox_when_exec_runs_then_it_exits_125() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["exec", "no-such-sandbox", "true"]).assert();
+
+    // Assert
+    assertion.code(DOCKER_CLI_FAILURE);
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_no_daemon_when_run_executes_then_it_exits_125() {
+    // Arrange
+    let mut cmd = std::process::Command::cargo_bin("ward").expect("locate ward");
+    cmd.env("WARD_SOCKET", "/nonexistent/ward.sock");
+
+    // Act
+    let assertion = cmd.args(["run", "alpine", "true"]).assert();
+
+    // Assert
+    assertion.code(DOCKER_CLI_FAILURE);
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_an_unknown_flag_when_run_or_exec_is_parsed_then_usage_error_exits_125() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    for subcommand in ["run", "exec"] {
+        // Act
+        let mut cmd = daemon.cli();
+        let assertion = cmd.args([subcommand, "--bogus", "x", "true"]).assert();
+
+        // Assert
+        assertion
+            .code(DOCKER_CLI_FAILURE)
+            .stderr(predicate::str::contains("--bogus"));
+    }
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_an_unknown_flag_when_another_command_is_parsed_then_clap_exits_2() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["ps", "--bogus"]).assert();
+
+    // Assert
+    assertion.code(2);
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_create_with_a_command_when_logs_runs_then_the_command_output_is_there() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let created = daemon
+        .cli()
+        .args(["create", "--name", "with-cmd", "alpine", "echo", "hi"])
+        .output()
+        .expect("create");
+    assert!(created.status.success());
+
+    // Act
+    let text = logs_until(&daemon, &["logs", "with-cmd"], "stub: echo");
+
+    // Assert
+    assert!(text.contains("stub: echo"), "got {text:?}");
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_a_memory_below_one_mib_when_create_runs_then_it_fails_with_a_clear_message() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["create", "-m", "512", "alpine"]).assert();
+
+    // Assert
+    assertion
+        .failure()
+        .stderr(predicate::str::contains("below the 1 MiB minimum"));
 }
 
 #[cfg(not(feature = "krunvm"))]
@@ -280,4 +433,63 @@ fn given_a_real_guest_when_run_exits_3_then_the_cli_exits_3() {
         .expect("run");
 
     assert_eq!(status.code(), Some(3));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_logs_f_with_tail_and_timestamps_when_the_process_printed_then_the_line_is_stamped_and_the_tail_of_a_finished_sandbox_prints()
+ {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "stamped-logs", "alpine", "echo"]);
+    assert!(cmd.output().expect("run -d").status.success());
+
+    // Act
+    let text = logs_until(
+        &daemon,
+        &["logs", "-f", "--tail", "1", "-t", "stamped-logs"],
+        "stub: echo",
+    );
+
+    // Assert
+    let line = text.lines().next().expect("one line");
+    let (stamp, rest) = line.split_once(' ').expect("stamp then text");
+    assert_eq!(stamp.len(), RFC3339_NANOS_LEN, "{line}");
+    assert!(stamp.ends_with('Z') && stamp.contains('T'), "{line}");
+    assert_eq!(rest, "stub: echo");
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_logs_since_in_the_future_or_an_invalid_value_when_run_then_old_output_is_hidden_or_it_fails()
+ {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "since-logs", "alpine", "echo"]);
+    assert!(cmd.output().expect("run -d").status.success());
+    logs_until(&daemon, &["logs", "since-logs"], "stub: echo");
+
+    // Act
+    let hidden = daemon
+        .cli()
+        .args(["logs", "--since", "2999-01-01T00:00:00Z", "since-logs"])
+        .output()
+        .expect("logs");
+    let shown = daemon
+        .cli()
+        .args(["logs", "--since", "1h", "since-logs"])
+        .output()
+        .expect("logs");
+    let invalid = daemon
+        .cli()
+        .args(["logs", "--since", "soon", "since-logs"])
+        .output()
+        .expect("logs");
+
+    // Assert
+    assert!(hidden.status.success() && hidden.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("stub: echo"));
+    assert!(!invalid.status.success());
 }

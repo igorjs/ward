@@ -21,7 +21,7 @@ use crate::pb::{
     StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
-use crate::sandbox::SandboxManager;
+use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
 use crate::volume::VolumeManager;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,10 @@ use crate::volume::VolumeManager;
 /// through the API.
 pub(super) fn api_err_to_status(err: ApiError) -> Status {
     match &err {
-        ApiError::SandboxNotFound(id) => Status::not_found(format!("sandbox not found: {id}")),
+        ApiError::SandboxNotFound(reference) => {
+            Status::not_found(format!("No such container: {reference}"))
+        }
+        ApiError::NameInUse { name, id } => Status::already_exists(name_conflict_message(name, id)),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
@@ -51,6 +54,32 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
     }
+}
+
+/// Docker's wording, so scripts and users that know it recognise the error.
+fn name_conflict_message(name: &str, id: &Option<String>) -> String {
+    let holder = id
+        .as_ref()
+        .map(|id| format!(" by container \"{id}\""))
+        .unwrap_or_default();
+    format!(
+        "Conflict. The container name \"/{name}\" is already in use{holder}. \
+         You have to remove (or rename) that container to be able to reuse that name."
+    )
+}
+
+/// Signal that ends an exec process; the backend cannot deliver others.
+const KILL_SIGNAL: i32 = 9;
+
+/// An exec process can only be killed, so any other signal is refused
+/// instead of being silently turned into a kill.
+fn check_signal_supported(pid: &str, signal: i32) -> Result<(), ApiError> {
+    if pid != MAIN_PROCESS_PID && signal != 0 && signal != KILL_SIGNAL {
+        return Err(ApiError::InvalidRequest(format!(
+            "only signal {KILL_SIGNAL} can be sent to an exec process, got {signal}"
+        )));
+    }
+    Ok(())
 }
 
 /// Turn a name, id or id prefix into a full sandbox id. Handlers call this
@@ -198,7 +227,11 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         let id = authorized_id(&self.sandbox, &req.id, &token).await?;
-        let info = self.sandbox.stop(&id).await.map_err(api_err_to_status)?;
+        let info = self
+            .sandbox
+            .stop_within(&id, req.grace_seconds)
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -227,7 +260,11 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         let id = authorized_id(&self.sandbox, &req.id, &token).await?;
-        let info = self.sandbox.restart(&id).await.map_err(api_err_to_status)?;
+        let info = self
+            .sandbox
+            .restart_within(&id, req.grace_seconds)
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(info))
     }
 
@@ -366,15 +403,23 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         crate::validate::entity_id(&req.pid, "process").map_err(api_err_to_status)?;
+        check_signal_supported(&req.pid, req.signal).map_err(api_err_to_status)?;
         let sandbox_id = resolve_sandbox(&self.sandbox, &req.sandbox_id).await?;
         self.sandbox
             .authorize(&sandbox_id, &token)
             .await
             .map_err(api_err_to_status)?;
-        self.sandbox
-            .kill_process(&sandbox_id, &req.pid)
-            .await
-            .map_err(api_err_to_status)?;
+        if req.pid == MAIN_PROCESS_PID {
+            self.sandbox
+                .signal_main_process(&sandbox_id, req.signal)
+                .await
+                .map_err(api_err_to_status)?;
+        } else {
+            self.sandbox
+                .kill_process(&sandbox_id, &req.pid)
+                .await
+                .map_err(api_err_to_status)?;
+        }
         Ok(Response::new(()))
     }
 
@@ -900,12 +945,35 @@ mod tests {
             &self,
             reference: &str,
             dest: &Path,
-        ) -> Result<String, crate::backend::BackendError> {
+        ) -> Result<crate::backend::image::PulledImage, crate::backend::BackendError> {
             std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(format!("sha256:{hash:016x}"))
+            Ok(crate::backend::image::PulledImage::without_config(format!(
+                "sha256:{hash:016x}"
+            )))
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::exec_default("1a2b", 0, true)]
+    #[case::exec_kill("1a2b", 9, true)]
+    #[case::exec_term("1a2b", 15, false)]
+    #[case::main_term("0", 15, true)]
+    fn given_pid_and_signal_when_checked_then_only_kill_is_allowed_for_exec(
+        #[case] pid: &str,
+        #[case] signal: i32,
+        #[case] allowed: bool,
+    ) {
+        // Act
+        let result = check_signal_supported(pid, signal);
+
+        // Assert
+        assert_eq!(result.is_ok(), allowed);
+        if let Err(err) = result {
+            assert!(matches!(err, ApiError::InvalidRequest(_)));
+            assert_eq!(api_err_to_status(err).code(), tonic::Code::InvalidArgument);
         }
     }
 
@@ -920,6 +988,59 @@ mod tests {
         // Assert
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status.message().contains("aaaa-1") && status.message().contains("aaaa-2"));
+    }
+
+    #[test]
+    fn given_missing_sandbox_when_mapped_then_not_found_in_docker_wording() {
+        // Arrange
+        let err = ApiError::SandboxNotFound("web".into());
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(status.message(), "No such container: web");
+    }
+
+    #[test]
+    fn given_name_held_by_a_sandbox_when_mapped_then_already_exists_in_docker_wording() {
+        // Arrange
+        let err = ApiError::NameInUse {
+            name: "web".into(),
+            id: Some("abc123".into()),
+        };
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert_eq!(
+            status.message(),
+            "Conflict. The container name \"/web\" is already in use by container \"abc123\". \
+             You have to remove (or rename) that container to be able to reuse that name."
+        );
+    }
+
+    #[test]
+    fn given_name_held_by_a_pending_create_when_mapped_then_message_omits_the_container() {
+        // Arrange
+        let err = ApiError::NameInUse {
+            name: "web".into(),
+            id: None,
+        };
+
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert!(
+            status
+                .message()
+                .contains("\"/web\" is already in use. You have to remove")
+        );
     }
 
     fn build_test_server() -> WardGrpcServer {

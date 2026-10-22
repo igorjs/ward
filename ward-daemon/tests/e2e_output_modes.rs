@@ -43,7 +43,7 @@ fn given_create_with_json_flag_when_run_then_emits_single_json_object() {
 }
 
 #[test]
-fn given_create_without_json_when_run_then_emits_key_value_lines() {
+fn given_create_without_json_when_run_then_prints_only_the_id() {
     // Arrange
     let daemon = common::Daemon::spawn();
 
@@ -51,13 +51,10 @@ fn given_create_without_json_when_run_then_emits_key_value_lines() {
     let mut cmd = daemon.cli();
     let assertion = cmd.args(["create", "alpine:latest"]).assert();
 
-    // Assert: historical key/value lines still work, byte-for-byte
-    // compatible with existing scripts.
+    // Assert: like `docker create`, only the bare sandbox id is printed.
     assertion
         .success()
-        .stdout(predicate::str::contains("id:"))
-        .stdout(predicate::str::contains("status: running"))
-        .stdout(predicate::str::contains("image: alpine:latest"))
+        .stdout(predicate::str::is_match("^[0-9a-f-]{36}\\n$").unwrap())
         // Negative: no JSON braces leak into the default path.
         .stdout(predicate::str::contains("{").not());
 }
@@ -153,11 +150,8 @@ fn given_remove_with_json_when_run_then_emits_removed_key() {
         .args(["create", "alpine:latest"])
         .output()
         .expect("create");
-    let stdout = String::from_utf8(create.stdout).expect("utf8");
-    let id = stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("id: "))
-        .expect("id line")
+    let id = String::from_utf8(create.stdout)
+        .expect("utf8")
         .trim()
         .to_string();
 

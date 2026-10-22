@@ -70,6 +70,18 @@ message CreateSandboxRequest {
   repeated string command = 10;  // main process argv; empty means none
   string workdir = 11;
   bool tty = 12;
+  // Remove the sandbox once its main process ends.
+  bool auto_remove = 13;
+  // Start from the image config like `docker run`: the image Entrypoint and
+  // Cmd fill in what `command` leaves out, and its WorkingDir and Env fill in
+  // `workdir` and `env`. Without it only the fields given here apply.
+  bool use_image_config = 14;
+  // Replaces the image Entrypoint. Present but empty clears it. When set, the
+  // image Cmd is ignored unless `command` is given. Needs use_image_config.
+  optional string entrypoint = 15;
+  // Fail when no command results from the request and the image config.
+  // Needs use_image_config.
+  bool require_command = 16;
 }
 
 message GetSandboxRequest {
@@ -83,6 +95,9 @@ message RemoveSandboxRequest {
 // `id` is a sandbox name, id or unique id prefix.
 message StopRequest {
   string id = 1;
+  // Seconds to wait after SIGTERM before SIGKILL. Absent means 10, 0 kills
+  // at once, a negative value waits without limit.
+  optional int32 grace_seconds = 2;
 }
 
 message StartRequest {
@@ -91,6 +106,8 @@ message StartRequest {
 
 message RestartRequest {
   string id = 1;
+  // Same meaning as StopRequest.grace_seconds.
+  optional int32 grace_seconds = 2;
 }
 
 message ListSandboxesResponse {
@@ -115,6 +132,14 @@ message SandboxInfo {
   string command_name = 12;
   // Full argv, which can hold secrets. Filled only for a caller with a valid token.
   repeated string command = 13;
+  // Absent until the main process has started or ended.
+  google.protobuf.Timestamp started_at = 14;
+  google.protobuf.Timestamp finished_at = 15;
+  // Leading part of `command` that came from an Entrypoint. Filled like
+  // `command`.
+  repeated string entrypoint = 16;
+  // The image's User. Recorded for display: the guest does not apply it.
+  string user = 17;
 }
 
 enum SandboxStatus {
@@ -203,7 +228,10 @@ message WriteStdinRequest {
 
 message KillProcessRequest {
   string sandbox_id = 1;
+  // "0" means the sandbox's main process.
   string pid = 2;
+  // Signal number sent to the main process. 0 means SIGKILL.
+  int32 signal = 3;
 }
 
 // One message type for both directions of an Attach stream.
@@ -216,6 +244,7 @@ message AttachMessage {
     AttachSignal signal = 4;
     AttachData data = 5;
     AttachExit exit = 6;
+    AttachReplayEnd replay_end = 7;
   }
 }
 
@@ -253,6 +282,20 @@ message AttachSignal {
 
 message AttachData {
   bytes data = 1;
+  // Which stream the bytes came from. Absent or 0 means stdout, so a client
+  // or server that predates this field keeps its behavior.
+  AttachStream stream = 2;
+  // When the daemon received the bytes. Absent when the server predates it.
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+// Sent once on a main process attach, after the buffered output and before
+// any live output, so a client knows where the replay ends.
+message AttachReplayEnd {}
+
+enum AttachStream {
+  ATTACH_STREAM_STDOUT = 0;
+  ATTACH_STREAM_STDERR = 1;
 }
 
 message AttachExit {

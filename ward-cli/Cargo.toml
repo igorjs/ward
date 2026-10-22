@@ -14,6 +14,7 @@ anyhow = "1"
 # JSON mode encodes broker payload bytes as base64 so binary publishes
 # survive the round-trip without collapsing through `from_utf8_lossy`.
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
@@ -25,6 +26,7 @@ tokio = { version = "1", features = ["full"] }
 # rustix: termios raw mode and window size without the libc unsafe surface.
 rustix = { version = "1", features = ["termios"] }
 tokio-stream = "0.1"
+prost-types = "0.14"
 tonic = "0.14"
 tower = "0.5"
 ward-core = { path = "../ward-core" }
@@ -32,6 +34,7 @@ ward-core = { path = "../ward-core" }
 [dev-dependencies]
 # Diff-style assertions for readable failures on multi-field structs.
 pretty_assertions = "1"
+rstest = "0.26"
 # Terminal tests open their own pty and signal a child process.
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
 # Per-test temporary directories for the token store round-trip tests.

@@ -101,8 +101,8 @@ mod tests {
 
     mod attach {
         use super::super::pb::{
-            AttachData, AttachExit, AttachMessage, AttachMode, AttachResize, AttachSignal,
-            AttachStart, AttachStdin, attach_message::Kind,
+            AttachData, AttachExit, AttachMessage, AttachMode, AttachReplayEnd, AttachResize,
+            AttachSignal, AttachStart, AttachStdin, AttachStream, attach_message::Kind,
         };
         use prost::Message;
 
@@ -131,7 +131,13 @@ mod tests {
                 Kind::Signal(AttachSignal { signo: SIGTERM }),
                 Kind::Data(AttachData {
                     data: b"out\0".to_vec(),
+                    stream: AttachStream::Stderr.into(),
+                    timestamp: Some(prost_types::Timestamp {
+                        seconds: 1,
+                        nanos: 2,
+                    }),
                 }),
+                Kind::ReplayEnd(AttachReplayEnd {}),
                 Kind::Exit(AttachExit { exit_code: 7 }),
             ];
 

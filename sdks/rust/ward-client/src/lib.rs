@@ -174,8 +174,10 @@ pub enum StreamEvent {
 pub enum WardError {
     #[error("transport error: {0}")]
     Transport(String),
-    #[error("sandbox not found: {0}")]
+    #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    AlreadyExists(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
     #[error("permission denied: {0}")]
@@ -189,10 +191,11 @@ pub enum WardError {
 impl From<tonic::Status> for WardError {
     fn from(s: tonic::Status) -> Self {
         // Tonic status codes map back to the SDK's narrower error shape.
-        // INVALID_ARGUMENT and NOT_FOUND are common enough to surface as
+        // INVALID_ARGUMENT, NOT_FOUND and ALREADY_EXISTS are common enough to surface as
         // dedicated variants; everything else collapses into `Daemon`.
         match s.code() {
             tonic::Code::NotFound => WardError::NotFound(s.message().into()),
+            tonic::Code::AlreadyExists => WardError::AlreadyExists(s.message().into()),
             tonic::Code::InvalidArgument => WardError::InvalidRequest(s.message().into()),
             tonic::Code::PermissionDenied => WardError::PermissionDenied(s.message().into()),
             _ => WardError::Daemon(format!("{}: {}", s.code(), s.message())),
@@ -472,6 +475,7 @@ impl WardClient {
         let req = pb::KillProcessRequest {
             sandbox_id: sandbox_id.into(),
             pid: pid.into(),
+            ..Default::default()
         };
         self.inner.kill_process(attach_token(req, token)?).await?;
         Ok(())
@@ -609,5 +613,20 @@ mod tests {
             WardError::NotFound(m) => assert_eq!(m, "no sandbox"),
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn given_already_exists_status_when_converted_then_becomes_already_exists() {
+        let s = tonic::Status::already_exists("name in use");
+        match WardError::from(s) {
+            WardError::AlreadyExists(m) => assert_eq!(m, "name in use"),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_not_found_error_when_displayed_then_only_the_daemon_message() {
+        let e = WardError::NotFound("No such container: web".into());
+        assert_eq!(e.to_string(), "No such container: web");
     }
 }

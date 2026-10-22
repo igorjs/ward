@@ -38,18 +38,24 @@ impl Action {
         }
     }
 
-    async fn call(self, c: &mut WardClient<Channel>, target: &Resolved) -> Result<()> {
+    async fn call(
+        self,
+        c: &mut WardClient<Channel>,
+        target: &Resolved,
+        grace_seconds: Option<i32>,
+    ) -> Result<()> {
         let id = target.id.clone();
         match self {
             Self::Stop => {
-                let request = StopRequest { id };
+                let request = StopRequest { id, grace_seconds };
                 c.stop(target.request(request)?).await?;
             }
             Self::Start => {
                 c.start(target.request(StartRequest { id })?).await?;
             }
             Self::Restart => {
-                c.restart(target.request(RestartRequest { id })?).await?;
+                let request = RestartRequest { id, grace_seconds };
+                c.restart(target.request(request)?).await?;
             }
         }
         Ok(())
@@ -57,21 +63,24 @@ impl Action {
 }
 
 /// Tallies per-reference failures and prints each one to stderr.
-struct Failures {
+pub struct Failures {
     count: usize,
 }
 
 impl Failures {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { count: 0 }
     }
 
-    fn record(&mut self, subject: &str, error: &anyhow::Error) {
+    pub fn record(&mut self, subject: &str, error: &anyhow::Error) {
         self.count += 1;
-        eprintln!("error: {subject}: {}", error_text(error));
+        match client::daemon_error_line(error) {
+            Some(line) => eprintln!("{line}"),
+            None => eprintln!("error: {subject}: {error:#}"),
+        }
     }
 
-    fn finish(self, total: usize, did_what: &str) -> Result<()> {
+    pub fn finish(self, total: usize, did_what: &str) -> Result<()> {
         if self.count > 0 {
             anyhow::bail!(
                 "{} of {total} sandboxes could not be {did_what}",
@@ -82,26 +91,19 @@ impl Failures {
     }
 }
 
-/// A daemon status shows its message only, without the transport framing.
-fn error_text(error: &anyhow::Error) -> String {
-    match error.downcast_ref::<tonic::Status>() {
-        Some(status) => status.message().to_string(),
-        None => format!("{error:#}"),
-    }
-}
-
 pub async fn lifecycle(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     action: Action,
     refs: &[String],
+    grace_seconds: Option<i32>,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
     for reference in refs {
         let result = async {
             let target = client::resolve(c, token_store, reference).await?;
-            action.call(c, &target).await
+            action.call(c, &target, grace_seconds).await
         }
         .await;
         match result {
@@ -134,7 +136,7 @@ pub async fn remove(
         .await;
         match result {
             Ok(()) if json => println!("{}", json!({"removed": reference})),
-            Ok(()) => println!("removed: {reference}"),
+            Ok(()) => println!("{reference}"),
             Err(e) => failures.record(reference, &e),
         }
     }

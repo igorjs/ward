@@ -15,8 +15,10 @@ use tracing::{info, warn};
 use super::server::api_err_to_status;
 use crate::backend::ProcessControl;
 use crate::pb::attach_message::Kind;
-use crate::pb::{AttachData, AttachExit, AttachMessage, AttachMode, AttachStart};
-use crate::protocol::StreamEvent;
+use crate::pb::{
+    AttachData, AttachExit, AttachMessage, AttachMode, AttachReplayEnd, AttachStart, AttachStream,
+};
+use crate::protocol::{OutputChunk, RawStream, StreamEvent};
 use crate::sandbox::{
     ProcessIo, SandboxManager, decode_wait_status, event_chunk, event_wait_status,
 };
@@ -109,11 +111,33 @@ fn run(
     });
 }
 
-async fn send_data(tx: &Outbound, data: Vec<u8>) -> bool {
-    if data.is_empty() {
+async fn send_data(tx: &Outbound, chunk: OutputChunk) -> bool {
+    if chunk.bytes.is_empty() {
         return true;
     }
-    let kind = Kind::Data(AttachData { data });
+    let stream = match chunk.stream {
+        RawStream::Stdout => AttachStream::Stdout,
+        RawStream::Stderr => AttachStream::Stderr,
+    };
+    let kind = Kind::Data(AttachData {
+        data: chunk.bytes.to_vec(),
+        stream: stream.into(),
+        timestamp: Some(prost_types::Timestamp {
+            seconds: chunk.at.timestamp(),
+            nanos: chunk
+                .at
+                .timestamp_subsec_nanos()
+                .try_into()
+                .unwrap_or_default(),
+        }),
+    });
+    tx.send(Ok(AttachMessage { kind: Some(kind) }))
+        .await
+        .is_ok()
+}
+
+async fn send_replay_end(tx: &Outbound) -> bool {
+    let kind = Kind::ReplayEnd(AttachReplayEnd {});
     tx.send(Ok(AttachMessage { kind: Some(kind) }))
         .await
         .is_ok()
@@ -137,7 +161,12 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
         Ok(subscription) => subscription,
         Err(e) => return send_error(&tx, api_err_to_status(e)).await,
     };
-    if !send_data(&tx, buffered).await || buffer_only {
+    for chunk in buffered {
+        if !send_data(&tx, chunk).await {
+            return;
+        }
+    }
+    if !send_replay_end(&tx).await || buffer_only {
         return;
     }
     let exit = manager.main_exit_status(&id);
@@ -147,7 +176,7 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
             _ = tx.closed() => return,
             chunk = live.recv() => match chunk {
                 Ok(chunk) => {
-                    if !send_data(&tx, chunk.to_vec()).await {
+                    if !send_data(&tx, chunk).await {
                         return;
                     }
                 }
@@ -161,7 +190,7 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
                 loop {
                     match live.try_recv() {
                         Ok(chunk) => {
-                            if !send_data(&tx, chunk.to_vec()).await {
+                            if !send_data(&tx, chunk).await {
                                 return;
                             }
                         }
@@ -273,7 +302,7 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
 
     use super::*;
-    use crate::pb::{AttachResize, AttachSignal, AttachStdin};
+    use crate::pb::{AttachReplayEnd as ReplayEnd, AttachResize, AttachSignal, AttachStdin};
     use crate::sandbox::{create_with_command, host_manager};
 
     const TEST_DEADLINE: Duration = Duration::from_secs(30);
@@ -320,11 +349,20 @@ mod tests {
 
     /// Read replies until the exit code arrives or the stream ends.
     async fn collect(replies: &mut Replies) -> (String, Option<i32>) {
-        let mut text = Vec::new();
+        let (out, err, code) = collect_streams(replies).await;
+        (out + &err, code)
+    }
+
+    /// Read replies to the end, keeping stdout and stderr apart.
+    async fn collect_streams(replies: &mut Replies) -> (String, String, Option<i32>) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
         let read = async {
             while let Some(reply) = replies.recv().await {
                 match reply.expect("reply").kind {
-                    Some(Kind::Data(data)) => text.extend(data.data),
+                    Some(Kind::Data(data)) if data.stream == AttachStream::Stderr as i32 => {
+                        err.extend(data.data)
+                    }
+                    Some(Kind::Data(data)) => out.extend(data.data),
                     Some(Kind::Exit(exit)) => return Some(exit.exit_code),
                     _ => {}
                 }
@@ -334,7 +372,11 @@ mod tests {
         let code = tokio::time::timeout(TEST_DEADLINE, read)
             .await
             .expect("stream ended in time");
-        (String::from_utf8_lossy(&text).into_owned(), code)
+        (
+            String::from_utf8_lossy(&out).into_owned(),
+            String::from_utf8_lossy(&err).into_owned(),
+            code,
+        )
     }
 
     /// Read replies until the text holds `expected`.
@@ -569,18 +611,27 @@ mod tests {
         assert!(echoed.is_err(), "cat received the ignored stdin");
     }
 
+    async fn wait_for_buffered_output(mgr: &SandboxManager, id: &str) {
+        let buffered = async {
+            loop {
+                let (buffered, _) = mgr.subscribe_main_output(id).await.expect("subscribe");
+                if !buffered.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(POLL_STEP).await;
+            }
+        };
+        tokio::time::timeout(TEST_DEADLINE, buffered)
+            .await
+            .expect("main process output was never buffered");
+    }
+
     #[tokio::test]
     async fn given_replay_without_follow_when_attached_then_buffer_arrives_and_stream_ends() {
         // Arrange
         let mgr = host_manager(OUTPUT_CAP);
         let id = create_with_command(&mgr, &["sh", "-c", "echo one; exec cat"], false).await;
-        loop {
-            let (buffered, _) = mgr.subscribe_main_output(&id).await.expect("subscribe");
-            if !buffered.is_empty() {
-                break;
-            }
-            tokio::time::sleep(POLL_STEP).await;
-        }
+        wait_for_buffered_output(&mgr, &id).await;
         let start = AttachStart {
             replay: true,
             ..main_start(&id)
@@ -592,6 +643,76 @@ mod tests {
 
         // Assert: the stream ended with the buffer and no exit code.
         assert_eq!((text.as_str(), code), ("one\n", None));
+    }
+
+    #[tokio::test]
+    async fn given_buffered_output_when_replayed_with_follow_then_the_marker_follows_the_buffer_and_data_is_stamped()
+     {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo one; exec cat"], false).await;
+        wait_for_buffered_output(&mgr, &id).await;
+        let start = AttachStart {
+            replay: true,
+            follow: true,
+            ..main_start(&id)
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+        let first = replies.recv().await.expect("open").expect("reply");
+        let second = replies.recv().await.expect("open").expect("reply");
+
+        // Assert
+        let Some(Kind::Data(data)) = first.kind else {
+            panic!("expected data first, got {first:?}");
+        };
+        assert_eq!(data.data, b"one\n");
+        assert!(data.timestamp.is_some_and(|t| t.seconds > 0));
+        assert_eq!(second.kind, Some(Kind::ReplayEnd(ReplayEnd {})));
+    }
+
+    #[tokio::test]
+    async fn given_exec_writing_to_both_streams_when_attached_then_they_stay_apart() {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["cat"], false).await;
+        let start = AttachStart {
+            sandbox_id: id.clone(),
+            mode: AttachMode::Exec as i32,
+            command: vec!["sh".into(), "-c".into(), "echo out; echo err >&2".into()],
+            ..Default::default()
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+
+        // Assert
+        let (out, err, code) = collect_streams(&mut replies).await;
+        assert_eq!(
+            (out.as_str(), err.as_str(), code),
+            ("out\n", "err\n", Some(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_main_process_that_wrote_to_both_streams_when_replayed_then_they_stay_apart() {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo out; echo err >&2"], false).await;
+        let exited = mgr.main_exit_status(&id).await;
+        assert!(exited.is_ok());
+        let start = AttachStart {
+            replay: true,
+            ..main_start(&id)
+        };
+
+        // Act
+        let (_feed, mut replies) = attach(&mgr, &id, start).await;
+
+        // Assert
+        let (out, err, _) = collect_streams(&mut replies).await;
+        assert_eq!((out.as_str(), err.as_str()), ("out\n", "err\n"));
     }
 
     #[tokio::test]

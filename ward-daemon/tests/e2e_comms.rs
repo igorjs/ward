@@ -132,12 +132,7 @@ fn create_in_group(daemon: &common::Daemon, image: &str, group: &str) -> String 
         .output()
         .expect("create");
     assert!(out.status.success(), "create failed: {:?}", out);
-    let stdout = std::str::from_utf8(&out.stdout).unwrap();
-    stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("id: ").map(str::trim))
-        .expect("id line")
-        .to_string()
+    std::str::from_utf8(&out.stdout).unwrap().trim().to_string()
 }
 
 #[test]

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::image::{ImageStore, OFFLINE_IMAGES_ENV};
+use super::image::{ImageConfig, ImageStore, OFFLINE_IMAGES_ENV};
 use super::{Backend, BackendError, ExecMode, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
@@ -363,6 +363,8 @@ impl Backend for KrunvmBackend {
             token: String::new(),
             spec: opts.spec.clone(),
             exit_code: None,
+            started_at: None,
+            finished_at: None,
         };
 
         #[cfg(feature = "krunvm")]
@@ -384,6 +386,10 @@ impl Backend for KrunvmBackend {
 
         self.sandboxes.write().await.insert(id, state);
         Ok(info)
+    }
+
+    async fn image_config(&self, image: &str) -> Result<ImageConfig> {
+        self.image_store.config(image).await
     }
 
     /// Retrieve sandbox info by ID.
@@ -1408,12 +1414,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImagePuller for FakePuller {
-        async fn pull(&self, reference: &str, dest: &Path) -> crate::backend::Result<String> {
+        async fn pull(
+            &self,
+            reference: &str,
+            dest: &Path,
+        ) -> crate::backend::Result<crate::backend::image::PulledImage> {
             std::fs::create_dir_all(dest.join("bin")).map_err(crate::backend::BackendError::Io)?;
             let hash: u64 = reference
                 .bytes()
                 .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(format!("sha256:{hash:016x}"))
+            Ok(crate::backend::image::PulledImage::without_config(format!(
+                "sha256:{hash:016x}"
+            )))
         }
     }
 
