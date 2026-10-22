@@ -28,6 +28,14 @@ service Ward {
   // Bidirectional stream to a sandbox process. The first client message
   // must be `start`; the token travels in call metadata.
   rpc Attach(stream AttachMessage) returns (stream AttachMessage);
+  // Unpack a tar stream into a directory of a running sandbox. The first
+  // client message must be `start`, then `data` chunks of one tar. The token
+  // travels in call metadata.
+  rpc CopyTo(stream CopyToMessage) returns (google.protobuf.Empty);
+  // Stream a tar of a file or directory of a running sandbox. The daemon
+  // checks each entry before it forwards any byte from that entry's header
+  // on; a refused tar ends the stream with an error.
+  rpc CopyFrom(CopyFromRequest) returns (stream CopyFromChunk);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -300,6 +308,34 @@ enum AttachStream {
 
 message AttachExit {
   int32 exit_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+// File copy messages
+// ---------------------------------------------------------------------------
+
+message CopyToMessage {
+  oneof kind {
+    CopyToStart start = 1;
+    // A slice of the tar stream; at most 1 MiB.
+    bytes data = 2;
+  }
+}
+
+message CopyToStart {
+  string sandbox_id = 1;
+  // Absolute guest directory the tar is unpacked into.
+  string path = 2;
+}
+
+message CopyFromRequest {
+  string sandbox_id = 1;
+  // Absolute guest file or directory.
+  string path = 2;
+}
+
+message CopyFromChunk {
+  bytes data = 1;
 }
 
 // ---------------------------------------------------------------------------

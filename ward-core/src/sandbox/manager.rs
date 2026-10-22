@@ -18,6 +18,7 @@ use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, OutputChunk,
     RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
+use crate::sandbox::copy;
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
@@ -1402,6 +1403,50 @@ impl SandboxManager {
             stdin: main.stdin_tx.clone(),
             control: main.control_tx.clone(),
         })
+    }
+
+    /// Unpack the tar in `chunks` into the directory `path` of a running
+    /// sandbox. The guest agent enforces the copy policy while it unpacks.
+    pub async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()> {
+        let id = self.copy_target(sandbox_id, path).await?;
+        let target = copy::GuestTarget::new(sandbox_id, path);
+        self.backend
+            .copy_to(&id, path, chunks)
+            .await
+            .map_err(|e| target.backend_failure(e))
+    }
+
+    /// Stream a tar of the file or directory `path` of a running sandbox.
+    /// The guest is untrusted, so each entry is checked against the copy
+    /// policy before its bytes are forwarded.
+    pub async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<mpsc::Receiver<Result<bytes::Bytes>>> {
+        let id = self.copy_target(sandbox_id, path).await?;
+        let target = copy::GuestTarget::new(sandbox_id, path);
+        let source = self
+            .backend
+            .copy_from(&id, path)
+            .await
+            .map_err(|e| target.backend_failure(e))?;
+        let limits = ward_archive::Limits::default();
+        Ok(copy::checked_relay(source, limits, target))
+    }
+
+    async fn copy_target(&self, sandbox_id: &str, path: &str) -> Result<String> {
+        crate::validate::guest_path(path)?;
+        let id = self.resolve(sandbox_id).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            return Err(not_running(&id));
+        }
+        Ok(id)
     }
 
     /// Send `signal` to the main process, or SIGKILL when `signal` is 0.
@@ -4341,6 +4386,22 @@ pub(crate) mod tests {
         async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
             self.inner.kill_process(sandbox_id, pid).await
         }
+        async fn copy_to(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+            chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        ) -> crate::backend::Result<()> {
+            self.inner.copy_to(sandbox_id, path, chunks).await
+        }
+        async fn copy_from(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+        ) -> crate::backend::Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>
+        {
+            self.inner.copy_from(sandbox_id, path).await
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -4941,6 +5002,22 @@ pub(crate) mod tests {
         }
         async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
             self.inner.kill_process(sandbox_id, pid).await
+        }
+        async fn copy_to(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+            chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        ) -> crate::backend::Result<()> {
+            self.inner.copy_to(sandbox_id, path, chunks).await
+        }
+        async fn copy_from(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+        ) -> crate::backend::Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>
+        {
+            self.inner.copy_from(sandbox_id, path).await
         }
         async fn create_snapshot(
             &self,

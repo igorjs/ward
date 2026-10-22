@@ -9,16 +9,17 @@ use tracing::error;
 
 use super::attach;
 use crate::pb::attach_message::Kind;
+use crate::pb::copy_to_message;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest,
-    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse,
-    ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest,
-    GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
-    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest,
-    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest, StopRequest,
-    StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk, CopyFromRequest,
+    CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
+    EgressLogEntry, EgressLogResponse, ExecRequest, GetCommunicationLogRequest,
+    GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
+    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
+    Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
+    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest,
+    StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -102,7 +103,37 @@ async fn authorized_id(
     Ok(id)
 }
 
+/// Largest data frame a `CopyTo` client may send, as the proto documents.
+const MAX_COPY_DATA_BYTES: usize = crate::backend::agent::ARCHIVE_CHUNK_BYTES;
+
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
+
+/// Pass the data frames of a `CopyTo` stream on to the copy. A frame past
+/// the documented size, or any other kind, ends the stream with an error.
+async fn forward_copy_data<S>(
+    mut inbound: S,
+    feed: tokio::sync::mpsc::Sender<bytes::Bytes>,
+) -> Result<(), Status>
+where
+    S: tokio_stream::Stream<Item = Result<CopyToMessage, Status>> + Unpin,
+{
+    while let Some(message) = inbound.next().await {
+        match message?.kind {
+            Some(copy_to_message::Kind::Data(data)) if data.len() <= MAX_COPY_DATA_BYTES => {
+                if feed.send(bytes::Bytes::from(data)).await.is_err() {
+                    break;
+                }
+            }
+            Some(copy_to_message::Kind::Data(_)) => {
+                return Err(Status::invalid_argument(format!(
+                    "copy data frames hold at most {MAX_COPY_DATA_BYTES} bytes"
+                )));
+            }
+            _ => return Err(Status::invalid_argument("expected a data message")),
+        }
+    }
+    Ok(())
+}
 
 /// Read the caller-presented capability token off request metadata. A
 /// missing key and a value that fails ASCII/UTF-8 decoding are both
@@ -678,6 +709,69 @@ impl Ward for WardGrpcServer {
         )))
     }
 
+    #[tracing::instrument(name = "rpc.copy_to", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn copy_to(
+        &self,
+        request: Request<tonic::Streaming<CopyToMessage>>,
+    ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("copy stream ended before a start message")
+        })??;
+        let Some(copy_to_message::Kind::Start(start)) = first.kind else {
+            return Err(Status::invalid_argument("first copy message must be start"));
+        };
+        let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
+        let (feed, chunks) = tokio::sync::mpsc::channel(crate::backend::COPY_CHANNEL_CAPACITY);
+        let pump = tokio::spawn(forward_copy_data(inbound, feed));
+        let copied = self.sandbox.copy_to(&id, &start.path, chunks).await;
+        // A copy that ended early must not leave the pump waiting on a client
+        // that keeps its stream open.
+        if copied.is_err() {
+            pump.abort();
+        }
+        // A client that broke the stream must not look like a finished copy.
+        match pump.await {
+            Ok(Ok(())) => {}
+            Ok(Err(status)) => return Err(status),
+            Err(e) if e.is_cancelled() => {}
+            Err(_) => return Err(Status::internal("internal error")),
+        }
+        copied.map_err(api_err_to_status)?;
+        Ok(Response::new(()))
+    }
+
+    type CopyFromStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<CopyFromChunk, Status>> + Send + 'static>,
+    >;
+
+    #[tracing::instrument(
+        name = "rpc.copy_from",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn copy_from(
+        &self,
+        request: Request<CopyFromRequest>,
+    ) -> Result<Response<Self::CopyFromStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let tar = self
+            .sandbox
+            .copy_from(&id, &req.path)
+            .await
+            .map_err(api_err_to_status)?;
+        let chunks = tokio_stream::wrappers::ReceiverStream::new(tar).map(|item| {
+            item.map(|data| CopyFromChunk {
+                data: data.to_vec(),
+            })
+            .map_err(api_err_to_status)
+        });
+        Ok(Response::new(Box::pin(chunks)))
+    }
+
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
 
     #[tracing::instrument(
@@ -930,6 +1024,35 @@ mod tests {
         // Assert
         assert_eq!(pb.r#type, crate::pb::StreamEventType::Stderr as i32);
         assert_eq!(pb.line, "a\u{fffd}b");
+    }
+
+    fn data_frame(len: usize) -> Result<CopyToMessage, Status> {
+        Ok(CopyToMessage {
+            kind: Some(copy_to_message::Kind::Data(vec![0; len])),
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::at_the_cap(MAX_COPY_DATA_BYTES, None)]
+    #[case::over_the_cap(MAX_COPY_DATA_BYTES + 1, Some(tonic::Code::InvalidArgument))]
+    #[test]
+    fn given_a_copy_data_frame_when_forwarded_then_only_one_over_the_cap_is_refused(
+        #[case] len: usize,
+        #[case] refused: Option<tonic::Code>,
+    ) {
+        // Arrange
+        let (feed, mut chunks) = tokio::sync::mpsc::channel(crate::backend::COPY_CHANNEL_CAPACITY);
+        let inbound = tokio_stream::iter(vec![data_frame(len)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Act
+        let result = runtime.block_on(forward_copy_data(inbound, feed));
+
+        // Assert
+        assert_eq!(result.err().map(|s| s.code()), refused);
+        assert_eq!(chunks.try_recv().is_ok(), refused.is_none());
     }
 
     /// Offline image puller: materialises a minimal bin/ rootfs without

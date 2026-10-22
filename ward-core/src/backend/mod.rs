@@ -26,6 +26,9 @@ pub enum BackendError {
     Internal(String),
 }
 
+/// Tar chunks buffered between the two ends of a file copy.
+pub const COPY_CHANNEL_CAPACITY: usize = 4;
+
 /// Convenience result alias for backend operations.
 pub type Result<T> = std::result::Result<T, BackendError>;
 
@@ -138,6 +141,25 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<ProcessHandle>;
 
     async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()>;
+
+    // -- File copy ------------------------------------------------------
+
+    /// Unpack the tar stream `chunks` into the guest directory `path`.
+    async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()>;
+
+    /// Stream a tar of the guest file or directory `path`. The guest is
+    /// untrusted: callers check the tar before they use it. A failure
+    /// midway arrives as an `Err` item.
+    async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>;
 
     // -- Snapshots ------------------------------------------------------
 

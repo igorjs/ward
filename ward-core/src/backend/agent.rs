@@ -34,7 +34,9 @@ use proto::{Event, Exec, Request, event, request};
 /// any payload arrived.
 const MAX_FRAME_BYTES: u32 = 2 * 1024 * 1024;
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -68,7 +70,10 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<V
 /// could ship a malformed `len = 0` frame (from a future `Request::default()`
 /// caller) to the guest, where the agent's reader would reject it as
 /// `InvalidData` and surface the failure as an opaque peer disconnect.
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     if bytes.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -89,7 +94,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io:
     Ok(())
 }
 
-fn encode<M: Message>(m: &M) -> Vec<u8> {
+pub(crate) fn encode<M: Message>(m: &M) -> Vec<u8> {
     let mut buf = Vec::with_capacity(m.encoded_len());
     m.encode(&mut buf)
         .expect("encoding into a Vec is infallible");
@@ -308,6 +313,110 @@ where
             std::io::ErrorKind::InvalidData,
             "agent reply to Ping was not Pong",
         )),
+    }
+}
+
+/// Bytes of tar in one `ArchiveChunk` frame, well under the frame cap.
+pub const ARCHIVE_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn protocol_error(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
+}
+
+fn agent_failure(message: String) -> std::io::Error {
+    std::io::Error::other(format!("guest agent: {message}"))
+}
+
+/// Send `chunks` as one tar stream to unpack into the guest directory `path`.
+///
+/// # Errors
+///
+/// Returns an error if the agent refuses the tar or the connection fails.
+pub async fn put_archive<S>(
+    stream: S,
+    path: String,
+    mut chunks: mpsc::Receiver<bytes::Bytes>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::PutArchive(proto::PutArchive { path })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    while let Some(chunk) = chunks.recv().await {
+        for piece in chunk.chunks(ARCHIVE_CHUNK_BYTES) {
+            let frame = Request {
+                kind: Some(request::Kind::ArchiveChunk(proto::ArchiveChunk {
+                    data: piece.to_vec(),
+                })),
+            };
+            write_frame(&mut writer, &encode(&frame)).await?;
+        }
+    }
+    let end = Request {
+        kind: Some(request::Kind::ArchiveEnd(proto::ArchiveEnd {})),
+    };
+    write_frame(&mut writer, &encode(&end)).await?;
+    let frame = read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
+        _ => Err(protocol_error(
+            "agent answered a PutArchive with another event",
+        )),
+    }
+}
+
+/// Ask the agent for a tar of the guest `path` and pass its chunks to `out`.
+/// A failure ends the stream with an `Err` item, since chunks sent before it
+/// are incomplete.
+pub async fn get_archive<S>(
+    stream: S,
+    path: String,
+    out: mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = relay_archive(stream, path, &out).await {
+        let _ = out.send(Err(e)).await;
+    }
+}
+
+async fn relay_archive<S>(
+    stream: S,
+    path: String,
+    out: &mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::GetArchive(proto::GetArchive { path })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    loop {
+        let frame = read_frame(&mut reader)
+            .await?
+            .ok_or_else(|| protocol_error("agent closed the connection mid-archive"))?;
+        match Event::decode(&frame[..]).map(|e| e.kind) {
+            Ok(Some(event::Kind::ArchiveChunk(c))) => {
+                if out.send(Ok(bytes::Bytes::from(c.data))).await.is_err() {
+                    return Ok(()); // consumer gone
+                }
+            }
+            Ok(Some(event::Kind::ArchiveDone(_))) => return Ok(()),
+            Ok(Some(event::Kind::ArchiveError(e))) => return Err(agent_failure(e.message)),
+            _ => {
+                return Err(protocol_error(
+                    "agent answered a GetArchive with another event",
+                ));
+            }
+        }
     }
 }
 
