@@ -233,7 +233,7 @@ impl DirMode {
         if stat.st_dev as u64 != self.dev || stat.st_ino as u64 != self.ino {
             return Err(ArchiveError::UnsafePath(self.path.display().to_string()));
         }
-        let mode = Mode::from_bits_truncate(self.mode.try_into().unwrap_or_default());
+        let mode = Mode::from_bits_truncate(self.mode as fs::RawMode);
         fs::fchmod(&fd, mode).map_err(os_error)
     }
 }
