@@ -17,6 +17,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+mod archive;
 mod pty;
 
 #[allow(clippy::doc_lazy_continuation)]
@@ -200,9 +201,17 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
     }
 }
 
-/// Handle a single daemon connection: read the opening `Exec`, run the
-/// process, and stream its output until it exits.
+/// Handle a single daemon connection, dispatching on its opening frame:
+/// `Exec` runs a process and streams its output until it exits, `Ping`
+/// answers `Pong`, and `PutArchive` and `GetArchive` transfer a tar stream.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    handle_connection_scoped(stream, &archive::Scope::guest()).await
+}
+
+async fn handle_connection_scoped<S>(stream: S, scope: &archive::Scope) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
@@ -221,10 +230,18 @@ where
             };
             return write_frame(&mut writer, &encode_event(&pong)).await;
         }
+        Some(request::Kind::PutArchive(put)) => {
+            let (mut reader, mut writer) = (reader, writer);
+            return archive::put(scope, &put.path, &mut reader, &mut writer).await;
+        }
+        Some(request::Kind::GetArchive(get)) => {
+            let mut writer = writer;
+            return archive::get(scope, &get.path, &mut writer).await;
+        }
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec or Ping",
+                "first frame must be Exec, Ping, PutArchive or GetArchive",
             ));
         }
     };
@@ -371,7 +388,12 @@ async fn apply_request(
                 tracing::warn!(error = %e, "pty resize failed");
             }
         }
-        request::Kind::Exec(_) | request::Kind::Ping(_) => {}
+        request::Kind::Exec(_)
+        | request::Kind::Ping(_)
+        | request::Kind::PutArchive(_)
+        | request::Kind::GetArchive(_)
+        | request::Kind::ArchiveChunk(_)
+        | request::Kind::ArchiveEnd(_) => {}
     }
 }
 
@@ -563,7 +585,14 @@ mod tests {
                 Some(event::Kind::Stdout(l)) => out.push(l.text.clone()),
                 Some(event::Kind::Stderr(l)) => err.push(l.text.clone()),
                 Some(event::Kind::Exited(x)) => code = Some(x.code),
-                Some(event::Kind::Pong(_) | event::Kind::Data(_)) | None => {}
+                Some(
+                    event::Kind::Pong(_)
+                    | event::Kind::Data(_)
+                    | event::Kind::ArchiveChunk(_)
+                    | event::Kind::ArchiveDone(_)
+                    | event::Kind::ArchiveError(_),
+                )
+                | None => {}
             }
         }
         (out, err, code)

@@ -25,6 +25,10 @@ message Request {
     Ping ping = 4;
     Resize resize = 5;
     Signal signal = 6;
+    PutArchive put_archive = 7;
+    GetArchive get_archive = 8;
+    ArchiveChunk archive_chunk = 9;
+    ArchiveEnd archive_end = 10;
   }
 }
 
@@ -70,7 +74,43 @@ message Event {
     Exited exited = 3;
     Pong pong = 4;
     Data data = 5;
+    ArchiveChunk archive_chunk = 6;
+    ArchiveDone archive_done = 7;
+    ArchiveError archive_error = 8;
   }
+}
+
+// File transfer. PutArchive must be the first frame on a connection. The
+// daemon then sends ArchiveChunk frames carrying one tar stream and a final
+// ArchiveEnd. The agent unpacks the tar into the directory `path` and
+// answers with one ArchiveDone or ArchiveError.
+message PutArchive {
+  string path = 1;                      // absolute guest directory
+}
+
+// Must be the first frame on a connection. The agent answers with
+// ArchiveChunk frames carrying one tar stream of the file or directory at
+// `path`, then ArchiveDone, or ArchiveError if it cannot read the path. The
+// walk can fail midway, so chunks received before an ArchiveError are
+// incomplete and must be discarded.
+message GetArchive {
+  string path = 1;                      // absolute guest file or directory
+}
+
+// A slice of a tar stream, in either direction.
+message ArchiveChunk {
+  bytes data = 1;
+}
+
+// Daemon -> agent: the tar stream is complete.
+message ArchiveEnd {}
+
+// Agent -> daemon: the transfer finished.
+message ArchiveDone {}
+
+// Agent -> daemon: the transfer failed; the message says why.
+message ArchiveError {
+  string message = 1;
 }
 
 // Answer to Ping.

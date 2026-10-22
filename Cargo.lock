@@ -3574,11 +3574,15 @@ dependencies = [
  "libc",
  "prost",
  "prost-build",
+ "rstest",
  "rustix",
+ "tar",
+ "tempfile",
  "tokio",
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "ward-archive",
 ]
 
 [[package]]
