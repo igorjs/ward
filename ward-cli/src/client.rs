@@ -109,6 +109,8 @@ pub fn daemon_error_line(error: &anyhow::Error) -> Option<String> {
 pub struct Resolved {
     pub id: String,
     pub status: SandboxStatus,
+    /// The sandbox's working directory; empty when it has none.
+    pub workdir: String,
     token: Option<String>,
 }
 
@@ -119,6 +121,7 @@ impl Resolved {
             token: tokens::load(token_store, &info.id)?,
             id: info.id.clone(),
             status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
+            workdir: info.workdir.clone(),
         })
     }
 
@@ -128,6 +131,7 @@ impl Resolved {
             token: Some(token),
             id: info.id.clone(),
             status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
+            workdir: info.workdir.clone(),
         }
     }
 
