@@ -12,6 +12,8 @@ mod log_output;
 mod output;
 mod resources;
 mod socket;
+mod stats;
+mod template;
 mod terminal;
 mod tokens;
 mod top;
@@ -336,6 +338,31 @@ enum Commands {
         /// Options for `ps`.
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         ps_args: Vec<String>,
+    },
+
+    /// Show the CPU, memory and process use of running sandboxes.
+    ///
+    /// Refreshes every second until interrupted; --no-stream prints one
+    /// reading. With no sandbox named it covers every running sandbox this
+    /// user holds a token for. CPU % is of one CPU. Network and block I/O are
+    /// not measured and print `--`. --format takes a Go template over
+    /// .Container .ID .Name .CPUPerc .MemUsage .MemPerc .NetIO .BlockIO .PIDs,
+    /// `table ` prefix and `{{json .}}`.
+    Stats {
+        /// Show stopped sandboxes too, with `--` for their figures.
+        #[arg(short, long)]
+        all: bool,
+        /// Print the full sandbox ID.
+        #[arg(long)]
+        no_trunc: bool,
+        /// Print one reading instead of streaming.
+        #[arg(long)]
+        no_stream: bool,
+        /// Go template for each row.
+        #[arg(long)]
+        format: Option<String>,
+        /// Sandbox names, IDs or ID prefixes.
+        references: Vec<String>,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -984,6 +1011,23 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Top { reference, ps_args } => {
             top::run(&socket_path, &token_store, &reference, ps_args, json).await?;
+        }
+
+        Commands::Stats {
+            all,
+            no_trunc,
+            no_stream,
+            format,
+            references,
+        } => {
+            let options = stats::Options {
+                no_stream,
+                format,
+                json,
+                all,
+                no_trunc,
+            };
+            stats::run(&socket_path, &token_store, &references, options).await?;
         }
 
         Commands::Prune => {

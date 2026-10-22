@@ -39,6 +39,9 @@ service Ward {
   // List the processes of a running sandbox, like `docker top`. The token
   // travels in call metadata.
   rpc Top(TopRequest) returns (TopResponse);
+  // One reading of a running sandbox's resource use, like one frame of
+  // `docker stats`. The token travels in call metadata.
+  rpc Stats(StatsRequest) returns (StatsResponse);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -362,6 +365,27 @@ message TopResponse {
 // One process, with one field per title.
 message TopProcess {
   repeated string fields = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Stats messages
+// ---------------------------------------------------------------------------
+
+message StatsRequest {
+  string sandbox_id = 1;
+}
+
+message StatsResponse {
+  // CPU time all guest processes have used so far, in nanoseconds.
+  uint64 cpu_nanos = 1;
+  uint32 online_cpus = 2;
+  // Guest memory in use, not counting memory that can be reclaimed.
+  uint64 mem_used_bytes = 3;
+  // The configured memory limit, or the guest's total memory without one.
+  uint64 mem_limit_bytes = 4;
+  uint32 pids = 5;
+  // When the daemon took the reading, for working out rates between two.
+  google.protobuf.Timestamp read_at = 6;
 }
 
 // ---------------------------------------------------------------------------

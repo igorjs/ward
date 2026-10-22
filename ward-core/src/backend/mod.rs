@@ -60,6 +60,17 @@ pub struct ProcessTable {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Guest-wide resource counters read at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestStats {
+    /// CPU time all guest processes have used so far, in nanoseconds.
+    pub cpu_nanos: u64,
+    pub online_cpus: u32,
+    pub mem_total_bytes: u64,
+    pub mem_available_bytes: u64,
+    pub pids: u32,
+}
+
 /// Handle to a running process inside a sandbox.
 #[derive(Debug)]
 pub struct ProcessHandle {
@@ -175,6 +186,9 @@ pub trait Backend: Send + Sync + 'static {
     /// List the processes running inside the guest, as `ps` with `ps_args`
     /// would. The guest refuses options it does not support.
     async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<ProcessTable>;
+
+    /// Read the guest's CPU, memory and process counters.
+    async fn stats(&self, sandbox_id: &str) -> Result<GuestStats>;
 
     // -- Snapshots ------------------------------------------------------
 

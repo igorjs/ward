@@ -15,8 +15,8 @@ use tonic::{Request, Status};
 use ward_core::pb::{
     CreateSandboxRequest, CreateSnapshotRequest, ExecRequest, GetCommunicationLogRequest,
     GetEgressLogRequest, GetSandboxRequest, KillProcessRequest, ListSnapshotsRequest,
-    PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest, StreamOutputRequest,
-    SubscribeRequest, TopRequest, WriteStdinRequest,
+    PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest, StatsRequest,
+    StreamOutputRequest, SubscribeRequest, TopRequest, WriteStdinRequest,
 };
 
 #[tokio::test]
@@ -424,6 +424,41 @@ async fn given_wrong_missing_or_empty_token_when_top_then_permission_denied() {
 
         // Act
         let status = client.top(request).await.expect_err("top must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_stats_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let create = CreateSandboxRequest {
+        image: "alpine:latest".into(),
+        ..Default::default()
+    };
+    let sandbox_id = client
+        .create_sandbox(create)
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let stats = StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        let stats = match token {
+            Some(token) => common::with_token(stats, token),
+            None => Request::new(stats),
+        };
+
+        // Act
+        let status = client
+            .stats(stats)
+            .await
+            .expect_err("stats must be refused");
 
         // Assert
         assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
