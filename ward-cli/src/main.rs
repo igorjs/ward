@@ -4,6 +4,7 @@
 
 mod attach;
 mod client;
+mod cp;
 mod docker;
 mod inspect;
 mod lifecycle;
@@ -298,6 +299,28 @@ enum Commands {
         /// Remove a running sandbox too.
         #[arg(short, long)]
         force: bool,
+    },
+
+    /// Copy files between a sandbox and the host, as `docker cp` does.
+    ///
+    /// One of SRC and DEST is `SANDBOX:PATH`. Use `-` for SRC to read a tar
+    /// from stdin, or for DEST to write a tar to stdout. A `/.` suffix on a
+    /// directory copies its contents. A relative sandbox path starts at the
+    /// sandbox's working directory.
+    Cp {
+        /// A host path, `-` for stdin, or `SANDBOX:PATH`.
+        src: String,
+        /// A host path, `-` for stdout, or `SANDBOX:PATH`.
+        dest: String,
+        /// Copy the file a host symlink SRC points to, not the link.
+        #[arg(short = 'L', long)]
+        follow_link: bool,
+        /// Accepted for `docker cp` scripts; ownership is never carried over.
+        #[arg(short = 'a', long)]
+        archive: bool,
+        /// Accepted for `docker cp` scripts; `ward cp` prints no progress.
+        #[arg(short = 'q', long)]
+        quiet: bool,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -933,6 +956,15 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Remove { refs, force } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+        }
+
+        Commands::Cp {
+            src,
+            dest,
+            follow_link,
+            ..
+        } => {
+            cp::run(&socket_path, &token_store, &src, &dest, follow_link).await?;
         }
 
         Commands::Prune => {

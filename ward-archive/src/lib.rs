@@ -64,6 +64,10 @@ const FILE_OPEN_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NONBLOCK);
 /// Mode bits a snapshot restore keeps: permissions plus the sticky bit.
 const RESTORED_MODE_BITS: u32 = 0o1777;
+/// Mode bits a copy keeps: no setuid, setgid or sticky bit lands on the host.
+const COPIED_MODE_BITS: u32 = 0o777;
+/// What a directory needs to be writable by its owner while it is filled.
+const OWNER_RWX: u32 = 0o700;
 
 /// Tar block size, the unit of headers and padded bodies.
 const BLOCK_SIZE: usize = 512;
@@ -453,12 +457,16 @@ fn scan<R: Read>(
     let guard = HeaderGuard::new(reader, policy == Policy::Copy, Rc::clone(&verdict));
     let blame = |e: io::Error| verdict.borrow_mut().take().unwrap_or(ArchiveError::Io(e));
     let mut archive = tar::Archive::new(guard);
-    // Overwrite is safe: `unpack_in` refuses paths that leave `dest`. The
-    // header mode is not applied by tar (`set_preserve_permissions(false)`
-    // leaves the process umask in charge), so a snapshot restore sets the
-    // modes it keeps itself.
+    // Overwrite is safe: `unpack_in` refuses paths that leave `dest`. Tar
+    // drops the setuid, setgid and sticky bits itself
+    // (`set_preserve_permissions(false)`), and a directory is made writable
+    // while it fills, so directory modes are applied last.
     archive.set_overwrite(true);
     archive.set_preserve_permissions(false);
+    let kept_mode_bits = match policy {
+        Policy::Snapshot => RESTORED_MODE_BITS,
+        Policy::Copy => COPIED_MODE_BITS,
+    };
     let mut totals = Totals::default();
     let mut dir_modes: Vec<DirMode> = Vec::new();
     let mut symlinks = SymlinkTrail::default();
@@ -473,7 +481,7 @@ fn scan<R: Read>(
             continue;
         };
         let kind = entry.header().entry_type();
-        let mode = entry.header().mode()? & RESTORED_MODE_BITS;
+        let mode = entry.header().mode()? & kept_mode_bits;
         if kind == tar::EntryType::Link {
             check_hardlink_inside(&entry, dest)?;
         }
@@ -486,14 +494,14 @@ fn scan<R: Read>(
         if !written {
             return Err(ArchiveError::UnsafePath(shown));
         }
-        if policy == Policy::Snapshot {
-            let target = dest.join(&path);
-            match kind {
-                tar::EntryType::Regular | tar::EntryType::Continuous => set_mode(&target, mode)?,
-                // Applied last so a read-only directory cannot block its children.
-                tar::EntryType::Directory => dir_modes.push(DirMode::record(target, mode)?),
-                _ => {}
+        let target = dest.join(&path);
+        match kind {
+            tar::EntryType::Regular | tar::EntryType::Continuous if policy == Policy::Snapshot => {
+                set_mode(&target, mode)?;
             }
+            // Applied last so a read-only directory cannot block its children.
+            tar::EntryType::Directory => dir_modes.push(DirMode::record(target, mode)?),
+            _ => {}
         }
     }
     for dir in dir_modes.into_iter().rev() {
@@ -571,7 +579,10 @@ struct DirMode {
 
 impl DirMode {
     fn record(path: PathBuf, mode: u32) -> Result<Self> {
-        let stat = fs::fstat(open_dir_nofollow(&path)?).map_err(os_error)?;
+        let fd = open_dir_nofollow(&path)?;
+        let stat = fs::fstat(&fd).map_err(os_error)?;
+        let writable = Mode::from_bits_truncate((mode | OWNER_RWX) as fs::RawMode);
+        fs::fchmod(&fd, writable).map_err(os_error)?;
         Ok(Self {
             path,
             mode,
@@ -1503,6 +1514,32 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o7777, 0o1777);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_a_read_only_dir_when_unpacked_with_the_copy_policy_then_its_children_land_and_modes_stay()
+     {
+        // Arrange
+        use std::os::unix::fs::PermissionsExt;
+        let tar = build(vec![
+            (header("d", tar::EntryType::Directory, 0o1550, 0), vec![]),
+            (
+                header("d/tool", tar::EntryType::Regular, 0o755, 1),
+                vec![b'x'],
+            ),
+        ]);
+
+        // Act
+        let (dest, result) = run(&tar, Policy::Copy, &Limits::default());
+
+        // Assert
+        result.unwrap();
+        let mode = |name: &str| {
+            let meta = std::fs::metadata(dest.path().join(name)).unwrap();
+            meta.permissions().mode() & 0o7777
+        };
+        assert_eq!((mode("d"), mode("d/tool")), (0o550, 0o755));
     }
 
     #[cfg(unix)]
