@@ -7,10 +7,12 @@ mod client;
 mod cp;
 mod docker;
 mod events;
+mod images;
 mod inspect;
 mod lifecycle;
 mod log_output;
 mod output;
+mod pull;
 mod resources;
 mod socket;
 mod stats;
@@ -398,6 +400,46 @@ enum Commands {
         /// Go template for each event.
         #[arg(long)]
         format: Option<String>,
+    },
+
+    /// List the images in the local cache.
+    ///
+    /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
+    /// SIZE. Every cached image is a final image, so -a adds nothing.
+    /// --filter takes reference=<pattern> (`*` matches any run of characters)
+    /// and dangling=true|false; no cached image is dangling. --format takes a
+    /// Go template over .Repository .Tag .ID .Digest .CreatedAt .CreatedSince
+    /// .Size, the `table ` prefix, and `{{json .}}`.
+    Images {
+        /// Show all images. Ward keeps no intermediate images.
+        #[arg(short, long)]
+        all: bool,
+        /// Print only image IDs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Print the full image ID.
+        #[arg(long)]
+        no_trunc: bool,
+        /// Go template for each image.
+        #[arg(long)]
+        format: Option<String>,
+        /// Only images matching name=value. Repeatable.
+        #[arg(short, long)]
+        filter: Vec<String>,
+        /// Only images of this REPOSITORY[:TAG].
+        reference: Option<String>,
+    },
+
+    /// Pull an image into the local cache.
+    ///
+    /// Progress prints like `docker pull`. A pull stops at 2 GiB of layers
+    /// and fails instead of evicting images when the cache is full.
+    Pull {
+        /// Print only the image reference once the pull is done.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Image to pull: IMAGE[:TAG|@DIGEST].
+        image: String,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -1083,6 +1125,29 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 json,
             };
             events::run(&socket_path, options).await?;
+        }
+
+        Commands::Images {
+            quiet,
+            no_trunc,
+            format,
+            filter,
+            reference,
+            ..
+        } => {
+            let options = images::Options {
+                quiet,
+                no_trunc,
+                format,
+                filters: filter,
+                reference,
+                json,
+            };
+            images::run(&socket_path, options).await?;
+        }
+
+        Commands::Pull { quiet, image } => {
+            pull::run(&socket_path, &image, quiet).await?;
         }
 
         Commands::Prune => {

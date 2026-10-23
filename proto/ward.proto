@@ -53,6 +53,14 @@ service Ward {
   // destroyed sandboxes included.
   rpc Events(EventsRequest) returns (stream SandboxEvent);
 
+  // Images in the local cache, like `docker images`. Needs no sandbox token,
+  // like ListSandboxes.
+  rpc ListImages(google.protobuf.Empty) returns (ListImagesResponse);
+  // Pull an image into the local cache, streaming progress lines like
+  // `docker pull`. Needs no sandbox token. The pull stops at a size cap and
+  // fails rather than evict cached images when the cache is full.
+  rpc PullImage(PullImageRequest) returns (stream PullProgress);
+
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
   rpc RestoreSnapshot(RestoreSnapshotRequest) returns (google.protobuf.Empty);
@@ -405,6 +413,34 @@ message WaitRequest {
 message WaitResponse {
   // The main process's exit code, or 0 for a sandbox without a command.
   int32 exit_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Image messages
+// ---------------------------------------------------------------------------
+
+message ImageInfo {
+  // The reference the image was pulled as, e.g. alpine:3.20.
+  string reference = 1;
+  // Manifest digest, e.g. sha256:...
+  string digest = 2;
+  uint64 size_bytes = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message ListImagesResponse {
+  repeated ImageInfo images = 1;
+}
+
+message PullImageRequest {
+  string reference = 1;
+}
+
+message PullProgress {
+  // The layer or tag the line is about. Empty for a line about the image.
+  string id = 1;
+  // Docker's wording, e.g. "Pull complete".
+  string status = 2;
 }
 
 // ---------------------------------------------------------------------------

@@ -35,7 +35,26 @@ fn backend_err(e: BackendError) -> ApiError {
     match e {
         BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
         BackendError::InvalidArgument(message) => ApiError::InvalidRequest(message),
+        BackendError::ResourceExhausted(message) => ApiError::ResourceExhausted(message),
         other => ApiError::Backend(other.to_string()),
+    }
+}
+
+/// Pull errors name the image and the registry's complaint, never a
+/// secret, so the client sees them instead of a generic internal error.
+fn image_backend_err(e: BackendError) -> ApiError {
+    match e {
+        BackendError::Image(message) => ApiError::InvalidRequest(message),
+        other => backend_err(other),
+    }
+}
+
+fn image_to_pb(image: &crate::backend::image::CachedImage) -> crate::pb::ImageInfo {
+    crate::pb::ImageInfo {
+        reference: image.reference.clone(),
+        digest: image.digest.clone(),
+        size_bytes: image.size_bytes,
+        created_at: Some(image.pulled_at.into()),
     }
 }
 
@@ -1163,6 +1182,27 @@ impl SandboxManager {
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
         let info = recorded_state(&*self.entries.read().await, redact_token(info));
         Ok(protocol_info_to_pb(info, view))
+    }
+
+    /// Images in the local cache.
+    pub async fn list_images(&self) -> Result<Vec<crate::pb::ImageInfo>> {
+        let images = self.backend.list_images().await.map_err(backend_err)?;
+        Ok(images.iter().map(image_to_pb).collect())
+    }
+
+    /// Pull an image into the cache. The messages on `progress` end when the
+    /// pull does.
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        progress: tokio::sync::mpsc::UnboundedSender<crate::backend::image::PullProgress>,
+    ) -> Result<crate::pb::ImageInfo> {
+        let image = self
+            .backend
+            .pull_image(reference, Some(progress))
+            .await
+            .map_err(image_backend_err)?;
+        Ok(image_to_pb(&image))
     }
 
     /// List all sandboxes.

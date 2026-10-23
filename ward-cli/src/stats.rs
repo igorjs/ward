@@ -107,10 +107,16 @@ fn mem_percent(used: u64, limit: u64) -> f64 {
 
 /// A size in binary units with four significant digits, like Docker's.
 fn format_bytes(bytes: u64) -> String {
+    human_size(bytes, BYTES_PER_UNIT, &BYTE_UNITS)
+}
+
+/// `bytes` in the largest of `units` that keeps the value under `per_unit`,
+/// with four significant digits.
+pub(crate) fn human_size(bytes: u64, per_unit: f64, units: &[&str]) -> String {
     let mut value = bytes as f64;
     let mut unit = 0;
-    while value >= BYTES_PER_UNIT && unit + 1 < BYTE_UNITS.len() {
-        value /= BYTES_PER_UNIT;
+    while value >= per_unit && unit + 1 < units.len() {
+        value /= per_unit;
         unit += 1;
     }
     let decimals = SIZE_DIGITS.saturating_sub(value.max(1.0).log10() as usize + 1);
@@ -120,7 +126,7 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         &text
     };
-    format!("{text}{}", BYTE_UNITS[unit])
+    format!("{text}{}", units[unit])
 }
 
 /// The columns of the default table, as `--format` fields.

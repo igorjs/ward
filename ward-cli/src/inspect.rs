@@ -95,7 +95,7 @@ pub fn parse_signal(text: &str) -> Result<i32> {
 }
 
 /// Docker's wording for an elapsed time, such as `5 minutes` or `About an hour`.
-fn duration_text(seconds: i64) -> String {
+pub(crate) fn duration_text(seconds: i64) -> String {
     let plural = |count: i64, unit: &str| {
         let s = if count == 1 { "" } else { "s" };
         format!("{count} {unit}{s}")
@@ -112,7 +112,10 @@ fn duration_text(seconds: i64) -> String {
 }
 
 /// Seconds from `time` to `now_seconds`, never negative.
-fn seconds_since(time: &Option<prost_types::Timestamp>, now_seconds: i64) -> Option<i64> {
+pub(crate) fn seconds_since(
+    time: &Option<prost_types::Timestamp>,
+    now_seconds: i64,
+) -> Option<i64> {
     time.as_ref().map(|t| (now_seconds - t.seconds).max(0))
 }
 

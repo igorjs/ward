@@ -24,6 +24,8 @@ pub enum BackendError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     InvalidArgument(String),
+    #[error("{0}")]
+    ResourceExhausted(String),
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -120,6 +122,22 @@ pub trait Backend: Send + Sync + 'static {
     /// that do not read images report an empty config.
     async fn image_config(&self, _image: &str) -> Result<image::ImageConfig> {
         Ok(image::ImageConfig::default())
+    }
+
+    /// Images in the local cache. Backends without a cache report none.
+    async fn list_images(&self) -> Result<Vec<image::CachedImage>> {
+        Ok(Vec::new())
+    }
+
+    /// Pull `reference` into the local image cache, reporting progress.
+    async fn pull_image(
+        &self,
+        _reference: &str,
+        _progress: Option<tokio::sync::mpsc::UnboundedSender<image::PullProgress>>,
+    ) -> Result<image::CachedImage> {
+        Err(BackendError::InvalidArgument(
+            "this backend has no image cache".to_string(),
+        ))
     }
 
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
