@@ -406,6 +406,8 @@ fn file_type(stat: &Stat) -> FileType {
     FileType::from_raw_mode(stat.st_mode)
 }
 
+/// `st_mode` is 16 bits on macOS and 32 bits on Linux.
+#[allow(clippy::useless_conversion)]
 fn mode_bits(stat: &Stat) -> u32 {
     u32::from(stat.st_mode) & PERMISSION_BITS
 }
