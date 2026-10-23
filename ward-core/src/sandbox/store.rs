@@ -186,7 +186,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::protocol::SandboxSpec;
+    use crate::protocol::{PublishedPort, SandboxSpec};
 
     const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
     const ID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -212,6 +212,11 @@ mod tests {
                     auto_remove: false,
                     entrypoint_len: 0,
                     user: "1000:1000".into(),
+                    published_ports: vec![PublishedPort {
+                        host_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+                        host_port: 49153,
+                        container_port: 80,
+                    }],
                 },
             },
             created_at: SystemTime::now(),
@@ -279,6 +284,20 @@ mod tests {
 
         // Assert
         assert_eq!(loaded[0].options.spec.user, "1000:1000");
+    }
+
+    #[test]
+    fn given_published_port_when_loaded_then_the_chosen_host_port_is_kept() {
+        // Arrange
+        let (_tmp, store) = store();
+        store.save(&meta(ID_A, SandboxStatus::Stopped)).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        let ports = &loaded[0].options.spec.published_ports;
+        assert_eq!((ports[0].host_port, ports[0].container_port), (49153, 80));
     }
 
     #[test]

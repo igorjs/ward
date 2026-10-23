@@ -5,6 +5,7 @@ pub mod commit;
 pub mod diff;
 pub mod image;
 pub mod krunvm;
+pub mod ports;
 
 #[cfg(feature = "krunvm")]
 pub(crate) mod krun_ffi;
@@ -30,6 +31,8 @@ pub enum BackendError {
     ResourceExhausted(String),
     #[error("internal: {0}")]
     Internal(String),
+    #[error("{0}")]
+    AddressInUse(String),
 }
 
 /// Tar chunks buffered between the two ends of a file copy.
@@ -170,6 +173,19 @@ pub trait Backend: Send + Sync + 'static {
     async fn start_sandbox(&self, id: &str) -> Result<()>;
 
     async fn count(&self) -> Result<usize>;
+
+    /// Forward connections on host address `bind` to TCP `guest_port` of
+    /// the running sandbox `id`. Dropping the listener closes it.
+    async fn publish_port(
+        &self,
+        _id: &str,
+        _bind: std::net::SocketAddr,
+        _guest_port: u16,
+    ) -> Result<ports::PortListener> {
+        Err(BackendError::InvalidArgument(
+            ports::NEEDS_MICROVM.to_string(),
+        ))
+    }
 
     // -- Processes ------------------------------------------------------
 

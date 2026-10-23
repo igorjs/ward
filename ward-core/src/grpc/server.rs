@@ -61,6 +61,9 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
         ApiError::ResourceExhausted(msg) => Status::resource_exhausted(msg.clone()),
+        ApiError::AddressInUse(msg) => {
+            Status::already_exists(format!("address already in use: {msg}"))
+        }
     }
 }
 

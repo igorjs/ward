@@ -125,6 +125,19 @@ message CreateSandboxRequest {
   // name|uid[:group|gid], like `docker run --user`. Empty uses the image's
   // User.
   string user = 17;
+  // Host ports to forward into the guest, like `docker run -p`.
+  repeated PortMapping published_ports = 18;
+}
+
+// A host TCP port forwarded to a guest port. In a create request `host_port`
+// 0 asks for any free port and `host_ip` empty means 127.0.0.1; in
+// SandboxInfo both are filled with the values in use.
+message PortMapping {
+  string host_ip = 1;
+  uint32 host_port = 2;
+  uint32 container_port = 3;
+  // "tcp" or empty. Other protocols are rejected.
+  string protocol = 4;
 }
 
 message GetSandboxRequest {
@@ -184,6 +197,7 @@ message SandboxInfo {
   // The user the main process runs as: the request's `user`, else the
   // image's User. Empty means the guest default (root).
   string user = 17;
+  repeated PortMapping published_ports = 18;
 }
 
 enum SandboxStatus {

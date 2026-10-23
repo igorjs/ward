@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
 use crate::backend::image::ImageConfig;
+use crate::backend::ports::{BackendForwarder, PortForwarder, PortListener};
 use crate::backend::{Backend, BackendError, ExecMode, ProcessControl, ProcessHandle};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
@@ -36,6 +37,7 @@ fn backend_err(e: BackendError) -> ApiError {
         BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
         BackendError::InvalidArgument(message) => ApiError::InvalidRequest(message),
         BackendError::ResourceExhausted(message) => ApiError::ResourceExhausted(message),
+        BackendError::AddressInUse(address) => ApiError::AddressInUse(address),
         other => ApiError::Backend(other.to_string()),
     }
 }
@@ -83,6 +85,21 @@ struct SandboxEntry {
     /// minted at creation. `authorize()` compares against that hash; the
     /// token itself is never kept.
     meta: SandboxMeta,
+    /// Open while the sandbox runs; dropping them closes the host ports.
+    listeners: Vec<PortListener>,
+}
+
+/// What leaves the `entries` map when a sandbox is removed.
+struct RemovedEntry {
+    meta: SandboxMeta,
+    listeners: Vec<PortListener>,
+}
+
+/// Close every listener, returning once all their host ports are free.
+async fn close_all(listeners: Vec<PortListener>) {
+    for listener in listeners {
+        listener.close().await;
+    }
 }
 
 /// Holds a sandbox name while its creation is in flight, so two concurrent
@@ -560,6 +577,7 @@ pub struct SandboxManager {
     /// Names claimed by creates that have not yet inserted their entry.
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
     events: EventLog,
+    forwarder: Arc<dyn PortForwarder>,
 }
 
 impl SandboxManager {
@@ -571,6 +589,7 @@ impl SandboxManager {
         network_backend: crate::config::NetworkBackendChoice,
     ) -> Self {
         Self {
+            forwarder: Arc::new(BackendForwarder(Arc::clone(&backend))),
             backend,
             broker,
             entries: Arc::new(RwLock::new(HashMap::new())),
@@ -784,6 +803,7 @@ impl SandboxManager {
                 timeout_handle,
                 _creation_permit: permit,
                 meta,
+                listeners: Vec::new(),
             },
         );
         // No broker registration: a reloaded sandbox is not running, and
@@ -890,6 +910,8 @@ impl SandboxManager {
             crate::validate::entity_id(vid, "volume")?;
         }
 
+        let published_ports = crate::validate::published_ports(&req.published_ports)?;
+
         let name_reservation = self.reserve_name(&req.name).await?;
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -977,6 +999,7 @@ impl SandboxManager {
                 user: launch.user,
                 tty: req.tty,
                 auto_remove: req.auto_remove,
+                published_ports,
             },
         };
 
@@ -985,6 +1008,24 @@ impl SandboxManager {
             .create_sandbox(id.clone(), &opts)
             .await
             .map_err(backend_err)?;
+        let mut opts = opts;
+        let listeners = match self
+            .open_listeners(&id, &mut opts.spec.published_ports)
+            .await
+        {
+            Ok(listeners) => listeners,
+            Err(e) => {
+                if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %remove_err,
+                        "backend remove failed after a port could not be published"
+                    );
+                }
+                return Err(e);
+            }
+        };
+        info.spec.published_ports = opts.spec.published_ports.clone();
         // The backend has finished creating it, whatever it reports for a
         // sandbox it did not boot.
         info.status = crate::protocol::SandboxStatus::Running;
@@ -1005,6 +1046,7 @@ impl SandboxManager {
         };
         info.started_at = meta.started_at;
         if let Err(e) = self.persist(meta.clone()).await {
+            close_all(listeners).await;
             if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -1030,6 +1072,7 @@ impl SandboxManager {
                 timeout_handle,
                 _creation_permit: permit,
                 meta,
+                listeners,
             },
         );
 
@@ -1346,6 +1389,7 @@ impl SandboxManager {
             return Ok(());
         };
         tracing::info!(sandbox_id = %id, "stopping sandbox");
+        self.close_listeners(id).await;
         let main_code = self.end_main_process(id, grace).await;
         let died_with = main_code.unwrap_or(0);
         if let Err(e) = self.backend.stop_sandbox(id).await {
@@ -1405,9 +1449,19 @@ impl SandboxManager {
             return Ok(());
         };
         tracing::info!(sandbox_id = %id, "starting sandbox");
+        // An exited sandbox still holds its ports, and a restart must be
+        // able to bind them again.
+        self.close_listeners(id).await;
         if let Err(e) = self.backend.start_sandbox(id).await {
             self.mark_failed(id).await;
             return Err(backend_err(e));
+        }
+        if let Err(e) = self.reopen_listeners(id).await {
+            if let Err(stop_err) = self.backend.stop_sandbox(id).await {
+                tracing::warn!(sandbox_id = %id, error = %stop_err, "cannot end the VM after a port failed");
+            }
+            self.mark_failed(id).await;
+            return Err(e);
         }
         self.commit_running_and_register(id, comms).await?;
         self.emit_event(id, EventAction::Start, None).await;
@@ -1416,6 +1470,61 @@ impl SandboxManager {
             return Err(e);
         }
         tracing::info!(sandbox_id = %id, "sandbox started");
+        Ok(())
+    }
+
+    /// Open every port in `ports`, filling in the host port the OS chose for
+    /// a 0. Ports opened before a failure are closed (and freed) again.
+    async fn open_listeners(
+        &self,
+        id: &str,
+        ports: &mut [crate::protocol::PublishedPort],
+    ) -> Result<Vec<PortListener>> {
+        let mut listeners = Vec::with_capacity(ports.len());
+        for port in ports.iter_mut() {
+            if port.host_ip.is_unspecified() {
+                tracing::warn!(sandbox_id = %id, host_port = port.host_port, "publishing on all host interfaces");
+            }
+            let listener = match self
+                .forwarder
+                .open(id, port.host_addr(), port.container_port)
+                .await
+            {
+                Ok(listener) => listener,
+                Err(e) => {
+                    close_all(listeners).await;
+                    return Err(backend_err(e));
+                }
+            };
+            port.host_port = listener.local_addr().port();
+            tracing::info!(sandbox_id = %id, host_port = port.host_port, container_port = port.container_port, "published port");
+            listeners.push(listener);
+        }
+        Ok(listeners)
+    }
+
+    /// Close the sandbox's ports and wait until the host frees them.
+    async fn close_listeners(&self, id: &str) {
+        let listeners = match self.entries.write().await.get_mut(id) {
+            Some(entry) => std::mem::take(&mut entry.listeners),
+            None => return,
+        };
+        close_all(listeners).await;
+    }
+
+    /// Open the ports the sandbox was created with, on the same host ports.
+    async fn reopen_listeners(&self, id: &str) -> Result<()> {
+        let mut ports = {
+            let entries = self.entries.read().await;
+            let Some(entry) = entries.get(id) else {
+                return Ok(());
+            };
+            entry.meta.options.spec.published_ports.clone()
+        };
+        let listeners = self.open_listeners(id, &mut ports).await?;
+        if let Some(entry) = self.entries.write().await.get_mut(id) {
+            entry.listeners = listeners;
+        }
         Ok(())
     }
 
@@ -1857,6 +1966,7 @@ impl SandboxManager {
     /// Record a failed transition. A sandbox removed meanwhile is already
     /// gone, so this only logs when it cannot save.
     async fn mark_failed(&self, id: &str) {
+        self.close_listeners(id).await;
         if let Err(e) = self
             .set_state(id, crate::protocol::SandboxStatus::Failed)
             .await
@@ -1889,17 +1999,20 @@ impl SandboxManager {
 
     /// Stop the removed entry's timer unless that timer is the caller.
     /// Returns the removed sandbox's record, if there was an entry.
-    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> Option<SandboxMeta> {
+    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> Option<RemovedEntry> {
         let entry = entry?;
         if !from_timeout && let Some(handle) = entry.timeout_handle {
             handle.abort();
         }
-        Some(entry.meta)
+        Some(RemovedEntry {
+            meta: entry.meta,
+            listeners: entry.listeners,
+        })
     }
 
     /// Drop everything tied to a sandbox whose entry has left `entries`.
     async fn finish_cleanup(
-        removed: Option<SandboxMeta>,
+        mut removed: Option<RemovedEntry>,
         teardown: &Teardown,
         id: &str,
     ) -> std::result::Result<(), BackendError> {
@@ -1911,8 +2024,13 @@ impl SandboxManager {
         teardown.mains.write().await.remove(id);
         teardown.broker.deregister_sandbox(id).await;
 
+        // The host ports must be free before the sandbox counts as gone, so
+        // a new sandbox can publish the same ones right away.
+        if let Some(removed) = removed.as_mut() {
+            close_all(std::mem::take(&mut removed.listeners)).await;
+        }
         let result = teardown.backend.remove_sandbox(id).await;
-        if let Some(meta) = removed {
+        if let Some(RemovedEntry { meta, .. }) = removed {
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
             // Removing a running sandbox kills it, as `docker rm -f` does.
@@ -2278,6 +2396,7 @@ fn recorded_state(
         info.exit_code = entry.meta.exit_code;
         info.started_at = entry.meta.started_at;
         info.finished_at = entry.meta.finished_at;
+        info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
     }
     info
 }
@@ -2334,6 +2453,17 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         workdir: info.spec.workdir,
         user: info.spec.user,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
+        published_ports: info
+            .spec
+            .published_ports
+            .iter()
+            .map(|port| crate::pb::PortMapping {
+                host_ip: port.host_ip.to_string(),
+                host_port: u32::from(port.host_port),
+                container_port: u32::from(port.container_port),
+                protocol: crate::validate::PUBLISH_PROTOCOL.to_string(),
+            })
+            .collect(),
         entrypoint: match view {
             CommandView::Full => info
                 .spec
@@ -6815,4 +6945,7 @@ pub(crate) mod tests {
         let got = history(&mgr, 5).await;
         assert_eq!(got[4].0, EventAction::Stop);
     }
+
+    #[cfg(not(feature = "krunvm"))]
+    mod ports;
 }

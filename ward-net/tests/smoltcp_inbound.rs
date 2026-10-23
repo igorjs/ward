@@ -583,3 +583,58 @@ async fn given_guest_not_listening_when_host_connects_then_reset_reaches_client(
     let err = outcome.expect_err("client should see a reset, not a clean close");
     assert_eq!(err.kind(), ErrorKind::ConnectionReset);
 }
+
+#[tokio::test]
+async fn given_a_busy_host_port_when_publishing_then_the_error_says_address_in_use() {
+    // Arrange
+    let handle = spawn_net().await;
+    let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let busy = occupied.local_addr().unwrap().port();
+
+    // Act
+    let err = handle
+        .add_inbound_loopback(busy, GUEST_PORT)
+        .await
+        .err()
+        .expect("bind should fail");
+
+    // Assert
+    assert!(
+        matches!(&err, ward_net::Error::Listen { source, .. } if source.kind() == ErrorKind::AddrInUse),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains(&busy.to_string()), "{err}");
+}
+
+#[tokio::test]
+async fn given_a_closed_forward_when_the_port_is_bound_again_then_it_is_free_at_once() {
+    // Arrange
+    let handle = spawn_net().await;
+    let forward = handle.add_inbound_loopback(0, GUEST_PORT).await.unwrap();
+    let port = forward.local_addr().port();
+
+    // Act
+    forward.close().await;
+
+    // Assert
+    assert!(handle.add_inbound_loopback(port, GUEST_PORT).await.is_ok());
+}
+
+#[tokio::test]
+async fn given_production_spawn_when_no_dhcp_lease_then_guest_addr_is_the_static_guest_address() {
+    // Arrange
+    let mut handle = ward_net::smoltcp_backend::spawn_for_sandbox(
+        "inbound-test",
+        &AttachOptions::default(),
+        Box::new(always_allow),
+    )
+    .await
+    .unwrap();
+
+    // Act
+    let addr = handle.guest_addr();
+
+    // Assert
+    assert_eq!(addr, Some(GUEST_ADDR));
+    handle.detach().await.unwrap();
+}

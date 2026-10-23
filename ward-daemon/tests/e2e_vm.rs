@@ -923,3 +923,77 @@ fn given_unknown_user_when_exec_then_exit_126_with_dockers_wording() {
         r.stderr
     );
 }
+
+const GUEST_REPLY: &str = "ward-guest-reply";
+const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+const HTTP_PORT: u16 = 80;
+
+/// Guest script that answers every connection on `port` with `GUEST_REPLY`.
+fn reply_server(port: u16) -> String {
+    format!("while true; do printf '{GUEST_REPLY}' | nc -l -p {port}; done")
+}
+
+/// `ward port ID` as (container port, host port) pairs.
+fn published(d: &Daemon, id: &str) -> Vec<(u16, u16)> {
+    let mut cmd = d.cli();
+    cmd.args(["port", id]);
+    run_ok(cmd)
+        .lines()
+        .map(|line| {
+            let (container, address) = line.split_once("/tcp -> 127.0.0.1:").expect(line);
+            (container.parse().unwrap(), address.parse().unwrap())
+        })
+        .collect()
+}
+
+/// Dial the host port until the guest answers, then return what it sent.
+fn dial_reply(port: u16) -> String {
+    use std::io::Read;
+    let deadline = Instant::now() + DIAL_DEADLINE;
+    loop {
+        let mut reply = String::new();
+        let read = std::net::TcpStream::connect(("127.0.0.1", port))
+            .and_then(|mut stream| stream.read_to_string(&mut reply));
+        if read.is_ok() && !reply.is_empty() {
+            return reply;
+        }
+        assert!(Instant::now() < deadline, "no reply on host port {port}");
+        std::thread::sleep(EXIT_POLL);
+    }
+}
+
+fn refused(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+#[test]
+fn given_any_host_port_and_a_guest_server_when_the_host_port_is_dialed_then_the_reply_arrives() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-p", "0:80"]);
+    start(&d, &id, None, &["sh", "-c", &reply_server(HTTP_PORT)]);
+
+    let mappings = published(&d, &id);
+
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].0, HTTP_PORT);
+    assert_eq!(dial_reply(mappings[0].1), GUEST_REPLY);
+}
+
+#[test]
+fn given_a_published_port_when_stopped_and_started_then_it_is_refused_then_serves_on_the_same_port()
+{
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-p", "0:80"]);
+    let port = published(&d, &id)[0].1;
+
+    lifecycle(&d, "stop", &id);
+    wait_until("the host port to close", DIAL_DEADLINE, || refused(port));
+    lifecycle(&d, "start", &id);
+    start(&d, &id, None, &["sh", "-c", &reply_server(HTTP_PORT)]);
+
+    assert_eq!(published(&d, &id)[0].1, port);
+    assert_eq!(dial_reply(port), GUEST_REPLY);
+}

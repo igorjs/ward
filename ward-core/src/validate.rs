@@ -359,6 +359,71 @@ pub fn user_spec(spec: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Most ports one sandbox may publish.
+const MAX_PUBLISHED_PORTS: usize = 64;
+/// The only protocol a port may be published with.
+pub const PUBLISH_PROTOCOL: &str = "tcp";
+
+/// Validate `-p` mappings and fill in the defaults: 127.0.0.1 for an empty
+/// host address (Docker would use 0.0.0.0, but exposing a guest to the
+/// network must be asked for).
+pub fn published_ports(
+    mappings: &[crate::pb::PortMapping],
+) -> Result<Vec<crate::protocol::PublishedPort>, ApiError> {
+    if mappings.len() > MAX_PUBLISHED_PORTS {
+        return Err(ApiError::InvalidRequest(format!(
+            "at most {MAX_PUBLISHED_PORTS} ports can be published"
+        )));
+    }
+    let ports = mappings
+        .iter()
+        .map(published_port)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut claimed = std::collections::HashSet::new();
+    for port in ports.iter().filter(|port| port.host_port != 0) {
+        if !claimed.insert((port.host_ip, port.host_port)) {
+            return Err(ApiError::InvalidRequest(format!(
+                "host port {}:{} is published more than once",
+                port.host_ip, port.host_port
+            )));
+        }
+    }
+    Ok(ports)
+}
+
+fn published_port(m: &crate::pb::PortMapping) -> Result<crate::protocol::PublishedPort, ApiError> {
+    if !m.protocol.is_empty() && m.protocol != PUBLISH_PROTOCOL {
+        return Err(ApiError::InvalidRequest(format!(
+            "unsupported protocol \"{}\": only tcp ports can be published",
+            m.protocol
+        )));
+    }
+    let host_ip = if m.host_ip.is_empty() {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        m.host_ip.parse().map_err(|_| {
+            ApiError::InvalidRequest(format!("invalid host address \"{}\"", m.host_ip))
+        })?
+    };
+    let host_port = u16::try_from(m.host_port).map_err(|_| {
+        ApiError::InvalidRequest(format!("host port {} is out of range", m.host_port))
+    })?;
+    let container_port = u16::try_from(m.container_port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            ApiError::InvalidRequest(format!(
+                "container port {} must be between 1 and 65535",
+                m.container_port
+            ))
+        })?;
+    Ok(crate::protocol::PublishedPort {
+        host_ip,
+        host_port,
+        container_port,
+    })
+}
+
 /// Validate a language name for the run RPC.
 pub fn language_name(language: &str) -> Result<(), ApiError> {
     if language.is_empty() {
@@ -463,6 +528,93 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::udp("", 8080, 53, "udp", false)]
+    #[case::zero_container("", 8080, 0, "", false)]
+    #[case::container_too_big("", 8080, 65_536, "", false)]
+    #[case::host_too_big("", 65_536, 80, "", false)]
+    #[case::bad_address("not-an-ip", 8080, 80, "", false)]
+    #[case::tcp("", 8080, 80, "tcp", true)]
+    #[case::any_host_port("127.0.0.1", 0, 80, "", true)]
+    #[case::ipv6("::1", 8080, 80, "", true)]
+    fn given_a_port_mapping_when_validated_then_only_a_sound_tcp_mapping_passes(
+        #[case] host_ip: &str,
+        #[case] host_port: u32,
+        #[case] container_port: u32,
+        #[case] protocol: &str,
+        #[case] valid: bool,
+    ) {
+        // Arrange
+        let mapping = crate::pb::PortMapping {
+            host_ip: host_ip.into(),
+            host_port,
+            container_port,
+            protocol: protocol.into(),
+        };
+
+        // Act
+        let result = published_ports(&[mapping]);
+
+        // Assert
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+    }
+
+    #[test]
+    fn given_a_mapping_without_host_address_when_validated_then_it_binds_loopback() {
+        // Arrange
+        let mapping = crate::pb::PortMapping {
+            container_port: 80,
+            ..Default::default()
+        };
+
+        // Act
+        let ports = published_ports(&[mapping]).unwrap();
+
+        // Assert
+        assert_eq!(ports[0].host_ip, std::net::Ipv4Addr::LOCALHOST);
+    }
+
+    #[rstest]
+    #[case::same_fixed_port(("", 8080, 80), ("", 8080, 81), false)]
+    #[case::same_port_other_address(("127.0.0.1", 8080, 80), ("::1", 8080, 80), true)]
+    #[case::random_ports_same_container_port(("", 0, 80), ("", 0, 80), true)]
+    fn given_two_mappings_when_validated_then_a_repeated_host_endpoint_is_rejected(
+        #[case] first: (&str, u32, u32),
+        #[case] second: (&str, u32, u32),
+        #[case] accepted: bool,
+    ) {
+        // Arrange
+        let mapping =
+            |(host_ip, host_port, container_port): (&str, u32, u32)| crate::pb::PortMapping {
+                host_ip: host_ip.into(),
+                host_port,
+                container_port,
+                protocol: String::new(),
+            };
+
+        // Act
+        let result = published_ports(&[mapping(first), mapping(second)]);
+
+        // Assert
+        assert_eq!(result.is_ok(), accepted, "{result:?}");
+    }
+
+    #[test]
+    fn given_more_mappings_than_the_limit_when_validated_then_it_is_rejected() {
+        // Arrange
+        let mapping = crate::pb::PortMapping {
+            container_port: 80,
+            ..Default::default()
+        };
+        let mappings = vec![mapping; MAX_PUBLISHED_PORTS + 1];
+
+        // Act
+        let result = published_ports(&mappings);
+
+        // Assert
+        assert!(result.is_err());
+    }
 
     #[rstest]
     #[case::root("/", true)]

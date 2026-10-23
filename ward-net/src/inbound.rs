@@ -126,6 +126,13 @@ impl InboundHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+
+    /// Closes the listener and returns once the host port is free again,
+    /// which a plain drop does not wait for.
+    pub async fn close(mut self) {
+        self.accept_task.abort();
+        let _ = (&mut self.accept_task).await;
+    }
 }
 
 impl Drop for InboundHandle {
@@ -147,7 +154,7 @@ pub(crate) async fn start_listener(
     }
     let listener = TcpListener::bind(bind)
         .await
-        .map_err(|err| Error::Process(format!("cannot listen on {bind}: {err}")))?;
+        .map_err(|source| Error::Listen { addr: bind, source })?;
     let local_addr = listener
         .local_addr()
         .map_err(|err| Error::Process(format!("cannot read listener address: {err}")))?;
