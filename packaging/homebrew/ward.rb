@@ -1,3 +1,4 @@
+# Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 # Homebrew formula for ward. The release workflow rewrites version, url
 # and sha256 through scripts/update-formula.sh; do not edit them by hand.
 class Ward < Formula
