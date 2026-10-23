@@ -2371,7 +2371,7 @@ mod tests {
     }
 
     /// Runs `body` under a restrictive umask, as the daemon does.
-    fn with_umask<T>(mask: u16, body: impl FnOnce() -> T) -> T {
+    fn with_umask<T>(mask: rustix::fs::RawMode, body: impl FnOnce() -> T) -> T {
         let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
         let out = body();
         rustix::process::umask(previous);
@@ -2381,7 +2381,7 @@ mod tests {
     #[test]
     fn given_restrictive_umask_when_materialize_dir_then_image_dir_modes_are_kept() {
         use std::os::unix::fs::PermissionsExt;
-        const DAEMON_UMASK: u16 = 0o077;
+        const DAEMON_UMASK: rustix::fs::RawMode = 0o077;
         const WORLD_SEARCH: u32 = 0o001;
         const STICKY_TMP: u32 = 0o1777;
         // Arrange
