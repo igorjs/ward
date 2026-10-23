@@ -113,7 +113,8 @@ pub type EgressCheckFuture = Pin<Box<dyn Future<Output = bool> + Send>>;
 /// Consulted once a flow's destination has cleared the private-IP guard
 /// (`is_flow_destination_safe`), given the flow's resolved domain label
 /// (or the bare destination IP if unresolved) and destination port.
-/// Returns `true` if the flow may proceed to the [`Connector`]. In
+/// Returns `true` if the flow may proceed to the [`Connector`]. Guest DNS
+/// queries are gated the same way, with the queried name and port 53. In
 /// production this is `ward-core`'s `EgressProxy::check`, wired in by
 /// `ward-core`'s krunvm backend since this crate cannot depend on
 /// `ward-core`; tests inject a fake standing in for an allowlist policy.
@@ -312,7 +313,8 @@ struct PendingDnsQuery {
     /// can be recorded against it in `Stack::resolved`.
     domain: String,
     remote: udp::UdpMetadata,
-    answer: oneshot::Receiver<Vec<IpAddr>>,
+    /// `None` when the egress policy refused the lookup.
+    answer: oneshot::Receiver<Option<Vec<IpAddr>>>,
 }
 
 /// A parsed guest DNS query, ready to be relayed to a [`Resolver`].
@@ -361,6 +363,9 @@ const NAME_POINTER_TO_QUESTION: [u8; 2] = [0xC0, 0x0C];
 /// TTL smoltcp's wire types have no opinion on; any positive value is
 /// valid, so this picks a modest one rather than caching indefinitely.
 const DNS_ANSWER_TTL_SECS: u32 = 60;
+/// DNS RCODE REFUSED (RFC 1035 section 4.1.1), sent for a lookup the
+/// egress policy does not permit.
+const DNS_RCODE_REFUSED: u16 = 5;
 
 /// Upper bound on `Stack::resolved` entries. Guests can query arbitrarily
 /// many names, so this caps memory use; the oldest entry is evicted (FIFO)
@@ -397,7 +402,12 @@ pub(crate) const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// dropped; there is no relay-side AAAA support yet). smoltcp's wire types
 /// can parse a DNS response but not emit one, so this builds the bytes
 /// directly per RFC 1035.
-fn build_dns_response(transaction_id: u16, question: &[u8], answers: &[IpAddr]) -> Vec<u8> {
+fn build_dns_response(
+    transaction_id: u16,
+    question: &[u8],
+    answers: &[IpAddr],
+    rcode: u16,
+) -> Vec<u8> {
     let ipv4_answers: Vec<Ipv4Addr> = answers
         .iter()
         .filter_map(|addr| match addr {
@@ -409,7 +419,7 @@ fn build_dns_response(transaction_id: u16, question: &[u8], answers: &[IpAddr]) 
     let mut response = Vec::with_capacity(12 + question.len() + ipv4_answers.len() * 16);
     response.extend_from_slice(&transaction_id.to_be_bytes());
     let flags = DnsFlags::RESPONSE | DnsFlags::RECURSION_DESIRED | DnsFlags::RECURSION_AVAILABLE;
-    response.extend_from_slice(&flags.bits().to_be_bytes());
+    response.extend_from_slice(&(flags.bits() | rcode).to_be_bytes());
     response.extend_from_slice(&1u16.to_be_bytes()); // question count
     response.extend_from_slice(&(ipv4_answers.len() as u16).to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes()); // authority count
@@ -1522,9 +1532,20 @@ impl Stack {
             };
             let (answer_tx, answer_rx) = oneshot::channel();
             let resolver = Arc::clone(&self.resolver);
+            let egress_check = Arc::clone(&self.egress_check);
             let domain_for_resolve = domain.clone();
             tokio::task::spawn(async move {
-                let answers = resolver.resolve(&domain_for_resolve).await;
+                // The host resolver is itself an outbound path, so a name
+                // the policy refuses is never handed to it.
+                let answers = if egress_check(&domain_for_resolve, DNS_SERVER_PORT).await {
+                    Some(resolver.resolve(&domain_for_resolve).await)
+                } else {
+                    tracing::debug!(
+                        domain = %domain_for_resolve,
+                        "refusing guest DNS query: egress policy denies the name"
+                    );
+                    None
+                };
                 // Best-effort: a dropped receiver means this Stack (and
                 // its pending-query list) has already gone away.
                 let _ = answer_tx.send(answers);
@@ -1546,8 +1567,14 @@ impl Stack {
         for mut query in std::mem::take(&mut self.pending_dns_queries) {
             match query.answer.try_recv() {
                 Ok(answers) => {
+                    let rcode = if answers.is_some() {
+                        0
+                    } else {
+                        DNS_RCODE_REFUSED
+                    };
+                    let answers = answers.unwrap_or_default();
                     let response =
-                        build_dns_response(query.transaction_id, &query.question, &answers);
+                        build_dns_response(query.transaction_id, &query.question, &answers, rcode);
                     // Only IPv4 answers are ever sent to the guest (see
                     // build_dns_response), so only those are recorded as
                     // resolved; an IPv6 answer the guest never saw would be
@@ -1753,7 +1780,13 @@ pub async fn spawn_for_sandbox(
     opts: &AttachOptions,
     egress_check: Box<EgressCheckFn>,
 ) -> Result<SmoltcpHandle, Error> {
-    spawn_for_sandbox_with_tuning(sandbox_id, opts, egress_check, InboundTuning::default()).await
+    let handle =
+        spawn_for_sandbox_with_tuning(sandbox_id, opts, egress_check, InboundTuning::default())
+            .await?;
+    // The guest agent configures this address itself and never asks DHCP, so
+    // inbound flows would otherwise wait for a lease that does not come.
+    let _ = handle.guest_addr.set(DHCP_POOL_START);
+    Ok(handle)
 }
 
 /// [`spawn_for_sandbox`] with explicit inbound flow timeouts, so tests need

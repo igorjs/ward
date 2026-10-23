@@ -174,6 +174,18 @@ impl std::fmt::Debug for SandboxState {
     }
 }
 
+#[cfg(feature = "krunvm")]
+#[async_trait::async_trait]
+impl super::ports::OpenPort for ward_net::inbound::InboundHandle {
+    fn local_addr(&self) -> std::net::SocketAddr {
+        Self::local_addr(self)
+    }
+
+    async fn close(self: Box<Self>) {
+        (*self).close().await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
@@ -544,6 +556,36 @@ impl Backend for KrunvmBackend {
     /// Count of active sandboxes.
     async fn count(&self) -> Result<usize> {
         Ok(self.sandboxes.read().await.len())
+    }
+
+    #[cfg(feature = "krunvm")]
+    async fn publish_port(
+        &self,
+        id: &str,
+        bind: std::net::SocketAddr,
+        guest_port: u16,
+    ) -> Result<super::ports::PortListener> {
+        let sandboxes = self.sandboxes.read().await;
+        let state = sandboxes
+            .get(id)
+            .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        let smoltcp = state.smoltcp.as_ref().ok_or_else(|| {
+            BackendError::InvalidArgument(
+                "port publishing needs the smoltcp network backend".to_string(),
+            )
+        })?;
+        let handle = smoltcp
+            .add_inbound(bind, guest_port)
+            .await
+            .map_err(|e| match e {
+                ward_net::Error::Listen { source, .. }
+                    if source.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    BackendError::AddressInUse(bind.to_string())
+                }
+                other => BackendError::Internal(format!("cannot publish {bind}: {other}")),
+            })?;
+        Ok(Box::new(handle))
     }
 
     /// Signal a process to terminate by sending a Kill over its agent
@@ -1061,9 +1103,11 @@ impl KrunvmBackend {
         let agent_socket = self.agent_socket_path(id);
         let _ = std::fs::remove_file(&agent_socket);
 
-        let (smoltcp, egress, net_fd) = if opts.egress.mode != EgressMode::Deny
-            && self.network_backend == NetworkBackendChoice::Smoltcp
-        {
+        // Published ports need the stack even when egress is denied; the
+        // proxy still denies every outbound flow in that case.
+        let wants_stack = self.network_backend == NetworkBackendChoice::Smoltcp
+            && (opts.egress.mode != EgressMode::Deny || !opts.spec.published_ports.is_empty());
+        let (smoltcp, egress, net_fd) = if wants_stack {
             // The proxy is the single source of truth for this sandbox's
             // allow/deny decisions; the spawned Stack task consults it
             // through the closure below on every flow.

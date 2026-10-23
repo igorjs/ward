@@ -40,6 +40,26 @@ pub struct SandboxSpec {
     /// Remove the sandbox when its main process ends.
     #[serde(default)]
     pub auto_remove: bool,
+    /// Host TCP ports forwarded to the guest. The host port is the one in
+    /// use, so a restart opens the same port again.
+    #[serde(default)]
+    pub published_ports: Vec<PublishedPort>,
+}
+
+/// A host TCP port forwarded to a guest port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPort {
+    pub host_ip: std::net::IpAddr,
+    /// 0 asks for any free port when the sandbox is created.
+    pub host_port: u16,
+    pub container_port: u16,
+}
+
+impl PublishedPort {
+    #[must_use]
+    pub fn host_addr(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.host_ip, self.host_port)
+    }
 }
 
 /// A filesystem bind-mount passed into a sandbox.
@@ -330,6 +350,8 @@ pub enum ApiError {
     AmbiguousReference(String),
     #[error("resource exhausted: {0}")]
     ResourceExhausted(String),
+    #[error("address already in use: {0}")]
+    AddressInUse(String),
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ mod inspect;
 mod lifecycle;
 mod log_output;
 mod output;
+mod ports;
 mod pull;
 mod resources;
 mod socket;
@@ -101,6 +102,16 @@ struct SandboxOpts {
     /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
     #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
     user: Option<String>,
+    /// Publish a TCP port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp]. Without
+    /// HOST_PORT, or with 0, the daemon picks a free one. Repeatable.
+    /// Unlike Docker, HOST_IP defaults to 127.0.0.1, not 0.0.0.0; the port
+    /// stays open while the sandbox is exited and closes on stop or rm; TCP only.
+    #[arg(
+        short = 'p',
+        long = "publish",
+        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
+    )]
+    publish: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,6 +160,19 @@ enum Commands {
         /// Output format. Only `json` is supported.
         #[arg(long, value_parser = ["json"])]
         format: Option<String>,
+    },
+
+    /// Print the host address each published port is reachable on.
+    ///
+    /// With PORT (80 or 80/tcp), prints only the host address for it.
+    ///
+    /// Unlike Docker, a port without HOST_IP binds 127.0.0.1, not 0.0.0.0. It
+    /// stays open while the sandbox is exited and closes on stop or rm. TCP only.
+    Port {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// Container port, optionally with /tcp.
+        port: Option<String>,
     },
 
     /// Print low level details of one or more sandboxes as a JSON array.
@@ -637,9 +661,12 @@ fn create_request(
         .iter()
         .map(|spec| parse_mount_spec(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let published_ports = ports::parse_all(&opts.publish)?;
+    ports::warn_if_exposed(&published_ports);
     Ok(ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
+        published_ports,
         egress: Some(ward_core::pb::EgressPolicy {
             mode: egress_mode as i32,
             domains: opts.allow_domain,
@@ -821,6 +848,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_pretty,
             };
             inspect::ps(&mut c, options).await?;
+        }
+
+        Commands::Port { reference, port } => {
+            ports::run(
+                &socket_path,
+                &token_store,
+                &reference,
+                port.as_deref(),
+                json,
+            )
+            .await?;
         }
 
         Commands::Inspect { references } => {
@@ -1545,6 +1583,52 @@ mod tests {
 
         // Assert
         assert_eq!(request.user, expected);
+    }
+
+    #[test]
+    fn given_repeated_publish_flags_when_create_request_built_then_each_becomes_a_mapping() {
+        // Arrange
+        let cli = Cli::try_parse_from([
+            "ward",
+            "run",
+            "-p",
+            "0:80",
+            "--publish",
+            "127.0.0.1:8443:443",
+            "alpine",
+        ])
+        .expect("parse");
+        let Commands::Run { image, opts, .. } = cli.command else {
+            panic!("expected Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let ports: Vec<_> = request
+            .published_ports
+            .iter()
+            .map(|m| (m.host_ip.as_str(), m.host_port, m.container_port))
+            .collect();
+        assert_eq!(ports, vec![("", 0, 80), ("127.0.0.1", 8443, 443)]);
+    }
+
+    #[test]
+    fn given_port_command_when_parsed_then_sandbox_and_port_are_kept() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "port", "web", "80/tcp"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Port { reference, port } => {
+                assert_eq!(
+                    (reference.as_str(), port.as_deref()),
+                    ("web", Some("80/tcp"))
+                );
+            }
+            other => panic!("expected Port, got {other:?}"),
+        }
     }
 
     #[test]
