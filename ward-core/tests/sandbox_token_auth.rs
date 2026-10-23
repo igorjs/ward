@@ -13,10 +13,11 @@ mod common;
 use tonic::{Request, Status};
 
 use ward_core::pb::{
-    CreateSandboxRequest, CreateSnapshotRequest, ExecRequest, GetCommunicationLogRequest,
-    GetEgressLogRequest, GetSandboxRequest, KillProcessRequest, ListSnapshotsRequest,
-    PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest, StatsRequest,
-    StreamOutputRequest, SubscribeRequest, TopRequest, WaitRequest, WriteStdinRequest,
+    CreateSandboxRequest, CreateSnapshotRequest, DiffRequest, ExecRequest,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, KillProcessRequest,
+    ListSnapshotsRequest, PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest,
+    StatsRequest, StreamOutputRequest, SubscribeRequest, TopRequest, WaitRequest,
+    WriteStdinRequest,
 };
 
 #[tokio::test]
@@ -495,4 +496,67 @@ async fn given_wrong_missing_or_empty_token_when_wait_then_permission_denied() {
         // Assert
         assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
     }
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_diff_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let sandbox_id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let diff = DiffRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        let request = match token {
+            Some(token) => common::with_token(diff, token),
+            None => Request::new(diff),
+        };
+
+        // Act
+        let status = client
+            .diff(request)
+            .await
+            .expect_err("diff must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_the_right_token_when_diff_on_an_untouched_sandbox_then_it_lists_no_changes() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let created = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner();
+
+    // Act
+    let reply = client
+        .diff(common::with_token(
+            DiffRequest {
+                sandbox_id: created.id,
+            },
+            &created.token,
+        ))
+        .await
+        .expect("diff")
+        .into_inner();
+
+    // Assert
+    assert!(reply.changes.is_empty(), "{:?}", reply.changes);
 }

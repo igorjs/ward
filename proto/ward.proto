@@ -46,6 +46,9 @@ service Ward {
   // return its exit code, like `docker wait`. The token travels in call
   // metadata.
   rpc Wait(WaitRequest) returns (WaitResponse);
+  // Paths of a sandbox that differ from its image, like `docker diff`. The
+  // token travels in call metadata.
+  rpc Diff(DiffRequest) returns (DiffResponse);
   // Lifecycle events of every sandbox, like `docker events`. Replays the
   // recent history from `since`, then streams live until `until`. Like
   // ListSandboxes it needs no sandbox token: it carries only ids, names,
@@ -413,6 +416,34 @@ message WaitRequest {
 message WaitResponse {
   // The main process's exit code, or 0 for a sandbox without a command.
   int32 exit_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Diff messages
+// ---------------------------------------------------------------------------
+
+message DiffRequest {
+  string sandbox_id = 1;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_MODIFIED = 1;
+  CHANGE_KIND_ADDED = 2;
+  CHANGE_KIND_DELETED = 3;
+}
+
+message FileChange {
+  ChangeKind kind = 1;
+  // Absolute path inside the sandbox, as raw bytes: a guest file name need
+  // not be valid UTF-8.
+  bytes path = 2;
+}
+
+message DiffResponse {
+  // Sorted by path. A changed path's parent directories are listed as
+  // modified, as `docker diff` does.
+  repeated FileChange changes = 1;
 }
 
 // ---------------------------------------------------------------------------

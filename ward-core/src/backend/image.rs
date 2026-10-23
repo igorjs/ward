@@ -1079,6 +1079,14 @@ impl ImageStore {
             .is_some()
     }
 
+    /// The cached rootfs of `reference`, or `None` when it is not cached.
+    /// Unlike `ensure`, this never pulls.
+    pub async fn cached_rootfs(&self, reference: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .find_cache_entry_by_ref(reference)?
+            .map(|(entry_dir, _)| entry_dir.join("rootfs")))
+    }
+
     /// Remove an image from the cache, deleting its directory. Per-sandbox
     /// rootfs copies made from this entry are unaffected.
     pub async fn remove(&self, reference: &str) -> Result<()> {
