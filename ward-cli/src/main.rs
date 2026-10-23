@@ -5,6 +5,7 @@
 mod attach;
 mod client;
 mod cp;
+mod diff;
 mod docker;
 mod events;
 mod images;
@@ -440,6 +441,13 @@ enum Commands {
         quiet: bool,
         /// Image to pull: IMAGE[:TAG|@DIGEST].
         image: String,
+    },
+
+    /// Show the paths a sandbox changed against its image, as `docker diff`
+    /// does: `A` added, `C` changed, `D` deleted.
+    Diff {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -1150,6 +1158,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             pull::run(&socket_path, &image, quiet).await?;
         }
 
+        Commands::Diff { reference } => {
+            diff::run(&socket_path, &token_store, &reference, json).await?;
+        }
+
         Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
@@ -1547,6 +1559,18 @@ mod tests {
                 );
             }
             other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_diff_with_a_sandbox_when_parsed_then_it_holds_the_reference() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["ward", "diff", "web1"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Diff { reference } => assert_eq!(reference, "web1"),
+            other => panic!("expected Diff, got {other:?}"),
         }
     }
 

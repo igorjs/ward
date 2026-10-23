@@ -1,5 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
+use std::os::unix::ffi::OsStringExt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12,13 +13,14 @@ use crate::pb::attach_message::Kind;
 use crate::pb::copy_to_message;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk, CopyFromRequest,
-    CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
-    EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, GetCommunicationLogRequest,
-    GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
-    ListImagesResponse, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
-    ListVolumesResponse, Message, ProcessInfo, PublishRequest, PullImageRequest, PullProgress,
-    RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
+    AttachMessage, ChangeKind, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk,
+    CopyFromRequest, CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest,
+    CreateVolumeRequest, DaemonInfo, DiffRequest, DiffResponse, EgressLogEntry, EgressLogResponse,
+    EventsRequest, ExecRequest, FileChange, GetCommunicationLogRequest, GetEgressLogRequest,
+    GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest, ListImagesResponse,
+    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
+    Message, ProcessInfo, PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest,
+    RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
     SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
     StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
     TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
@@ -104,6 +106,15 @@ async fn authorized_id(
         .await
         .map_err(api_err_to_status)?;
     Ok(id)
+}
+
+fn change_kind(kind: crate::backend::diff::ChangeKind) -> ChangeKind {
+    use crate::backend::diff::ChangeKind as Domain;
+    match kind {
+        Domain::Added => ChangeKind::Added,
+        Domain::Modified => ChangeKind::Modified,
+        Domain::Deleted => ChangeKind::Deleted,
+    }
 }
 
 /// Largest data frame a `CopyTo` client may send, as the proto documents.
@@ -842,6 +853,27 @@ impl Ward for WardGrpcServer {
         let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
         let exit_code = self.sandbox.wait(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(WaitResponse { exit_code }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.diff",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let changes = self.sandbox.diff(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(DiffResponse {
+            changes: changes
+                .into_iter()
+                .map(|change| FileChange {
+                    kind: change_kind(change.kind) as i32,
+                    path: change.path.into_os_string().into_vec(),
+                })
+                .collect(),
+        }))
     }
 
     type EventsStream = tokio_stream::wrappers::ReceiverStream<Result<PbSandboxEvent, Status>>;

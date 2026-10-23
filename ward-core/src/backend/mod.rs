@@ -1,6 +1,7 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod agent;
+pub mod diff;
 pub mod image;
 pub mod krunvm;
 
@@ -207,6 +208,13 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Read the guest's CPU, memory and process counters.
     async fn stats(&self, sandbox_id: &str) -> Result<GuestStats>;
+
+    /// Paths of the sandbox's rootfs that differ from its image.
+    async fn diff_sandbox(&self, _sandbox_id: &str) -> Result<Vec<diff::FsChange>> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot compare a sandbox with its image".to_string(),
+        ))
+    }
 
     // -- Snapshots ------------------------------------------------------
 

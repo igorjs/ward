@@ -1563,6 +1563,13 @@ impl SandboxManager {
         self.backend.top(&id, ps_args).await.map_err(backend_err)
     }
 
+    /// Paths of a sandbox that differ from its image. Works in any state,
+    /// as `docker diff` does.
+    pub async fn diff(&self, sandbox_id: &str) -> Result<Vec<crate::backend::diff::FsChange>> {
+        let id = self.resolve(sandbox_id).await?;
+        self.backend.diff_sandbox(&id).await.map_err(backend_err)
+    }
+
     /// Read the resource use of a running sandbox. The limit is the
     /// configured memory, or the guest's total memory when none is set.
     pub async fn stats(&self, sandbox_id: &str) -> Result<SandboxStats> {

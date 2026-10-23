@@ -41,6 +41,10 @@ const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
 
+/// Guest paths the backend writes at boot, which `diff` ignores so a
+/// pristine sandbox shows no changes.
+const BOOT_WRITTEN_PATHS: &[&str] = &[AGENT_GUEST_PATH];
+
 /// Guest-agent argument that introduces one mount.
 #[cfg(feature = "krunvm")]
 const AGENT_MOUNT_ARG: &str = "--mount";
@@ -716,6 +720,34 @@ impl Backend for KrunvmBackend {
         let (tx, rx) = tokio::sync::mpsc::channel(super::COPY_CHANNEL_CAPACITY);
         tokio::spawn(super::agent::get_archive(stream, path.to_string(), tx));
         Ok(rx)
+    }
+
+    async fn diff_sandbox(&self, sandbox_id: &str) -> Result<Vec<super::diff::FsChange>> {
+        let (image, rootfs) = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            (state.info.image.clone(), state.rootfs.clone())
+        };
+        let base = match self.image_store.cached_rootfs(&image).await? {
+            Some(base) if !image.is_empty() => base,
+            _ => {
+                return Err(BackendError::InvalidArgument(format!(
+                    "image \"{image}\" of sandbox {sandbox_id} is not cached, so there is nothing to compare with"
+                )));
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            super::diff::diff_trees(
+                &base,
+                &rootfs,
+                BOOT_WRITTEN_PATHS,
+                super::diff::DiffLimits::default(),
+            )
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("diff task: {e}")))?
     }
 
     async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<super::ProcessTable> {
@@ -1496,6 +1528,52 @@ mod tests {
         let state = table.get("sb2").expect("entry for adopted id");
         assert_eq!(state.rootfs, stored_rootfs);
         assert_eq!(state.info.status, SandboxStatus::Stopped);
+    }
+
+    // ----- diff_sandbox --------------------------------------------------
+
+    #[tokio::test]
+    async fn given_boot_file_and_user_files_when_diffed_then_only_user_changes_show() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        let rootfs = backend.sandbox_rootfs("sb1");
+        std::fs::write(rootfs.join("ward-agent"), b"agent").expect("boot file");
+
+        // Act
+        let pristine = backend.diff_sandbox("sb1").await.expect("diff pristine");
+        std::fs::write(rootfs.join("added"), b"x").expect("user file");
+        std::fs::remove_dir(rootfs.join("bin")).expect("remove dir");
+        let changed = backend.diff_sandbox("sb1").await.expect("diff changed");
+
+        // Assert
+        assert!(pristine.is_empty(), "{pristine:?}");
+        let listed: Vec<_> = changed.iter().map(|c| (c.kind, c.path.clone())).collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    crate::backend::diff::ChangeKind::Added,
+                    std::path::PathBuf::from("/added")
+                ),
+                (
+                    crate::backend::diff::ChangeKind::Deleted,
+                    std::path::PathBuf::from("/bin")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_diffed_then_not_found() {
+        // Arrange
+        let backend = backend_in_tempdir();
+
+        // Act
+        let result = backend.diff_sandbox("ghost").await;
+
+        // Assert
+        assert!(matches!(result, Err(BackendError::NotFound(_))));
     }
 
     // ----- stop_sandbox / start_sandbox ---------------------------------
