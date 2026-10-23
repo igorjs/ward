@@ -737,6 +737,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    const EXEC_POLL_ATTEMPTS: usize = 100;
+    #[cfg(target_os = "linux")]
+    const EXEC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn given_a_spawned_sleep_when_listed_from_real_proc_then_one_row_has_its_pid_and_command() {
         // Arrange
@@ -746,16 +751,23 @@ mod tests {
             .unwrap();
 
         // Act
-        let listed = list_all(Path::new("/proc"), Path::new("/etc/passwd")).unwrap();
+        let pid = child.id().to_string();
+        let mut found = Vec::new();
+        for _ in 0..EXEC_POLL_ATTEMPTS {
+            let listed = list_all(Path::new("/proc"), Path::new("/etc/passwd")).unwrap();
+            found = rows(&listed)
+                .into_iter()
+                .filter(|r| r[COL_PID] == pid)
+                .collect();
+            if found.len() == 1 && found[0][COL_CMD] == "sleep 600" {
+                break;
+            }
+            std::thread::sleep(EXEC_POLL_INTERVAL);
+        }
         child.kill().unwrap();
         child.wait().unwrap();
 
         // Assert
-        let pid = child.id().to_string();
-        let found: Vec<_> = rows(&listed)
-            .into_iter()
-            .filter(|r| r[COL_PID] == pid)
-            .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0][COL_CMD], "sleep 600");
     }
