@@ -20,6 +20,8 @@ const MAX_TOPIC_LEN: usize = 128;
 /// Longest path Linux accepts (`PATH_MAX`).
 const MAX_GUEST_PATH_LEN: usize = 4096;
 const MAX_GROUP_LEN: usize = 64;
+/// Longest `name|uid[:group|gid]` spec. Names in `/etc/passwd` are far shorter.
+const MAX_USER_SPEC_LEN: usize = 256;
 
 /// Longest sandbox name, and so the longest name, id or id prefix a lookup
 /// may carry.
@@ -342,6 +344,17 @@ pub fn exec_command(command: &[String]) -> Result<(), ApiError> {
         return Err(ApiError::InvalidRequest(
             "command executable must not be empty".into(),
         ));
+    }
+    Ok(())
+}
+
+/// Validate a `--user` spec. Empty means no user. The guest agent resolves
+/// the names; this only keeps oversized or control-character input out.
+pub fn user_spec(spec: &str) -> Result<(), ApiError> {
+    if spec.len() > MAX_USER_SPEC_LEN || spec.chars().any(char::is_control) {
+        return Err(ApiError::InvalidRequest(format!(
+            "user must be at most {MAX_USER_SPEC_LEN} bytes with no control characters"
+        )));
     }
     Ok(())
 }
@@ -1116,5 +1129,29 @@ mod proptests {
                 prop_assert!(result.is_err(), "accepted len {}", payload.len());
             }
         }
+    }
+
+    #[rstest::rstest]
+    #[case::empty("", true)]
+    #[case::uid("1000", true)]
+    #[case::uid_gid("1000:1000", true)]
+    #[case::name_group("app:staff", true)]
+    #[case::newline("app\nroot", false)]
+    #[case::nul("app\0", false)]
+    fn user_spec_accepts_plain_specs_only(#[case] spec: &str, #[case] ok: bool) {
+        // Act
+        let result = user_spec(spec);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn user_spec_rejects_oversized_input() {
+        // Act
+        let result = user_spec(&"a".repeat(MAX_USER_SPEC_LEN + 1));
+
+        // Assert
+        assert!(result.is_err());
     }
 }

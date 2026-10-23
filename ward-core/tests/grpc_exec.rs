@@ -45,6 +45,7 @@ async fn given_existing_sandbox_when_exec_echo_then_returns_pid_and_running_stat
                 command: vec!["echo".into(), "hello".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             &s.token,
         ))
@@ -80,6 +81,7 @@ async fn given_empty_command_when_exec_then_invalid_argument() {
                 command: vec![],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             &s.token,
         ))
@@ -102,6 +104,7 @@ async fn given_unknown_sandbox_when_exec_then_not_found() {
             command: vec!["echo".into()],
             working_dir: String::new(),
             env: Default::default(),
+            ..Default::default()
         })
         .await
         .expect_err("unknown sandbox");
@@ -123,6 +126,7 @@ async fn given_malformed_sandbox_id_when_exec_then_invalid_argument() {
             command: vec!["echo".into()],
             working_dir: String::new(),
             env: Default::default(),
+            ..Default::default()
         })
         .await
         .expect_err("malformed id");
@@ -154,6 +158,7 @@ async fn given_exec_with_working_dir_when_request_succeeds_then_does_not_leak() 
                 command: vec!["pwd".into()],
                 working_dir: "/work".into(),
                 env: Default::default(),
+                ..Default::default()
             },
             &s.token,
         ))
@@ -780,6 +785,7 @@ async fn given_named_sandbox_when_exec_by_name_then_process_reports_resolved_id(
                 command: vec!["true".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             },
             &s.token,
         ))

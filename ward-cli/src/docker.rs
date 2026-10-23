@@ -63,6 +63,7 @@ pub struct ExecSpec {
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub workdir: String,
+    pub user: String,
     pub interactive: bool,
     pub tty: bool,
 }
@@ -84,6 +85,7 @@ pub async fn exec(
         tty: spec.tty,
         env: spec.env,
         workdir: spec.workdir,
+        user: spec.user,
         ..Default::default()
     };
     require_exit(attach::attach(&mut c, &target, start, spec.interactive).await?)

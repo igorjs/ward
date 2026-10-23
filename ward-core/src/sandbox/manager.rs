@@ -825,19 +825,15 @@ impl SandboxManager {
                 entrypoint,
                 args: &req.command,
                 workdir: &req.workdir,
+                user: &req.user,
                 env: &req.env,
             },
         );
-        if !launch.user.is_empty() {
-            tracing::warn!(
-                image = %req.image,
-                user = %launch.user,
-                "image user is not applied; commands run as the guest default"
-            );
-        }
         if req.require_command && launch.command.is_empty() {
             return Err(ApiError::InvalidRequest(NO_COMMAND_MESSAGE.to_string()));
         }
+        // The image's USER is untrusted input too.
+        crate::validate::user_spec(&launch.user)?;
         Ok(launch)
     }
 
@@ -855,6 +851,7 @@ impl SandboxManager {
         // because the failure rate matters as much as the success rate.
         let create_start = std::time::Instant::now();
         crate::validate::image_ref(&req.image)?;
+        crate::validate::user_spec(&req.user)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
         }
@@ -1439,6 +1436,7 @@ impl SandboxManager {
         let mode = ExecMode {
             tty: spec.tty,
             raw: true,
+            user: spec.user,
         };
         let workdir = (!spec.workdir.is_empty()).then_some(spec.workdir);
         let handle = self
@@ -1731,6 +1729,20 @@ impl SandboxManager {
         }
     }
 
+    /// The user a new process runs as: the one asked for, else the
+    /// sandbox's own, like `docker exec`.
+    async fn user_for(&self, id: &str, requested: &str) -> Result<String> {
+        crate::validate::user_spec(requested)?;
+        if !requested.is_empty() {
+            return Ok(requested.to_string());
+        }
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        Ok(entry.meta.options.spec.user.clone())
+    }
+
     /// Start `command` in a running sandbox for an attached client, which owns
     /// the returned handle. It is not tracked as an exec process.
     pub async fn spawn_attached(
@@ -1740,9 +1752,14 @@ impl SandboxManager {
         workdir: Option<String>,
         env: HashMap<String, String>,
         tty: bool,
+        user: &str,
     ) -> Result<ProcessHandle> {
         crate::validate::exec_command(&command)?;
-        let mode = ExecMode { tty, raw: true };
+        let mode = ExecMode {
+            tty,
+            raw: true,
+            user: self.user_for(id, user).await?,
+        };
         self.backend
             .exec(id, command, workdir, env, mode)
             .await
@@ -1974,6 +1991,7 @@ impl SandboxManager {
     pub async fn exec(&self, req: ExecRequest) -> Result<ProcessInfo> {
         let sandbox_id = self.resolve(&req.sandbox_id).await?;
         crate::validate::exec_command(&req.command)?;
+        let user = self.user_for(&sandbox_id, &req.user).await?;
         let handle = self
             .backend
             .exec(
@@ -1985,7 +2003,10 @@ impl SandboxManager {
                     Some(req.working_dir.clone())
                 },
                 req.env.clone(),
-                crate::backend::ExecMode::default(),
+                crate::backend::ExecMode {
+                    user,
+                    ..Default::default()
+                },
             )
             .await
             .map_err(backend_err)?;
@@ -3244,6 +3265,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into(), "hello".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect("exec");
@@ -3270,6 +3292,7 @@ pub(crate) mod tests {
                 command: vec![],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("empty command must be rejected");
@@ -3290,6 +3313,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("malformed id");
@@ -3311,6 +3335,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("unknown sandbox");
@@ -5065,9 +5090,17 @@ pub(crate) mod tests {
     /// host process (on a pty when asked), so the main process tests see
     /// real output, pids and wait statuses.
     #[cfg(not(feature = "krunvm"))]
+    const BAD_USER_IMAGE: &str = "bad-user";
+    /// A control character makes the spec fail validation.
+    #[cfg(not(feature = "krunvm"))]
+    const BAD_IMAGE_USER: &str = "app\u{7}";
+
+    #[cfg(not(feature = "krunvm"))]
     struct HostBackend {
         inner: crate::backend::krunvm::KrunvmBackend,
         fail_stop: bool,
+        /// The `user` of every exec, in order, for tests to read.
+        exec_users: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -5120,6 +5153,18 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     #[async_trait::async_trait]
     impl Backend for HostBackend {
+        async fn image_config(&self, image: &str) -> crate::backend::Result<ImageConfig> {
+            let user = if image == BAD_USER_IMAGE {
+                BAD_IMAGE_USER
+            } else {
+                ""
+            };
+            Ok(ImageConfig {
+                user: user.to_string(),
+                ..Default::default()
+            })
+        }
+
         async fn exec(
             &self,
             sandbox_id: &str,
@@ -5129,6 +5174,7 @@ pub(crate) mod tests {
             mode: ExecMode,
         ) -> crate::backend::Result<crate::backend::ProcessHandle> {
             use std::process::Stdio;
+            self.exec_users.lock().unwrap().push(mode.user.clone());
             let mut cmd = tokio::process::Command::new(&command[0]);
             cmd.args(&command[1..]).kill_on_drop(true);
             let (output_tx, output_rx) = mpsc::channel(16);
@@ -5360,6 +5406,15 @@ pub(crate) mod tests {
 
     #[cfg(not(feature = "krunvm"))]
     fn host_manager_with(output_cap: usize, fail_stop: bool) -> Arc<SandboxManager> {
+        host_manager_recording(output_cap, fail_stop).0
+    }
+
+    /// A host manager plus the list of users its execs were asked to run as.
+    #[cfg(not(feature = "krunvm"))]
+    fn host_manager_recording(
+        output_cap: usize,
+        fail_stop: bool,
+    ) -> (Arc<SandboxManager>, Arc<std::sync::Mutex<Vec<String>>>) {
         use crate::backend::image::ImageStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -5367,8 +5422,13 @@ pub(crate) mod tests {
         let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(dir);
         let inner = crate::backend::krunvm::KrunvmBackend::with_image_store_for_test(path, store);
-        let backend: Arc<dyn Backend> = Arc::new(HostBackend { inner, fail_stop });
-        Arc::new(
+        let exec_users = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn Backend> = Arc::new(HostBackend {
+            inner,
+            fail_stop,
+            exec_users: Arc::clone(&exec_users),
+        });
+        let manager = Arc::new(
             SandboxManager::new(
                 backend,
                 Arc::new(Broker::new()),
@@ -5378,7 +5438,8 @@ pub(crate) mod tests {
             )
             .with_output_cap(output_cap)
             .with_stop_grace(TEST_STOP_GRACE),
-        )
+        );
+        (manager, exec_users)
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -5646,6 +5707,124 @@ pub(crate) mod tests {
             assert!(std::time::Instant::now() < deadline, "got {text:?}");
             tokio::time::sleep(TEST_POLL_STEP).await;
         }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_user_on_create_when_main_process_spawns_then_the_backend_gets_it() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["true".into()],
+            user: "1000:1000".into(),
+            ..Default::default()
+        };
+
+        // Act
+        let info = mgr.create(req, "").await.expect("create");
+
+        // Assert
+        assert_eq!(info.user, "1000:1000");
+        assert_eq!(*users.lock().unwrap(), ["1000:1000"]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_image_user_that_is_invalid_when_create_then_it_is_rejected() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: BAD_USER_IMAGE.into(),
+            command: vec!["true".into()],
+            use_image_config: true,
+            ..Default::default()
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("bad image user");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+        assert!(users.lock().unwrap().is_empty());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::sandbox_user_is_the_default("", "1000")]
+    #[case::request_overrides("2000", "2000")]
+    #[tokio::test]
+    async fn given_sandbox_user_when_exec_then_request_user_wins_else_sandbox_user(
+        #[case] requested: &str,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            user: "1000".into(),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        mgr.exec(crate::pb::ExecRequest {
+            sandbox_id: id,
+            command: vec!["true".into()],
+            user: requested.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("exec");
+
+        // Assert
+        assert_eq!(*users.lock().unwrap(), [expected]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_attached_exec_with_user_when_spawned_then_the_backend_gets_it() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        users.lock().unwrap().clear();
+
+        // Act
+        let handle = mgr
+            .spawn_attached(
+                &id,
+                vec!["true".into()],
+                None,
+                HashMap::new(),
+                false,
+                "1000",
+            )
+            .await;
+
+        // Assert
+        assert!(handle.is_ok());
+        assert_eq!(*users.lock().unwrap(), ["1000"]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_control_character_in_user_when_exec_then_invalid_request() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        let result = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: id,
+                command: vec!["true".into()],
+                user: "app\nroot".into(),
+                ..Default::default()
+            })
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 
     #[cfg(not(feature = "krunvm"))]

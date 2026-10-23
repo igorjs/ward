@@ -33,7 +33,7 @@ pub struct SandboxSpec {
     #[serde(default)]
     pub entrypoint_len: usize,
     pub workdir: String,
-    /// The image's `User`, recorded though the guest does not apply it.
+    /// The user the main process runs as, and the default for execs.
     #[serde(default)]
     pub user: String,
     pub tty: bool,

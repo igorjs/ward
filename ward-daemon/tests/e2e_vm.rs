@@ -795,3 +795,131 @@ fn given_a_guest_busy_loop_when_stats_read_twice_then_cpu_time_grew_within_wall_
         "{grew} ns of cpu over {ceiling}"
     );
 }
+
+const USER_UID: &str = "1000";
+const USER_EXTRA_GID: &str = "1010";
+/// Adds uid 1000 to the guest's user database, in a group of its own and in
+/// one more that lists it.
+const ADD_USER: &str = "echo 'dev:x:1000:1000::/home/dev:/bin/sh' >> /etc/passwd; \
+                        echo 'dev:x:1000:' >> /etc/group; \
+                        echo 'extra:x:1010:dev' >> /etc/group";
+const EXIT_NOT_INVOKABLE: i32 = 126;
+
+/// Run `argv` through `ward exec -u USER` and return its output and exit code.
+fn exec_as(d: &Daemon, id: &str, user: &str, argv: &[&str]) -> Finished {
+    let out = d
+        .cli()
+        .args(["exec", "-u", user, id, "--"])
+        .args(argv)
+        .output()
+        .expect("run ward");
+    Finished {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit: out.status.code().expect("exit code"),
+    }
+}
+
+#[test]
+fn given_user_1000_when_run_then_id_u_prints_1000() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let mut cmd = d.cli();
+    cmd.args(["run", "--rm", "-u", "1000:1000", &image(), "id", "-u"]);
+
+    let out = run_ok(cmd);
+
+    assert_eq!(out.trim(), USER_UID);
+}
+
+#[test]
+fn given_user_1000_1000_when_exec_id_u_then_it_prints_1000() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let r = exec_as(&d, &id, "1000:1000", &["id", "-u"]);
+
+    assert_eq!((r.stdout.trim(), r.exit), (USER_UID, 0));
+}
+
+#[test]
+fn given_uid_gid_when_exec_id_g_then_only_that_group_is_listed() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "1000:1000", &["id", "-G"]);
+
+    assert_eq!(r.stdout.trim(), USER_UID, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn given_bare_user_name_when_exec_id_g_then_guest_group_memberships_are_listed() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "dev", &["id", "-G"]);
+
+    let mut groups: Vec<&str> = r.stdout.split_whitespace().collect();
+    groups.sort_unstable();
+    assert_eq!(groups, [USER_UID, USER_EXTRA_GID], "stderr: {}", r.stderr);
+}
+
+#[test]
+fn given_a_root_only_workdir_when_exec_as_user_then_it_fails_after_the_drop() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, "mkdir -m 0700 /rootonly").exit, 0);
+
+    let out = d
+        .cli()
+        .args([
+            "exec",
+            "-u",
+            "1000:1000",
+            "-w",
+            "/rootonly",
+            &id,
+            "--",
+            "pwd",
+        ])
+        .output()
+        .expect("run ward");
+
+    assert_eq!(out.status.code(), Some(EXIT_NOT_INVOKABLE));
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+}
+
+#[test]
+fn given_user_name_when_exec_then_home_comes_from_passwd() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "dev", &["sh", "-c", "echo $HOME"]);
+
+    assert_eq!(r.stdout.trim(), "/home/dev");
+}
+
+#[test]
+fn given_unknown_user_when_exec_then_exit_126_with_dockers_wording() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let r = exec_as(&d, &id, "ghost", &["id", "-u"]);
+
+    assert_eq!(r.exit, EXIT_NOT_INVOKABLE);
+    assert!(
+        r.stderr
+            .contains("unable to find user ghost: no matching entries in passwd file"),
+        "stderr: {}",
+        r.stderr
+    );
+}

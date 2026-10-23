@@ -67,7 +67,14 @@ where
         AttachMode::Exec if !start.replay => {
             let workdir = (!start.workdir.is_empty()).then_some(start.workdir);
             let handle = manager
-                .spawn_attached(&id, start.command, workdir, start.env, start.tty)
+                .spawn_attached(
+                    &id,
+                    start.command,
+                    workdir,
+                    start.env,
+                    start.tty,
+                    &start.user,
+                )
                 .await
                 .map_err(api_err_to_status)?;
             info!(sandbox_id = %id, pid = %handle.pid, "attach to new exec");

@@ -121,6 +121,10 @@ message CreateSandboxRequest {
   // Fail when no command results from the request and the image config.
   // Needs use_image_config.
   bool require_command = 16;
+  // Run the main process, and by default every exec, as this user:
+  // name|uid[:group|gid], like `docker run --user`. Empty uses the image's
+  // User.
+  string user = 17;
 }
 
 message GetSandboxRequest {
@@ -177,7 +181,8 @@ message SandboxInfo {
   // Leading part of `command` that came from an Entrypoint. Filled like
   // `command`.
   repeated string entrypoint = 16;
-  // The image's User. Recorded for display: the guest does not apply it.
+  // The user the main process runs as: the request's `user`, else the
+  // image's User. Empty means the guest default (root).
   string user = 17;
 }
 
@@ -225,6 +230,8 @@ message ExecRequest {
   repeated string command = 2;
   string working_dir = 3;
   map<string, string> env = 4;
+  // name|uid[:group|gid]. Empty uses the sandbox's user.
+  string user = 5;
 }
 
 message RunRequest {

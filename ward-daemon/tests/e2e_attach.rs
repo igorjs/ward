@@ -99,24 +99,35 @@ async fn given_wrong_missing_or_empty_token_when_attach_then_permission_denied()
 
 #[cfg(not(feature = "krunvm"))]
 #[tokio::test]
-async fn given_start_with_user_when_attach_then_unimplemented() {
+async fn given_start_with_user_when_attach_then_the_stream_runs_instead_of_failing() {
     // Arrange
     let daemon = Daemon::spawn();
     let mut client = common::connect(&daemon.socket).await;
     let sandbox = create(&mut client, &["echo"]).await;
     let start = AttachStart {
         user: "1000".into(),
+        replay: true,
+        follow: true,
         ..main_start(&sandbox.id)
     };
 
     // Act
-    let result = attach(&mut client, Some(&sandbox.token), start).await;
+    let attached = attach(&mut client, Some(&sandbox.token), start).await;
 
     // Assert
-    assert_eq!(
-        result.err().map(|status| status.code()),
-        Some(Code::Unimplemented)
-    );
+    let (_feed, mut replies) = attached.expect("the user is no longer rejected");
+    let mut exit_code = None;
+    let read = async {
+        while let Some(reply) = replies.message().await.expect("reply") {
+            if let Some(Kind::Exit(exit)) = reply.kind {
+                exit_code = Some(exit.exit_code);
+            }
+        }
+    };
+    tokio::time::timeout(STREAM_DEADLINE, read)
+        .await
+        .expect("stream ends");
+    assert_eq!(exit_code, Some(0));
 }
 
 #[cfg(not(feature = "krunvm"))]
