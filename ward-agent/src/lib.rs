@@ -8,6 +8,8 @@
 //! exactly one process: an opening `Exec`, then `Stdin`/`Kill`/`Signal`/`Resize`
 //! frames inbound and `Data` (or legacy line) and `Exited` frames outbound.
 
+use std::ffi::CString;
+use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
@@ -22,6 +24,7 @@ mod archive;
 mod pty;
 mod stats;
 mod top;
+mod user;
 
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
@@ -35,6 +38,15 @@ const PROC_ROOT: &str = "/proc";
 
 /// The guest's user database, used to name process owners.
 const PASSWD_PATH: &str = "/etc/passwd";
+
+/// The guest's group database, used to resolve `--user` groups.
+const GROUP_PATH: &str = "/etc/group";
+
+/// Larger passwd or group files are refused rather than read whole.
+const MAX_USER_DB_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Docker sets this from the passwd entry when `--user` is given.
+const HOME_ENV: &str = "HOME";
 
 /// Frames larger than this are rejected as malformed, protecting the agent
 /// from a hostile or buggy peer that advertises a huge length.
@@ -300,19 +312,52 @@ struct ChildIo {
     pty: Option<pty::PtyMaster>,
 }
 
+/// Make the child drop to `identity`, then enter `workdir`, just before it
+/// runs the program. A failed call fails the spawn, so the program never
+/// runs with more rights than asked for.
+fn run_as(
+    cmd: &mut Command,
+    identity: Option<&user::Identity>,
+    workdir: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(identity) = identity.cloned() else {
+        return Ok(());
+    };
+    // Built here because the closure must not allocate.
+    let workdir = workdir.map(CString::new).transpose()?;
+    // SAFETY: the closure runs between fork and exec and only makes the
+    // setgroups, setgid, setuid and chdir system calls, which are
+    // async-signal-safe and do not allocate.
+    unsafe {
+        cmd.pre_exec(move || user::enter_as(&user::SystemDropper, &identity, workdir.as_deref()));
+    }
+    Ok(())
+}
+
 /// Start the child. It always leads its own process group (a pty child, its
 /// own session), so signals and kills reach everything it spawns.
-fn spawn_child(exec: &Exec) -> std::io::Result<(Child, ChildIo)> {
+fn spawn_child(
+    exec: &Exec,
+    identity: Option<&user::Identity>,
+) -> std::io::Result<(Child, ChildIo)> {
     let mut cmd = Command::new(&exec.command[0]);
     cmd.args(&exec.command[1..]);
-    if !exec.working_dir.is_empty() {
-        cmd.current_dir(&exec.working_dir);
+    let workdir = (!exec.working_dir.is_empty()).then_some(exec.working_dir.as_str());
+    // With a user, the directory is entered after the privilege drop instead.
+    if let (None, Some(dir)) = (identity, workdir) {
+        cmd.current_dir(dir);
     }
     cmd.envs(exec.env.iter());
+    if let Some(identity) = identity
+        && !exec.env.contains_key(HOME_ENV)
+    {
+        cmd.env(HOME_ENV, &identity.home);
+    }
 
     if exec.tty {
         let (master, slave) = pty::open()?;
         pty::attach_slave(&mut cmd, slave)?;
+        run_as(&mut cmd, identity, workdir)?;
         let child = cmd.spawn()?;
         // `cmd` holds the parent's slave copies; drop them so the master
         // sees a hangup when the child side closes.
@@ -329,6 +374,7 @@ fn spawn_child(exec: &Exec) -> std::io::Result<(Child, ChildIo)> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    run_as(&mut cmd, identity, workdir)?;
     let mut child = cmd.spawn()?;
     let mut outputs: Vec<(Stream, Box<dyn AsyncRead + Send + Unpin>)> = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -471,6 +517,47 @@ async fn drain_outputs(tasks: Vec<JoinHandle<()>>, tty: bool) {
     }
 }
 
+/// Report a process that never started: one stderr line, then an exit code.
+async fn end_without_process(
+    event_tx: mpsc::Sender<Event>,
+    writer_task: JoinHandle<()>,
+    message: &str,
+    code: i32,
+) {
+    let _ = event_tx.send(stderr_event(message.to_string())).await;
+    let _ = event_tx.send(synthetic_exit_event(code)).await;
+    drop(event_tx);
+    let _ = writer_task.await;
+}
+
+/// The identity for `spec`, or `None` when no user was asked for.
+fn load_identity(
+    spec: &str,
+    passwd: &Path,
+    group: &Path,
+) -> Result<Option<user::Identity>, user::UserError> {
+    if spec.is_empty() {
+        return Ok(None);
+    }
+    let passwd = read_user_db(passwd, "passwd")?;
+    let group = read_user_db(group, "group")?;
+    Ok(Some(user::resolve(spec, &passwd, &group)?))
+}
+
+/// The file's text, empty when it is missing or unreadable so a numeric uid
+/// still resolves, or an error when it is over the size limit.
+fn read_user_db(path: &Path, name: &'static str) -> Result<String, user::UserError> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Ok(String::new());
+    };
+    let mut text = String::new();
+    let _ = file.take(MAX_USER_DB_BYTES + 1).read_to_string(&mut text);
+    if text.len() as u64 > MAX_USER_DB_BYTES {
+        return Err(user::UserError::FileTooLarge(name));
+    }
+    Ok(text)
+}
+
 async fn run_process<R, W>(exec: Exec, reader: R, writer: W) -> std::io::Result<()>
 where
     R: AsyncRead + Send + Unpin + 'static,
@@ -489,27 +576,25 @@ where
     });
 
     if exec.command.is_empty() {
-        let _ = event_tx
-            .send(stderr_event("empty command".to_string()))
-            .await;
-        let _ = event_tx.send(synthetic_exit_event(EXIT_UNKNOWN)).await;
-        drop(event_tx);
-        let _ = writer_task.await;
+        end_without_process(event_tx, writer_task, "empty command", EXIT_UNKNOWN).await;
         return Ok(());
     }
 
-    let (mut child, io) = match spawn_child(&exec) {
+    let identity = match load_identity(&exec.user, Path::new(PASSWD_PATH), Path::new(GROUP_PATH)) {
+        Ok(identity) => identity,
+        Err(e) => {
+            end_without_process(event_tx, writer_task, &e.to_string(), EXIT_NOT_INVOKABLE).await;
+            return Ok(());
+        }
+    };
+
+    let (mut child, io) = match spawn_child(&exec, identity.as_ref()) {
         Ok(spawned) => spawned,
         Err(e) => {
             // Surface the OS error on stderr too.
-            let _ = event_tx
-                .send(stderr_event(format!("spawn failed: {e}")))
-                .await;
-            let _ = event_tx
-                .send(synthetic_exit_event(spawn_failure_exit_code(&exec, &e)))
-                .await;
-            drop(event_tx);
-            let _ = writer_task.await;
+            let message = format!("spawn failed: {e}");
+            let code = spawn_failure_exit_code(&exec, &e);
+            end_without_process(event_tx, writer_task, &message, code).await;
             return Ok(());
         }
     };
@@ -709,6 +794,103 @@ mod tests {
         // Assert
         let (_out, _err, code) = lines_of(&events);
         assert_eq!(code, Some(126));
+    }
+
+    fn exec_req_as(command: &[&str], user: &str) -> Request {
+        let mut req = exec_req(command);
+        if let Some(request::Kind::Exec(exec)) = req.kind.as_mut() {
+            exec.user = user.into();
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn given_unknown_user_when_exec_then_exit_126_with_docker_wording_and_no_output() {
+        // Arrange
+        let req = exec_req_as(&["echo", "ran"], "ward-no-such-user");
+
+        // Act
+        let events = run(vec![req]).await;
+
+        // Assert
+        let (out, err, code) = lines_of(&events);
+        assert_eq!(code, Some(126));
+        assert_eq!(
+            err,
+            vec!["unable to find user ward-no-such-user: no matching entries in passwd file"]
+        );
+        assert!(out.is_empty(), "the command ran: {out:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a non-root agent"]
+    async fn given_a_user_switch_that_is_refused_when_exec_then_the_command_never_runs() {
+        // Arrange: only a root agent may switch to an arbitrary user.
+        let req = exec_req_as(&["echo", "ran"], "4242424");
+
+        // Act
+        let events = run(vec![req]).await;
+
+        // Assert
+        let (out, err, code) = lines_of(&events);
+        assert_eq!(code, Some(126));
+        assert!(out.is_empty(), "the command ran: {out:?}");
+        assert!(err.iter().any(|l| l.contains("spawn failed")), "{err:?}");
+    }
+
+    #[test]
+    fn given_an_oversized_passwd_when_loading_identity_then_it_is_refused() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (passwd, group) = (dir.path().join("passwd"), dir.path().join("group"));
+        let filler = vec![b'#'; usize::try_from(MAX_USER_DB_BYTES).unwrap() + 1];
+        std::fs::write(&passwd, filler).expect("write");
+
+        // Act
+        let identity = load_identity("1000", &passwd, &group);
+
+        // Assert
+        assert_eq!(identity, Err(user::UserError::FileTooLarge("passwd")));
+    }
+
+    #[test]
+    fn given_no_user_when_loading_identity_then_none() {
+        // Act
+        let identity = load_identity("", Path::new("/nope"), Path::new("/nope"));
+
+        // Assert
+        assert_eq!(identity, Ok(None));
+    }
+
+    #[test]
+    fn given_guest_files_when_loading_identity_then_they_are_read() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (passwd, group) = (dir.path().join("passwd"), dir.path().join("group"));
+        std::fs::write(&passwd, "app:x:1000:1000::/home/app:/bin/sh\n").expect("write");
+        std::fs::write(&group, "staff:x:50:app\n").expect("write");
+
+        // Act
+        let identity = load_identity("app", &passwd, &group)
+            .expect("resolves")
+            .expect("some");
+
+        // Assert
+        assert_eq!(identity.groups, vec![1000, 50]);
+        assert_eq!(identity.home, "/home/app");
+    }
+
+    #[test]
+    fn given_missing_guest_files_when_loading_numeric_identity_then_it_still_resolves() {
+        // Act
+        let identity = load_identity("1000:1000", Path::new("/nope"), Path::new("/nope"));
+
+        // Assert
+        let identity = identity.expect("resolves").expect("some");
+        assert_eq!(
+            (identity.uid, identity.gid, identity.groups),
+            (1000, 1000, vec![1000])
+        );
     }
 
     #[tokio::test]

@@ -723,11 +723,6 @@ impl Ward for WardGrpcServer {
             ));
         };
         let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
-        if !start.user.is_empty() {
-            return Err(Status::unimplemented(
-                "attach with a user is not supported yet",
-            ));
-        }
         let rx = attach::serve(Arc::clone(&self.sandbox), id, start, inbound).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,

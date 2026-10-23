@@ -211,7 +211,7 @@ mod tests {
                     tty: true,
                     auto_remove: false,
                     entrypoint_len: 0,
-                    user: String::new(),
+                    user: "1000:1000".into(),
                 },
             },
             created_at: SystemTime::now(),
@@ -266,6 +266,19 @@ mod tests {
         assert_eq!(spec.command, vec!["sh", "-c", "echo hi"]);
         assert!(spec.tty);
         assert_eq!(spec.workdir, "/srv");
+    }
+
+    #[test]
+    fn given_user_when_loaded_then_it_is_kept() {
+        // Arrange
+        let (_tmp, store) = store();
+        store.save(&meta(ID_A, SandboxStatus::Stopped)).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        assert_eq!(loaded[0].options.spec.user, "1000:1000");
     }
 
     #[test]

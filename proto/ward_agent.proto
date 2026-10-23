@@ -40,7 +40,7 @@ message Exec {
   string working_dir = 2;               // empty = agent default (/)
   map<string, string> env = 3;
   bool tty = 4;                         // run on a pty
-  string user = 5;                      // unused until user switching lands
+  string user = 5;                      // name|uid[:group|gid]; empty = run as the agent
   bool raw = 6;                         // stream raw Data events (implied by tty)
 }
 

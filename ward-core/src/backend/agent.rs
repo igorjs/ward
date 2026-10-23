@@ -156,7 +156,7 @@ where
             env,
             tty: mode.tty,
             raw: mode.raw,
-            ..Default::default()
+            user: mode.user,
         })),
     };
     write_frame(&mut writer, &encode(&exec)).await?;
@@ -766,6 +766,7 @@ mod tests {
             ExecMode {
                 tty: false,
                 raw: true,
+                ..Default::default()
             },
         )
         .await;
@@ -841,6 +842,7 @@ mod tests {
                 ExecMode {
                     tty: true,
                     raw: false,
+                    ..Default::default()
                 },
                 true,
                 false,
@@ -849,6 +851,7 @@ mod tests {
                 ExecMode {
                     tty: false,
                     raw: true,
+                    ..Default::default()
                 },
                 false,
                 true,
@@ -885,6 +888,7 @@ mod tests {
             ExecMode {
                 tty: true,
                 raw: false,
+                ..Default::default()
             },
         )
         .await;
@@ -961,6 +965,7 @@ mod tests {
             let mode = ExecMode {
                 tty: false,
                 raw: true,
+                ..Default::default()
             };
             let (mut handle, _kill) = drive_real(&["sleep", "30"], mode).await;
             let control = handle.control_tx.clone().expect("control channel");
@@ -988,6 +993,7 @@ mod tests {
             let mode = ExecMode {
                 tty: true,
                 raw: false,
+                ..Default::default()
             };
             let (mut handle, _kill) = drive_real(&["sh", "-c", &script], mode).await;
             let control = handle.control_tx.clone().expect("control channel");

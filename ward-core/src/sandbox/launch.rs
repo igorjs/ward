@@ -15,7 +15,7 @@ pub(crate) struct Launch {
     /// How many leading entries of `command` came from an Entrypoint.
     pub entrypoint_len: usize,
     pub workdir: String,
-    /// The image's `User`, which the guest does not apply.
+    /// The user to run as: the request's, else the image's `User`.
     pub user: String,
     pub env: HashMap<String, String>,
 }
@@ -26,6 +26,7 @@ pub(crate) struct Overrides<'a> {
     pub entrypoint: Option<&'a str>,
     pub args: &'a [String],
     pub workdir: &'a str,
+    pub user: &'a str,
     pub env: &'a HashMap<String, String>,
 }
 
@@ -61,12 +62,17 @@ pub(crate) fn resolve(image: &ImageConfig, given: Overrides<'_>) -> Launch {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
     env.extend(given.env.clone());
+    let user = if given.user.is_empty() {
+        image.user.clone()
+    } else {
+        given.user.to_string()
+    };
 
     Launch {
         command,
         entrypoint_len,
         workdir,
-        user: image.user.clone(),
+        user,
         env,
     }
 }
@@ -100,6 +106,7 @@ mod tests {
                 entrypoint,
                 args: &args,
                 workdir: "",
+                user: "",
                 env: &HashMap::new(),
             },
         );
@@ -147,6 +154,7 @@ mod tests {
             entrypoint: None,
             args: &[],
             workdir,
+            user: "",
             env: &none,
         };
 
@@ -175,6 +183,7 @@ mod tests {
                 entrypoint: None,
                 args: &[],
                 workdir: "",
+                user: "",
                 env: &given,
             },
         );
@@ -205,6 +214,7 @@ mod tests {
                 entrypoint: None,
                 args: &[],
                 workdir: "",
+                user: "",
                 env: &none,
             },
         );
@@ -232,11 +242,44 @@ mod tests {
                 entrypoint: None,
                 args: &[],
                 workdir: "",
+                user: "",
                 env: &none,
             },
         );
 
         // Assert
         assert_eq!(launch.user, "app");
+    }
+
+    #[rstest::rstest]
+    #[case::request_wins("app", "1000:1000", "1000:1000")]
+    #[case::image_default("app", "", "app")]
+    #[case::none("", "", "")]
+    fn given_a_requested_user_when_resolving_then_it_overrides_the_image(
+        #[case] image_user: &str,
+        #[case] requested: &str,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let config = ImageConfig {
+            user: image_user.to_string(),
+            ..ImageConfig::default()
+        };
+        let none = HashMap::new();
+
+        // Act
+        let launch = resolve(
+            &config,
+            Overrides {
+                entrypoint: None,
+                args: &[],
+                workdir: "",
+                user: requested,
+                env: &none,
+            },
+        );
+
+        // Assert
+        assert_eq!(launch.user, expected);
     }
 }

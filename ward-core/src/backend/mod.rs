@@ -40,12 +40,14 @@ pub type Result<T> = std::result::Result<T, BackendError>;
 
 /// How an exec should run. The default is a plain pipe child that reports
 /// line events.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecMode {
     /// Run the child on a pty.
     pub tty: bool,
     /// Report unframed `Data` events instead of lines (implied by `tty`).
     pub raw: bool,
+    /// Run as this `name|uid[:group|gid]`. Empty keeps the agent's user.
+    pub user: String,
 }
 
 /// A request to a running process, sent next to stdin and kill.

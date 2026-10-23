@@ -98,6 +98,9 @@ struct SandboxOpts {
     /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
     #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
     cpus: String,
+    /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
+    #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,6 +171,9 @@ enum Commands {
         /// Working directory.
         #[arg(short = 'w', long)]
         workdir: Option<String>,
+        /// User to run as: name|uid[:group|gid]. Defaults to the sandbox's user.
+        #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
+        user: Option<String>,
         /// Environment variables in KEY=VALUE form.
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -641,6 +647,7 @@ fn create_request(
         resources: Some(resources),
         env: parse_env(&opts.env),
         name: opts.name.unwrap_or_default(),
+        user: opts.user.unwrap_or_default(),
         ..Default::default()
     })
 }
@@ -825,6 +832,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             id,
             command,
             workdir,
+            user,
             env,
             interactive,
             tty,
@@ -835,6 +843,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     command,
                     env: parse_env(&env),
                     workdir: workdir.unwrap_or_default(),
+                    user: user.unwrap_or_default(),
                     interactive,
                     tty,
                 };
@@ -848,6 +857,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 command,
                 working_dir: workdir.unwrap_or_default(),
                 env: parse_env(&env),
+                user: user.unwrap_or_default(),
             })?;
             let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`.
@@ -1512,6 +1522,46 @@ mod tests {
         // Assert
         assert!(!request.use_image_config);
         assert_eq!(request.entrypoint, None);
+    }
+
+    #[rstest::rstest]
+    #[case::short(&["ward", "run", "-u", "1000:1000", "alpine"], "1000:1000")]
+    #[case::long(&["ward", "create", "--user", "app", "alpine"], "app")]
+    #[case::absent(&["ward", "run", "alpine"], "")]
+    fn given_user_flag_when_create_request_built_then_user_is_set(
+        #[case] args: &[&str],
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let cli = Cli::try_parse_from(args).expect("parse");
+        let (Commands::Create { image, opts, .. } | Commands::Run { image, opts, .. }) =
+            cli.command
+        else {
+            panic!("expected Create or Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(request.user, expected);
+    }
+
+    #[test]
+    fn given_exec_with_user_flag_when_parsed_then_user_is_kept() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "exec", "-u", "1000", "sb", "id"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Exec { user, command, .. } => {
+                assert_eq!(
+                    (user.as_deref(), command),
+                    (Some("1000"), vec!["id".into()])
+                );
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
     }
 
     #[test]
