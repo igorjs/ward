@@ -4,6 +4,7 @@
 
 mod attach;
 mod client;
+mod commit;
 mod cp;
 mod diff;
 mod docker;
@@ -448,6 +449,39 @@ enum Commands {
     Diff {
         /// Sandbox name, ID or ID prefix.
         reference: String,
+    },
+
+    /// Save a sandbox's filesystem as a new local image, as `docker commit`
+    /// does, and print the new image id.
+    ///
+    /// The image takes the command, environment and working directory the
+    /// sandbox started with, then CHANGE on top. CHANGE accepts CMD,
+    /// ENTRYPOINT, ENV, WORKDIR and USER. A sandbox cannot be paused yet, so
+    /// the copy is taken while it runs and a file being written may be copied
+    /// part way. An unreadable file fails the commit. Device nodes, pipes and
+    /// sockets are not copied; hard links become separate files; setuid and
+    /// setgid bits are dropped; extended attributes, sparse holes and
+    /// modification times are not kept. A committed image is never evicted
+    /// from the cache. A tag already in use moves to the new image, and the
+    /// old one stays by its digest.
+    Commit {
+        /// Author of the commit, e.g. "Ada <ada@example.com>".
+        #[arg(short, long)]
+        author: Option<String>,
+        /// Commit message.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Apply a Dockerfile instruction to the image config. Repeatable.
+        #[arg(short = 'c', long = "change", value_name = "CHANGE")]
+        change: Vec<String>,
+        /// Pause the sandbox during the commit. Accepted for Docker
+        /// compatibility: pausing is not supported yet and the copy is live.
+        #[arg(short, long, default_value_t = true, action = clap::ArgAction::Set)]
+        pause: bool,
+        /// Sandbox name, ID or ID prefix.
+        container: String,
+        /// Local tag for the new image, REPOSITORY[:TAG].
+        repository: Option<String>,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -1162,6 +1196,24 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             diff::run(&socket_path, &token_store, &reference, json).await?;
         }
 
+        Commands::Commit {
+            author,
+            message,
+            change,
+            pause,
+            container,
+            repository,
+        } => {
+            let options = commit::Options {
+                author: author.unwrap_or_default(),
+                message: message.unwrap_or_default(),
+                changes: change,
+                pause,
+                reference: repository.unwrap_or_default(),
+            };
+            commit::run(&socket_path, &token_store, &container, options).await?;
+        }
+
         Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
@@ -1559,6 +1611,53 @@ mod tests {
                 );
             }
             other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_commit_with_docker_flags_when_parsed_then_it_holds_them() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from([
+            "ward", "commit", "-a", "Ada", "-m", "msg", "-c", "ENV A=1", "-c", "CMD sh",
+            "-p=false", "web1", "mine:v1",
+        ])
+        .expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Commit {
+                author,
+                message,
+                change,
+                pause,
+                container,
+                repository,
+            } => {
+                assert_eq!(author.as_deref(), Some("Ada"));
+                assert_eq!(message.as_deref(), Some("msg"));
+                assert_eq!(change, ["ENV A=1", "CMD sh"]);
+                assert!(!pause);
+                assert_eq!(container, "web1");
+                assert_eq!(repository.as_deref(), Some("mine:v1"));
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_commit_without_flags_when_parsed_then_it_pauses_and_has_no_tag() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["ward", "commit", "web1"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Commit {
+                pause, repository, ..
+            } => {
+                assert!(pause);
+                assert_eq!(repository, None);
+            }
+            other => panic!("expected Commit, got {other:?}"),
         }
     }
 

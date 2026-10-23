@@ -16,6 +16,7 @@ default = []
 krunvm = ["dep:ward-bundle", "dep:libloading"]
 
 [dependencies]
+shlex = "1"
 ward-bundle = { path = "../ward-bundle", features = ["embed"], optional = true }
 libloading = { version = "0.8", optional = true }
 # Generated protobuf types + tonic gRPC stubs for the ward.v1 wire

@@ -30,7 +30,7 @@ const COMPARE_CHUNK_BYTES: usize = 64 * 1024;
 /// Permission, setuid, setgid and sticky bits of a file mode.
 const PERMISSION_BITS: u32 = 0o7777;
 /// Flags for descending into a directory without following a link.
-const DIR_FLAGS: OFlags = OFlags::RDONLY
+pub(super) const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
@@ -402,7 +402,7 @@ fn verdict(same: bool) -> Verdict {
     }
 }
 
-fn file_type(stat: &Stat) -> FileType {
+pub(super) fn file_type(stat: &Stat) -> FileType {
     FileType::from_raw_mode(stat.st_mode)
 }
 
@@ -424,7 +424,7 @@ fn is_regular(file: &File) -> std::io::Result<bool> {
     Ok(file_type(&fs::fstat(file)?) == FileType::RegularFile)
 }
 
-fn open_root(path: &Path) -> Result<OwnedFd> {
+pub(super) fn open_root(path: &Path) -> Result<OwnedFd> {
     Ok(fs::openat(CWD, path, DIR_FLAGS, Mode::empty()).map_err(std::io::Error::from)?)
 }
 
@@ -440,12 +440,12 @@ fn open_dir(parent: &OwnedFd, name: &OsStr) -> Result<Opened> {
     }
 }
 
-fn open_file(parent: &OwnedFd, name: &OsStr) -> std::result::Result<File, Errno> {
+pub(super) fn open_file(parent: &OwnedFd, name: &OsStr) -> std::result::Result<File, Errno> {
     fs::openat(parent, name, FILE_FLAGS, Mode::empty()).map(File::from)
 }
 
 /// Metadata of `name` itself, never of a link's target. `None` if it is gone.
-fn stat_at(dir: &OwnedFd, name: &OsStr) -> std::result::Result<Option<Stat>, Errno> {
+pub(super) fn stat_at(dir: &OwnedFd, name: &OsStr) -> std::result::Result<Option<Stat>, Errno> {
     match fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => Ok(Some(stat)),
         Err(Errno::NOENT) => Ok(None),
@@ -455,7 +455,7 @@ fn stat_at(dir: &OwnedFd, name: &OsStr) -> std::result::Result<Option<Stat>, Err
 
 /// Names in `dir`, read up front so no directory stream stays open while the
 /// walk descends.
-fn list_names(dir: &OwnedFd) -> Result<BTreeSet<OsString>> {
+pub(super) fn list_names(dir: &OwnedFd) -> Result<BTreeSet<OsString>> {
     let mut names = BTreeSet::new();
     for entry in Dir::read_from(dir).map_err(std::io::Error::from)? {
         let entry = entry.map_err(std::io::Error::from)?;
