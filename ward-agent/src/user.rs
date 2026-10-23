@@ -211,7 +211,9 @@ pub fn enter_as(
     workdir: Option<&CStr>,
 ) -> std::io::Result<()> {
     drop_privileges(dropper, identity)?;
-    workdir.map_or(Ok(()), |dir| dropper.change_dir(dir))
+    workdir.map_or(Ok(()), |dir| {
+        dropper.change_dir(dir).map_err(|e| tag(Step::ChangeDir, e))
+    })
 }
 
 /// Drop to `identity`: groups first, then gid, then uid, because a process
@@ -221,9 +223,68 @@ pub fn drop_privileges(
     dropper: &impl PrivilegeDropper,
     identity: &Identity,
 ) -> std::io::Result<()> {
-    dropper.set_groups(&identity.groups)?;
-    dropper.set_gid(identity.gid)?;
-    dropper.set_uid(identity.uid)
+    dropper
+        .set_groups(&identity.groups)
+        .map_err(|e| tag(Step::SetGroups, e))?;
+    dropper
+        .set_gid(identity.gid)
+        .map_err(|e| tag(Step::SetGid, e))?;
+    dropper
+        .set_uid(identity.uid)
+        .map_err(|e| tag(Step::SetUid, e))
+}
+
+/// The step of the privilege drop that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    SetGroups = 1,
+    SetGid,
+    SetUid,
+    ChangeDir,
+}
+
+impl Step {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SetGroups => "setgroups",
+            Self::SetGid => "setgid",
+            Self::SetUid => "setuid",
+            Self::ChangeDir => "chdir",
+        }
+    }
+
+    const ALL: [Step; 4] = [Self::SetGroups, Self::SetGid, Self::SetUid, Self::ChangeDir];
+}
+
+/// The step number lives above the errno bits of the error code.
+const STEP_SHIFT: u32 = 16;
+const ERRNO_MASK: i32 = (1 << STEP_SHIFT) - 1;
+
+/// Mark `err` with the failed `step`. The standard library hands a
+/// `pre_exec` failure to the parent as its bare OS error code, so the step
+/// rides in the high bits of that code and costs no allocation in the child.
+fn tag(step: Step, err: std::io::Error) -> std::io::Error {
+    match err.raw_os_error() {
+        Some(errno) => std::io::Error::from_raw_os_error(((step as i32) << STEP_SHIFT) | errno),
+        None => err,
+    }
+}
+
+/// Undo [`tag`]: the failed step, if marked, and the plain OS error.
+pub fn untag(err: std::io::Error) -> (Option<Step>, std::io::Error) {
+    let Some(code) = err.raw_os_error() else {
+        return (None, err);
+    };
+    let step = Step::ALL
+        .into_iter()
+        .find(|s| *s as i32 == code >> STEP_SHIFT);
+    match step {
+        Some(step) => (
+            Some(step),
+            std::io::Error::from_raw_os_error(code & ERRNO_MASK),
+        ),
+        None => (None, err),
+    }
 }
 
 /// The real calls, on Linux. Elsewhere there is nothing safe to do, so
@@ -479,6 +540,39 @@ mod tests {
         // Assert
         assert!(result.is_err());
         assert_eq!(dropper.calls.borrow().len(), calls_made);
+    }
+
+    const EACCES: i32 = 13;
+    const ENOENT: i32 = 2;
+
+    #[rstest::rstest]
+    #[case::groups(Step::SetGroups)]
+    #[case::gid(Step::SetGid)]
+    #[case::uid(Step::SetUid)]
+    #[case::dir(Step::ChangeDir)]
+    fn given_a_tagged_os_error_when_untagged_then_step_and_errno_come_back(#[case] step: Step) {
+        // Arrange
+        let tagged = tag(step, std::io::Error::from_raw_os_error(EACCES));
+
+        // Act
+        let (found, plain) = untag(tagged);
+
+        // Assert
+        assert_eq!(found, Some(step));
+        assert_eq!(plain.raw_os_error(), Some(EACCES));
+    }
+
+    #[test]
+    fn given_an_untagged_os_error_when_untagged_then_no_step_is_found() {
+        // Arrange
+        let err = std::io::Error::from_raw_os_error(ENOENT);
+
+        // Act
+        let (found, plain) = untag(err);
+
+        // Assert
+        assert_eq!(found, None);
+        assert_eq!(plain.raw_os_error(), Some(ENOENT));
     }
 
     #[test]

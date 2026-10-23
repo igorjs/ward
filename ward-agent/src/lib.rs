@@ -591,8 +591,12 @@ where
     let (mut child, io) = match spawn_child(&exec, identity.as_ref()) {
         Ok(spawned) => spawned,
         Err(e) => {
-            // Surface the OS error on stderr too.
-            let message = format!("spawn failed: {e}");
+            // Surface the OS error on stderr too, with the step that failed.
+            let (step, e) = user::untag(e);
+            let message = match step {
+                Some(step) => format!("spawn failed at {}: {e}", step.name()),
+                None => format!("spawn failed: {e}"),
+            };
             let code = spawn_failure_exit_code(&exec, &e);
             end_without_process(event_tx, writer_task, &message, code).await;
             return Ok(());

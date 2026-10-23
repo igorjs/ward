@@ -814,7 +814,14 @@ fn write_meta_json(path: &Path, meta: &CacheMeta) -> Result<()> {
 /// This is intentionally a sync fn because it is called from
 /// `spawn_blocking`; avoid blocking executor threads in async callers.
 pub(crate) fn materialize_dir(src_dir: &Path, dst_dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
     let mut stack = vec![(src_dir.to_path_buf(), dst_dir.to_path_buf())];
+    // Directory modes are applied last: a read-only image directory would
+    // otherwise reject its own children.
+    let mut dir_modes = vec![(
+        dst_dir.to_path_buf(),
+        std::fs::Permissions::from_mode(ROOTFS_ROOT_MODE),
+    )];
     while let Some((src, dst)) = stack.pop() {
         std::fs::create_dir_all(&dst)?;
         for entry in std::fs::read_dir(&src)? {
@@ -823,6 +830,7 @@ pub(crate) fn materialize_dir(src_dir: &Path, dst_dir: &Path) -> std::io::Result
             let dst_path = dst.join(entry.file_name());
             let meta = entry.metadata()?;
             if meta.is_dir() {
+                dir_modes.push((dst_path.clone(), meta.permissions()));
                 stack.push((src_path, dst_path));
             } else if meta.file_type().is_symlink() {
                 let target = std::fs::read_link(&src_path)?;
@@ -833,8 +841,20 @@ pub(crate) fn materialize_dir(src_dir: &Path, dst_dir: &Path) -> std::io::Result
             }
         }
     }
+    // Children before parents, so a restrictive parent mode never blocks one.
+    for (dir, mode) in dir_modes.into_iter().rev() {
+        std::fs::set_permissions(dir, mode)?;
+    }
     Ok(())
 }
+
+/// Mode of the guest-visible root. The host user's umask must not narrow it,
+/// or any other guest user cannot search `/`; host access is guarded by the
+/// private sandbox directory above it.
+const ROOTFS_ROOT_MODE: u32 = 0o755;
+
+/// Mode of the per-sandbox directory that holds the guest-visible rootfs.
+const SANDBOX_DIR_MODE: u32 = 0o700;
 
 /// Copy `src` to `dst`. The guest writes to its rootfs in place, so sandboxes
 /// must not share inodes with each other or with the image cache.
@@ -856,6 +876,20 @@ fn materialize_file(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
         other => other.map(|_| ()),
     }
+}
+
+/// Create `rootfs` and its parent, the parent being owner-only so the
+/// world-searchable guest root stays unreachable to other host users.
+fn create_private_parent(rootfs: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if let Some(parent) = rootfs.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(SANDBOX_DIR_MODE)
+            .create(parent)?;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(SANDBOX_DIR_MODE))?;
+    }
+    std::fs::create_dir_all(rootfs)
 }
 
 /// Owner read permission bit.
@@ -1223,8 +1257,10 @@ impl ImageStore {
     /// This is the entry point called by the krunvm backend.
     pub async fn prepare_sandbox_rootfs(&self, reference: &str, dest: &Path) -> Result<()> {
         let cache_rootfs = self.ensure(reference).await?;
-        tokio::fs::create_dir_all(dest)
+        let dest_owned = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || create_private_parent(&dest_owned))
             .await
+            .map_err(|e| BackendError::Internal(format!("rootfs dir task: {e}")))?
             .map_err(BackendError::Io)?;
         let src = cache_rootfs.clone();
         let dst = dest.to_path_buf();
@@ -2328,6 +2364,52 @@ mod tests {
 
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"aaa");
         assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"bbb");
+    }
+
+    /// Runs `body` under a restrictive umask, as the daemon does.
+    fn with_umask<T>(mask: u16, body: impl FnOnce() -> T) -> T {
+        let previous = rustix::process::umask(rustix::fs::Mode::from_bits_truncate(mask));
+        let out = body();
+        rustix::process::umask(previous);
+        out
+    }
+
+    #[test]
+    fn given_restrictive_umask_when_materialize_dir_then_image_dir_modes_are_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        const DAEMON_UMASK: u16 = 0o077;
+        const WORLD_SEARCH: u32 = 0o001;
+        const STICKY_TMP: u32 = 0o1777;
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("sandbox/rootfs");
+        for dir in ["bin", "etc", "usr/bin", "tmp"] {
+            std::fs::create_dir_all(src.join(dir)).expect("mkdir");
+        }
+        std::fs::set_permissions(src.join("tmp"), std::fs::Permissions::from_mode(STICKY_TMP))
+            .expect("chmod tmp");
+        // The cache root is created by the daemon, so it is owner-only.
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o700)).expect("chmod src");
+
+        // Act
+        with_umask(DAEMON_UMASK, || {
+            create_private_parent(&dst).expect("parent");
+            materialize_dir(&src, &dst).expect("materialize");
+        });
+
+        // Assert
+        let mode_of = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o7777;
+        for dir in ["", "bin", "etc", "usr", "usr/bin"] {
+            assert_eq!(
+                mode_of(&dst.join(dir)) & WORLD_SEARCH,
+                WORLD_SEARCH,
+                "{dir}"
+            );
+        }
+        assert_eq!(mode_of(&dst), ROOTFS_ROOT_MODE);
+        assert_eq!(mode_of(&dst.join("tmp")), STICKY_TMP);
+        assert_eq!(mode_of(dst.parent().unwrap()), SANDBOX_DIR_MODE);
     }
 
     #[test]
