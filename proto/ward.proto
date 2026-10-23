@@ -63,6 +63,10 @@ service Ward {
   // `docker pull`. Needs no sandbox token. The pull stops at a size cap and
   // fails rather than evict cached images when the cache is full.
   rpc PullImage(PullImageRequest) returns (stream PullProgress);
+  // Save a sandbox's filesystem as a new cached image under a local tag,
+  // like `docker commit`. The token travels in call metadata. An existing
+  // tag is refused and the image cache is never evicted to make room.
+  rpc Commit(CommitRequest) returns (CommitResponse);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -472,6 +476,25 @@ message PullProgress {
   string id = 1;
   // Docker's wording, e.g. "Pull complete".
   string status = 2;
+}
+
+message CommitRequest {
+  string sandbox_id = 1;
+  // Local tag for the new image, e.g. myapp:v2. Empty leaves it untagged.
+  string reference = 2;
+  string author = 3;
+  string message = 4;
+  // Dockerfile instructions applied to the image config: CMD, ENTRYPOINT,
+  // ENV, WORKDIR and USER.
+  repeated string changes = 5;
+  // Accepted for Docker compatibility. A sandbox cannot be paused yet, so
+  // the copy is always taken live.
+  bool pause = 6;
+}
+
+message CommitResponse {
+  // Id of the new image, e.g. sha256:...
+  string image_id = 1;
 }
 
 // ---------------------------------------------------------------------------

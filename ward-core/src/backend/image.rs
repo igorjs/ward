@@ -25,6 +25,7 @@
 
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flate2::read::GzDecoder;
@@ -34,6 +35,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::{Stream, StreamExt};
 
+use super::commit::{self, CommitSpec, CopyError, CopyLimits};
 use super::{BackendError, Result};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -83,6 +85,15 @@ pub struct CacheMeta {
     /// fall back to `last_used_at`.
     #[serde(default)]
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Who committed the image. `None` for pulled images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// The commit message. `None` for pulled images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Made by a commit. Such an image is never evicted from the cache.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub committed: bool,
 }
 
 /// The parts of an OCI image config a sandbox's main process starts from.
@@ -763,6 +774,25 @@ fn dir_size_bytes(dir: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// A fresh image id for a commit, so it never lands on an existing entry.
+fn commit_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let hex: String = Sha256::digest(uuid::Uuid::new_v4().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{DIGEST_ALGORITHM_PREFIX}{hex}")
+}
+
+/// Sets its flag when dropped, so a commit whose caller went away stops.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Atomically write `meta` to `path` via a sibling temp file.
 fn write_meta_json(path: &Path, meta: &CacheMeta) -> Result<()> {
     let bytes =
@@ -849,6 +879,25 @@ pub struct ImageStore {
     install_lock: Mutex<()>,
 }
 
+/// Prefix of the cache directories a pull or commit is still filling.
+const STAGING_PREFIX: &str = ".tmp-";
+
+/// Remove staging directories a crashed daemon left behind.
+fn sweep_staging(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX)
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// A pull's directory in the cache, removed on drop unless moved into place.
 struct StagingDir(PathBuf);
 
@@ -870,6 +919,7 @@ impl ImageStore {
         max_cached_images: usize,
         puller: Arc<dyn ImagePuller>,
     ) -> Self {
+        sweep_staging(&cache_dir);
         Self {
             cache_dir,
             max_cached_images,
@@ -912,7 +962,7 @@ impl ImageStore {
     ) -> Result<(StagingDir, PulledImage)> {
         let staging = StagingDir(
             self.cache_dir
-                .join(format!(".tmp-{}", uuid::Uuid::new_v4())),
+                .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4())),
         );
         let temp_rootfs = staging.0.join("rootfs");
 
@@ -985,6 +1035,9 @@ impl ImageStore {
             layer_count: 0,
             config: Some(config),
             created_at: Some(now),
+            author: None,
+            comment: None,
+            committed: false,
         };
         write_meta_json(&entry_dir.join("meta.json"), &meta)?;
 
@@ -1022,6 +1075,117 @@ impl ImageStore {
         };
         session.report("", &format!("Digest: {}", meta.digest));
         session.report("", &format!("Status: {status} for {reference}"));
+        self.cached_image(&meta)
+    }
+
+    /// Commit the rootfs of a sandbox as a new image, like `docker commit`.
+    /// `base` is the config of the sandbox, with `spec.changes` laid over it.
+    /// A tag already in use moves to the new image and the old one stays by
+    /// digest. The cache is untouched if the copy fails, is cancelled or does
+    /// not fit, and nothing is evicted to make room. A committed image is
+    /// never evicted.
+    pub async fn commit(
+        self: &Arc<Self>,
+        rootfs: &Path,
+        base: ImageConfig,
+        spec: &CommitSpec,
+        skip: &'static [&'static str],
+    ) -> Result<CachedImage> {
+        if let Some(reference) = &spec.reference {
+            validate_reference(reference)?;
+        }
+        let mut config = base;
+        commit::apply_changes(&mut config, &spec.changes)?;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancel.clone());
+        let (store, rootfs, spec) = (self.clone(), rootfs.to_path_buf(), spec.clone());
+        tokio::task::spawn_blocking(move || {
+            store.commit_blocking(&rootfs, config, &spec, skip, &cancel)
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("commit task: {e}")))?
+    }
+
+    /// The whole commit after validation. It owns the staging directory, so
+    /// the directory is removed only once the copy has stopped.
+    fn commit_blocking(
+        &self,
+        rootfs: &Path,
+        config: ImageConfig,
+        spec: &CommitSpec,
+        skip: &[&str],
+        cancel: &AtomicBool,
+    ) -> Result<CachedImage> {
+        let room = self.session(None)?.cache_room;
+        let limits = CopyLimits {
+            max_bytes: room.min(commit::MAX_COMMIT_BYTES),
+            ..CopyLimits::default()
+        };
+        let staging = StagingDir(
+            self.cache_dir
+                .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4())),
+        );
+        let staged_rootfs = staging.0.join("rootfs");
+        std::fs::create_dir_all(&staged_rootfs).map_err(BackendError::Io)?;
+        let size_bytes = commit::copy_tree(rootfs, &staged_rootfs, skip, limits, cancel).map_err(
+            |e| match e {
+                CopyError::TooLarge if room <= commit::MAX_COMMIT_BYTES => {
+                    BackendError::ResourceExhausted(format!(
+                        "image cache is full: the filesystem does not fit in the {room} bytes left"
+                    ))
+                }
+                CopyError::TooLarge => BackendError::ResourceExhausted(format!(
+                    "the filesystem is larger than the commit limit of {} bytes",
+                    commit::MAX_COMMIT_BYTES
+                )),
+                CopyError::Cancelled => BackendError::Internal("commit cancelled".to_string()),
+                CopyError::Backend(e) => e,
+            },
+        )?;
+
+        let now = chrono::Utc::now();
+        let digest = commit_digest();
+        let meta = CacheMeta {
+            image_ref: spec.reference.clone().unwrap_or_else(|| digest.clone()),
+            digest,
+            size_bytes,
+            last_used_at: now,
+            layer_count: 0,
+            config: Some(config),
+            created_at: Some(now),
+            author: Some(spec.author.clone()).filter(|a| !a.is_empty()),
+            comment: Some(spec.message.clone()).filter(|m| !m.is_empty()),
+            committed: true,
+        };
+        write_meta_json(&staging.0.join("meta.json"), &meta)?;
+
+        // The room and the tag owner are read again under the lock: another
+        // commit or pull may have changed either since the first look.
+        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.load(Ordering::Relaxed) {
+            return Err(BackendError::Internal("commit cancelled".to_string()));
+        }
+        self.session(None)?.check_cache_room(size_bytes)?;
+        let previous = match &spec.reference {
+            Some(reference) => self.find_cache_entry_by_ref(reference)?,
+            None => None,
+        };
+        // The old image keeps its place under its digest; the tag moves.
+        if let Some((dir, old)) = &previous {
+            let untagged = CacheMeta {
+                image_ref: old.digest.clone(),
+                ..old.clone()
+            };
+            write_meta_json(&dir.join("meta.json"), &untagged)?;
+        }
+        let entry_dir = self.cache_dir.join(digest_to_dir_name(&meta.digest));
+        if let Err(e) = std::fs::rename(&staging.0, &entry_dir) {
+            if let Some((dir, old)) = &previous {
+                let _ = write_meta_json(&dir.join("meta.json"), old);
+            }
+            return Err(BackendError::Io(e));
+        }
         self.cached_image(&meta)
     }
 
@@ -1127,7 +1291,7 @@ impl ImageStore {
             }
             // Skip temp dirs from in-progress pulls.
             let dir_name = entry_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if dir_name.starts_with(".tmp-") {
+            if dir_name.starts_with(STAGING_PREFIX) {
                 continue;
             }
             let meta_path = entry_dir.join("meta.json");
@@ -1158,8 +1322,9 @@ impl ImageStore {
             return Ok(());
         }
         // Oldest first (ascending last_used_at).
-        entries.sort_by_key(|(_, meta)| meta.last_used_at);
         let to_evict = entries.len() - self.max_cached_images;
+        entries.retain(|(_, meta)| !meta.committed);
+        entries.sort_by_key(|(_, meta)| meta.last_used_at);
         for (entry_dir, _) in entries.into_iter().take(to_evict) {
             // Best-effort: a failed eviction must not fail the pull that
             // triggered it, but a silent failure lets the cache grow past
@@ -2183,5 +2348,223 @@ mod tests {
         // And the other way round: a guest edit must not reach the source.
         std::fs::write(dst.join("file.txt"), b"guest edit").expect("guest edit");
         assert_eq!(std::fs::read(src.join("file.txt")).unwrap(), b"mutated");
+    }
+
+    // ----- commit ---------------------------------------------------------
+
+    const NO_SKIP: &[&str] = &[];
+
+    fn sandbox_rootfs(files: &[(&str, &[u8])]) -> TempDir {
+        let rootfs = TempDir::new().expect("rootfs");
+        for (name, bytes) in files {
+            std::fs::write(rootfs.path().join(name), bytes).expect("write");
+        }
+        rootfs
+    }
+
+    fn shared_store() -> (Arc<ImageStore>, TempDir) {
+        let (store, tmp) = store_in_tempdir();
+        (Arc::new(store), tmp)
+    }
+
+    fn spec(reference: &str) -> CommitSpec {
+        CommitSpec {
+            reference: Some(reference.to_string()),
+            ..CommitSpec::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_commit_after_writing_a_file_when_a_sandbox_is_prepared_from_the_tag_then_the_file_and_config_are_there()
+     {
+        // Arrange
+        let (store, _tmp) = shared_store();
+        store.pull("alpine:3", None).await.expect("pull");
+        let rootfs = sandbox_rootfs(&[("data", b"known bytes")]);
+        let commit = CommitSpec {
+            author: "Ada".into(),
+            message: "wip".into(),
+            changes: vec!["ENV A=1".into()],
+            ..spec("mine:v1")
+        };
+
+        // Act
+        let image = store
+            .commit(rootfs.path(), fake_config(), &commit, NO_SKIP)
+            .await
+            .expect("commit");
+        let dest = TempDir::new().expect("dest");
+        store
+            .prepare_sandbox_rootfs("mine:v1", dest.path())
+            .await
+            .expect("prepare");
+        let config = store.config("mine:v1").await.expect("config");
+
+        // Assert
+        assert_eq!(
+            std::fs::read(dest.path().join("data")).unwrap(),
+            b"known bytes"
+        );
+        assert!(image.digest.starts_with(DIGEST_ALGORITHM_PREFIX));
+        assert_eq!(config.cmd, fake_config().cmd);
+        assert_eq!(config.entrypoint, fake_config().entrypoint);
+        assert_eq!(config.env, ["PATH=/bin", "A=1"]);
+        let listed: Vec<_> = store
+            .list()
+            .await
+            .into_iter()
+            .map(|i| i.reference)
+            .collect();
+        assert!(listed.contains(&"mine:v1".to_string()), "{listed:?}");
+        let (_, meta) = store.find_cache_entry_by_ref("mine:v1").unwrap().unwrap();
+        assert_eq!(meta.author.as_deref(), Some("Ada"));
+        assert_eq!(meta.comment.as_deref(), Some("wip"));
+    }
+
+    #[tokio::test]
+    async fn given_a_pulled_tag_when_committed_to_it_then_the_tag_moves_and_the_old_image_stays_by_digest()
+     {
+        // Arrange
+        let (store, _tmp) = shared_store();
+        let old = store.pull("alpine", None).await.expect("pull");
+        let rootfs = sandbox_rootfs(&[("data", b"x")]);
+
+        // Act
+        let new = store
+            .commit(
+                rootfs.path(),
+                ImageConfig::default(),
+                &spec("alpine"),
+                NO_SKIP,
+            )
+            .await
+            .expect("commit");
+
+        // Assert
+        let (_, tagged) = store.find_cache_entry_by_ref("alpine").unwrap().unwrap();
+        assert_eq!(tagged.digest, new.digest);
+        let (_, kept) = store.find_cache_entry_by_ref(&old.digest).unwrap().unwrap();
+        assert_eq!(kept.digest, old.digest);
+        assert!(!kept.committed);
+    }
+
+    #[tokio::test]
+    async fn given_a_committed_image_when_more_images_are_pulled_than_the_cache_holds_then_it_survives()
+     {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let store = Arc::new(ImageStore::with_puller(
+            tmp.path().to_path_buf(),
+            2,
+            Arc::new(FakePuller),
+        ));
+        let rootfs = sandbox_rootfs(&[("data", b"x")]);
+        store
+            .commit(
+                rootfs.path(),
+                ImageConfig::default(),
+                &spec("mine:v1"),
+                NO_SKIP,
+            )
+            .await
+            .expect("commit");
+
+        // Act
+        for image in ["a:1", "b:1", "c:1"] {
+            store.pull(image, None).await.expect("pull");
+        }
+
+        // Assert
+        assert!(store.is_cached("mine:v1").await);
+        assert!(!store.is_cached("a:1").await);
+    }
+
+    #[test]
+    fn given_leftover_staging_dirs_when_the_store_starts_then_they_are_removed() {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".tmp-stale/rootfs")).expect("stale");
+
+        // Act
+        let _store = ImageStore::new(tmp.path().to_path_buf(), 64);
+
+        // Assert
+        assert!(cache_dir_names(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_bad_tag_when_committed_then_it_is_rejected_before_any_copy() {
+        for tag in ["../../x", "/abs/path", "a/../b", "Not A Ref"] {
+            // Arrange
+            let (store, tmp) = shared_store();
+            let missing = tmp.path().join("no-such-rootfs");
+
+            // Act
+            let error = store
+                .commit(&missing, ImageConfig::default(), &spec(tag), NO_SKIP)
+                .await
+                .expect_err("bad tag");
+
+            // Assert
+            assert!(
+                matches!(error, BackendError::InvalidArgument(_)),
+                "{tag}: {error}"
+            );
+            assert!(cache_dir_names(tmp.path()).is_empty(), "{tag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_rootfs_that_would_pass_the_cache_cap_when_committed_then_it_is_full_and_unchanged()
+     {
+        // Arrange
+        let (store, tmp) = {
+            let tmp = TempDir::new().expect("tempdir");
+            let store = ImageStore::with_puller(tmp.path().to_path_buf(), 64, Arc::new(FakePuller))
+                .with_limits(u64::MAX, SMALL_CAP);
+            (Arc::new(store), tmp)
+        };
+        let rootfs = sandbox_rootfs(&[("big", &[0u8; SMALL_CAP as usize + 1])]);
+
+        // Act
+        let error = store
+            .commit(
+                rootfs.path(),
+                ImageConfig::default(),
+                &spec("big:v1"),
+                NO_SKIP,
+            )
+            .await
+            .expect_err("cache full");
+
+        // Assert
+        assert!(
+            matches!(error, BackendError::ResourceExhausted(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("cache is full"), "{error}");
+        assert!(cache_dir_names(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_an_unsupported_change_when_committed_then_it_is_rejected_and_nothing_is_cached()
+    {
+        // Arrange
+        let (store, tmp) = shared_store();
+        let rootfs = sandbox_rootfs(&[]);
+        let commit = CommitSpec {
+            changes: vec!["EXPOSE 80".into()],
+            ..spec("x:v1")
+        };
+
+        // Act
+        let error = store
+            .commit(rootfs.path(), ImageConfig::default(), &commit, NO_SKIP)
+            .await
+            .expect_err("unsupported");
+
+        // Assert
+        assert!(error.to_string().contains("unsupported change"), "{error}");
+        assert!(cache_dir_names(tmp.path()).is_empty());
     }
 }

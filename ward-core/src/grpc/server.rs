@@ -9,21 +9,23 @@ use tonic::{Request, Response, Status};
 use tracing::error;
 
 use super::attach;
+use crate::backend::commit::CommitSpec;
 use crate::pb::attach_message::Kind;
 use crate::pb::copy_to_message;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    AttachMessage, ChangeKind, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk,
-    CopyFromRequest, CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest,
-    CreateVolumeRequest, DaemonInfo, DiffRequest, DiffResponse, EgressLogEntry, EgressLogResponse,
-    EventsRequest, ExecRequest, FileChange, GetCommunicationLogRequest, GetEgressLogRequest,
-    GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest, ListImagesResponse,
-    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
-    Message, ProcessInfo, PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest,
-    RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
-    SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
-    StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
-    TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
+    AttachMessage, ChangeKind, CommitRequest, CommitResponse, CommunicationLogEntry,
+    CommunicationLogResponse, CopyFromChunk, CopyFromRequest, CopyToMessage, CreateSandboxRequest,
+    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, DiffRequest, DiffResponse,
+    EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, FileChange,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
+    HealthStatus, KillProcessRequest, ListImagesResponse, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
+    PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest, RemoveVolumeRequest,
+    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
+    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
+    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
+    WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -907,6 +909,32 @@ impl Ward for WardGrpcServer {
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(ListImagesResponse { images }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.commit",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn commit(
+        &self,
+        request: Request<CommitRequest>,
+    ) -> Result<Response<CommitResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let spec = CommitSpec {
+            reference: Some(req.reference).filter(|r| !r.is_empty()),
+            author: req.author,
+            message: req.message,
+            changes: req.changes,
+        };
+        let image_id = self
+            .sandbox
+            .commit_image(&id, &spec)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(CommitResponse { image_id }))
     }
 
     type PullImageStream = tokio_stream::wrappers::ReceiverStream<Result<PullProgress, Status>>;

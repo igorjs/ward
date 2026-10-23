@@ -1,6 +1,7 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod agent;
+pub mod commit;
 pub mod diff;
 pub mod image;
 pub mod krunvm;
@@ -213,6 +214,17 @@ pub trait Backend: Send + Sync + 'static {
     async fn diff_sandbox(&self, _sandbox_id: &str) -> Result<Vec<diff::FsChange>> {
         Err(BackendError::InvalidArgument(
             "this backend cannot compare a sandbox with its image".to_string(),
+        ))
+    }
+
+    /// Commit the sandbox's rootfs as a new image in the local cache.
+    async fn commit_sandbox(
+        &self,
+        _sandbox_id: &str,
+        _spec: &commit::CommitSpec,
+    ) -> Result<image::CachedImage> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot commit a sandbox to an image".to_string(),
         ))
     }
 

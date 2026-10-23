@@ -750,6 +750,30 @@ impl Backend for KrunvmBackend {
         .map_err(|e| BackendError::Internal(format!("diff task: {e}")))?
     }
 
+    async fn commit_sandbox(
+        &self,
+        sandbox_id: &str,
+        spec: &super::commit::CommitSpec,
+    ) -> Result<CachedImage> {
+        let (image, rootfs, sandbox_spec, env) = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            (
+                state.info.image.clone(),
+                state.rootfs.clone(),
+                state.opts.spec.clone(),
+                state.opts.env.clone(),
+            )
+        };
+        let mut base = self.image_store.config(&image).await?;
+        super::commit::overlay_sandbox(&mut base, &sandbox_spec, &env);
+        self.image_store
+            .commit(&rootfs, base, spec, BOOT_WRITTEN_PATHS)
+            .await
+    }
+
     async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<super::ProcessTable> {
         let stream = self.agent_stream(sandbox_id).await?;
         super::agent::top(stream, ps_args).await

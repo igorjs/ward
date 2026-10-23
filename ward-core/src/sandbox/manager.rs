@@ -1570,6 +1570,23 @@ impl SandboxManager {
         self.backend.diff_sandbox(&id).await.map_err(backend_err)
     }
 
+    /// Commit a sandbox's filesystem as a new cached image and return its id.
+    /// The copy is taken from the live rootfs: there is no way to pause a
+    /// guest, so a file being written may be copied part way.
+    pub async fn commit_image(
+        &self,
+        sandbox_id: &str,
+        spec: &crate::backend::commit::CommitSpec,
+    ) -> Result<String> {
+        let id = self.resolve(sandbox_id).await?;
+        let image = self
+            .backend
+            .commit_sandbox(&id, spec)
+            .await
+            .map_err(image_backend_err)?;
+        Ok(image.digest)
+    }
+
     /// Read the resource use of a running sandbox. The limit is the
     /// configured memory, or the guest's total memory when none is set.
     pub async fn stats(&self, sandbox_id: &str) -> Result<SandboxStats> {
