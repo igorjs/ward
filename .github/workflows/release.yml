@@ -426,3 +426,88 @@ jobs:
             dist/ward-*.tar.gz.sha256
           fail_on_unmatched_files: true
           prerelease: ${{ contains(needs.resolve.outputs.tag, 'dev-') }}
+
+  # ── Update the Homebrew formula for a tagged release ───────────────
+  # Rewrites packaging/homebrew/ward.rb with the release version and the
+  # per-target checksums, uploads it as an artefact, and pushes it to the
+  # igorjs/homebrew-ward tap as Formula/ward.rb. The push is skipped
+  # cleanly unless a HOMEBREW_TAP_TOKEN secret (contents:write on the tap
+  # repo) is configured. Only stable vX.Y.Z tags touch the formula or the
+  # tap; pre-releases and dev-* manual runs skip it.
+  homebrew:
+    needs: [resolve, publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Classify the tag and the tap token
+        id: gate
+        env:
+          HAS_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "stable=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "stable=false" >> "${GITHUB_OUTPUT}"
+            echo "${GITHUB_REF} is not a stable vX.Y.Z tag; skipping the formula update and tap push."
+          fi
+          echo "have_token=${HAS_TOKEN}" >> "${GITHUB_OUTPUT}"
+      - name: Download checksums
+        if: steps.gate.outputs.stable == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Rewrite the formula
+        if: steps.gate.outputs.stable == 'true'
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: bash scripts/update-formula.sh --require-all packaging/homebrew/ward.rb "${VERSION}" dist
+      - name: Upload formula
+        if: steps.gate.outputs.stable == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: homebrew-formula
+          path: packaging/homebrew/ward.rb
+          if-no-files-found: error
+          retention-days: 14
+      - name: Push formula to the tap
+        if: steps.gate.outputs.stable == 'true' && steps.gate.outputs.have_token == 'true'
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "${TAP_TOKEN}" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git -c "http.extraheader=Authorization: Basic ${auth}" \
+            clone --depth 1 https://github.com/igorjs/homebrew-ward.git tap
+          mkdir -p tap/Formula
+          cp packaging/homebrew/ward.rb tap/Formula/ward.rb
+          cd tap
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Formula already at ${VERSION}; nothing to push."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ward.rb
+          git commit -m "ward ${VERSION}"
+          git -c "http.extraheader=Authorization: Basic ${auth}" push origin HEAD
+      - name: Note skipped tap push
+        if: steps.gate.outputs.stable == 'true' && steps.gate.outputs.have_token != 'true'
+        run: echo "HOMEBREW_TAP_TOKEN is not set; formula uploaded as an artefact only."
