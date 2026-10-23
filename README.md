@@ -85,6 +85,7 @@ Full CLI: `ward --help`.
 - [`docs/SPEC.md`](docs/SPEC.md); architecture index (ADRs)
 - [`docs/architecture.md`](docs/architecture.md); system diagram
 - [`docs/platforms.md`](docs/platforms.md); supported platforms + libkrun setup
+- [`docs/service.md`](docs/service.md); run wardd at login (launchd, systemd, brew services)
 - [`docs/workspace.md`](docs/workspace.md); crate layout
 - [`docs/status.md`](docs/status.md); what's shipped, what's pending
 - [`docs/why.md`](docs/why.md); why ward vs Docker / SaaS sandboxes
