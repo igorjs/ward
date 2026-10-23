@@ -29,7 +29,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use smoltcp::iface::{
@@ -47,9 +47,13 @@ use smoltcp::wire::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
+use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::inbound::{
+    InboundFlow, InboundHandle, InboundTuning, LocalPorts, MAX_INBOUND_TOTAL, NewInbound,
+    start_listener,
+};
 use crate::{AttachId, AttachOptions, Error, NetworkBackend};
 
 /// Resolves a domain name to zero or more addresses on the guest's behalf.
@@ -386,7 +390,7 @@ const MAX_FLOW_ENTRIES: usize = 1024;
 /// How long a flow may stay half-closed after ward sent its FIN. A guest that
 /// never closes its own side (an idle keep-alive pool) would otherwise hold a
 /// flow slot and two socket buffers forever.
-const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Hand-encodes a DNS response: header, the query's own echoed question,
 /// then one `A` record per IPv4 address in `answers` (IPv6 addresses are
@@ -495,7 +499,7 @@ fn build_dhcp_reply(
 /// Bytes of payload storage in each direction of a flow's TCP socket. A
 /// fresh socket is created lazily per destination the guest opens, so this
 /// only costs memory for flows that are actually in use.
-const TCP_SOCKET_BUFFER_BYTES: usize = 16384;
+pub(crate) const TCP_SOCKET_BUFFER_BYTES: usize = 16384;
 
 /// How long a spawned host-io task waits for one write to the connector's
 /// `TcpStream` to complete before giving up on the flow. Every host-side
@@ -747,6 +751,17 @@ pub struct Stack {
     /// Insertion order of `resolved`'s keys, oldest first, so the cap in
     /// `record_resolved` can evict FIFO instead of tracking recency.
     resolved_order: VecDeque<IpAddr>,
+    /// Host connections being relayed to the guest, see `crate::inbound`.
+    inbound: Vec<InboundFlow>,
+    inbound_tuning: InboundTuning,
+    inbound_ports: LocalPorts,
+    /// Signalled by host I/O tasks when they have bytes for the stack.
+    inbound_wake: Arc<Notify>,
+    /// Last time any inbound flow moved bytes or one was accepted.
+    inbound_active_at: Option<std::time::Instant>,
+    /// Address of the first DHCP lease: the single guest inbound
+    /// connections target. Unset until the guest has asked for one.
+    guest_addr: Arc<OnceLock<Ipv4Addr>>,
 }
 
 impl Stack {
@@ -819,6 +834,12 @@ impl Stack {
             dhcp_leases: HashMap::new(),
             resolved: HashMap::new(),
             resolved_order: VecDeque::new(),
+            inbound: Vec::new(),
+            inbound_tuning: InboundTuning::default(),
+            inbound_ports: LocalPorts::new(),
+            inbound_wake: Arc::new(Notify::new()),
+            inbound_active_at: None,
+            guest_addr: Arc::new(OnceLock::new()),
         }
     }
 
@@ -889,6 +910,12 @@ impl Stack {
         self.half_close_timeout = timeout;
     }
 
+    /// Replaces the inbound flow timeouts, so a test need not wait for the
+    /// defaults.
+    pub fn set_inbound_tuning(&mut self, tuning: InboundTuning) {
+        self.inbound_tuning = tuning;
+    }
+
     /// Number of guest TCP flows currently tracked.
     #[must_use]
     pub fn flow_count_for_test(&self) -> usize {
@@ -937,6 +964,7 @@ impl Stack {
         }
 
         self.pump_flows();
+        self.pump_inbound();
         self.relay_dns_queries();
         self.deliver_dns_answers();
         self.serve_dhcp();
@@ -1212,6 +1240,79 @@ impl Stack {
         }
     }
 
+    /// True while inbound flows exist and bytes moved recently, so the
+    /// loop ticks fast only when there is traffic to carry. Host data wakes
+    /// the loop through `inbound_wake` regardless, and an idle flow costs
+    /// one slow tick per `POLL_INTERVAL`.
+    fn inbound_is_active(&self) -> bool {
+        !self.inbound.is_empty()
+            && self
+                .inbound_active_at
+                .is_some_and(|at| at.elapsed() < INBOUND_ACTIVE_WINDOW)
+    }
+
+    /// Opens a TCP connection from the gateway to the guest for a freshly
+    /// accepted host connection. On failure the host client is reset.
+    fn accept_inbound(&mut self, new: NewInbound) {
+        let Some(guest_addr) = self.guest_addr.get().copied() else {
+            tracing::warn!("rejecting inbound connection: the guest has no DHCP lease yet");
+            new.reset();
+            return;
+        };
+        let local_port = self
+            .inbound_ports
+            .allocate(|port| self.inbound.iter().any(|flow| flow.local_port() == port));
+        let remote = IpEndpoint::new(IpAddress::Ipv4(guest_addr), new.guest_port());
+        let local = IpEndpoint::new(IpAddress::Ipv4(GATEWAY_ADDR), local_port);
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
+        );
+        let handle = self.sockets.add(socket);
+        let cx = self.interface.context();
+        if let Err(err) = self
+            .sockets
+            .get_mut::<tcp::Socket>(handle)
+            .connect(cx, remote, local)
+        {
+            tracing::warn!(guest = %remote, error = %err, "cannot open inbound connection to guest");
+            self.sockets.remove(handle);
+            self.inbound_ports.retire(local_port);
+            new.reset();
+            return;
+        }
+        self.inbound_active_at = Some(std::time::Instant::now());
+        self.inbound.push(InboundFlow::new(
+            new,
+            handle,
+            local_port,
+            Arc::clone(&self.inbound_wake),
+        ));
+    }
+
+    /// Advances every inbound flow and retires finished ones. Sockets are
+    /// aborted now (so a final RST goes out) and freed on the next
+    /// `pump_flows`, like outbound flows.
+    fn pump_inbound(&mut self) {
+        let tuning = self.inbound_tuning;
+        let mut moved = false;
+        self.inbound.retain_mut(|flow| {
+            let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle());
+            let done = flow.pump(socket, &tuning);
+            moved |= flow.take_moved();
+            if !done {
+                return true;
+            }
+            socket.abort();
+            self.sockets_pending_removal.push(flow.handle());
+            self.inbound_ports.retire(flow.local_port());
+            false
+        });
+        if moved {
+            self.inbound_active_at = Some(std::time::Instant::now());
+        }
+    }
+
     /// True once `self.flows` holds `MAX_FLOW_ENTRIES` entries. Shared by
     /// `poll_flows` and the test-only accessor below so neither path can
     /// admit a flow past the cap.
@@ -1337,6 +1438,7 @@ impl Stack {
         let [a, b, c, d] = DHCP_POOL_START.octets();
         let addr = Ipv4Addr::new(a, b, c, d + offset as u8);
         self.dhcp_leases.insert(mac, addr);
+        let _ = self.guest_addr.set(addr);
         Some(addr)
     }
 
@@ -1476,6 +1578,8 @@ impl Stack {
 pub enum StackCommand {
     /// Tells the task to exit its poll loop and return.
     Shutdown,
+    /// A host connection to relay to the guest.
+    Inbound(NewInbound),
 }
 
 /// Returned by [`spawn_for_sandbox`]. Holds the guest-side fd to hand to
@@ -1487,9 +1591,68 @@ pub struct SmoltcpHandle {
     pub guest_fd: RawFd,
     pub task: JoinHandle<()>,
     pub cmd_tx: mpsc::Sender<StackCommand>,
+    inbound_total: Arc<Semaphore>,
+    guest_addr: Arc<OnceLock<Ipv4Addr>>,
 }
 
 impl SmoltcpHandle {
+    /// Publishes `guest_port` on `host_addr`: every connection accepted on
+    /// the host is relayed to the guest at the address of its first DHCP
+    /// lease; until the guest has one, connections are reset. Pass port 0 to let the OS choose and read it from
+    /// [`InboundHandle::local_addr`]. Binding a non-loopback address
+    /// exposes the guest port to the network, so callers must opt in by
+    /// passing one; prefer [`SmoltcpHandle::add_inbound_loopback`].
+    ///
+    /// Dropping the returned handle closes the listener and resets its
+    /// connections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Process`] if the host address cannot be bound.
+    pub async fn add_inbound(
+        &self,
+        host_addr: SocketAddr,
+        guest_port: u16,
+    ) -> Result<InboundHandle, Error> {
+        start_listener(
+            host_addr,
+            guest_port,
+            self.cmd_tx.clone(),
+            Arc::clone(&self.inbound_total),
+        )
+        .await
+    }
+
+    /// Address of the guest's first DHCP lease, once granted.
+    #[must_use]
+    pub fn guest_addr(&self) -> Option<Ipv4Addr> {
+        self.guest_addr.get().copied()
+    }
+
+    /// Inbound connections currently holding a slot toward
+    /// `MAX_INBOUND_TOTAL`.
+    #[must_use]
+    pub fn inbound_in_use(&self) -> usize {
+        MAX_INBOUND_TOTAL - self.inbound_total.available_permits()
+    }
+
+    /// [`SmoltcpHandle::add_inbound`] bound to 127.0.0.1 only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Process`] if the host port cannot be bound.
+    pub async fn add_inbound_loopback(
+        &self,
+        host_port: u16,
+        guest_port: u16,
+    ) -> Result<InboundHandle, Error> {
+        self.add_inbound(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, host_port)),
+            guest_port,
+        )
+        .await
+    }
+
     /// Sends [`StackCommand::Shutdown`] to the spawned task and awaits its
     /// join. Idempotent: a task that has already finished (from a prior
     /// `detach` call) is detected via `is_finished` and this returns
@@ -1523,6 +1686,13 @@ impl SmoltcpHandle {
 /// `select!` race is noticed.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Tick used instead of `POLL_INTERVAL` while inbound flows are moving
+/// bytes, so their throughput is not limited to one buffer per 50 ms.
+const INBOUND_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// How long after the last inbound byte the fast tick stays on.
+const INBOUND_ACTIVE_WINDOW: Duration = Duration::from_millis(200);
+
 fn set_close_on_exec(fd: RawFd) -> Result<(), Error> {
     // SAFETY: `fd` is an open descriptor owned by the caller.
     let ret = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -1535,15 +1705,42 @@ fn set_close_on_exec(fd: RawFd) -> Result<(), Error> {
     Ok(())
 }
 
+/// Kernel buffer size requested for each end of the guest socketpair. The
+/// default on some platforms (macOS) holds only a few frames, so a burst of
+/// TCP segments would be dropped and recovered only by slow retransmits.
+const SOCKETPAIR_BUFFER_BYTES: usize = 512 * 1024;
+
+/// Best-effort enlargement of `fd`'s send and receive buffers.
+fn grow_socket_buffers(fd: RawFd) {
+    let size = SOCKETPAIR_BUFFER_BYTES as std::ffi::c_int;
+    for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+        // SAFETY: `fd` is an open socket and the pointer and length describe
+        // a valid `c_int`.
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                (&raw const size).cast(),
+                size_of::<std::ffi::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            tracing::debug!(option, "could not enlarge a guest socketpair buffer");
+        }
+    }
+}
+
 /// Allocates an `AF_UNIX SOCK_DGRAM` socketpair for `sandbox_id` and
 /// spawns a dedicated task that owns the host-side end exclusively via
 /// a `RawFdDevice`, polling it on a schedule and listening for commands.
 /// The returned handle carries only the guest-side fd, the task's
 /// `JoinHandle`, and a `Sender` to control it.
 ///
-/// `sandbox_id` and `opts` aren't consumed yet (no port-forwarding or
-/// per-sandbox identification is wired up); they are accepted now to
-/// match the shape callers will need once that lands.
+/// `sandbox_id` and `opts` aren't consumed yet (per-sandbox identification
+/// is not wired up); they are accepted now to match the shape callers will
+/// need once that lands. Host-to-guest port forwarding goes through
+/// [`SmoltcpHandle::add_inbound`].
 ///
 /// `egress_check` is consulted for every flow that clears the private-IP
 /// guard; see [`EgressCheckFn`] for its contract.
@@ -1552,9 +1749,24 @@ fn set_close_on_exec(fd: RawFd) -> Result<(), Error> {
 ///
 /// Returns [`Error::Process`] if the socketpair syscall fails.
 pub async fn spawn_for_sandbox(
+    sandbox_id: &str,
+    opts: &AttachOptions,
+    egress_check: Box<EgressCheckFn>,
+) -> Result<SmoltcpHandle, Error> {
+    spawn_for_sandbox_with_tuning(sandbox_id, opts, egress_check, InboundTuning::default()).await
+}
+
+/// [`spawn_for_sandbox`] with explicit inbound flow timeouts, so tests need
+/// not wait for the defaults.
+///
+/// # Errors
+///
+/// Returns [`Error::Process`] if the socketpair syscall fails.
+pub async fn spawn_for_sandbox_with_tuning(
     _sandbox_id: &str,
     _opts: &AttachOptions,
     egress_check: Box<EgressCheckFn>,
+    tuning: InboundTuning,
 ) -> Result<SmoltcpHandle, Error> {
     // socketpair(AF_UNIX, SOCK_DGRAM, 0) → [host_fd, guest_fd]. SOCK_DGRAM
     // preserves datagram boundaries, matching RawFdDevice's one-recv-
@@ -1577,29 +1789,39 @@ pub async fn spawn_for_sandbox(
     // its guest end clears the flag on that fd before it execs.
     set_close_on_exec(sv[0])?;
     set_close_on_exec(sv[1])?;
+    grow_socket_buffers(sv[0]);
+    grow_socket_buffers(sv[1]);
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    // Stack (device + Interface + SocketSet) lives only inside the task, so
+    // the host-side fd is never shared or locked from outside it.
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(SystemResolver),
+        Box::new(TokioConnector),
+        egress_check,
+    );
+    stack.set_inbound_tuning(tuning);
+    let guest_addr = Arc::clone(&stack.guest_addr);
+    let wake = Arc::clone(&stack.inbound_wake);
     let task = tokio::task::spawn(async move {
-        // Stack (device + Interface + SocketSet) lives only inside this
-        // task, so the host-side fd is never shared or locked from
-        // outside it.
-        let mut stack = Stack::new(
-            host_fd,
-            Box::new(SystemResolver),
-            Box::new(TokioConnector),
-            egress_check,
-        );
         loop {
+            let interval = if stack.inbound_is_active() {
+                INBOUND_POLL_INTERVAL
+            } else {
+                POLL_INTERVAL
+            };
             tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
                     Some(StackCommand::Shutdown) | None => break,
+                    Some(StackCommand::Inbound(new)) => stack.accept_inbound(new),
                 },
-                () = tokio::time::sleep(POLL_INTERVAL) => {
-                    // Drives ingress/egress for one tick; routing polled
-                    // sockets to sandbox-visible state is future work.
-                    let _ = stack.poll();
-                }
+                () = wake.notified() => {}
+                () = tokio::time::sleep(interval) => {}
             }
+            // Drives ingress/egress for one tick; routing polled
+            // sockets to sandbox-visible state is future work.
+            let _ = stack.poll();
         }
     });
 
@@ -1607,6 +1829,8 @@ pub async fn spawn_for_sandbox(
         guest_fd,
         task,
         cmd_tx,
+        inbound_total: Arc::new(Semaphore::new(MAX_INBOUND_TOTAL)),
+        guest_addr,
     })
 }
 

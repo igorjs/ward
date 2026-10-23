@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+pub mod inbound;
 pub mod null;
 pub mod smoltcp_backend;
 
