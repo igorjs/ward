@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::image::{ImageConfig, ImageStore, OFFLINE_IMAGES_ENV};
+use super::image::{CachedImage, ImageConfig, ImageStore, OFFLINE_IMAGES_ENV, PullProgress};
 use super::{Backend, BackendError, ExecMode, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
@@ -390,6 +390,18 @@ impl Backend for KrunvmBackend {
 
     async fn image_config(&self, image: &str) -> Result<ImageConfig> {
         self.image_store.config(image).await
+    }
+
+    async fn list_images(&self) -> Result<Vec<CachedImage>> {
+        Ok(self.image_store.list().await)
+    }
+
+    async fn pull_image(
+        &self,
+        reference: &str,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<PullProgress>>,
+    ) -> Result<CachedImage> {
+        self.image_store.pull(reference, progress).await
     }
 
     /// Retrieve sandbox info by ID.

@@ -16,12 +16,12 @@ use crate::pb::{
     CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo,
     EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, GetCommunicationLogRequest,
     GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest,
-    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
-    Message, ProcessInfo, PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest,
-    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
-    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
-    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
-    WaitRequest, WaitResponse, WriteStdinRequest,
+    ListImagesResponse, ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse,
+    ListVolumesResponse, Message, ProcessInfo, PublishRequest, PullImageRequest, PullProgress,
+    RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
+    SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
+    StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
+    TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -56,6 +56,7 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         }
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
+        ApiError::ResourceExhausted(msg) => Status::resource_exhausted(msg.clone()),
     }
 }
 
@@ -110,6 +111,8 @@ const MAX_COPY_DATA_BYTES: usize = crate::backend::agent::ARCHIVE_CHUNK_BYTES;
 
 /// Events queued for one `Events` client before its bridge task waits for it.
 const EVENT_STREAM_BUFFER: usize = 16;
+/// Progress lines queued for one `PullImage` client.
+const PULL_STREAM_BUFFER: usize = 16;
 /// Attribute names Docker uses on container events.
 const EVENT_IMAGE_ATTRIBUTE: &str = "image";
 const EVENT_NAME_ATTRIBUTE: &str = "name";
@@ -861,6 +864,34 @@ impl Ward for WardGrpcServer {
         )))
     }
 
+    #[tracing::instrument(name = "rpc.list_images", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn list_images(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<ListImagesResponse>, Status> {
+        let images = self
+            .sandbox
+            .list_images()
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(ListImagesResponse { images }))
+    }
+
+    type PullImageStream = tokio_stream::wrappers::ReceiverStream<Result<PullProgress, Status>>;
+
+    #[tracing::instrument(name = "rpc.pull_image", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn pull_image(
+        &self,
+        request: Request<PullImageRequest>,
+    ) -> Result<Response<Self::PullImageStream>, Status> {
+        let reference = request.into_inner().reference;
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        tokio::spawn(stream_pull(self.sandbox.clone(), reference, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
+    }
+
     type SubscribeStream = tokio_stream::wrappers::ReceiverStream<Result<Message, Status>>;
 
     #[tracing::instrument(
@@ -1040,6 +1071,44 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
 fn event_time(ts: prost_types::Timestamp) -> Result<std::time::SystemTime, Status> {
     std::time::SystemTime::try_from(ts)
         .map_err(|_| Status::invalid_argument("event time is out of range"))
+}
+
+/// Pulls that may run at once across all clients.
+const MAX_CONCURRENT_PULLS: usize = 2;
+static PULL_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PULLS);
+
+/// Run a pull and send its progress lines to `out`, then its error if it
+/// failed. A client that hangs up aborts the pull, whose staging dir is
+/// removed on drop.
+async fn stream_pull(
+    sandbox: Arc<SandboxManager>,
+    reference: String,
+    out: tokio::sync::mpsc::Sender<Result<PullProgress, Status>>,
+) {
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pull = tokio::spawn(async move {
+        let _slot = PULL_SLOTS.acquire().await;
+        sandbox.pull_image(&reference, progress_tx).await
+    });
+    loop {
+        tokio::select! {
+            () = out.closed() => return pull.abort(),
+            line = progress_rx.recv() => {
+                let Some(line) = line else { break };
+                let line = PullProgress { id: line.id, status: line.status };
+                let _ = out.send(Ok(line)).await;
+            }
+        }
+    }
+    let failure = match pull.await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => api_err_to_status(e),
+        Err(e) => {
+            error!(error = %e, "pull task failed");
+            Status::internal("internal error")
+        }
+    };
+    let _ = out.send(Err(failure)).await;
 }
 
 /// Send events to `out` until `until` passes or the client hangs up.

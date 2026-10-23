@@ -23,13 +23,27 @@
 //! to its rootfs in place, and a shared inode would let one sandbox change
 //! the image cache and every later sandbox built from it.
 
-use std::io::{Cursor, Read};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flate2::read::GzDecoder;
+use oci_client::errors::OciDistributionError;
+use std::io::ErrorKind::FileTooLarge;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc::UnboundedSender;
+use tokio_stream::{Stream, StreamExt};
 
 use super::{BackendError, Result};
+
+const GIB: u64 = 1024 * 1024 * 1024;
+/// A pull stops once the layers it downloads add up to this many bytes.
+pub const MAX_PULL_BYTES: u64 = 2 * GIB;
+/// A pull fails rather than grow the whole image cache past this many bytes.
+pub const MAX_CACHE_BYTES: u64 = 20 * GIB;
+/// Docker shows layers by the first characters of their digest.
+const LAYER_ID_LEN: usize = 12;
+const DIGEST_ALGORITHM_PREFIX: &str = "sha256:";
 
 /// Set to `1` to skip registry pulls and build synthetic, unbootable images.
 pub(crate) const OFFLINE_IMAGES_ENV: &str = "WARD_OCI_OFFLINE";
@@ -47,6 +61,7 @@ pub struct CachedImage {
     /// Digest of the pulled manifest.
     pub digest: String,
     pub pulled_at: std::time::SystemTime,
+    pub size_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,6 +79,10 @@ pub struct CacheMeta {
     /// `None` for entries cached before the config was kept.
     #[serde(default)]
     pub config: Option<ImageConfig>,
+    /// When the image was first cached. `None` for older entries, which
+    /// fall back to `last_used_at`.
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The parts of an OCI image config a sandbox's main process starts from.
@@ -146,6 +165,82 @@ impl PulledImage {
 #[async_trait::async_trait]
 pub trait ImagePuller: Send + Sync + std::fmt::Debug {
     async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage>;
+
+    /// Like [`pull`](Self::pull), but reports the bytes it will download to
+    /// `session` before downloading them, and its progress as it goes.
+    async fn pull_streaming(
+        &self,
+        reference: &str,
+        dest: &Path,
+        _session: &mut PullSession,
+    ) -> Result<PulledImage> {
+        self.pull(reference, dest).await
+    }
+}
+
+/// One progress line of a pull, in Docker's wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullProgress {
+    /// The layer or tag the line is about. Empty for a line about the image.
+    pub id: String,
+    pub status: String,
+}
+
+/// The limits and progress sink of one pull.
+#[derive(Debug)]
+pub struct PullSession {
+    max_bytes: u64,
+    cache_room: u64,
+    used: u64,
+    progress: Option<UnboundedSender<PullProgress>>,
+}
+
+impl PullSession {
+    pub fn new(
+        max_bytes: u64,
+        cache_room: u64,
+        progress: Option<UnboundedSender<PullProgress>>,
+    ) -> Self {
+        Self {
+            max_bytes,
+            cache_room,
+            used: 0,
+            progress,
+        }
+    }
+
+    /// Count `bytes` about to be downloaded, failing once the pull passes
+    /// its size cap or the room left in the cache.
+    pub fn charge(&mut self, bytes: u64) -> Result<()> {
+        self.used = self.used.saturating_add(bytes);
+        if self.used > self.max_bytes {
+            return Err(BackendError::ResourceExhausted(format!(
+                "image layers exceed the pull limit of {} bytes",
+                self.max_bytes
+            )));
+        }
+        self.check_cache_room(self.used)
+    }
+
+    fn check_cache_room(&self, bytes: u64) -> Result<()> {
+        if bytes > self.cache_room {
+            return Err(BackendError::ResourceExhausted(format!(
+                "image cache is full: {bytes} bytes do not fit in the {} bytes left",
+                self.cache_room
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn report(&self, id: &str, status: &str) {
+        if let Some(progress) = &self.progress {
+            // A client that hung up must not abort a pull half way.
+            let _ = progress.send(PullProgress {
+                id: id.to_string(),
+                status: status.to_string(),
+            });
+        }
+    }
 }
 
 /// Real puller: talks to an OCI registry over HTTPS, then unpacks each
@@ -156,6 +251,16 @@ pub struct OciPuller;
 #[async_trait::async_trait]
 impl ImagePuller for OciPuller {
     async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage> {
+        let mut unlimited = PullSession::new(u64::MAX, u64::MAX, None);
+        self.pull_streaming(reference, dest, &mut unlimited).await
+    }
+
+    async fn pull_streaming(
+        &self,
+        reference: &str,
+        dest: &Path,
+        session: &mut PullSession,
+    ) -> Result<PulledImage> {
         // WARD_OCI_OFFLINE=1: skip the real registry pull and materialise a
         // minimal synthetic rootfs (a `bin/` directory). Set by e2e test
         // harnesses that spawn wardd in an egress-blocked environment (e.g.
@@ -228,37 +333,95 @@ impl ImagePuller for OciPuller {
             ..Default::default()
         });
         let auth = RegistryAuth::Anonymous;
-        let accepted = vec![
+        let accepted = [
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_MEDIA_TYPE,
         ];
 
-        let image = pull_with_retry(&client, &image_ref, &auth, accepted, reference).await?;
+        let (image_manifest, digest, config_blob) = with_retry(reference, || {
+            client.pull_manifest_and_config(&image_ref, &auth)
+        })
+        .await?;
+        let config = ImageConfig::from_blob(config_blob.as_bytes())?;
 
-        let layer_count = image.layers.len();
-        let config = ImageConfig::from_blob(&image.config.data)?;
-
-        // Layers are applied bottom-up in manifest order; each is a tar
-        // diff over the accumulated filesystem. Consuming `image.layers`
-        // here lets each layer's owned fields move directly into the
-        // blocking task instead of being cloned to satisfy
-        // spawn_blocking's 'static bound.
-        for layer in image.layers {
-            let data = layer.data;
-            let media_type = layer.media_type;
-            let dest = dest.to_path_buf();
-            tokio::task::spawn_blocking(move || unpack_layer(&data, &media_type, &dest))
-                .await
-                .map_err(|e| BackendError::Internal(format!("unpack thread panicked: {e}")))??;
+        if let Some(layer) = image_manifest
+            .layers
+            .iter()
+            .find(|layer| !accepted.contains(&layer.media_type.as_str()))
+        {
+            return Err(BackendError::Image(format!(
+                "unsupported layer media type {}",
+                layer.media_type
+            )));
+        }
+        // Charge every layer before the first byte is downloaded, so an
+        // image that is too big costs no bandwidth.
+        for layer in &image_manifest.layers {
+            session.charge(u64::try_from(layer.size).unwrap_or(u64::MAX))?;
         }
 
-        let _ = layer_count; // available for future meta.json enrichment
-        Ok(PulledImage {
-            digest: image.digest.unwrap_or_else(|| "sha256:unknown".to_string()),
-            config,
-        })
+        // Layers are applied bottom-up in manifest order; each is a tar
+        // diff over the accumulated filesystem.
+        for layer in &image_manifest.layers {
+            let id = layer_id(&layer.digest);
+            session.report(&id, "Pulling fs layer");
+            let blob = dest.with_file_name(format!("{id}.blob"));
+            with_retry(reference, || async {
+                let stream = client.pull_blob_stream(&image_ref, layer).await?;
+                Ok(spool(stream, &blob, u64::try_from(layer.size).unwrap_or(0)).await?)
+            })
+            .await?;
+            session.report(&id, "Download complete");
+            let media_type = layer.media_type.clone();
+            let dest = dest.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let limit = MAX_UNPACKED_IMAGE_BYTES.saturating_sub(dir_size_bytes(&dest)?);
+                unpack_into(std::fs::File::open(&blob)?, &media_type, &dest, limit)?;
+                std::fs::remove_file(&blob)?;
+                Ok::<_, BackendError>(())
+            })
+            .await
+            .map_err(|e| BackendError::Internal(format!("unpack thread panicked: {e}")))??;
+            session.report(&id, "Pull complete");
+        }
+
+        Ok(PulledImage { digest, config })
     }
+}
+
+/// Write `stream` to `path`, refusing more than `declared` bytes.
+async fn spool(
+    mut stream: impl Stream<Item = std::io::Result<bytes::Bytes>> + Unpin,
+    path: &Path,
+    declared: u64,
+) -> std::io::Result<()> {
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut left = declared;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        left = left.checked_sub(chunk.len() as u64).ok_or(FileTooLarge)?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await
+}
+
+/// Parse `reference` as an image reference. It is the only check that runs
+/// before a registry is contacted.
+pub fn validate_reference(reference: &str) -> Result<oci_client::Reference> {
+    reference.parse().map_err(|_| {
+        BackendError::InvalidArgument(format!("invalid reference format: {reference}"))
+    })
+}
+
+/// The first characters of a layer digest, as Docker shows them.
+fn layer_id(digest: &str) -> String {
+    digest
+        .strip_prefix(DIGEST_ALGORITHM_PREFIX)
+        .unwrap_or(digest)
+        .chars()
+        .take(LAYER_ID_LEN)
+        .collect()
 }
 
 /// Debug builds only: JSON `ImageConfig` that offline pulls report, so tests
@@ -280,18 +443,18 @@ fn offline_image_config() -> Result<ImageConfig> {
 const PULL_ATTEMPTS: u32 = 3;
 const PULL_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn pull_with_retry(
-    client: &oci_client::Client,
-    image_ref: &oci_client::Reference,
-    auth: &oci_client::secrets::RegistryAuth,
-    accepted: Vec<&str>,
-    reference: &str,
-) -> Result<oci_client::client::ImageData> {
+async fn with_retry<T, F, Fut>(reference: &str, mut attempt_once: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+            Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
+        >,
+{
     let mut attempt = 1;
     loop {
-        match client.pull(image_ref, auth, accepted.clone()).await {
-            Ok(image) => return Ok(image),
-            Err(e) if attempt < PULL_ATTEMPTS => {
+        match attempt_once().await {
+            Ok(value) => return Ok(value),
+            Err(e) if attempt < PULL_ATTEMPTS && !is_oversized(&e) => {
                 let delay = PULL_RETRY_BASE_DELAY * attempt;
                 tracing::warn!(
                     reference,
@@ -308,6 +471,11 @@ async fn pull_with_retry(
             }
         }
     }
+}
+
+/// The registry streamed past the declared size; retrying cannot help.
+fn is_oversized(e: &OciDistributionError) -> bool {
+    matches!(e, OciDistributionError::IoError(io) if io.kind() == FileTooLarge)
 }
 
 /// OCI operating system name of every ward guest.
@@ -380,16 +548,10 @@ fn normalise_registry(s: &str) -> String {
 // Layer unpacking (pure, registry-independent)
 // ---------------------------------------------------------------------------
 
-/// Unpack one image layer tarball into `dest`, applying OCI whiteouts.
-///
-/// `media_type` selects gzip vs. plain tar. Path traversal is prevented two
-/// ways: the `tar` crate refuses to write outside `dest`, and whiteout
-/// targets are resolved through [`safe_join`], which rejects `..` and
-/// absolute components.
-/// Maximum decompressed bytes per OCI layer. Prevents zip-bomb attacks where
-/// a small compressed layer expands to an arbitrarily large amount of data.
-/// 10 GiB is well above any realistic layer; real base images are < 1 GiB.
-const MAX_DECOMPRESSED_LAYER_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// Maximum decompressed bytes across all layers of one image. Prevents
+/// zip-bomb attacks where a small compressed layer expands without bound.
+/// 10 GiB is well above any realistic image; real base images are < 1 GiB.
+const MAX_UNPACKED_IMAGE_BYTES: u64 = 10 * GIB;
 
 /// Wraps a `Read` and errors if the cumulative bytes read exceed `limit`.
 struct BoundedReader<R> {
@@ -416,8 +578,8 @@ impl<R: Read> Read for BoundedReader<R> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "decompressed layer exceeds {} GiB limit; refusing to unpack",
-                    self.limit / (1024 * 1024 * 1024),
+                    "decompressed image exceeds {} GiB limit; refusing to unpack",
+                    MAX_UNPACKED_IMAGE_BYTES / GIB,
                 ),
             ));
         }
@@ -425,17 +587,21 @@ impl<R: Read> Read for BoundedReader<R> {
     }
 }
 
-fn unpack_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<()> {
-    let reader: Box<dyn Read> = if media_type.ends_with("gzip") {
-        Box::new(BoundedReader::new(
-            GzDecoder::new(Cursor::new(data)),
-            MAX_DECOMPRESSED_LAYER_BYTES,
-        ))
+/// Unpack one image layer tarball into `dest`, applying OCI whiteouts.
+///
+/// `media_type` selects gzip vs. plain tar. The `tar` crate refuses to write
+/// outside `dest` and whiteouts go through [`confined_path`]. The layer may
+/// unpack to at most `limit` bytes.
+fn unpack_into<'a, R: Read + 'a>(
+    layer: R,
+    media_type: &str,
+    dest: &Path,
+    limit: u64,
+) -> Result<()> {
+    let reader: Box<dyn Read + 'a> = if media_type.ends_with("gzip") {
+        Box::new(BoundedReader::new(GzDecoder::new(layer), limit))
     } else {
-        Box::new(BoundedReader::new(
-            Cursor::new(data),
-            MAX_DECOMPRESSED_LAYER_BYTES,
-        ))
+        Box::new(BoundedReader::new(layer, limit))
     };
 
     let mut archive = tar::Archive::new(reader);
@@ -489,7 +655,11 @@ fn classify_entry(path: &Path) -> EntryKind {
 
     if name == OPAQUE_WHITEOUT {
         EntryKind::OpaqueWhiteout(parent.to_path_buf())
-    } else if let Some(removed) = name.strip_prefix(WHITEOUT_PREFIX) {
+    } else if let Some(removed) = name
+        .strip_prefix(WHITEOUT_PREFIX)
+        // A marker with no real name would target the parent.
+        .filter(|removed| !matches!(*removed, "" | "." | ".."))
+    {
         EntryKind::Whiteout(parent.join(removed))
     } else {
         EntryKind::Normal
@@ -500,7 +670,7 @@ fn classify_entry(path: &Path) -> EntryKind {
 /// not an error: a layer may whiteout something a sibling layer never
 /// created, which OCI treats as a no-op.
 fn apply_whiteout(dest: &Path, target: &Path) -> Result<()> {
-    let Some(full) = safe_join(dest, target) else {
+    let Some(full) = confined_path(dest, target) else {
         return Ok(());
     };
     remove_path(&full)
@@ -509,10 +679,10 @@ fn apply_whiteout(dest: &Path, target: &Path) -> Result<()> {
 /// Clear the contents of a directory named by an opaque whiteout, keeping
 /// the directory itself.
 fn apply_opaque_whiteout(dest: &Path, dir: &Path) -> Result<()> {
-    let Some(full) = safe_join(dest, dir) else {
+    let Some(full) = confined_path(dest, dir) else {
         return Ok(());
     };
-    if !full.is_dir() {
+    if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) {
         return Ok(());
     }
     for child in std::fs::read_dir(&full).map_err(BackendError::Io)? {
@@ -533,6 +703,17 @@ fn remove_path(path: &Path) -> Result<()> {
     } else {
         std::fs::remove_file(path).map_err(BackendError::Io)
     }
+}
+
+/// Like [`safe_join`], but `None` when a parent is a symlink or missing: an
+/// earlier layer's symlink would lead a delete out of `base`.
+fn confined_path(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let full = safe_join(base, rel)?;
+    full.parent()?
+        .ancestors()
+        .take_while(|dir| *dir != base)
+        .all(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
+        .then_some(full)
 }
 
 /// Join `rel` onto `base`, returning `None` if `rel` is absolute or contains
@@ -586,7 +767,7 @@ fn dir_size_bytes(dir: &Path) -> std::io::Result<u64> {
 fn write_meta_json(path: &Path, meta: &CacheMeta) -> Result<()> {
     let bytes =
         serde_json::to_vec_pretty(meta).map_err(|e| BackendError::Internal(e.to_string()))?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
     std::fs::write(&tmp, &bytes).map_err(BackendError::Io)?;
     std::fs::rename(&tmp, path).map_err(BackendError::Io)?;
     Ok(())
@@ -662,6 +843,19 @@ pub struct ImageStore {
     cache_dir: PathBuf,
     max_cached_images: usize,
     puller: Arc<dyn ImagePuller>,
+    max_pull_bytes: u64,
+    max_cache_bytes: u64,
+    /// Makes the room check and the move into the cache one step.
+    install_lock: Mutex<()>,
+}
+
+/// A pull's directory in the cache, removed on drop unless moved into place.
+struct StagingDir(PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl ImageStore {
@@ -680,7 +874,17 @@ impl ImageStore {
             cache_dir,
             max_cached_images,
             puller,
+            max_pull_bytes: MAX_PULL_BYTES,
+            max_cache_bytes: MAX_CACHE_BYTES,
+            install_lock: Mutex::new(()),
         }
+    }
+
+    /// Replace the pull size cap and the whole-cache size cap.
+    pub fn with_limits(mut self, max_pull_bytes: u64, max_cache_bytes: u64) -> Self {
+        self.max_pull_bytes = max_pull_bytes;
+        self.max_cache_bytes = max_cache_bytes;
+        self
     }
 
     /// Return the shared cache rootfs path for `reference`, pulling and
@@ -701,27 +905,26 @@ impl ImageStore {
 
     /// Pull `reference` into a fresh temp dir inside the cache. The caller
     /// moves or removes the returned dir.
-    async fn pull_into_temp(&self, reference: &str) -> Result<(PathBuf, PulledImage)> {
-        let temp_dir = self
-            .cache_dir
-            .join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-        let temp_rootfs = temp_dir.join("rootfs");
+    async fn pull_into_temp(
+        &self,
+        reference: &str,
+        session: &mut PullSession,
+    ) -> Result<(StagingDir, PulledImage)> {
+        let staging = StagingDir(
+            self.cache_dir
+                .join(format!(".tmp-{}", uuid::Uuid::new_v4())),
+        );
+        let temp_rootfs = staging.0.join("rootfs");
 
-        // Ensure cache_dir exists before creating the temp dir inside it.
-        tokio::fs::create_dir_all(&self.cache_dir)
-            .await
-            .map_err(BackendError::Io)?;
         tokio::fs::create_dir_all(&temp_rootfs)
             .await
             .map_err(BackendError::Io)?;
 
-        match self.puller.pull(reference, &temp_rootfs).await {
-            Ok(pulled) => Ok((temp_dir, pulled)),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&temp_dir);
-                Err(e)
-            }
-        }
+        let pulled = self
+            .puller
+            .pull_streaming(reference, &temp_rootfs, session)
+            .await?;
+        Ok((staging, pulled))
     }
 
     /// The cache entry for `reference` as it is after this call, pulled if
@@ -735,8 +938,8 @@ impl ImageStore {
         // Fast path: already on disk.
         if let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? {
             if need_config && meta.config.is_none() {
-                let (temp_dir, pulled) = self.pull_into_temp(reference).await?;
-                let _ = std::fs::remove_dir_all(&temp_dir);
+                let mut session = self.session(None)?;
+                let (_staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
                 meta.config = Some(pulled.config);
             }
             meta.last_used_at = chrono::Utc::now();
@@ -745,27 +948,43 @@ impl ImageStore {
         }
 
         // Slow path: pull into a temp dir, move to final location on success.
-        let (temp_dir, PulledImage { digest, config }) = self.pull_into_temp(reference).await?;
+        let mut session = self.session(None)?;
+        let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
+        self.install_entry(staging, reference, pulled)
+    }
 
-        let size_bytes = dir_size_bytes(&temp_dir.join("rootfs")).unwrap_or(0);
+    /// Move a pulled staging dir into the cache under its digest and record
+    /// it. The staging dir is removed if the image does not fit.
+    fn install_entry(
+        &self,
+        staging: StagingDir,
+        reference: &str,
+        pulled: PulledImage,
+    ) -> Result<(PathBuf, CacheMeta)> {
+        let PulledImage { digest, config } = pulled;
+        let size_bytes = dir_size_bytes(&staging.0.join("rootfs")).unwrap_or(0);
         let entry_name = digest_to_dir_name(&digest);
         let entry_dir = self.cache_dir.join(&entry_name);
 
+        // Room is measured under the lock, against what other installs left.
+        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.session(None)?.check_cache_room(size_bytes)?;
+
         // If a concurrent call already moved the same digest into place,
-        // discard our temp and reuse the existing entry.
+        // discard our staging dir and reuse the existing entry.
         if !entry_dir.exists() {
-            std::fs::rename(&temp_dir, &entry_dir).map_err(BackendError::Io)?;
-        } else {
-            let _ = std::fs::remove_dir_all(&temp_dir);
+            std::fs::rename(&staging.0, &entry_dir).map_err(BackendError::Io)?;
         }
 
+        let now = chrono::Utc::now();
         let meta = CacheMeta {
             image_ref: reference.to_string(),
             digest,
             size_bytes,
-            last_used_at: chrono::Utc::now(),
+            last_used_at: now,
             layer_count: 0,
             config: Some(config),
+            created_at: Some(now),
         };
         write_meta_json(&entry_dir.join("meta.json"), &meta)?;
 
@@ -773,6 +992,62 @@ impl ImageStore {
         self.run_lru_eviction()?;
 
         Ok((entry_dir.join("rootfs"), meta))
+    }
+
+    /// Pull `reference` into the cache like `docker pull`, reporting
+    /// progress lines to `progress`. Nothing is cached if the pull fails, and
+    /// no cached image is evicted to make room.
+    pub async fn pull(
+        &self,
+        reference: &str,
+        progress: Option<UnboundedSender<PullProgress>>,
+    ) -> Result<CachedImage> {
+        let parsed = validate_reference(reference)?;
+        let mut session = self.session(progress)?;
+        session.report(
+            parsed.tag().unwrap_or_default(),
+            &format!("Pulling from {}", parsed.repository()),
+        );
+        let (meta, status) = match self.find_cache_entry_by_ref(reference)? {
+            Some((entry_dir, mut meta)) => {
+                meta.last_used_at = chrono::Utc::now();
+                write_meta_json(&entry_dir.join("meta.json"), &meta)?;
+                (meta, "Image is up to date")
+            }
+            None => {
+                let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
+                let (_, meta) = self.install_entry(staging, reference, pulled)?;
+                (meta, "Downloaded newer image")
+            }
+        };
+        session.report("", &format!("Digest: {}", meta.digest));
+        session.report("", &format!("Status: {status} for {reference}"));
+        self.cached_image(&meta)
+    }
+
+    /// A pull session limited by the pull cap and the room left in the cache.
+    fn session(&self, progress: Option<UnboundedSender<PullProgress>>) -> Result<PullSession> {
+        let used: u64 = self
+            .scan_cache_entries()?
+            .iter()
+            .map(|(_, meta)| meta.size_bytes)
+            .sum();
+        Ok(PullSession::new(
+            self.max_pull_bytes,
+            self.max_cache_bytes.saturating_sub(used),
+            progress,
+        ))
+    }
+
+    fn cached_image(&self, meta: &CacheMeta) -> Result<CachedImage> {
+        let entry_dir = self.cache_dir.join(digest_to_dir_name(&meta.digest));
+        Ok(CachedImage {
+            reference: meta.image_ref.clone(),
+            rootfs_path: entry_dir.join("rootfs"),
+            digest: meta.digest.clone(),
+            pulled_at: meta.created_at.unwrap_or(meta.last_used_at).into(),
+            size_bytes: meta.size_bytes,
+        })
     }
 
     /// Materialize the image rootfs for `reference` into `dest` (the
@@ -818,16 +1093,8 @@ impl ImageStore {
     pub async fn list(&self) -> Vec<CachedImage> {
         self.scan_cache_entries()
             .unwrap_or_default()
-            .into_iter()
-            .map(|(entry_dir, meta)| {
-                let last_used: std::time::SystemTime = meta.last_used_at.into();
-                CachedImage {
-                    reference: meta.image_ref,
-                    rootfs_path: entry_dir.join("rootfs"),
-                    digest: meta.digest,
-                    pulled_at: last_used,
-                }
-            })
+            .iter()
+            .filter_map(|(_, meta)| self.cached_image(meta).ok())
             .collect()
     }
 
@@ -1021,6 +1288,10 @@ mod tests {
     /// (used to inject whiteout markers, which aren't real files).
     fn gzip_marker(path: &str) -> Vec<u8> {
         gzip_layer(&[(path, b"")])
+    }
+
+    fn unpack_layer(data: &[u8], media_type: &str, dest: &Path) -> Result<()> {
+        unpack_into(data, media_type, dest, MAX_UNPACKED_IMAGE_BYTES)
     }
 
     const GZIP_MEDIA: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
@@ -1223,6 +1494,162 @@ mod tests {
                 env: vec!["A=1".to_string()],
             }
         );
+    }
+
+    // ----- pull and list --------------------------------------------------
+
+    /// A registry stand-in that records its calls and "downloads" layers of
+    /// the given byte size.
+    #[derive(Debug)]
+    struct RecordingPuller {
+        layer_bytes: u64,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingPuller {
+        fn new(layer_bytes: u64) -> Arc<Self> {
+            Arc::new(Self {
+                layer_bytes,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImagePuller for RecordingPuller {
+        async fn pull(&self, reference: &str, dest: &Path) -> Result<PulledImage> {
+            self.pull_streaming(
+                reference,
+                dest,
+                &mut PullSession::new(u64::MAX, u64::MAX, None),
+            )
+            .await
+        }
+
+        async fn pull_streaming(
+            &self,
+            reference: &str,
+            dest: &Path,
+            session: &mut PullSession,
+        ) -> Result<PulledImage> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            session.charge(self.layer_bytes)?;
+            std::fs::write(dest.join("layer"), vec![0u8; self.layer_bytes as usize])
+                .map_err(BackendError::Io)?;
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            Ok(PulledImage::without_config(format!("sha256:{hash:016x}")))
+        }
+    }
+
+    fn limited_store(
+        puller: Arc<RecordingPuller>,
+        max_pull: u64,
+        max_cache: u64,
+    ) -> (ImageStore, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 64, puller)
+            .with_limits(max_pull, max_cache);
+        (store, tmp)
+    }
+
+    fn cache_dir_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("read cache dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    const SMALL_CAP: u64 = 100;
+
+    #[tokio::test]
+    async fn given_layers_over_the_pull_cap_when_pulled_then_it_aborts_and_caches_nothing() {
+        // Arrange
+        let (store, tmp) = limited_store(RecordingPuller::new(SMALL_CAP + 1), SMALL_CAP, u64::MAX);
+
+        // Act
+        let error = store.pull("alpine:3", None).await.expect_err("too big");
+
+        // Assert
+        assert!(error.to_string().contains("pull limit"), "{error}");
+        assert!(cache_dir_names(tmp.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_cache_that_would_pass_its_cap_when_pulled_then_it_is_full_and_unchanged() {
+        // Arrange
+        let (store, tmp) = limited_store(RecordingPuller::new(SMALL_CAP), u64::MAX, SMALL_CAP + 50);
+        store.pull("first", None).await.expect("first fits");
+        let before = cache_dir_names(tmp.path());
+
+        // Act
+        let error = store.pull("second", None).await.expect_err("cache full");
+
+        // Assert
+        assert!(error.to_string().contains("cache is full"), "{error}");
+        assert_eq!(cache_dir_names(tmp.path()), before);
+        assert_eq!(store.list().await.len(), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::uppercase("Alpine")]
+    #[case::spaces("not a ref")]
+    #[case::traversal("../../etc")]
+    #[tokio::test]
+    async fn given_an_invalid_reference_when_pulled_then_the_registry_is_never_called(
+        #[case] reference: &str,
+    ) {
+        // Arrange
+        let puller = RecordingPuller::new(1);
+        let (store, _tmp) = limited_store(puller.clone(), SMALL_CAP, SMALL_CAP);
+
+        // Act
+        let error = store.pull(reference, None).await.expect_err("invalid");
+
+        // Assert
+        assert!(error.to_string().contains("invalid reference"), "{error}");
+        assert_eq!(puller.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn given_a_pulled_image_when_listed_then_it_has_a_size_above_zero() {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(10), SMALL_CAP, SMALL_CAP);
+        store.pull("alpine:3", None).await.expect("pull");
+
+        // Act
+        let images = store.list().await;
+
+        // Assert
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].reference, "alpine:3");
+        assert!(images[0].size_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn given_a_cached_image_when_pulled_again_then_it_is_up_to_date_without_a_registry_call()
+    {
+        // Arrange
+        let puller = RecordingPuller::new(10);
+        let (store, _tmp) = limited_store(puller.clone(), SMALL_CAP, SMALL_CAP);
+        store.pull("alpine:3", None).await.expect("first");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Act
+        store.pull("alpine:3", Some(tx)).await.expect("second");
+
+        // Assert
+        let mut last = String::new();
+        while let Some(line) = rx.recv().await {
+            last = line.status;
+        }
+        assert_eq!(last, "Status: Image is up to date for alpine:3");
+        assert_eq!(puller.calls(), 1);
     }
 
     // ----- LRU eviction --------------------------------------------------
@@ -1547,6 +1974,37 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         // Whiteout of something that was never created is a no-op, not an error.
         unpack_layer(&gzip_marker("nope/.wh.ghost"), GZIP_MEDIA, tmp.path()).expect("unpack");
+    }
+
+    #[test]
+    fn given_symlink_to_outside_when_whiteout_through_it_then_outside_is_untouched() {
+        // Arrange
+        let rootfs = TempDir::new().expect("rootfs");
+        let outside = TempDir::new().expect("outside");
+        std::fs::write(outside.path().join("victim"), b"host").expect("write");
+        std::os::unix::fs::symlink(outside.path(), rootfs.path().join("x")).expect("symlink");
+
+        // Act
+        unpack_layer(&gzip_marker("x/.wh.victim"), GZIP_MEDIA, rootfs.path()).expect("whiteout");
+        unpack_layer(&gzip_marker("x/.wh..wh..opq"), GZIP_MEDIA, rootfs.path()).expect("opaque");
+
+        // Assert
+        assert!(outside.path().join("victim").exists());
+    }
+
+    #[tokio::test]
+    async fn given_a_blob_longer_than_declared_when_spooled_then_it_is_refused() {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let chunks = tokio_stream::iter([Ok(bytes::Bytes::from_static(b"ab"))]);
+
+        // Act
+        let error = spool(chunks, &tmp.path().join("blob"), 1)
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(error.kind(), FileTooLarge);
     }
 
     // ----- safe_join: traversal rejection ---------------------------------

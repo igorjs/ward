@@ -328,6 +328,8 @@ pub enum ApiError {
     PermissionDenied(String),
     #[error("ambiguous sandbox reference: {0}")]
     AmbiguousReference(String),
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
 }
 
 // ---------------------------------------------------------------------------
