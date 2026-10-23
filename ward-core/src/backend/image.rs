@@ -883,11 +883,15 @@ fn materialize_file(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn create_private_parent(rootfs: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     if let Some(parent) = rootfs.parent() {
+        let existed = parent.exists();
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(SANDBOX_DIR_MODE)
             .create(parent)?;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(SANDBOX_DIR_MODE))?;
+        // A parent that already existed is not ours to re-mode.
+        if !existed {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(SANDBOX_DIR_MODE))?;
+        }
     }
     std::fs::create_dir_all(rootfs)
 }
