@@ -39,3 +39,15 @@ id = "RUSTSEC-2026-0173"
 #   - a `cargo update -p oci-spec` picks up a release that drops it
 # Issue tracking: file when removing the suppression becomes feasible.
 reason = "Informational (unmaintained) advisory, no CVSS / no exploit. Transitive proc-macro via oci-spec to getset; compile-time only, not present in shipped binary."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+# crypto-bigint 0.5.5: timing variability in operations meant to be
+# constant-time. The fix (>=0.7.6) is a new major version that
+# elliptic-curve 0.13 (p256 0.13) cannot use. Pulled in transitively via:
+#   ward-core -> oci-client -> jsonwebtoken -> p256 -> ecdsa -> elliptic-curve
+# Ward only verifies registry token signatures with public keys and never
+# holds an EC private key, so no secret-dependent operation runs.
+# Re-evaluate when jsonwebtoken / RustCrypto move to elliptic-curve 0.14
+# (crypto-bigint 0.7). Mirror of the entry in deny.toml.
+reason = "Transitive via oci-client -> jsonwebtoken -> p256; fix needs a new major version. No private-key operations in ward (public-key verification only)."
