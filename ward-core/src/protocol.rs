@@ -128,6 +128,8 @@ pub struct ResourceLimits {
     pub memory_mb: u32,
     pub pids_max: u32,
     pub timeout_seconds: u64,
+    #[serde(default)]
+    pub exited_ttl_seconds: u64,
 }
 
 // ---------------------------------------------------------------------------

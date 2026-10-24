@@ -258,6 +258,7 @@ impl Server {
                 memory_mb: args.memory_mb,
                 pids_max: 0,
                 timeout_seconds: 0,
+                exited_ttl_seconds: 0,
             }),
             env: args.env,
             comms: Some(pb::CommunicationPolicy {

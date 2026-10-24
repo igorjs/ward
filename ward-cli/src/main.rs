@@ -116,6 +116,20 @@ struct SandboxOpts {
     /// "pinned" (like missing, but the reference must carry a @sha256 digest).
     #[arg(long, value_enum, default_value_t = PullArg::Missing, value_name = "POLICY")]
     pull: PullArg,
+    /// Remove the sandbox this long after it ends: seconds, or a duration like
+    /// 10m or 1h30m. Off unless set here or by the daemon.
+    #[arg(long = "exited-ttl", value_name = "DURATION", value_parser = parse_exited_ttl)]
+    exited_ttl: Option<u64>,
+}
+
+/// Parse `--exited-ttl` into whole seconds, rounding a fraction up.
+fn parse_exited_ttl(value: &str) -> Result<u64, String> {
+    let invalid = || format!("invalid duration '{value}': use seconds or a value like 10m, 1h30m");
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Ok(seconds);
+    }
+    let duration = log_output::parse_duration(value).ok_or_else(invalid)?;
+    Ok(duration.as_secs() + u64::from(duration.subsec_nanos() > 0))
 }
 
 /// The `--pull` values: Docker's three, plus Ward's `pinned`.
@@ -679,6 +693,7 @@ fn create_request(
         memory_mb: resources::parse_memory_mib(&opts.memory)?,
         pids_max: 0, // 0 == "use daemon default"
         timeout_seconds,
+        exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
     };
     let mounts = opts
         .volume
@@ -1887,6 +1902,42 @@ mod tests {
             }
             other => panic!("expected Top, got {other:?}"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::seconds("90", Some(90))]
+    #[case::zero("0", Some(0))]
+    #[case::minutes("10m", Some(600))]
+    #[case::compound("1h30m", Some(5400))]
+    #[case::fraction_rounds_up("1.5s", Some(2))]
+    #[case::unknown_unit("3d", None)]
+    #[case::words("soon", None)]
+    #[case::empty("", None)]
+    fn given_exited_ttl_when_parsed_then_it_is_whole_seconds_or_rejected(
+        #[case] raw: &str,
+        #[case] want: Option<u64>,
+    ) {
+        // Act
+        let parsed = parse_exited_ttl(raw);
+
+        // Assert
+        assert_eq!(parsed.ok(), want);
+    }
+
+    #[test]
+    fn given_exited_ttl_flag_when_create_request_built_then_resources_carry_it() {
+        // Arrange
+        let cli =
+            Cli::try_parse_from(["ward", "create", "--exited-ttl", "2m", "alpine"]).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let req = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(req.resources.expect("resources").exited_ttl_seconds, 120);
     }
 
     #[rstest::rstest]

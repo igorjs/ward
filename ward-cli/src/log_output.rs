@@ -247,7 +247,7 @@ fn parse_unix_seconds(value: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(whole.parse().ok()?, nanos)
 }
 
-fn parse_duration(value: &str) -> Option<Duration> {
+pub(crate) fn parse_duration(value: &str) -> Option<Duration> {
     if value.is_empty() {
         return None;
     }

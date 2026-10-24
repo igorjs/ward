@@ -104,6 +104,16 @@ pub fn resource_limits(
     Ok(())
 }
 
+/// Validate an exited TTL. Zero means "use the daemon default".
+pub fn exited_ttl(seconds: u64) -> Result<(), ApiError> {
+    if seconds > MAX_TIMEOUT_SECONDS {
+        return Err(ApiError::InvalidRequest(format!(
+            "exited_ttl_seconds must be <= {MAX_TIMEOUT_SECONDS}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a volume name.
 /// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {

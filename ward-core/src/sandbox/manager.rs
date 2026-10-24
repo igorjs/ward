@@ -77,6 +77,8 @@ fn snapshot_backend_err(e: BackendError) -> ApiError {
 struct SandboxEntry {
     egress: EgressProxy,
     timeout_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Removes the sandbox once it has stayed ended for its exited TTL.
+    ttl_handle: Option<tokio::task::JoinHandle<()>>,
     /// Held for the sandbox's whole lifetime. Dropping it (on removal)
     /// returns the slot to `create_semaphore` so a concurrent `create`
     /// waiting on the cap can proceed. Never read directly; the field
@@ -406,6 +408,7 @@ async fn persist_meta(store: Option<&MetaStore>, meta: SandboxMeta) -> Result<()
 /// leaves the entry in its old state.
 async fn commit_meta(
     store: Option<&MetaStore>,
+    teardown: &Teardown,
     entry: &mut SandboxEntry,
     status: crate::protocol::SandboxStatus,
     exit_code: Option<i32>,
@@ -415,12 +418,13 @@ async fn commit_meta(
         crate::protocol::SandboxStatus::Creating => None,
         _ => entry.meta.end_reason,
     };
-    commit_meta_ended(store, entry, status, exit_code, reason).await
+    commit_meta_ended(store, teardown, entry, status, exit_code, reason).await
 }
 
 /// Like `commit_meta`, and records why the sandbox ended.
 async fn commit_meta_ended(
     store: Option<&MetaStore>,
+    teardown: &Teardown,
     entry: &mut SandboxEntry,
     status: crate::protocol::SandboxStatus,
     exit_code: Option<i32>,
@@ -433,7 +437,76 @@ async fn commit_meta_ended(
     next.end_reason = end_reason;
     persist_meta(store, next.clone()).await?;
     entry.meta = next;
+    rearm_exited_ttl(teardown, entry, std::time::SystemTime::now());
     Ok(())
+}
+
+fn has_ended(status: &crate::protocol::SandboxStatus) -> bool {
+    use crate::protocol::SandboxStatus as State;
+    matches!(status, State::Exited | State::Stopped)
+}
+
+/// The TTL that applies to a sandbox: its own, else the daemon default.
+fn exited_ttl_of(
+    resources: &ResourceLimits,
+    default: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match resources.exited_ttl_seconds {
+        0 => default,
+        seconds => Some(std::time::Duration::from_secs(seconds)),
+    }
+}
+
+/// Stop any exited-TTL timer on `entry`, then start one counting from
+/// `ended_at` if the sandbox has ended and has a TTL. A sandbox that runs
+/// again is left without a timer.
+fn rearm_exited_ttl(
+    teardown: &Teardown,
+    entry: &mut SandboxEntry,
+    ended_at: std::time::SystemTime,
+) {
+    if let Some(handle) = entry.ttl_handle.take() {
+        handle.abort();
+    }
+    if !has_ended(&entry.meta.status) {
+        return;
+    }
+    let Some(ttl) = exited_ttl_of(&entry.meta.options.resources, teardown.exited_ttl) else {
+        return;
+    };
+    let wait = (ended_at + ttl)
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + wait;
+    let teardown = teardown.clone();
+    let id = entry.meta.id.clone();
+    entry.ttl_handle = Some(tokio::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        remove_if_still_ended(&teardown, &id).await;
+    }));
+}
+
+/// Remove sandbox `id` through the same teardown as `rm`, unless it runs
+/// again or is already gone.
+async fn remove_if_still_ended(teardown: &Teardown, id: &str) {
+    let removed = {
+        let mut entries = teardown.entries.write().await;
+        let Some(entry) = entries.get_mut(id) else {
+            return;
+        };
+        if !has_ended(&entry.meta.status) {
+            return;
+        }
+        // Dropping the handle detaches this task instead of aborting it.
+        drop(entry.ttl_handle.take());
+        SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
+    };
+    match SandboxManager::finish_cleanup(removed, teardown, id).await {
+        Ok(()) => tracing::info!(sandbox_id = %id, "removed sandbox after its exited TTL"),
+        Err(e) => {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot remove sandbox after its exited TTL")
+        }
+    }
 }
 
 /// Record the start and finish times a move to `next` implies.
@@ -479,6 +552,8 @@ struct Teardown {
     backend: Arc<dyn Backend>,
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
     events: EventLog,
+    /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
+    exited_ttl: Option<std::time::Duration>,
 }
 
 fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
@@ -517,6 +592,7 @@ async fn mark_exited_on_main_end(
         }
         match commit_meta_ended(
             store.as_ref(),
+            &teardown,
             entry,
             crate::protocol::SandboxStatus::Exited,
             Some(code),
@@ -617,6 +693,8 @@ pub struct SandboxManager {
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
     events: EventLog,
     forwarder: Arc<dyn PortForwarder>,
+    /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
+    exited_ttl: Option<std::time::Duration>,
 }
 
 impl SandboxManager {
@@ -643,7 +721,15 @@ impl SandboxManager {
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
             events: EventLog::default(),
+            exited_ttl: None,
         }
+    }
+
+    /// Remove sandboxes that stay ended for `ttl`, unless they set their
+    /// own. `None` keeps them until removed by hand.
+    pub fn with_exited_ttl(mut self, ttl: Option<std::time::Duration>) -> Self {
+        self.exited_ttl = ttl;
+        self
     }
 
     /// Lifecycle events of every sandbox, for `Events` readers.
@@ -659,6 +745,7 @@ impl SandboxManager {
             backend: Arc::clone(&self.backend),
             processes: Arc::clone(&self.processes),
             events: self.events.clone(),
+            exited_ttl: self.exited_ttl,
         }
     }
 
@@ -793,7 +880,15 @@ impl SandboxManager {
         let entry = entries
             .get_mut(id)
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        commit_meta_ended(self.store.as_ref(), entry, status, exit_code, end_reason).await
+        commit_meta_ended(
+            self.store.as_ref(),
+            &self.teardown(),
+            entry,
+            status,
+            exit_code,
+            end_reason,
+        )
+        .await
     }
 
     /// Write the new state to disk, then adopt it in memory, so a failed
@@ -804,7 +899,14 @@ impl SandboxManager {
         status: crate::protocol::SandboxStatus,
         exit_code: Option<i32>,
     ) -> Result<()> {
-        commit_meta(self.store.as_ref(), entry, status, exit_code).await
+        commit_meta(
+            self.store.as_ref(),
+            &self.teardown(),
+            entry,
+            status,
+            exit_code,
+        )
+        .await
     }
 
     async fn persist(&self, meta: SandboxMeta) -> Result<()> {
@@ -879,16 +981,17 @@ impl SandboxManager {
 
         let timeout_handle = remaining.map(|left| self.spawn_timeout(&id, left));
         let egress = EgressProxy::new(id.clone(), meta.options.egress.clone());
-        self.entries.write().await.insert(
-            id.clone(),
-            SandboxEntry {
-                egress,
-                timeout_handle,
-                _creation_permit: permit,
-                meta,
-                listeners: Vec::new(),
-            },
-        );
+        let ended_at = meta.finished_at.unwrap_or(now);
+        let mut entry = SandboxEntry {
+            egress,
+            timeout_handle,
+            ttl_handle: None,
+            _creation_permit: permit,
+            meta,
+            listeners: Vec::new(),
+        };
+        rearm_exited_ttl(&self.teardown(), &mut entry, ended_at);
+        self.entries.write().await.insert(id.clone(), entry);
         // No broker registration: a reloaded sandbox is not running, and
         // `start` registers its stored policy.
         tracing::info!(sandbox_id = %id, "reloaded sandbox from disk");
@@ -974,6 +1077,7 @@ impl SandboxManager {
         crate::validate::user_spec(&req.user)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
+            crate::validate::exited_ttl(r.exited_ttl_seconds)?;
         }
 
         // Validate communication policy: if a group is specified or mode is
@@ -1173,6 +1277,7 @@ impl SandboxManager {
             SandboxEntry {
                 egress,
                 timeout_handle,
+                ttl_handle: None,
                 _creation_permit: permit,
                 meta,
                 listeners,
@@ -2130,6 +2235,9 @@ impl SandboxManager {
         if !from_timeout && let Some(handle) = entry.timeout_handle {
             handle.abort();
         }
+        if let Some(handle) = entry.ttl_handle {
+            handle.abort();
+        }
         Some(RemovedEntry {
             meta: entry.meta,
             listeners: entry.listeners,
@@ -2500,6 +2608,7 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
         memory_mb: pb.memory_mb,
         pids_max: pb.pids_max,
         timeout_seconds: pb.timeout_seconds,
+        exited_ttl_seconds: pb.exited_ttl_seconds,
     }
 }
 
@@ -3590,6 +3699,7 @@ pub(crate) mod tests {
             memory_mb: 8192,
             pids_max: 256,
             timeout_seconds: 3600,
+            exited_ttl_seconds: 120,
         };
 
         // Act
@@ -3601,6 +3711,7 @@ pub(crate) mod tests {
         assert_eq!(result.memory_mb, 8192);
         assert_eq!(result.pids_max, 256);
         assert_eq!(result.timeout_seconds, 3600);
+        assert_eq!(result.exited_ttl_seconds, 120);
     }
 
     // ----- exec ----------------------------------------------------------
@@ -5352,6 +5463,204 @@ pub(crate) mod tests {
 
         // Assert
         assert!(removed, "the stopped sandbox outlived its timeout");
+    }
+
+    // ----- exited TTL ----------------------------------------------------
+
+    const TTL_SECONDS: u64 = 60;
+    const TTL: std::time::Duration = std::time::Duration::from_secs(TTL_SECONDS);
+    const BEFORE_TTL: std::time::Duration = std::time::Duration::from_secs(TTL_SECONDS - 1);
+    const PAST_TTL: std::time::Duration = std::time::Duration::from_secs(TTL_SECONDS + 1);
+    const SETTLE_STEPS: usize = 20;
+    const SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+    fn req_with_ttl(seconds: u64) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            resources: Some(PbResourceLimits {
+                exited_ttl_seconds: seconds,
+                ..Default::default()
+            }),
+            ..create_req("alpine")
+        }
+    }
+
+    async fn advance_and_settle(by: std::time::Duration) {
+        tokio::time::advance(by).await;
+        // Sleeping parks the runtime, which is what runs due timers.
+        for _ in 0..SETTLE_STEPS {
+            tokio::time::sleep(SETTLE_STEP).await;
+        }
+    }
+
+    async fn exited_with_ttl(mgr: &SandboxManager, seconds: u64) -> String {
+        let id = mgr.create(req_with_ttl(seconds), "").await.unwrap().id;
+        mgr.record_state(&id, ProtoStatus::Exited, Some(0))
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_exited_sandbox_with_ttl_when_it_elapses_then_sandbox_is_removed() {
+        // Arrange
+        let mgr = build_manager(2);
+        exited_with_ttl(&mgr, TTL_SECONDS).await;
+
+        // Act
+        advance_and_settle(BEFORE_TTL).await;
+        let before = mgr.list().await.unwrap().len();
+        advance_and_settle(PAST_TTL - BEFORE_TTL).await;
+
+        // Assert
+        assert_eq!(before, 1);
+        assert!(mgr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_stopped_sandbox_with_ttl_when_it_elapses_then_sandbox_is_removed() {
+        // Arrange
+        let mgr = build_manager(2);
+        let id = mgr.create(req_with_ttl(TTL_SECONDS), "").await.unwrap().id;
+        mgr.stop(&id).await.unwrap();
+
+        // Act
+        advance_and_settle(PAST_TTL).await;
+
+        // Assert
+        assert!(mgr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_exited_sandbox_without_ttl_when_time_passes_then_sandbox_stays() {
+        // Arrange
+        let mgr = build_manager(2);
+        exited_with_ttl(&mgr, 0).await;
+
+        // Act
+        advance_and_settle(TTL * 1000).await;
+
+        // Assert
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_daemon_default_ttl_when_sandbox_sets_none_then_default_applies() {
+        // Arrange
+        let mgr = Arc::new(
+            Arc::into_inner(build_manager(2))
+                .unwrap()
+                .with_exited_ttl(Some(TTL)),
+        );
+        exited_with_ttl(&mgr, 0).await;
+
+        // Act
+        advance_and_settle(PAST_TTL).await;
+
+        // Assert
+        assert!(mgr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_daemon_default_ttl_when_sandbox_sets_longer_then_its_own_applies() {
+        // Arrange
+        let mgr = Arc::new(
+            Arc::into_inner(build_manager(2))
+                .unwrap()
+                .with_exited_ttl(Some(TTL)),
+        );
+        exited_with_ttl(&mgr, TTL_SECONDS * 2).await;
+
+        // Act
+        advance_and_settle(PAST_TTL).await;
+
+        // Assert
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_exited_sandbox_when_started_before_ttl_then_it_is_kept() {
+        // Arrange
+        let mgr = build_manager(2);
+        let id = exited_with_ttl(&mgr, TTL_SECONDS).await;
+        advance_and_settle(BEFORE_TTL).await;
+
+        // Act
+        mgr.start(&id).await.unwrap();
+        advance_and_settle(TTL * 10).await;
+
+        // Assert
+        let kept = mgr.get(&id).await.unwrap();
+        assert_eq!(kept.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_removed_exited_sandbox_when_ttl_elapses_then_timer_does_nothing() {
+        // Arrange
+        let mgr = build_manager(2);
+        let id = exited_with_ttl(&mgr, TTL_SECONDS).await;
+        mgr.remove(&id).await.unwrap();
+
+        // Act
+        advance_and_settle(PAST_TTL).await;
+
+        // Assert
+        assert!(mgr.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_daemon_restart_when_exited_ttl_has_part_left_then_it_is_rearmed_from_the_end_time()
+     {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let id = exited_with_ttl(&first, TTL_SECONDS).await;
+        let store = MetaStore::new(tmp.path());
+        let mut meta = store.load_all().remove(0);
+        meta.finished_at = Some(std::time::SystemTime::now() - TTL / 2);
+        store.save(&meta).unwrap();
+        drop(first);
+
+        // Act
+        let second = restart(tmp.path()).await;
+        advance_and_settle(TTL / 2 - std::time::Duration::from_secs(1)).await;
+        let before = second.get(&id).await.is_ok();
+        advance_and_settle(std::time::Duration::from_secs(2)).await;
+
+        // Assert
+        assert!(before);
+        assert!(second.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_daemon_restart_when_exited_ttl_already_passed_then_sandbox_is_removed() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        exited_with_ttl(&first, TTL_SECONDS).await;
+        let store = MetaStore::new(tmp.path());
+        let mut meta = store.load_all().remove(0);
+        meta.finished_at = Some(std::time::SystemTime::now() - TTL * 2);
+        store.save(&meta).unwrap();
+        drop(first);
+
+        // Act
+        let second = restart(tmp.path()).await;
+        advance_and_settle(std::time::Duration::from_millis(1)).await;
+
+        // Assert
+        assert!(second.list().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn given_resources_without_exited_ttl_when_deserialized_then_it_is_zero() {
+        // Arrange
+        let old = r#"{"cpus":1,"memory_mb":2,"pids_max":3,"timeout_seconds":4}"#;
+
+        // Act
+        let resources: ResourceLimits = serde_json::from_str(old).unwrap();
+
+        // Assert
+        assert_eq!(resources.exited_ttl_seconds, 0);
     }
 
     #[tokio::test]
