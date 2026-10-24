@@ -180,7 +180,8 @@ const OUTPUT_CHUNK_OVERHEAD: usize = 64;
 /// which bounds the copy each write pays.
 const OUTPUT_MERGE_LIMIT: usize = 4096;
 
-/// Live chunks a slow subscriber may lag behind before it loses the oldest.
+/// Live chunks a slow subscriber may lag behind before it must recover the
+/// missed bytes from the retained buffer.
 const MAIN_OUTPUT_LIVE_CHUNKS: usize = 64;
 
 /// Bounded, memory only copy of a main process's output. Keeps the newest
@@ -194,25 +195,44 @@ struct OutputBuffer {
 struct BufferState {
     chunks: VecDeque<OutputChunk>,
     len: usize,
-    live: broadcast::Sender<OutputChunk>,
+    /// Payload bytes ever pushed. It never shrinks, so it names every byte.
+    total: u64,
+    live: broadcast::Sender<SeqChunk>,
+}
+
+/// A live chunk with the stream offset just past its last byte.
+#[derive(Clone)]
+struct SeqChunk {
+    chunk: OutputChunk,
+    end: u64,
+}
+
+impl BufferState {
+    /// Stream offset of the first retained byte.
+    fn retained_start(&self) -> u64 {
+        let retained: usize = self.chunks.iter().map(|c| c.bytes.len()).sum();
+        self.total - retained as u64
+    }
 }
 
 impl OutputBuffer {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize) -> Arc<Self> {
         let (live, _) = broadcast::channel(MAIN_OUTPUT_LIVE_CHUNKS);
-        Self {
+        Arc::new(Self {
             cap,
             state: std::sync::Mutex::new(BufferState {
                 chunks: VecDeque::new(),
                 len: 0,
+                total: 0,
                 live,
             }),
-        }
+        })
     }
 
     fn push(&self, chunk: OutputChunk) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let state = &mut *guard;
+        state.total += chunk.bytes.len() as u64;
         // Same stream and same millisecond: one chunk, so a burst of tiny
         // writes does not pay the per chunk overhead each time.
         let merged = match state.chunks.back_mut() {
@@ -248,19 +268,116 @@ impl OutputBuffer {
             }
         }
         // No subscribers is the normal case before a client attaches.
-        let _ = state.live.send(chunk);
+        let end = state.total;
+        let _ = state.live.send(SeqChunk { chunk, end });
     }
 
-    /// Everything buffered so far plus a receiver for what follows. Both are
+    /// Everything buffered so far plus a feed of what follows. Both are
     /// taken under one lock, so no chunk is missed or repeated.
-    fn subscribe(&self) -> (Vec<OutputChunk>, broadcast::Receiver<OutputChunk>) {
+    fn subscribe(self: &Arc<Self>) -> (Vec<OutputChunk>, OutputFeed) {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        (
-            state.chunks.iter().cloned().collect(),
-            state.live.subscribe(),
-        )
+        let feed = OutputFeed {
+            rx: state.live.subscribe(),
+            next: state.total,
+            pending: VecDeque::new(),
+            buffer: Arc::clone(self),
+        };
+        (state.chunks.iter().cloned().collect(), feed)
+    }
+
+    /// The retained bytes from stream offset `from` on, the count of bytes
+    /// before them that were already dropped, and the offset they end at.
+    fn read_from(&self, from: u64) -> (Vec<OutputChunk>, u64, u64) {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let start = state.retained_start();
+        let mut at = start;
+        let mut out = Vec::new();
+        for chunk in &state.chunks {
+            let end = at + chunk.bytes.len() as u64;
+            if end > from {
+                let skip = from.saturating_sub(at) as usize;
+                out.push(OutputChunk {
+                    bytes: chunk.bytes.slice(skip..),
+                    ..chunk.clone()
+                });
+            }
+            at = end;
+        }
+        (out, start.saturating_sub(from), state.total)
     }
 }
+
+/// Live output of a main process that never skips a byte while the buffer
+/// still holds it. A subscriber that lags re-reads the gap from the buffer.
+pub struct OutputFeed {
+    rx: broadcast::Receiver<SeqChunk>,
+    /// Stream offset of the next byte to hand out.
+    next: u64,
+    pending: VecDeque<OutputChunk>,
+    buffer: Arc<OutputBuffer>,
+}
+
+impl OutputFeed {
+    /// The next chunk, or `None` once the output has ended.
+    pub async fn recv(&mut self) -> Option<OutputChunk> {
+        loop {
+            if let Some(chunk) = self.pending.pop_front() {
+                return Some(chunk);
+            }
+            match self.rx.recv().await {
+                Ok(seq) => self.accept(seq),
+                Err(broadcast::error::RecvError::Lagged(_)) => self.recover(),
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// The next chunk already available, without waiting.
+    pub fn try_recv(&mut self) -> Option<OutputChunk> {
+        loop {
+            if let Some(chunk) = self.pending.pop_front() {
+                return Some(chunk);
+            }
+            match self.rx.try_recv() {
+                Ok(seq) => self.accept(seq),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => self.recover(),
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Queue the part of `seq` that was not handed out yet.
+    fn accept(&mut self, seq: SeqChunk) {
+        if seq.end <= self.next {
+            return;
+        }
+        let start = seq.end - seq.chunk.bytes.len() as u64;
+        let skip = self.next.saturating_sub(start) as usize;
+        self.next = seq.end;
+        self.pending.push_back(OutputChunk {
+            bytes: seq.chunk.bytes.slice(skip..),
+            ..seq.chunk
+        });
+    }
+
+    /// Queue the bytes the receiver missed from the buffer, and a warning
+    /// line for any the buffer no longer holds.
+    fn recover(&mut self) {
+        let (chunks, lost, end) = self.buffer.read_from(self.next);
+        if lost > 0 {
+            tracing::warn!(lost, "attach reader lagged past the retained output");
+            self.pending.push_back(OutputChunk {
+                stream: RawStream::Stderr,
+                bytes: bytes::Bytes::from(format!("{LOST_OUTPUT_NOTICE_PREFIX}{lost} bytes\n")),
+                at: chrono::Utc::now(),
+            });
+        }
+        self.pending.extend(chunks);
+        self.next = end;
+    }
+}
+
+const LOST_OUTPUT_NOTICE_PREFIX: &str = "[ward: output lost, reader fell behind by ";
 
 fn same_millisecond(a: chrono::DateTime<chrono::Utc>, b: chrono::DateTime<chrono::Utc>) -> bool {
     a.timestamp_millis() == b.timestamp_millis()
@@ -1799,7 +1916,7 @@ impl SandboxManager {
         let output = mains
             .get(id)
             .map(|m| Arc::clone(&m.output))
-            .unwrap_or_else(|| Arc::new(OutputBuffer::new(self.output_cap)));
+            .unwrap_or_else(|| OutputBuffer::new(self.output_cap));
         let (exit_tx, exit) = watch::channel(None);
         if let Some(events) = handle.output_rx {
             tokio::spawn(pump_main_output(events, Arc::clone(&output), exit_tx));
@@ -1837,10 +1954,7 @@ impl SandboxManager {
     }
 
     /// Output buffered so far, plus a receiver for what follows.
-    pub async fn subscribe_main_output(
-        &self,
-        id: &str,
-    ) -> Result<(Vec<OutputChunk>, broadcast::Receiver<OutputChunk>)> {
+    pub async fn subscribe_main_output(&self, id: &str) -> Result<(Vec<OutputChunk>, OutputFeed)> {
         let mains = self.mains.read().await;
         let main = mains.get(id).ok_or_else(|| no_main_process(id))?;
         Ok(main.output.subscribe())
@@ -6189,6 +6303,47 @@ pub(crate) mod tests {
             bytes: bytes::Bytes::copy_from_slice(text.as_bytes()),
             at,
         }
+    }
+
+    #[tokio::test]
+    async fn given_lagging_feed_when_buffer_retains_the_gap_then_no_byte_is_lost() {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_CAP);
+        let (_, mut feed) = buffer.subscribe();
+        let pushed = MAIN_OUTPUT_LIVE_CHUNKS * 3;
+        for i in 0..pushed {
+            buffer.push(chunk_at(RawStream::Stdout, "x", millis(i as i64)));
+        }
+
+        // Act
+        let mut got = Vec::new();
+        while let Some(c) = feed.try_recv() {
+            got.push(c);
+        }
+
+        // Assert
+        assert_eq!(got.iter().map(|c| c.bytes.len()).sum::<usize>(), pushed);
+    }
+
+    #[tokio::test]
+    async fn given_lagging_feed_when_buffer_dropped_the_gap_then_a_notice_precedes_the_rest() {
+        // Arrange
+        let buffer = OutputBuffer::new(MAIN_OUTPUT_LIVE_CHUNKS * 2 * (1 + OUTPUT_CHUNK_OVERHEAD));
+        let (_, mut feed) = buffer.subscribe();
+        for i in 0..MAIN_OUTPUT_LIVE_CHUNKS * 4 {
+            buffer.push(chunk_at(RawStream::Stdout, "x", millis(i as i64)));
+        }
+
+        // Act
+        let first = feed.try_recv().expect("notice");
+
+        // Assert
+        assert_eq!(first.stream, RawStream::Stderr);
+        assert!(
+            first
+                .bytes
+                .starts_with(LOST_OUTPUT_NOTICE_PREFIX.as_bytes())
+        );
     }
 
     #[test]

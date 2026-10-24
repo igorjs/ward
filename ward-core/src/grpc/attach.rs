@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::Status;
 use tracing::{info, warn};
@@ -186,29 +186,18 @@ async fn pump_main(manager: Arc<SandboxManager>, id: String, buffer_only: bool, 
         tokio::select! {
             _ = tx.closed() => return,
             chunk = live.recv() => match chunk {
-                Ok(chunk) => {
+                Some(chunk) => {
                     if !send_data(&tx, chunk).await {
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    warn!(sandbox_id = %id, missed, "attach reader lagged behind the output");
-                }
-                Err(broadcast::error::RecvError::Closed) => return,
+                None => return,
             },
             status = &mut exit => {
                 // The pump stores all output before it publishes the status.
-                loop {
-                    match live.try_recv() {
-                        Ok(chunk) => {
-                            if !send_data(&tx, chunk).await {
-                                return;
-                            }
-                        }
-                        Err(broadcast::error::TryRecvError::Lagged(missed)) => {
-                            warn!(sandbox_id = %id, missed, "attach reader lagged behind the output");
-                        }
-                        Err(_) => break,
+                while let Some(chunk) = live.try_recv() {
+                    if !send_data(&tx, chunk).await {
+                        return;
                     }
                 }
                 match status {
@@ -661,6 +650,26 @@ mod tests {
             (out.trim().parse::<usize>().unwrap(), code),
             (CHUNK_BYTES * CHUNKS, Some(0))
         );
+    }
+
+    #[tokio::test]
+    async fn given_burst_larger_than_live_queue_when_reader_is_slow_then_every_byte_arrives() {
+        // Arrange
+        const BURST_BYTES: usize = 512 * 1024;
+        const WRITER_HEAD_START: std::time::Duration = std::time::Duration::from_secs(1);
+        let mgr = host_manager(OUTPUT_CAP);
+        let script = format!("head -c {BURST_BYTES} /dev/zero | tr '\\0' x");
+        let id = create_with_command(&mgr, &["sh", "-c", &script], false).await;
+        let (_feed, mut replies) = attach(&mgr, &id, main_start(&id)).await;
+
+        // Act
+        tokio::time::sleep(WRITER_HEAD_START).await;
+        let (out, code) = tokio::time::timeout(TEST_DEADLINE, collect(&mut replies))
+            .await
+            .expect("process finished in time");
+
+        // Assert
+        assert_eq!((out.len(), code), (BURST_BYTES, Some(0)));
     }
 
     #[tokio::test]
