@@ -89,6 +89,7 @@ Full CLI: `ward --help`.
 - [`docs/workspace.md`](docs/workspace.md); crate layout
 - [`docs/status.md`](docs/status.md); what's shipped, what's pending
 - [`docs/why.md`](docs/why.md); why ward vs Docker / SaaS sandboxes
+- [`docs/docker-differences.md`](docs/docker-differences.md); where ward deliberately differs from Docker
 - [`docs/adr/`](docs/adr/); architecture decision records (most recent: [ADR-016](docs/adr/016-embedded-mode-microvms.md))
 - [CONTRIBUTING.md](CONTRIBUTING.md); dev setup, libkrun bump, PR + release
 - [SECURITY.md](SECURITY.md); responsible disclosure

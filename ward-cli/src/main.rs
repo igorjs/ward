@@ -63,6 +63,9 @@ struct Cli {
     command: Commands,
 }
 
+/// Footer for commands whose behavior differs from Docker's.
+const DOCKER_DIFFERENCES: &str = "See docs/docker-differences.md or https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
+
 const DEFAULT_MEMORY: &str = "512m";
 const DEFAULT_CPUS: &str = "1";
 
@@ -154,6 +157,7 @@ impl From<PullArg> for ward_core::pb::PullPolicy {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Create a new sandbox without starting a command, and print its ID.
     Create {
         /// OCI image reference.
@@ -187,6 +191,7 @@ enum Commands {
     /// List all sandboxes.
     List,
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// List running sandboxes, or every sandbox with -a.
     Ps {
         /// Show sandboxes in every state.
@@ -200,6 +205,7 @@ enum Commands {
         format: Option<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print the host address each published port is reachable on.
     ///
     /// With PORT (80 or 80/tcp), prints only the host address for it.
@@ -213,6 +219,7 @@ enum Commands {
         port: Option<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print low level details of one or more sandboxes as a JSON array.
     Inspect {
         /// Sandbox names, IDs or ID prefixes.
@@ -220,6 +227,7 @@ enum Commands {
         references: Vec<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Execute a command inside a sandbox.
     ///
     /// The command's output is printed and the CLI exits with its exit
@@ -251,6 +259,7 @@ enum Commands {
         detach: bool,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Create a sandbox, run a command in it and exit with its exit code.
     Run {
         /// OCI image reference.
@@ -280,6 +289,7 @@ enum Commands {
         detach: bool,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Run a language snippet inside a sandbox.
     RunCode {
         /// Sandbox ID.
@@ -378,6 +388,7 @@ enum Commands {
         force: bool,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Copy files between a sandbox and the host, as `docker cp` does.
     ///
     /// One of SRC and DEST is `SANDBOX:PATH`. Use `-` for SRC to read a tar
@@ -400,6 +411,7 @@ enum Commands {
         quiet: bool,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// List the processes of a running sandbox, as `docker top` does.
     ///
     /// Options after the sandbox are ps-style: none (as `ps -ef`), aux, axu,
@@ -414,6 +426,7 @@ enum Commands {
         ps_args: Vec<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Show the CPU, memory and process use of running sandboxes.
     ///
     /// Refreshes every second until interrupted; --no-stream prints one
@@ -448,6 +461,7 @@ enum Commands {
         references: Vec<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Stream sandbox events: create, start, die, stop and destroy.
     ///
     /// The daemon answers without a sandbox token, like `ward ps`, and keeps
@@ -472,6 +486,7 @@ enum Commands {
         format: Option<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// List the images in the local cache.
     ///
     /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
@@ -500,6 +515,7 @@ enum Commands {
         reference: Option<String>,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Pull an image into the local cache.
     ///
     /// Progress prints like `docker pull`. A pull stops at 2 GiB of layers
@@ -519,6 +535,7 @@ enum Commands {
         reference: String,
     },
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
     /// Save a sandbox's filesystem as a new local image, as `docker commit`
     /// does, and print the new image id.
     ///
