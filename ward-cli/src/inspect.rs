@@ -24,6 +24,8 @@ pub const PS_HEADERS: [&str; 6] = [
 
 /// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
+/// What Docker reports when a container's exit status was lost.
+const UNKNOWN_EXIT_CODE: i32 = 255;
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 3600;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -117,6 +119,20 @@ pub(crate) fn seconds_since(
     now_seconds: i64,
 ) -> Option<i64> {
     time.as_ref().map(|t| (now_seconds - t.seconds).max(0))
+}
+
+/// The exit code to show: the recorded one, 255 when a sandbox with a command
+/// ended without one, and 0 for a sandbox that has not ended or has no command.
+fn state_exit_code(info: &SandboxInfo) -> i32 {
+    let ended = matches!(
+        SandboxStatus::try_from(info.status),
+        Ok(SandboxStatus::Exited | SandboxStatus::Stopped)
+    );
+    match info.exit_code {
+        Some(code) => code,
+        None if ended && !info.command_name.is_empty() => UNKNOWN_EXIT_CODE,
+        None => 0,
+    }
 }
 
 /// Docker style status: `Up 5 minutes`, `Exited (7) 5 minutes ago`, `Created`.
@@ -244,7 +260,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "Created": info.created_at.as_ref().map(|t| rfc3339(t.seconds)),
         "State": {
             "Status": status_name(info.status),
-            "ExitCode": info.exit_code.unwrap_or_default(),
+            "ExitCode": state_exit_code(info),
             "StartedAt": state_time(&info.started_at),
             "FinishedAt": state_time(&info.finished_at),
         },
@@ -413,6 +429,28 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[rstest::rstest]
+    #[case::stopped_with_command_and_no_code(SandboxStatus::Stopped, None, "sh", 255)]
+    #[case::running(SandboxStatus::Running, None, "sh", 0)]
+    #[case::stopped_without_command(SandboxStatus::Stopped, None, "", 0)]
+    #[case::recorded_code(SandboxStatus::Stopped, Some(0), "sh", 0)]
+    fn given_sandbox_when_exit_code_shown_then_lost_status_is_255(
+        #[case] status: SandboxStatus,
+        #[case] code: Option<i32>,
+        #[case] command: &str,
+        #[case] expected: i32,
+    ) {
+        // Arrange
+        let mut sandbox = info(status, code);
+        sandbox.command_name = command.into();
+
+        // Act
+        let shown = state_exit_code(&sandbox);
+
+        // Assert
+        assert_eq!(shown, expected);
     }
 
     #[test]

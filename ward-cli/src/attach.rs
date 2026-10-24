@@ -110,6 +110,41 @@ pub async fn attach_with(
     target: &Resolved,
     start: AttachStart,
     forward_stdin: bool,
+    sink: impl FnMut(Output) -> std::io::Result<()>,
+) -> Result<Option<i32>> {
+    // Registered first so a signal during setup cannot leave raw mode on.
+    let mut exits = ExitSignals::register(!relays_signals(&start, forward_stdin))?;
+    attach_with_exits(client, target, start, forward_stdin, &mut exits, sink).await
+}
+
+/// Like [`attach`], using handlers the caller registered with SIGINT and
+/// SIGTERM included, so the caller keeps hearing them once the attach ends.
+pub async fn attach_registered(
+    client: &mut WardClient<Channel>,
+    target: &Resolved,
+    start: AttachStart,
+    forward_stdin: bool,
+    exits: &mut ExitSignals,
+) -> Result<Option<i32>> {
+    let sink = |output: Output| match output {
+        Output::Data(chunk) => write_to_terminal(chunk.stream, chunk.bytes),
+        Output::ReplayEnd => Ok(()),
+    };
+    attach_with_exits(client, target, start, forward_stdin, exits, sink).await
+}
+
+/// SIGINT and SIGTERM go to the guest, unless the CLI owns the terminal
+/// (raw mode) or only watches (replay).
+fn relays_signals(start: &AttachStart, forward_stdin: bool) -> bool {
+    !(start.tty && forward_stdin) && !start.replay
+}
+
+async fn attach_with_exits(
+    client: &mut WardClient<Channel>,
+    target: &Resolved,
+    start: AttachStart,
+    forward_stdin: bool,
+    exits: &mut ExitSignals,
     mut sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
     let tty = start.tty;
@@ -117,9 +152,7 @@ pub async fn attach_with(
     // Raw mode turns Ctrl-C into a byte, so it is only worth it when
     // stdin is forwarded. Dropped on every exit path, which restores it.
     let raw_input = tty && forward_stdin;
-    let relay_signals = !raw_input && !replay;
-    // Registered first so a signal during setup cannot leave raw mode on.
-    let mut exits = ExitSignals::register(!relay_signals)?;
+    let relay_signals = relays_signals(&start, forward_stdin);
     let _raw = if raw_input {
         Some(enter_raw_mode()?)
     } else {
@@ -149,10 +182,22 @@ pub async fn attach_with(
     // `tx` lives to here, so the client half stays open until the end.
     let outcome = tokio::select! {
         outcome = streaming => outcome,
-        code = exits.recv_exit_code() => Ok(Some(code)),
+        code = recv_exit(exits, relay_signals) => Ok(Some(code)),
     };
     drop(tx);
+    if relay_signals {
+        // Already relayed to the guest, not meant for the caller's next wait.
+        exits.discard_pending_interrupts();
+    }
     outcome
+}
+
+async fn recv_exit(exits: &mut ExitSignals, relay_signals: bool) -> i32 {
+    if relay_signals {
+        exits.recv_hangup().await
+    } else {
+        exits.recv_exit_code().await
+    }
 }
 
 /// Hands every output chunk to `sink` until the stream ends or reports an

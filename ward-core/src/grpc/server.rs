@@ -29,6 +29,7 @@ use crate::pb::{
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
+use crate::utf8::Utf8Stream;
 use crate::volume::VolumeManager;
 
 // ---------------------------------------------------------------------------
@@ -405,10 +406,12 @@ impl Ward for WardGrpcServer {
         // dropping the inner receiver and shutting the pipeline down.
         let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, Status>>(16);
         tokio::spawn(async move {
+            let mut bridge = PbEventBridge::default();
             while let Some(evt) = inner_rx.recv().await {
-                let pb_evt = stream_event_to_pb(evt);
-                if out_tx.send(Ok(pb_evt)).await.is_err() {
-                    break;
+                for pb_evt in bridge.convert(evt) {
+                    if out_tx.send(Ok(pb_evt)).await.is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -1079,6 +1082,63 @@ impl Ward for WardGrpcServer {
 // Conversions
 // ---------------------------------------------------------------------------
 
+/// Turns a process's events into pb events. The pb event carries text only,
+/// so raw bytes are decoded per stream, with a character cut off at a chunk
+/// edge held back for the next chunk. Attach reads the raw variant directly.
+#[derive(Default)]
+struct PbEventBridge {
+    stdout: Utf8Stream,
+    stderr: Utf8Stream,
+}
+
+impl PbEventBridge {
+    fn decoder(&mut self, stream: crate::protocol::RawStream) -> &mut Utf8Stream {
+        match stream {
+            crate::protocol::RawStream::Stdout => &mut self.stdout,
+            crate::protocol::RawStream::Stderr => &mut self.stderr,
+        }
+    }
+
+    /// The pb events for `evt`: none while a chunk holds only a partial
+    /// character, and the held-back tails ahead of the exit event.
+    fn convert(&mut self, mut evt: crate::protocol::StreamEvent) -> Vec<StreamEvent> {
+        use crate::protocol::{RawStream, StreamEventKind};
+        match &evt.kind {
+            StreamEventKind::Data { stream, bytes } => {
+                let (stream, bytes) = (*stream, bytes.clone());
+                evt.line = self.decoder(stream).push(&bytes);
+                if evt.line.is_empty() {
+                    return Vec::new();
+                }
+                vec![stream_event_to_pb(evt)]
+            }
+            StreamEventKind::Exit => {
+                let mut out = Vec::new();
+                for stream in [RawStream::Stdout, RawStream::Stderr] {
+                    let tail = self.decoder(stream).finish();
+                    if !tail.is_empty() {
+                        let kind = StreamEventKind::Data {
+                            stream,
+                            bytes: Vec::new(),
+                        };
+                        out.push(stream_event_to_pb(crate::protocol::StreamEvent {
+                            kind,
+                            line: tail,
+                            exit_code: None,
+                            wait_status: None,
+                            timestamp: evt.timestamp,
+                            duration_ms: 0,
+                        }));
+                    }
+                }
+                out.push(stream_event_to_pb(evt));
+                out
+            }
+            _ => vec![stream_event_to_pb(evt)],
+        }
+    }
+}
+
 /// Translate an internal `protocol::StreamEvent` into the on-wire pb shape.
 /// `exit_code` is widened from `Option<i32>` to `i32` because protobuf has
 /// no native optional integer; callers distinguish "exit event" by checking
@@ -1086,13 +1146,6 @@ impl Ward for WardGrpcServer {
 fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
     use crate::pb::StreamEventType;
     use crate::protocol::{RawStream, StreamEventKind};
-
-    // The pb event carries text lines only, so raw bytes are shown as lossy
-    // UTF-8 here. Attach reads the raw variant directly.
-    let line = match &evt.kind {
-        StreamEventKind::Data { bytes, .. } => String::from_utf8_lossy(bytes).into_owned(),
-        _ => evt.line,
-    };
 
     let r#type = match evt.kind {
         StreamEventKind::Stdout
@@ -1119,7 +1172,7 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
 
     StreamEvent {
         r#type,
-        line,
+        line: evt.line,
         exit_code: evt.exit_code.unwrap_or(0),
         timestamp,
         duration_ms: evt.duration_ms,
@@ -1294,11 +1347,60 @@ mod tests {
         };
 
         // Act
-        let pb = stream_event_to_pb(evt);
+        let pb = PbEventBridge::default().convert(evt).remove(0);
 
         // Assert
         assert_eq!(pb.r#type, crate::pb::StreamEventType::Stderr as i32);
         assert_eq!(pb.line, "a\u{fffd}b");
+    }
+
+    fn raw_event(stream: crate::protocol::RawStream, bytes: &[u8]) -> crate::protocol::StreamEvent {
+        crate::protocol::StreamEvent {
+            kind: crate::protocol::StreamEventKind::Data {
+                stream,
+                bytes: bytes.to_vec(),
+            },
+            line: String::new(),
+            exit_code: None,
+            wait_status: None,
+            timestamp: std::time::SystemTime::now(),
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn given_three_byte_char_split_over_two_chunks_when_mapped_to_pb_then_it_is_intact() {
+        // Arrange
+        use crate::protocol::RawStream;
+        let euro = "\u{20ac}".as_bytes();
+        let mut bridge = PbEventBridge::default();
+
+        // Act
+        let first = bridge.convert(raw_event(RawStream::Stdout, &euro[..2]));
+        let second = bridge.convert(raw_event(RawStream::Stdout, &euro[2..]));
+
+        // Assert
+        assert!(first.is_empty());
+        assert_eq!(second[0].line, "\u{20ac}");
+    }
+
+    #[test]
+    fn given_chunks_split_on_both_streams_when_mapped_to_pb_then_streams_do_not_mix() {
+        // Arrange
+        use crate::protocol::RawStream;
+        let euro = "\u{20ac}".as_bytes();
+        let mut bridge = PbEventBridge::default();
+        bridge.convert(raw_event(RawStream::Stdout, &euro[..1]));
+
+        // Act
+        let err = bridge.convert(raw_event(RawStream::Stderr, b"e"));
+        let out = bridge.convert(raw_event(RawStream::Stdout, &euro[1..]));
+
+        // Assert
+        assert_eq!(
+            (err[0].line.as_str(), out[0].line.as_str()),
+            ("e", "\u{20ac}")
+        );
     }
 
     fn data_frame(len: usize) -> Result<CopyToMessage, Status> {
