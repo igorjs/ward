@@ -191,6 +191,7 @@ mod tests {
     use crate::protocol::{PublishedPort, SandboxSpec};
 
     const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
+    const IMAGE_DIGEST: &str = "sha256:abc123";
     const ID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
     const ID_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
 
@@ -219,6 +220,7 @@ mod tests {
                         host_port: 49153,
                         container_port: 80,
                     }],
+                    image_digest: IMAGE_DIGEST.into(),
                 },
             },
             created_at: SystemTime::now(),
@@ -301,6 +303,19 @@ mod tests {
         // Assert
         let ports = &loaded[0].options.spec.published_ports;
         assert_eq!((ports[0].host_port, ports[0].container_port), (49153, 80));
+    }
+
+    #[test]
+    fn given_image_digest_when_loaded_then_it_is_kept() {
+        // Arrange
+        let (_tmp, store) = store();
+        store.save(&meta(ID_A, SandboxStatus::Stopped)).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        assert_eq!(loaded[0].options.spec.image_digest, IMAGE_DIGEST);
     }
 
     #[test]

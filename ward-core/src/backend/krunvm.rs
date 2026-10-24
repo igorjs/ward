@@ -409,6 +409,14 @@ impl Backend for KrunvmBackend {
         self.image_store.config(image).await
     }
 
+    async fn resolve_image(
+        &self,
+        image: &str,
+        policy: crate::pb::PullPolicy,
+    ) -> Result<Option<String>> {
+        self.image_store.resolve(image, policy).await.map(Some)
+    }
+
     async fn list_images(&self) -> Result<Vec<CachedImage>> {
         Ok(self.image_store.list().await)
     }

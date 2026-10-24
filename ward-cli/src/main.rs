@@ -112,6 +112,30 @@ struct SandboxOpts {
         value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
     )]
     publish: Vec<String>,
+    /// When to pull the image: "always", "missing" (default), "never", or
+    /// "pinned" (like missing, but the reference must carry a @sha256 digest).
+    #[arg(long, value_enum, default_value_t = PullArg::Missing, value_name = "POLICY")]
+    pull: PullArg,
+}
+
+/// The `--pull` values: Docker's three, plus Ward's `pinned`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum PullArg {
+    Always,
+    Missing,
+    Never,
+    Pinned,
+}
+
+impl From<PullArg> for ward_core::pb::PullPolicy {
+    fn from(arg: PullArg) -> Self {
+        match arg {
+            PullArg::Always => Self::Always,
+            PullArg::Missing => Self::Missing,
+            PullArg::Never => Self::Never,
+            PullArg::Pinned => Self::Pinned,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -675,6 +699,7 @@ fn create_request(
         env: parse_env(&opts.env),
         name: opts.name.unwrap_or_default(),
         user: opts.user.unwrap_or_default(),
+        pull_policy: ward_core::pb::PullPolicy::from(opts.pull) as i32,
         ..Default::default()
     })
 }
@@ -1452,6 +1477,7 @@ fn status_name(status: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ward_core::pb::PullPolicy;
 
     #[test]
     fn given_source_and_target_when_parse_mount_then_read_write() {
@@ -1612,6 +1638,41 @@ mod tests {
             .map(|m| (m.host_ip.as_str(), m.host_port, m.container_port))
             .collect();
         assert_eq!(ports, vec![("", 0, 80), ("127.0.0.1", 8443, 443)]);
+    }
+
+    #[rstest::rstest]
+    #[case::default(&[], PullPolicy::Missing)]
+    #[case::always(&["--pull=always"], PullPolicy::Always)]
+    #[case::missing(&["--pull", "missing"], PullPolicy::Missing)]
+    #[case::never(&["--pull=never"], PullPolicy::Never)]
+    #[case::pinned(&["--pull=pinned"], PullPolicy::Pinned)]
+    fn given_pull_flag_when_create_request_built_then_it_carries_the_policy(
+        #[case] flags: &[&str],
+        #[case] expected: PullPolicy,
+    ) {
+        // Arrange
+        let mut args = vec!["ward", "create"];
+        args.extend(flags);
+        args.push("alpine");
+        let cli = Cli::try_parse_from(args).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(request.pull_policy, expected as i32);
+    }
+
+    #[test]
+    fn given_unknown_pull_value_when_parsed_then_it_is_rejected() {
+        // Act
+        let result = Cli::try_parse_from(["ward", "run", "--pull=sometimes", "alpine"]);
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[test]

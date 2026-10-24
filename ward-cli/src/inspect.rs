@@ -271,6 +271,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
+        "Image": info.image_digest,
         "Created": info.created_at.as_ref().map(|t| rfc3339(t.seconds)),
         "State": {
             "Status": status_name(info.status),
@@ -545,6 +546,20 @@ mod tests {
     }
 
     #[test]
+    fn given_image_digest_when_inspected_then_image_is_the_digest_and_config_keeps_the_reference() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.image_digest = "sha256:abc123".into();
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(value["Image"], "sha256:abc123");
+        assert_eq!(value["Config"]["Image"], "alpine");
+    }
+
+    #[test]
     fn given_command_when_inspected_then_cmd_is_full_argv_else_argv0() {
         // Arrange
         let mut sandbox = info(SandboxStatus::Running, None);
@@ -572,6 +587,7 @@ mod tests {
             json!({
                 "Id": "0123456789abcdef0123",
                 "Name": "/web1",
+                "Image": "",
                 "Created": "1970-01-12T13:44:40Z",
                 "State": {
                     "Status": "exited",

@@ -940,6 +940,23 @@ impl SandboxManager {
         Ok(launch)
     }
 
+    /// Apply the request's pull policy and return the digest of its image.
+    /// A clone starts from a snapshot, so it resolves no image.
+    async fn resolve_image(&self, req: &crate::pb::CreateSandboxRequest) -> Result<String> {
+        if req.image.is_empty() || !req.from_snapshot.is_empty() {
+            return Ok(String::new());
+        }
+        let policy = crate::pb::PullPolicy::try_from(req.pull_policy).map_err(|_| {
+            ApiError::InvalidRequest(format!("unknown pull policy {}", req.pull_policy))
+        })?;
+        let digest = self
+            .backend
+            .resolve_image(&req.image, policy)
+            .await
+            .map_err(image_backend_err)?;
+        Ok(digest.unwrap_or_default())
+    }
+
     /// Create a new sandbox. `presented_token` is only consulted when
     /// `req.from_snapshot` is set: it must match the token of the sandbox
     /// that owns the snapshot, so cloning a sandbox from its snapshot
@@ -1052,6 +1069,7 @@ impl SandboxManager {
             })?;
 
         // Last, so a rejected request never pulls an image.
+        let image_digest = self.resolve_image(&req).await?;
         let launch = self.resolve_launch(&req).await?;
 
         let resources = req
@@ -1083,6 +1101,7 @@ impl SandboxManager {
                 tty: req.tty,
                 auto_remove: req.auto_remove,
                 published_ports,
+                image_digest,
             },
         };
 
@@ -2505,6 +2524,7 @@ fn recorded_state(
         info.finished_at = entry.meta.finished_at;
         info.end_reason = entry.meta.end_reason;
         info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
+        info.spec.image_digest = entry.meta.options.spec.image_digest.clone();
     }
     info
 }
@@ -2572,6 +2592,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         end_reason: end_reason_to_pb(info.end_reason) as i32,
         workdir: info.spec.workdir,
         user: info.spec.user,
+        image_digest: info.spec.image_digest,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec
@@ -3134,6 +3155,89 @@ pub(crate) mod tests {
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
         assert_eq!(puller.pulled(), vec!["alpine".to_string()]);
+    }
+
+    // ----- pull policy and image digest -----------------------------------
+
+    fn create_req_with_policy(image: &str, policy: crate::pb::PullPolicy) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            pull_policy: policy as i32,
+            ..create_req(image)
+        }
+    }
+
+    #[tokio::test]
+    async fn given_created_sandbox_when_fetched_then_it_carries_the_image_digest() {
+        // Arrange
+        let mgr = build_manager(4);
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Act
+        let fetched = mgr.get(&created.id).await.unwrap();
+
+        // Assert
+        assert!(fetched.image_digest.starts_with("sha256:"), "{fetched:?}");
+        assert_eq!(fetched.image_digest, created.image_digest);
+    }
+
+    #[tokio::test]
+    async fn given_uncached_image_when_create_with_never_then_it_fails_and_nothing_is_pulled() {
+        // Arrange
+        let (mgr, puller) = build_recording_manager(4);
+
+        // Act
+        let err = mgr
+            .create(
+                create_req_with_policy("alpine", crate::pb::PullPolicy::Never),
+                "",
+            )
+            .await
+            .expect_err("not cached");
+
+        // Assert
+        assert!(
+            err.to_string()
+                .contains("Unable to find image 'alpine' locally"),
+            "{err}"
+        );
+        assert!(puller.pulled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_tag_when_create_with_pinned_then_it_is_rejected_and_nothing_is_pulled() {
+        // Arrange
+        let (mgr, puller) = build_recording_manager(4);
+
+        // Act
+        let err = mgr
+            .create(
+                create_req_with_policy("alpine:3.20", crate::pb::PullPolicy::Pinned),
+                "",
+            )
+            .await
+            .expect_err("bare tag");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
+        assert!(puller.pulled().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_cached_image_when_create_with_always_then_it_is_pulled_again() {
+        // Arrange
+        let (mgr, puller) = build_recording_manager(4);
+        mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Act
+        mgr.create(
+            create_req_with_policy("alpine", crate::pb::PullPolicy::Always),
+            "",
+        )
+        .await
+        .unwrap();
+
+        // Assert
+        assert_eq!(puller.pulled(), vec!["alpine".to_string(); 2]);
     }
 
     // ----- from_snapshot token gate ---------------------------------------

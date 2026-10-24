@@ -37,6 +37,7 @@ use tokio_stream::{Stream, StreamExt};
 
 use super::commit::{self, CommitSpec, CopyError, CopyLimits};
 use super::{BackendError, Result};
+use crate::pb::PullPolicy;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// A pull stops once the layers it downloads add up to this many bytes.
@@ -423,6 +424,11 @@ pub fn validate_reference(reference: &str) -> Result<oci_client::Reference> {
     reference.parse().map_err(|_| {
         BackendError::InvalidArgument(format!("invalid reference format: {reference}"))
     })
+}
+
+/// Whether `reference` names its image by digest, so it cannot move.
+fn is_pinned(reference: &str) -> bool {
+    reference.contains(&format!("@{DIGEST_ALGORITHM_PREFIX}"))
 }
 
 /// The first characters of a layer digest, as Docker shows them.
@@ -989,6 +995,45 @@ impl ImageStore {
     pub async fn config(&self, reference: &str) -> Result<ImageConfig> {
         let (_, meta) = self.ensure_entry(reference, true).await?;
         Ok(meta.config.unwrap_or_default())
+    }
+
+    /// Make `reference` available as `policy` says and return the manifest
+    /// digest it resolved to.
+    pub async fn resolve(&self, reference: &str, policy: PullPolicy) -> Result<String> {
+        match policy {
+            PullPolicy::Never => self
+                .find_cache_entry_by_ref(reference)?
+                .map(|(_, meta)| meta.digest)
+                .ok_or_else(|| {
+                    BackendError::Image(format!("Unable to find image '{reference}' locally"))
+                }),
+            PullPolicy::Always => self.refresh(reference).await,
+            PullPolicy::Pinned if !is_pinned(reference) => {
+                Err(BackendError::InvalidArgument(format!(
+                    "--pull=pinned needs an image reference with a digest (name@sha256:...), got '{reference}'"
+                )))
+            }
+            PullPolicy::Pinned | PullPolicy::Missing | PullPolicy::Unspecified => {
+                Ok(self.ensure_entry(reference, false).await?.1.digest)
+            }
+        }
+    }
+
+    /// Pull `reference` again and move its tag to what the registry has now.
+    /// The previous image stays in the cache under its digest.
+    async fn refresh(&self, reference: &str) -> Result<String> {
+        let mut session = self.session(None)?;
+        let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
+        let previous = self.find_cache_entry_by_ref(reference)?;
+        let (_, meta) = self.install_entry(staging, reference, pulled)?;
+        if let Some((dir, old)) = previous.filter(|(_, old)| old.digest != meta.digest) {
+            let untagged = CacheMeta {
+                image_ref: old.digest.clone(),
+                ..old
+            };
+            write_meta_json(&dir.join("meta.json"), &untagged)?;
+        }
+        Ok(meta.digest)
     }
 
     /// Pull `reference` into a fresh temp dir inside the cache. The caller
@@ -2096,6 +2141,130 @@ mod tests {
             "expected sha256: prefix, got: {}",
             entry.digest
         );
+    }
+
+    // ----- resolve: pull policy -------------------------------------------
+
+    const PINNED_REF: &str = "alpine@sha256:0123456789abcdef";
+
+    /// Reports a new digest on every pull, like a tag that keeps moving.
+    #[derive(Debug, Default)]
+    struct MovingPuller(std::sync::atomic::AtomicU32);
+
+    #[async_trait::async_trait]
+    impl ImagePuller for MovingPuller {
+        async fn pull(&self, _reference: &str, dest: &Path) -> Result<PulledImage> {
+            std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
+            let n = self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PulledImage::without_config(format!("sha256:{n:064x}")))
+        }
+    }
+
+    #[tokio::test]
+    async fn given_uncached_image_when_resolved_never_then_it_fails_like_docker() {
+        // Arrange
+        let (store, _tmp) = store_in_tempdir();
+
+        // Act
+        let err = store
+            .resolve("alpine", PullPolicy::Never)
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert!(
+            err.to_string()
+                .contains("Unable to find image 'alpine' locally"),
+            "got: {err}"
+        );
+        assert!(!store.is_cached("alpine").await);
+    }
+
+    #[tokio::test]
+    async fn given_cached_image_when_resolved_never_then_it_returns_the_digest_without_pulling() {
+        // Arrange
+        let (store, _tmp) = store_in_tempdir();
+        let cached = store.pull("alpine", None).await.expect("pull");
+
+        // Act
+        let digest = store.resolve("alpine", PullPolicy::Never).await.unwrap();
+
+        // Assert
+        assert_eq!(digest, cached.digest);
+    }
+
+    #[tokio::test]
+    async fn given_tag_without_digest_when_resolved_pinned_then_it_is_refused_and_not_pulled() {
+        // Arrange
+        let (store, _tmp) = store_in_tempdir();
+
+        // Act
+        let err = store
+            .resolve("alpine:latest", PullPolicy::Pinned)
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert!(
+            matches!(err, BackendError::InvalidArgument(_)),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("name@sha256:"), "got: {err}");
+        assert!(!store.is_cached("alpine:latest").await);
+    }
+
+    #[tokio::test]
+    async fn given_digest_reference_when_resolved_pinned_then_it_is_pulled() {
+        // Arrange
+        let (store, _tmp) = store_in_tempdir();
+
+        // Act
+        let digest = store.resolve(PINNED_REF, PullPolicy::Pinned).await.unwrap();
+
+        // Assert
+        assert!(digest.starts_with(DIGEST_ALGORITHM_PREFIX), "got: {digest}");
+        assert!(store.is_cached(PINNED_REF).await);
+    }
+
+    #[tokio::test]
+    async fn given_cached_image_when_resolved_missing_then_it_is_not_pulled_again() {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let store = ImageStore::with_puller(
+            tmp.path().to_path_buf(),
+            64,
+            Arc::new(MovingPuller::default()),
+        );
+        let first = store.resolve("alpine", PullPolicy::Missing).await.unwrap();
+
+        // Act
+        let second = store.resolve("alpine", PullPolicy::Missing).await.unwrap();
+
+        // Assert
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
+    async fn given_cached_image_when_resolved_always_then_the_tag_moves_and_the_old_image_stays_by_digest()
+     {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let store = ImageStore::with_puller(
+            tmp.path().to_path_buf(),
+            64,
+            Arc::new(MovingPuller::default()),
+        );
+        let old = store.resolve("alpine", PullPolicy::Always).await.unwrap();
+
+        // Act
+        let new = store.resolve("alpine", PullPolicy::Always).await.unwrap();
+
+        // Assert
+        assert_ne!(new, old);
+        let (_, tagged) = store.find_cache_entry_by_ref("alpine").unwrap().unwrap();
+        assert_eq!(tagged.digest, new);
+        let (_, kept) = store.find_cache_entry_by_ref(&old).unwrap().unwrap();
+        assert_eq!(kept.digest, old);
     }
 
     // ----- unpack_layer: file extraction ----------------------------------

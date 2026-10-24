@@ -131,6 +131,16 @@ pub trait Backend: Send + Sync + 'static {
         Ok(image::ImageConfig::default())
     }
 
+    /// Make `image` available as `policy` says and return its manifest
+    /// digest. Backends that do not read images resolve nothing.
+    async fn resolve_image(
+        &self,
+        _image: &str,
+        _policy: crate::pb::PullPolicy,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Images in the local cache. Backends without a cache report none.
     async fn list_images(&self) -> Result<Vec<image::CachedImage>> {
         Ok(Vec::new())

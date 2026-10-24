@@ -127,6 +127,22 @@ message CreateSandboxRequest {
   string user = 17;
   // Host ports to forward into the guest, like `docker run -p`.
   repeated PortMapping published_ports = 18;
+  // When to pull `image`, like `docker run --pull`. Unspecified means
+  // missing. Ignored when `from_snapshot` is set.
+  PullPolicy pull_policy = 19;
+}
+
+// Mirrors Docker's `--pull` values, plus `pinned`.
+enum PullPolicy {
+  PULL_POLICY_UNSPECIFIED = 0;
+  // Pull even when the image is cached, so a moved tag is picked up.
+  PULL_POLICY_ALWAYS = 1;
+  // Pull only when the image is not cached.
+  PULL_POLICY_MISSING = 2;
+  // Fail when the image is not cached.
+  PULL_POLICY_NEVER = 3;
+  // Like missing, but refuse a reference that has no sha256 digest.
+  PULL_POLICY_PINNED = 4;
 }
 
 // A host TCP port forwarded to a guest port. In a create request `host_port`
@@ -200,6 +216,9 @@ message SandboxInfo {
   repeated PortMapping published_ports = 18;
   // Why the sandbox last ended. Unspecified while it runs or when unknown.
   EndReason end_reason = 19;
+  // Manifest digest the image resolved to when the sandbox was created,
+  // e.g. sha256:... Empty for a sandbox created before it was recorded.
+  string image_digest = 20;
 }
 
 enum EndReason {
