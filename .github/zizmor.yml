@@ -18,3 +18,7 @@ rules:
   cache-poisoning:
     ignore:
       - release.yml
+  # Rolling stable toolchain tag, see unpinned-uses above.
+  ref-version-mismatch:
+    ignore:
+      - license.yml:121
