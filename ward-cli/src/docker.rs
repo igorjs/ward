@@ -4,7 +4,9 @@
 //! stream a process through Attach and exit with its exit code.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
 use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
@@ -12,9 +14,12 @@ use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
 use crate::attach::{self, require_exit, require_terminal};
 use crate::client::{self, Resolved};
 use crate::log_output::{LogOptions, LogPrinter, Printable};
+use crate::terminal::ExitSignals;
 use crate::{lifecycle, tokens};
 
 pub const TAIL_ALL: &str = "all";
+/// How long `--rm` waits for the daemon to remove the sandbox.
+const REMOVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The `ward run` flags that change how the process is attached.
 pub struct RunFlags {
@@ -49,13 +54,56 @@ pub async fn run(
         tty: flags.tty,
         ..Default::default()
     };
-    let outcome = attach::attach(&mut c, &target, start, flags.interactive).await;
-    if flags.rm
-        && let Err(e) = lifecycle::remove_resolved(&mut c, token_store, &target).await
-    {
-        eprintln!("warning: could not remove the sandbox: {e}");
+    // Registered before the attach so a Ctrl-C between its end and the
+    // removal is not lost.
+    let mut exits = if flags.rm {
+        ExitSignals::register(true).ok()
+    } else {
+        None
+    };
+    let outcome = match exits.as_mut() {
+        Some(exits) => {
+            attach::attach_registered(&mut c, &target, start, flags.interactive, exits).await
+        }
+        None => attach::attach(&mut c, &target, start, flags.interactive).await,
+    };
+    if flags.rm {
+        let removal = lifecycle::remove_resolved(&mut c, token_store, &target);
+        let interrupt = async {
+            match exits.as_mut() {
+                Some(exits) => exits.recv_exit_code().await,
+                None => std::future::pending().await,
+            }
+        };
+        let interrupted = remove_unless_interrupted(removal, interrupt, REMOVE_TIMEOUT).await;
+        if let Some(code) = interrupted {
+            return Ok(code);
+        }
     }
     require_exit(outcome?)
+}
+
+/// Runs the removal, warning on failure or after `limit`. Returns
+/// the exit code of a signal that arrived first.
+async fn remove_unless_interrupted(
+    removal: impl Future<Output = Result<()>>,
+    interrupt: impl Future<Output = i32>,
+    limit: Duration,
+) -> Option<i32> {
+    tokio::select! {
+        code = interrupt => {
+            eprintln!("warning: interrupted while removing the sandbox");
+            Some(code)
+        }
+        done = tokio::time::timeout(limit, removal) => {
+            match done {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("warning: could not remove the sandbox: {e}"),
+                Err(_) => eprintln!("warning: timed out removing the sandbox"),
+            }
+            None
+        }
+    }
 }
 
 /// What `ward exec` runs inside an existing sandbox.
@@ -141,6 +189,34 @@ pub fn parse_tail(value: &str) -> Result<Option<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIGINT_EXIT_CODE: i32 = 130;
+    const SHORT_LIMIT: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn given_slow_removal_when_interrupted_then_it_returns_130() {
+        // Arrange
+        let removal = std::future::pending::<Result<()>>();
+        let interrupt = async { SIGINT_EXIT_CODE };
+
+        // Act
+        let code = remove_unless_interrupted(removal, interrupt, REMOVE_TIMEOUT).await;
+
+        // Assert
+        assert_eq!(code, Some(SIGINT_EXIT_CODE));
+    }
+
+    #[tokio::test]
+    async fn given_hung_removal_when_timeout_passes_then_it_gives_up_without_a_code() {
+        // Arrange
+        let removal = std::future::pending::<Result<()>>();
+
+        // Act
+        let code = remove_unless_interrupted(removal, std::future::pending(), SHORT_LIMIT).await;
+
+        // Assert
+        assert_eq!(code, None);
+    }
 
     #[test]
     fn given_tail_values_when_parsed_then_all_is_none_and_numbers_are_counts() {

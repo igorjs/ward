@@ -8,6 +8,7 @@
 
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::task::{Context, Waker};
 
 use rustix::termios::{self, OptionalActions, Termios};
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -102,6 +103,27 @@ impl ExitSignals {
             _ = self.hangup.recv() => SignalKind::hangup(),
         };
         SIGNAL_EXIT_BASE + signo.as_raw_value()
+    }
+}
+
+impl ExitSignals {
+    /// Resolves with the exit code of a SIGHUP only, leaving any SIGINT or
+    /// SIGTERM pending for a later [`Self::recv_exit_code`].
+    pub async fn recv_hangup(&mut self) -> i32 {
+        self.hangup.recv().await;
+        SIGNAL_EXIT_BASE + SignalKind::hangup().as_raw_value()
+    }
+
+    /// Forgets the SIGINT and SIGTERM that arrived so far, such as ones
+    /// already relayed to a process.
+    pub fn discard_pending_interrupts(&mut self) {
+        let mut cx = Context::from_waker(Waker::noop());
+        for stream in [&mut self.interrupt, &mut self.terminate]
+            .into_iter()
+            .flatten()
+        {
+            while stream.poll_recv(&mut cx).is_ready() {}
+        }
     }
 }
 

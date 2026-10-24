@@ -3,6 +3,7 @@
 //! Attach: one bidirectional stream onto a sandbox's main process or onto a
 //! command started for the stream. A client disconnect only detaches.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -27,6 +28,9 @@ use crate::sandbox::{
 const OUTBOUND_CAPACITY: usize = 16;
 const SIGKILL: i32 = 9;
 const NO_EXIT_STATUS: &str = "process ended without an exit status";
+/// Stdin bytes held for a process that is not reading yet. Past this the
+/// client is no longer read, so a stalled process pushes back on it.
+const STDIN_BACKLOG_LIMIT: usize = 16 * 1024 * 1024;
 
 type Outbound = mpsc::Sender<Result<AttachMessage, Status>>;
 
@@ -252,8 +256,18 @@ async fn pump_exec(
     }
 }
 
+/// One step of the client's stdin, kept in order until the process reads it.
+enum StdinStep {
+    Data(Bytes),
+    Close,
+}
+
 /// Apply the client's stdin, resize and signal messages to the process.
 /// A read-only client is heard but ignored.
+///
+/// Stdin waits in a queue while the process is not reading, and signals and
+/// resizes still get through meanwhile. Nothing is dropped, so a slow reader
+/// sees every byte, as it would under Docker.
 async fn forward_input<S>(
     manager: Arc<SandboxManager>,
     id: String,
@@ -264,35 +278,79 @@ async fn forward_input<S>(
 ) where
     S: Stream<Item = Result<AttachMessage, Status>> + Unpin,
 {
-    while let Some(Ok(message)) = inbound.next().await {
-        if read_only {
-            continue;
-        }
-        match message.kind {
-            Some(Kind::Stdin(stdin)) if stdin.data.is_empty() => {
-                io.stdin = None;
-                if is_main {
-                    manager.close_main_stdin(&id).await;
-                }
-            }
-            Some(Kind::Stdin(stdin)) => {
-                if let Some(tx) = &io.stdin {
-                    let _ = tx.send(Bytes::from(stdin.data)).await;
-                }
-            }
-            Some(Kind::Resize(resize)) => {
-                let control = ProcessControl::Resize {
-                    rows: resize.rows,
-                    cols: resize.cols,
+    let mut backlog: VecDeque<StdinStep> = VecDeque::new();
+    let mut backlog_bytes = 0;
+    let mut input_closed = false;
+    loop {
+        tokio::select! {
+            permit = stdin_permit(io.stdin.clone()), if !backlog.is_empty() => {
+                let Some(permit) = permit else {
+                    // The process is gone or stopped taking input for good.
+                    backlog.clear();
+                    io.stdin = None;
+                    continue;
                 };
-                send_control(&io, control).await;
+                match backlog.pop_front() {
+                    Some(StdinStep::Data(data)) => {
+                        backlog_bytes -= data.len();
+                        permit.send(data);
+                    }
+                    Some(StdinStep::Close) => {
+                        drop(permit);
+                        io.stdin = None;
+                        if is_main {
+                            manager.close_main_stdin(&id).await;
+                        }
+                    }
+                    None => {}
+                }
             }
-            Some(Kind::Signal(signal)) => {
-                send_control(&io, ProcessControl::Signal(signal.signo)).await
+            message = inbound.next(), if backlog_bytes < STDIN_BACKLOG_LIMIT => {
+                let Some(Ok(message)) = message else { break };
+                if read_only {
+                    continue;
+                }
+                match message.kind {
+                    Some(Kind::Stdin(_)) if input_closed => {}
+                    Some(Kind::Stdin(stdin)) if stdin.data.is_empty() => {
+                        input_closed = true;
+                        backlog.push_back(StdinStep::Close);
+                    }
+                    Some(Kind::Stdin(stdin)) => {
+                        backlog_bytes += stdin.data.len();
+                        backlog.push_back(StdinStep::Data(Bytes::from(stdin.data)));
+                    }
+                    Some(Kind::Resize(resize)) => {
+                        let control = ProcessControl::Resize {
+                            rows: resize.rows,
+                            cols: resize.cols,
+                        };
+                        send_control(&io, control).await;
+                    }
+                    Some(Kind::Signal(signal)) => {
+                        send_control(&io, ProcessControl::Signal(signal.signo)).await
+                    }
+                    _ => warn!(sandbox_id = %id, "attach ignored an unexpected message"),
+                }
             }
-            _ => warn!(sandbox_id = %id, "attach ignored an unexpected message"),
         }
     }
+    // The client is gone: release the process's control so an exec dies, then
+    // hand over whatever input it still had coming.
+    io.control = None;
+    while let Some(step) = backlog.pop_front() {
+        let Some(tx) = &io.stdin else { break };
+        let StdinStep::Data(data) = step else { break };
+        if tx.send(data).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Waits for room to queue one more stdin chunk. `None` when the process has
+/// no stdin or has dropped it.
+async fn stdin_permit(tx: Option<mpsc::Sender<Bytes>>) -> Option<mpsc::OwnedPermit<Bytes>> {
+    tx?.reserve_owned().await.ok()
 }
 
 async fn send_control(io: &ProcessIo, control: ProcessControl) {
@@ -549,6 +607,60 @@ mod tests {
 
         // Assert
         assert_eq!(collect(&mut replies).await.1, Some(143));
+    }
+
+    #[tokio::test]
+    async fn given_process_not_reading_stdin_when_sigterm_follows_large_write_then_it_is_delivered()
+    {
+        // Arrange
+        const CHUNK_BYTES: usize = 64 * 1024;
+        const CHUNKS: usize = 40;
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "60"], false).await;
+        let (feed, mut replies) = attach(&mgr, &id, main_start(&id)).await;
+        let chunk = vec![b'x'; CHUNK_BYTES];
+
+        // Act
+        let send = async {
+            for _ in 0..CHUNKS {
+                feed.send(stdin(&chunk)).await.unwrap();
+            }
+            feed.send(message(Kind::Signal(AttachSignal { signo: SIGTERM })))
+                .await
+                .unwrap();
+        };
+        tokio::time::timeout(TEST_DEADLINE, send)
+            .await
+            .expect("client messages accepted in time");
+
+        // Assert
+        assert_eq!(collect(&mut replies).await.1, Some(143));
+    }
+
+    #[tokio::test]
+    async fn given_process_that_reads_late_when_large_input_is_sent_then_every_byte_arrives() {
+        // Arrange
+        const CHUNK_BYTES: usize = 64 * 1024;
+        const CHUNKS: usize = 8;
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "sleep 3; wc -c"], false).await;
+        let (feed, mut replies) = attach(&mgr, &id, main_start(&id)).await;
+        let chunk = vec![b'x'; CHUNK_BYTES];
+
+        // Act
+        for _ in 0..CHUNKS {
+            feed.send(stdin(&chunk)).await.unwrap();
+        }
+        feed.send(stdin(b"")).await.unwrap();
+        let (out, code) = tokio::time::timeout(TEST_DEADLINE, collect(&mut replies))
+            .await
+            .expect("process finished in time");
+
+        // Assert
+        assert_eq!(
+            (out.trim().parse::<usize>().unwrap(), code),
+            (CHUNK_BYTES * CHUNKS, Some(0))
+        );
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ pub mod egress;
 pub mod grpc;
 pub mod protocol;
 pub mod sandbox;
+pub mod utf8;
 pub mod validate;
 pub mod volume;
 

@@ -383,28 +383,10 @@ impl Server {
             .await
             .map_err(|e| RpcError::internal(format!("ward_run stream_output: {e}")))?;
 
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
-        let mut exit_code: Option<i32> = None;
-        let mut duration_ms: u64 = 0;
-
+        let mut output = RunOutput::default();
         let collect = async {
             while let Some(ev) = rx.recv().await {
-                match ev.kind {
-                    StreamEventKind::Stdout => stdout_buf.push_str(&ev.line),
-                    StreamEventKind::Stderr => stderr_buf.push_str(&ev.line),
-                    StreamEventKind::Data { stream, bytes } => {
-                        let text = String::from_utf8_lossy(&bytes);
-                        match stream {
-                            RawStream::Stdout => stdout_buf.push_str(&text),
-                            RawStream::Stderr => stderr_buf.push_str(&text),
-                        }
-                    }
-                    StreamEventKind::Exit => {
-                        exit_code = ev.exit_code;
-                        duration_ms = ev.duration_ms;
-                    }
-                }
+                output.absorb(ev);
             }
         };
 
@@ -417,10 +399,10 @@ impl Server {
 
         let result = serde_json::json!({
             "pid": proc_info.pid,
-            "stdout": stdout_buf,
-            "stderr": stderr_buf,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+            "exit_code": output.exit_code,
+            "duration_ms": output.duration_ms,
         });
         Ok(result.to_string())
     }
@@ -791,6 +773,33 @@ fn status_label(status: i32) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+/// What `ward_run` collected from a process. Output stays as bytes until
+/// the end so a character split across chunks decodes whole.
+#[derive(Default)]
+struct RunOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+    duration_ms: u64,
+}
+
+impl RunOutput {
+    fn absorb(&mut self, ev: ward_core::protocol::StreamEvent) {
+        match ev.kind {
+            StreamEventKind::Stdout => self.stdout.extend_from_slice(ev.line.as_bytes()),
+            StreamEventKind::Stderr => self.stderr.extend_from_slice(ev.line.as_bytes()),
+            StreamEventKind::Data { stream, bytes } => match stream {
+                RawStream::Stdout => self.stdout.extend_from_slice(&bytes),
+                RawStream::Stderr => self.stderr.extend_from_slice(&bytes),
+            },
+            StreamEventKind::Exit => {
+                self.exit_code = ev.exit_code;
+                self.duration_ms = ev.duration_ms;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,5 +830,30 @@ mod tests {
 
         // Assert
         assert_eq!(labels, ("Exited".to_string(), "Stopping".to_string()));
+    }
+
+    #[test]
+    fn given_three_byte_char_split_over_two_chunks_when_collected_then_it_is_intact() {
+        // Arrange
+        let euro = "\u{20ac}".as_bytes();
+        let chunk = |bytes: &[u8]| ward_core::protocol::StreamEvent {
+            kind: StreamEventKind::Data {
+                stream: RawStream::Stdout,
+                bytes: bytes.to_vec(),
+            },
+            line: String::new(),
+            exit_code: None,
+            wait_status: None,
+            timestamp: std::time::SystemTime::now(),
+            duration_ms: 0,
+        };
+        let mut output = RunOutput::default();
+
+        // Act
+        output.absorb(chunk(&euro[..1]));
+        output.absorb(chunk(&euro[1..]));
+
+        // Assert
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "\u{20ac}");
     }
 }

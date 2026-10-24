@@ -282,6 +282,8 @@ const WAIT_STATUS_EXIT_MASK: i32 = 0xff;
 const SIGNAL_EXIT_BASE: i32 = 128;
 /// Exit code Docker reports when a command cannot be run.
 const EXEC_FAILED_EXIT: i32 = 126;
+/// Exit code Docker reports when a container's exit status was lost.
+const UNKNOWN_EXIT: i32 = 255;
 
 /// Seconds a stopping sandbox's main process gets to end after SIGTERM.
 pub const STOP_GRACE_SECONDS: u64 = 10;
@@ -313,6 +315,15 @@ pub(crate) fn decode_wait_status(raw: i32) -> i32 {
         0 => (raw >> WAIT_STATUS_EXIT_SHIFT) & WAIT_STATUS_EXIT_MASK,
         signal => SIGNAL_EXIT_BASE + signal,
     }
+}
+
+/// How a sandbox's main process ended when it was stopped.
+enum MainEnd {
+    NoMain,
+    Exited(i32),
+    /// The process was told to end but never reported an exit, for example
+    /// because the agent connection dropped.
+    Unknown,
 }
 
 /// Channels to a running process.
@@ -646,19 +657,47 @@ impl SandboxManager {
         &self,
         meta: &SandboxMeta,
         before: &crate::protocol::SandboxStatus,
-        exit_code: i32,
+        exit_code: Option<i32>,
     ) {
         // An exited sandbox already reported its `die`.
         if *before == crate::protocol::SandboxStatus::Running {
-            self.emit_for(meta, EventAction::Die, Some(exit_code)).await;
+            self.emit_for(meta, EventAction::Die, exit_code).await;
         }
     }
 
     /// Record that the main process could not start and report its `die`.
-    async fn fail_main_start(&self, id: &str) {
-        self.mark_failed(id).await;
+    /// A stop or removal that landed while the spawn was pending already
+    /// settled the state and reported, so nothing changes then. Returns
+    /// whether the failure was recorded.
+    async fn fail_main_start(&self, id: &str) -> bool {
+        let recorded = {
+            let mut entries = self.entries.write().await;
+            let Some(entry) = entries.get_mut(id) else {
+                return false;
+            };
+            if entry.meta.status != crate::protocol::SandboxStatus::Running {
+                return false;
+            }
+            let exit_code = entry.meta.exit_code;
+            self.commit(entry, crate::protocol::SandboxStatus::Failed, exit_code)
+                .await
+        };
+        if let Err(e) = recorded {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot record the failed state");
+        }
+        self.close_listeners(id).await;
         self.emit_event(id, EventAction::Die, Some(EXEC_FAILED_EXIT))
             .await;
+        true
+    }
+
+    /// End the VM and forget the comms policy of a start whose main process
+    /// could not run, so a failed sandbox holds no running VM.
+    async fn release_failed_start(&self, id: &str) {
+        if let Err(e) = self.backend.stop_sandbox(id).await {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot end the VM after the main process failed");
+        }
+        self.broker.deregister_sandbox(id).await;
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -1390,8 +1429,12 @@ impl SandboxManager {
         };
         tracing::info!(sandbox_id = %id, "stopping sandbox");
         self.close_listeners(id).await;
-        let main_code = self.end_main_process(id, grace).await;
-        let died_with = main_code.unwrap_or(0);
+        let main_end = self.end_main_process(id, grace).await;
+        let died_with = match main_end {
+            MainEnd::NoMain => Some(0),
+            MainEnd::Exited(code) => Some(code),
+            MainEnd::Unknown => None,
+        };
         if let Err(e) = self.backend.stop_sandbox(id).await {
             self.mark_failed(id).await;
             self.emit_die_if_was_running(&meta, &before, died_with)
@@ -1403,14 +1446,14 @@ impl SandboxManager {
             .await
             .retain(|_, rec| rec.sandbox_id != id);
         self.broker.deregister_sandbox(id).await;
-        match main_code {
-            Some(code) => {
-                self.record_state(id, crate::protocol::SandboxStatus::Stopped, Some(code))
-                    .await?;
-            }
-            None => {
+        match main_end {
+            MainEnd::NoMain => {
                 self.set_state(id, crate::protocol::SandboxStatus::Stopped)
                     .await?
+            }
+            MainEnd::Exited(_) | MainEnd::Unknown => {
+                self.record_state(id, crate::protocol::SandboxStatus::Stopped, died_with)
+                    .await?;
             }
         }
         tracing::info!(sandbox_id = %id, "sandbox stopped");
@@ -1422,11 +1465,14 @@ impl SandboxManager {
 
     /// Ask the main process to end with SIGTERM and force it with SIGKILL
     /// once the grace period passes. Returns its exit code, or `None` when
-    /// the sandbox has no main process.
-    async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> Option<i32> {
+    /// the sandbox has no main process, and unknown when it never reported an
+    /// exit even after SIGKILL.
+    async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> MainEnd {
         let (control, mut exit) = {
             let mains = self.mains.read().await;
-            let main = mains.get(id)?;
+            let Some(main) = mains.get(id) else {
+                return MainEnd::NoMain;
+            };
             (main.control_tx.clone(), main.exit.clone())
         };
         if let Some(control) = &control {
@@ -1439,8 +1485,10 @@ impl SandboxManager {
             }
             ended_within(&mut exit, Some(self.stop_grace)).await;
         }
-        let raw = (*exit.borrow()).map(decode_wait_status);
-        Some(raw.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL))
+        let raw = *exit.borrow();
+        raw.map_or(MainEnd::Unknown, |raw| {
+            MainEnd::Exited(decode_wait_status(raw))
+        })
     }
 
     async fn start_resolved(&self, id: &str) -> Result<()> {
@@ -1466,7 +1514,9 @@ impl SandboxManager {
         self.commit_running_and_register(id, comms).await?;
         self.emit_event(id, EventAction::Start, None).await;
         if let Err(e) = self.spawn_main(id).await {
-            self.fail_main_start(id).await;
+            if self.fail_main_start(id).await {
+                self.release_failed_start(id).await;
+            }
             return Err(e);
         }
         tracing::info!(sandbox_id = %id, "sandbox started");
@@ -1742,21 +1792,21 @@ impl SandboxManager {
 
     /// Block until the sandbox's main process has ended or the sandbox has
     /// stopped, and return the exit code. A sandbox without a main process
-    /// reports 0 once it is stopped. A sandbox that ends and is removed
-    /// before the next look still reports the code its process left, and one
-    /// removed while running reports the SIGKILL code its `die` event carries.
+    /// reports 0 once it is stopped, and one whose main process left no
+    /// exit code reports 255, as Docker does for a lost exit status. A sandbox
+    /// that ends and is removed before the next look still reports the code
+    /// its process left, and one removed while running reports the SIGKILL
+    /// code its `die` event carries.
     pub async fn wait(&self, reference: &str) -> Result<i32> {
         use crate::protocol::SandboxStatus as State;
         let id = self.resolve(reference).await?;
         let mut live: Option<watch::Receiver<Option<i32>>> = None;
         loop {
-            let recorded = self
-                .entries
-                .read()
-                .await
-                .get(&id)
-                .map(|entry| (entry.meta.status.clone(), entry.meta.exit_code));
-            let Some((status, exit_code)) = recorded else {
+            let recorded = self.entries.read().await.get(&id).map(|entry| {
+                let has_main = !entry.meta.options.spec.command.is_empty();
+                (entry.meta.status.clone(), entry.meta.exit_code, has_main)
+            });
+            let Some((status, exit_code, has_main)) = recorded else {
                 let Some(exit) = live else {
                     return Err(ApiError::SandboxNotFound(id));
                 };
@@ -1764,7 +1814,10 @@ impl SandboxManager {
                 return Ok(raw.map_or(SIGNAL_EXIT_BASE + SIGKILL, decode_wait_status));
             };
             match status {
-                State::Exited | State::Stopped => return Ok(exit_code.unwrap_or(0)),
+                State::Exited | State::Stopped => {
+                    let missing = if has_main { UNKNOWN_EXIT } else { 0 };
+                    return Ok(exit_code.unwrap_or(missing));
+                }
                 State::Failed => {
                     return Err(ApiError::InvalidRequest(format!(
                         "Container {id} failed to start"
@@ -5225,6 +5278,28 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     const BAD_IMAGE_USER: &str = "app\u{7}";
 
+    /// A main command whose agent connection drops before it reports an exit.
+    #[cfg(not(feature = "krunvm"))]
+    const LOST_EXIT_COMMAND: &str = "ward-test-lost-exit";
+    /// A main command that starts once, then fails slowly on later runs.
+    #[cfg(not(feature = "krunvm"))]
+    const FAILS_LATER_COMMAND: &str = "ward-test-fails-later";
+    #[cfg(not(feature = "krunvm"))]
+    const SLOW_EXEC_FAILURE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A process handle whose output channel closes without an exit event.
+    #[cfg(not(feature = "krunvm"))]
+    fn lost_exit_handle(sandbox_id: &str) -> crate::backend::ProcessHandle {
+        let (_gone, output_rx) = mpsc::channel(1);
+        crate::backend::ProcessHandle {
+            pid: "1".into(),
+            sandbox_id: sandbox_id.to_string(),
+            stdin_tx: None,
+            output_rx: Some(output_rx),
+            control_tx: None,
+        }
+    }
+
     #[cfg(not(feature = "krunvm"))]
     struct HostBackend {
         inner: crate::backend::krunvm::KrunvmBackend,
@@ -5304,7 +5379,22 @@ pub(crate) mod tests {
             mode: ExecMode,
         ) -> crate::backend::Result<crate::backend::ProcessHandle> {
             use std::process::Stdio;
-            self.exec_users.lock().unwrap().push(mode.user.clone());
+            let runs = {
+                let mut users = self.exec_users.lock().unwrap();
+                users.push(mode.user.clone());
+                users.len()
+            };
+            match command[0].as_str() {
+                LOST_EXIT_COMMAND => return Ok(lost_exit_handle(sandbox_id)),
+                FAILS_LATER_COMMAND if runs == 1 => return Ok(lost_exit_handle(sandbox_id)),
+                FAILS_LATER_COMMAND => {
+                    tokio::time::sleep(SLOW_EXEC_FAILURE).await;
+                    return Err(crate::backend::BackendError::Internal(
+                        "exec refused".into(),
+                    ));
+                }
+                _ => {}
+            }
             let mut cmd = tokio::process::Command::new(&command[0]);
             cmd.args(&command[1..]).kill_on_drop(true);
             let (output_tx, output_rx) = mpsc::channel(16);
@@ -6927,6 +7017,78 @@ pub(crate) mod tests {
         // Assert
         let got = history(&mgr, 3).await;
         assert_eq!(got[2].0, EventAction::Die);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_lost_agent_connection_when_stopped_then_exit_is_unknown_not_137() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[LOST_EXIT_COMMAND], false).await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+        assert_eq!(exit_code_of(&mgr, &id).await, None);
+        let die = history(&mgr, 4).await[2];
+        assert_eq!(die, (EventAction::Die, None));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_unknown_exit_when_waited_then_it_reports_255() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[LOST_EXIT_COMMAND], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        let code = mgr.wait(&id).await.expect("wait");
+
+        // Assert
+        assert_eq!(code, UNKNOWN_EXIT);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stop_racing_a_failing_spawn_when_both_finish_then_sandbox_is_stopped() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[FAILS_LATER_COMMAND], false).await;
+        mgr.stop(&id).await.expect("first stop");
+        let starter = {
+            let (mgr, id) = (Arc::clone(&mgr), id.clone());
+            tokio::spawn(async move { mgr.start(&id).await })
+        };
+        wait_for_status(&mgr, &id, SandboxStatus::Running).await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop during spawn");
+        starter.await.unwrap().expect_err("spawn fails");
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_failed_spawn_on_start_when_start_returns_then_vm_is_stopped_and_unregistered() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[FAILS_LATER_COMMAND], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        mgr.start(&id).await.expect_err("spawn fails");
+
+        // Assert
+        let backend_status = mgr.backend.get_sandbox(&id).await.expect("backend").status;
+        assert_eq!(backend_status, crate::protocol::SandboxStatus::Stopped);
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Failed);
+        let subscribed = mgr.broker().subscribe(&id, "topic").await;
+        assert!(matches!(subscribed, Err(ApiError::SandboxNotFound(_))));
     }
 
     #[cfg(not(feature = "krunvm"))]
