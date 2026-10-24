@@ -14,6 +14,8 @@
 export {
   WardClient,
   defaultSocketPath,
+  sandboxFromWire,
+  STATUS_UNKNOWN,
   type ConnectOptions,
   type CreateSandboxOptions,
   type Sandbox,

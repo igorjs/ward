@@ -67,6 +67,29 @@ class Sandbox:
     # is easy to track.
 
 
+STATUS_UNKNOWN = "unknown"
+
+# Proto SandboxStatus values by number.
+_SANDBOX_STATUS_NAMES = {
+    0: "unspecified",
+    1: "creating",
+    2: "running",
+    3: "stopped",
+    4: "failed",
+    5: "exited",
+    6: "stopping",
+}
+
+
+def sandbox_from_wire(id: str, image: str, status: int) -> Sandbox:
+    """Build a Sandbox from decoded wire fields.
+
+    A status this SDK does not know maps to ``STATUS_UNKNOWN`` instead of
+    raising, so a newer daemon never breaks an older client.
+    """
+    return Sandbox(id=id, image=image, status=_SANDBOX_STATUS_NAMES.get(status, STATUS_UNKNOWN))
+
+
 @dataclass
 class ExecResult:
     """Result of a fire-and-forget ``WardClient.run`` call."""

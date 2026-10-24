@@ -17,7 +17,18 @@ import sys
 import pytest
 
 import ward_sdk
-from ward_sdk import ExecResult, Sandbox, StreamEvent, WardClient, default_socket_path
+from ward_sdk import (
+    ExecResult,
+    Sandbox,
+    StreamEvent,
+    WardClient,
+    default_socket_path,
+    sandbox_from_wire,
+)
+from ward_sdk.client import STATUS_UNKNOWN
+
+EXITED_CODE = 5
+UNKNOWN_CODE = 9999
 
 
 def test_package_version_is_string() -> None:
@@ -92,3 +103,21 @@ def test_dataclasses_round_trip_via_kwargs() -> None:
     ev = StreamEvent(kind="stdout", line="hello")
     assert ev.kind == "stdout"
     assert ev.exit_code is None
+
+
+def test_sandbox_from_wire_maps_known_status() -> None:
+    # Act
+    sb = sandbox_from_wire("sb_01", "alpine:latest", EXITED_CODE)
+
+    # Assert
+    assert sb.status == "exited"
+
+
+def test_sandbox_from_wire_tolerates_unknown_status() -> None:
+    # Act
+    sb = sandbox_from_wire("sb_01", "alpine:latest", UNKNOWN_CODE)
+
+    # Assert
+    assert sb.status == STATUS_UNKNOWN
+    assert sb.id == "sb_01"
+    assert sb.image == "alpine:latest"

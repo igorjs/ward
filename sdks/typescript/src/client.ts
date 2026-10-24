@@ -37,6 +37,28 @@ export interface Sandbox {
   status: string;
 }
 
+export const STATUS_UNKNOWN = "unknown";
+
+/** Proto SandboxStatus values by number. */
+const SANDBOX_STATUS_NAMES: Readonly<Record<number, string>> = {
+  0: "unspecified",
+  1: "creating",
+  2: "running",
+  3: "stopped",
+  4: "failed",
+  5: "exited",
+  6: "stopping",
+};
+
+/**
+ * Build a Sandbox from decoded wire fields. A status this SDK does not
+ * know maps to STATUS_UNKNOWN instead of throwing, so a newer daemon
+ * never breaks an older client.
+ */
+export function sandboxFromWire(id: string, image: string, status: number): Sandbox {
+  return { id, image, status: SANDBOX_STATUS_NAMES[status] ?? STATUS_UNKNOWN };
+}
+
 export interface ExecResult {
   pid: string;
   stdout: string;
