@@ -38,7 +38,10 @@ pub fn open() -> io::Result<(PtyMaster, OwnedFd)> {
     rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC)?;
     let flags = rustix::fs::fcntl_getfl(&master)?;
     rustix::fs::fcntl_setfl(&master, flags | OFlags::NONBLOCK)?;
-    Ok((PtyMaster(Arc::new(AsyncFd::new(master)?)), slave))
+    // SAFETY: `master` is an open descriptor owned by the `AsyncFd` from here
+    // on, and nothing else closes or replaces it.
+    let registered = unsafe { AsyncFd::register(master) }.map_err(|e| e.into_parts().1)?;
+    Ok((PtyMaster(Arc::new(registered)), slave))
 }
 
 /// Make `slave` the child's stdin, stdout, stderr and controlling terminal,
