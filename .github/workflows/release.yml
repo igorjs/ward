@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -66,6 +66,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - id: r
         # Workflow-controlled inputs routed through env: per the GHA
         # expression-injection guidance, even though they aren't
@@ -143,6 +145,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Install protoc
         run: |
@@ -339,6 +343,9 @@ jobs:
   publish:
     needs: [resolve, build, slsa_provenance]
     runs-on: ubuntu-latest
+    # Attaches assets to the GitHub Release.
+    permissions:
+      contents: write
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -376,6 +383,8 @@ jobs:
             # the connection at the network layer.
             uploads.github.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
 
       - name: Download all artefacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -386,7 +395,7 @@ jobs:
       - name: Summarise release contents
         run: |
           {
-            echo "## Release ${{ needs.resolve.outputs.tag }}"
+            echo "## Release ${NEEDS_RESOLVE_OUTPUTS_TAG}"
             echo ""
             echo "**Artefacts** (paste into install.sh's CHECKSUMS table):"
             echo ""
@@ -394,6 +403,8 @@ jobs:
             cat dist/*.sha256 | sort
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          NEEDS_RESOLVE_OUTPUTS_TAG: ${{ needs.resolve.outputs.tag }}
 
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3

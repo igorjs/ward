@@ -40,6 +40,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Detect Rust-relevant changes
         id: filter
         shell: bash
@@ -102,6 +103,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -144,6 +147,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -203,6 +208,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
@@ -305,6 +312,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
@@ -384,6 +393,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -448,6 +459,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -520,6 +533,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - name: Read MSRV from Cargo.toml
         id: msrv
         run: |
@@ -557,6 +572,7 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Test the compatibility check
         run: bash scripts/check-proto-compat.test.sh
       - name: Check protos against the base branch
@@ -572,6 +588,8 @@ jobs:
         with:
           egress-policy: audit
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - name: Go SDK tests
         working-directory: sdks/go
         run: go test ./...
@@ -623,6 +641,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2
         with:
           tool: cargo-deny
@@ -673,6 +693,8 @@ jobs:
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
