@@ -44,6 +44,9 @@ pub struct SandboxSpec {
     /// use, so a restart opens the same port again.
     #[serde(default)]
     pub published_ports: Vec<PublishedPort>,
+    /// Manifest digest the image resolved to at creation. Empty when unknown.
+    #[serde(default)]
+    pub image_digest: String,
 }
 
 /// A host TCP port forwarded to a guest port.

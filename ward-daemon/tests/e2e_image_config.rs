@@ -241,3 +241,73 @@ fn given_main_process_that_ends_when_ps_json_then_reason_is_listed_and_status_ke
         "{row}"
     );
 }
+
+const PULL_NEVER: &str = "--pull=never";
+const PULL_PINNED: &str = "--pull=pinned";
+const PINNED_IMAGE: &str = "alpine@sha256:0123456789abcdef";
+const DIGEST_PREFIX: &str = "sha256:";
+
+#[test]
+fn given_uncached_image_when_run_with_pull_never_then_it_fails_like_docker() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let assertion = d.cli().args(["run", PULL_NEVER, IMAGE]).assert();
+
+    // Assert
+    assertion
+        .code(DOCKER_CLI_FAILURE)
+        .stderr(predicate::str::contains(
+            "Unable to find image 'alpine' locally",
+        ));
+}
+
+#[test]
+fn given_tag_when_create_with_pull_pinned_then_it_is_rejected_and_a_digest_is_accepted() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let bare = d.cli().args(["create", PULL_PINNED, IMAGE]).assert();
+    let pinned = d.cli().args(["create", PULL_PINNED, PINNED_IMAGE]).assert();
+
+    // Assert
+    bare.failure()
+        .stderr(predicate::str::contains("name@sha256:"));
+    pinned.success();
+}
+
+#[test]
+fn given_image_when_inspected_then_image_is_the_digest_and_config_keeps_the_reference() {
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["create", "--name", "web", IMAGE]);
+
+    // Act
+    let out = run(&d, &["inspect", "web"]);
+
+    // Assert
+    let parsed: Value = serde_json::from_slice(&out.stdout).expect("inspect json");
+    assert!(
+        parsed[0]["Image"]
+            .as_str()
+            .unwrap()
+            .starts_with(DIGEST_PREFIX),
+        "{parsed}"
+    );
+    assert_eq!(parsed[0]["Config"]["Image"], IMAGE);
+}
+
+#[test]
+fn given_cached_image_when_run_with_pull_never_then_it_starts() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(SHELL_IMAGE);
+    run_ok(&d, &["create", IMAGE]);
+
+    // Act
+    let assertion = d.cli().args(["run", PULL_NEVER, IMAGE]).assert();
+
+    // Assert
+    assertion.success();
+}
