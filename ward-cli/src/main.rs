@@ -8,6 +8,7 @@ mod commit;
 mod cp;
 mod diff;
 mod docker;
+mod egress;
 mod events;
 mod images;
 mod inspect;
@@ -576,6 +577,10 @@ enum Commands {
     #[command(subcommand)]
     Volume(VolumeCommands),
 
+    /// Egress policy helpers.
+    #[command(subcommand)]
+    Egress(EgressCommands),
+
     /// Publish a message to a pub/sub topic from a sandbox.
     Publish {
         /// Sandbox ID this message is published as.
@@ -602,6 +607,22 @@ enum Commands {
 
     /// Show daemon information.
     Info,
+}
+
+#[derive(Debug, Subcommand)]
+enum EgressCommands {
+    /// Print `--allow-domain` flags for the hosts a sandbox was blocked from.
+    ///
+    /// Ward-only: Docker has no equivalent. Records are kept after the
+    /// sandbox exits, until it is removed.
+    Suggest {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// Add the hosts to the sandbox's allowlist. Not supported yet: the
+        /// allowlist is fixed when the sandbox is created.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1231,6 +1252,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             ..
         } => {
             cp::run(&socket_path, &token_store, &src, &dest, follow_link).await?;
+        }
+
+        Commands::Egress(EgressCommands::Suggest { reference, apply }) => {
+            egress::suggest(&socket_path, &token_store, &reference, apply, json).await?;
         }
 
         Commands::Top { reference, ps_args } => {
@@ -1918,6 +1943,22 @@ mod tests {
                 assert_eq!(ps_args, expected);
             }
             other => panic!("expected Top, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_egress_suggest_with_apply_when_parsed_then_flag_is_set() {
+        // Arrange / Act
+        let cli =
+            Cli::try_parse_from(["ward", "egress", "suggest", "web1", "--apply"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Egress(EgressCommands::Suggest { reference, apply }) => {
+                assert_eq!(reference, "web1");
+                assert!(apply);
+            }
+            other => panic!("expected Egress Suggest, got {other:?}"),
         }
     }
 

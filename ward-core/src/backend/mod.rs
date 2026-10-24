@@ -235,6 +235,16 @@ pub trait Backend: Send + Sync + 'static {
     /// would. The guest refuses options it does not support.
     async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<ProcessTable>;
 
+    /// Destinations the egress policy refused, most recent first. Kept after
+    /// the sandbox stops, until it is removed. Backends with no policed
+    /// network report none.
+    async fn blocked_egress(
+        &self,
+        _sandbox_id: &str,
+    ) -> Result<Vec<crate::egress::BlockedDestination>> {
+        Ok(Vec::new())
+    }
+
     /// Read the guest's CPU, memory and process counters.
     async fn stats(&self, sandbox_id: &str) -> Result<GuestStats>;
 

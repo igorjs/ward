@@ -10,6 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
+use super::blocked::BlockedEgress;
 use crate::protocol::EgressPolicy;
 
 /// Cap on the CONNECT request header we'll read before giving up, and on the
@@ -64,6 +65,8 @@ pub struct EgressProxy {
     log: Arc<RwLock<VecDeque<LogEntry>>>,
     /// Maximum number of log entries retained in memory.
     log_capacity: usize,
+    /// Refused destinations; shared so it outlives this proxy.
+    blocked: Arc<BlockedEgress>,
 }
 
 impl EgressProxy {
@@ -73,7 +76,14 @@ impl EgressProxy {
             policy,
             log: Arc::new(RwLock::new(VecDeque::new())),
             log_capacity: 1_000,
+            blocked: Arc::new(BlockedEgress::default()),
         }
+    }
+
+    /// Reports refusals to `blocked` instead of a private recorder.
+    pub fn with_blocked(mut self, blocked: Arc<BlockedEgress>) -> Self {
+        self.blocked = blocked;
+        self
     }
 
     /// Evaluate whether a connection to `domain:port` is permitted.
@@ -98,6 +108,9 @@ impl EgressProxy {
         let decision = if allowed { "allowed" } else { "denied" };
         metrics::counter!("wardd_egress_check_total", "decision" => decision).increment(1);
 
+        if !allowed {
+            self.blocked.record(domain, SystemTime::now());
+        }
         self.record(domain, port, allowed).await;
         allowed
     }
@@ -601,6 +614,25 @@ mod tests {
 
         // Assert
         assert!(allowed);
+    }
+
+    #[tokio::test]
+    async fn given_shared_recorder_when_checks_refused_then_only_refusals_recorded() {
+        // Arrange
+        let blocked = Arc::new(BlockedEgress::default());
+        let proxy = build_proxy(EgressMode::Allowlist, vec!["ok.example.com"])
+            .with_blocked(Arc::clone(&blocked));
+
+        // Act
+        proxy.check("ok.example.com", 443).await;
+        proxy.check("evil.com", 443).await;
+        proxy.check("evil.com", 80).await;
+
+        // Assert
+        let seen = blocked.snapshot();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].host, "evil.com");
+        assert_eq!(seen[0].count, 2);
     }
 
     #[tokio::test]
