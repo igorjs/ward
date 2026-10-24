@@ -148,6 +148,21 @@ pub struct SandboxInfo {
     pub started_at: Option<SystemTime>,
     /// When the main process last ended, if it did.
     pub finished_at: Option<SystemTime>,
+    /// Why the sandbox last ended, if it has.
+    pub end_reason: Option<EndReason>,
+}
+
+/// Why a sandbox ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EndReason {
+    /// The main process ended on its own.
+    Exited,
+    /// A signal ended the main process.
+    Signal,
+    Oom,
+    Timeout,
+    EgressPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

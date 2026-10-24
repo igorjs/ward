@@ -13,11 +13,12 @@ use crate::backend::{Backend, BackendError, ExecMode, ProcessControl, ProcessHan
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
 use crate::pb::{
-    ExecRequest, ProcessInfo, RunRequest, SandboxInfo as PbSandboxInfo, SandboxStatus,
+    EndReason as PbEndReason, ExecRequest, ProcessInfo, RunRequest, SandboxInfo as PbSandboxInfo,
+    SandboxStatus,
 };
 use crate::protocol::{
-    ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, OutputChunk,
-    RawStream, ResourceLimits, StreamEvent, StreamEventKind,
+    ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, EndReason,
+    OutputChunk, RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
 use crate::sandbox::copy;
 use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
@@ -317,10 +318,19 @@ pub(crate) fn decode_wait_status(raw: i32) -> i32 {
     }
 }
 
+/// Why a main process with raw `wait(2)` status `raw` ended.
+fn end_reason_of(raw: i32) -> EndReason {
+    if raw & WAIT_STATUS_SIGNAL_MASK == 0 {
+        EndReason::Exited
+    } else {
+        EndReason::Signal
+    }
+}
+
 /// How a sandbox's main process ended when it was stopped.
 enum MainEnd {
     NoMain,
-    Exited(i32),
+    Exited(i32, EndReason),
     /// The process was told to end but never reported an exit, for example
     /// because the agent connection dropped.
     Unknown,
@@ -400,10 +410,27 @@ async fn commit_meta(
     status: crate::protocol::SandboxStatus,
     exit_code: Option<i32>,
 ) -> Result<()> {
+    // A new run clears the last run's reason; every other move keeps it.
+    let reason = match status {
+        crate::protocol::SandboxStatus::Creating => None,
+        _ => entry.meta.end_reason,
+    };
+    commit_meta_ended(store, entry, status, exit_code, reason).await
+}
+
+/// Like `commit_meta`, and records why the sandbox ended.
+async fn commit_meta_ended(
+    store: Option<&MetaStore>,
+    entry: &mut SandboxEntry,
+    status: crate::protocol::SandboxStatus,
+    exit_code: Option<i32>,
+    end_reason: Option<EndReason>,
+) -> Result<()> {
     let mut next = entry.meta.clone();
     stamp_times(&mut next, &status, std::time::SystemTime::now());
     next.status = status;
     next.exit_code = exit_code;
+    next.end_reason = end_reason;
     persist_meta(store, next.clone()).await?;
     entry.meta = next;
     Ok(())
@@ -488,11 +515,12 @@ async fn mark_exited_on_main_end(
         if current != Some(true) || entry.meta.status != crate::protocol::SandboxStatus::Running {
             return;
         }
-        match commit_meta(
+        match commit_meta_ended(
             store.as_ref(),
             entry,
             crate::protocol::SandboxStatus::Exited,
             Some(code),
+            raw.map(end_reason_of),
         )
         .await
         {
@@ -753,6 +781,21 @@ impl SandboxManager {
         self.commit(entry, status, exit_code).await
     }
 
+    /// Record a state change together with why the sandbox ended.
+    async fn record_ended(
+        &self,
+        id: &str,
+        status: crate::protocol::SandboxStatus,
+        exit_code: Option<i32>,
+        end_reason: Option<EndReason>,
+    ) -> Result<()> {
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        commit_meta_ended(self.store.as_ref(), entry, status, exit_code, end_reason).await
+    }
+
     /// Write the new state to disk, then adopt it in memory, so a failed
     /// write leaves the entry in its old state.
     async fn commit(
@@ -823,6 +866,7 @@ impl SandboxManager {
             exit_code: meta.exit_code,
             started_at: meta.started_at,
             finished_at: meta.finished_at,
+            end_reason: meta.end_reason,
         };
         if let Err(e) = self
             .backend
@@ -1081,6 +1125,7 @@ impl SandboxManager {
             exit_code: None,
             started_at: (!opts.spec.command.is_empty()).then_some(info.created_at),
             finished_at: None,
+            end_reason: None,
             token_hash: hash_token(&token),
         };
         info.started_at = meta.started_at;
@@ -1432,7 +1477,7 @@ impl SandboxManager {
         let main_end = self.end_main_process(id, grace).await;
         let died_with = match main_end {
             MainEnd::NoMain => Some(0),
-            MainEnd::Exited(code) => Some(code),
+            MainEnd::Exited(code, _) => Some(code),
             MainEnd::Unknown => None,
         };
         if let Err(e) = self.backend.stop_sandbox(id).await {
@@ -1451,7 +1496,16 @@ impl SandboxManager {
                 self.set_state(id, crate::protocol::SandboxStatus::Stopped)
                     .await?
             }
-            MainEnd::Exited(_) | MainEnd::Unknown => {
+            MainEnd::Exited(_, reason) => {
+                self.record_ended(
+                    id,
+                    crate::protocol::SandboxStatus::Stopped,
+                    died_with,
+                    Some(reason),
+                )
+                .await?;
+            }
+            MainEnd::Unknown => {
                 self.record_state(id, crate::protocol::SandboxStatus::Stopped, died_with)
                     .await?;
             }
@@ -1487,7 +1541,7 @@ impl SandboxManager {
         }
         let raw = *exit.borrow();
         raw.map_or(MainEnd::Unknown, |raw| {
-            MainEnd::Exited(decode_wait_status(raw))
+            MainEnd::Exited(decode_wait_status(raw), end_reason_of(raw))
         })
     }
 
@@ -2449,6 +2503,7 @@ fn recorded_state(
         info.exit_code = entry.meta.exit_code;
         info.started_at = entry.meta.started_at;
         info.finished_at = entry.meta.finished_at;
+        info.end_reason = entry.meta.end_reason;
         info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
     }
     info
@@ -2473,6 +2528,17 @@ fn redact_token(mut info: crate::protocol::SandboxInfo) -> crate::protocol::Sand
 enum CommandView {
     Argv0Only,
     Full,
+}
+
+fn end_reason_to_pb(reason: Option<EndReason>) -> PbEndReason {
+    match reason {
+        None => PbEndReason::Unspecified,
+        Some(EndReason::Exited) => PbEndReason::Exited,
+        Some(EndReason::Signal) => PbEndReason::Signal,
+        Some(EndReason::Oom) => PbEndReason::Oom,
+        Some(EndReason::Timeout) => PbEndReason::Timeout,
+        Some(EndReason::EgressPolicy) => PbEndReason::EgressPolicy,
+    }
 }
 
 fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) -> PbSandboxInfo {
@@ -2503,6 +2569,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         exit_code: info.exit_code,
         started_at: info.started_at.map(system_time_to_timestamp),
         finished_at: info.finished_at.map(system_time_to_timestamp),
+        end_reason: end_reason_to_pb(info.end_reason) as i32,
         workdir: info.spec.workdir,
         user: info.spec.user,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
@@ -4477,6 +4544,7 @@ pub(crate) mod tests {
             exit_code: None,
             started_at: None,
             finished_at: None,
+            end_reason: None,
             token_hash: hash_token(SEED_TOKEN),
         };
         MetaStore::new(path).save(&meta).unwrap();
@@ -6205,6 +6273,44 @@ pub(crate) mod tests {
         // Assert
         wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
         assert_eq!(exit_code_of(&mgr, &id).await, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::exited("exit 7", PbEndReason::Exited)]
+    #[case::signal("kill -9 $$", PbEndReason::Signal)]
+    #[tokio::test]
+    async fn given_command_that_ends_when_it_ends_then_the_reason_tells_exit_from_signal(
+        #[case] script: &str,
+        #[case] want: PbEndReason,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+
+        // Act
+        let id = create_with_command(&mgr, &["sh", "-c", script], false).await;
+
+        // Assert
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(mgr.get(&id).await.expect("get").end_reason, want as i32);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_running_command_when_stopped_then_the_reason_is_signal() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "echo up; read x"], false).await;
+        wait_for_output(&mgr, &id, "up\n").await;
+        let running = mgr.get(&id).await.expect("get");
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert_eq!(running.end_reason, PbEndReason::Unspecified as i32);
+        let stopped = mgr.get(&id).await.expect("get");
+        assert_eq!(stopped.end_reason, PbEndReason::Signal as i32);
     }
 
     #[cfg(not(feature = "krunvm"))]
