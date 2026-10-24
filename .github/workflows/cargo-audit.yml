@@ -58,7 +58,14 @@ jobs:
         # ward-core -> oci-client -> oci-spec -> getset; runs at
         # compile time only, not linked into the shipped binaries.
         # Mirrored in deny.toml and osv-scanner.toml.
+        #
+        # --ignore RUSTSEC-2026-0387 (crypto-bigint 0.5.5 timing): the
+        # fix needs a new major version that p256 0.13 cannot use. Reached
+        # via oci-client -> jsonwebtoken -> p256; ward only verifies
+        # registry token signatures with public keys. Mirrored in
+        # deny.toml and osv-scanner.toml.
         run: |
           cargo audit --deny warnings \
             --ignore RUSTSEC-2023-0071 \
-            --ignore RUSTSEC-2026-0173
+            --ignore RUSTSEC-2026-0173 \
+            --ignore RUSTSEC-2026-0387
