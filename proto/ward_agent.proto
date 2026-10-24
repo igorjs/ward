@@ -25,6 +25,12 @@ message Request {
     Ping ping = 4;
     Resize resize = 5;
     Signal signal = 6;
+    PutArchive put_archive = 7;
+    GetArchive get_archive = 8;
+    ArchiveChunk archive_chunk = 9;
+    ArchiveEnd archive_end = 10;
+    Top top = 11;
+    Stats stats = 12;
   }
 }
 
@@ -34,7 +40,7 @@ message Exec {
   string working_dir = 2;               // empty = agent default (/)
   map<string, string> env = 3;
   bool tty = 4;                         // run on a pty
-  string user = 5;                      // unused until user switching lands
+  string user = 5;                      // name|uid[:group|gid]; empty = run as the agent
   bool raw = 6;                         // stream raw Data events (implied by tty)
 }
 
@@ -70,7 +76,85 @@ message Event {
     Exited exited = 3;
     Pong pong = 4;
     Data data = 5;
+    ArchiveChunk archive_chunk = 6;
+    ArchiveDone archive_done = 7;
+    ArchiveError archive_error = 8;
+    Processes processes = 9;
+    TopError top_error = 10;
+    StatsSample stats_sample = 11;
   }
+}
+
+// File transfer. PutArchive must be the first frame on a connection. The
+// daemon then sends ArchiveChunk frames carrying one tar stream and a final
+// ArchiveEnd. The agent unpacks the tar into the directory `path` and
+// answers with one ArchiveDone or ArchiveError.
+message PutArchive {
+  string path = 1;                      // absolute guest directory
+}
+
+// Must be the first frame on a connection. The agent answers with
+// ArchiveChunk frames carrying one tar stream of the file or directory at
+// `path`, then ArchiveDone, or ArchiveError if it cannot read the path. The
+// walk can fail midway, so chunks received before an ArchiveError are
+// incomplete and must be discarded.
+message GetArchive {
+  string path = 1;                      // absolute guest file or directory
+}
+
+// A slice of a tar stream, in either direction.
+message ArchiveChunk {
+  bytes data = 1;
+}
+
+// Daemon -> agent: the tar stream is complete.
+message ArchiveEnd {}
+
+// Agent -> daemon: the transfer finished.
+message ArchiveDone {}
+
+// Agent -> daemon: the transfer failed; the message says why.
+message ArchiveError {
+  string message = 1;
+}
+
+// Must be the first and only frame on a connection. The agent answers with
+// one Processes event built from the guest's /proc, or a TopError when it
+// refuses ps_args, then closes.
+message Top {
+  // ps-style options, empty for `ps -ef`.
+  repeated string ps_args = 1;
+}
+
+// Agent -> daemon: the ps_args of a Top are not supported.
+message TopError {
+  string message = 1;
+}
+
+// Agent -> daemon: the guest's processes, one row per process, each row with
+// one field per title.
+message Processes {
+  repeated string titles = 1;
+  repeated ProcessRow rows = 2;
+}
+
+message ProcessRow {
+  repeated string fields = 1;
+}
+
+// Must be the first and only frame on a connection. The agent answers with
+// one StatsSample read from the guest's /proc, then closes.
+message Stats {}
+
+// Agent -> daemon: guest-wide counters at one instant.
+message StatsSample {
+  // Cumulative CPU time all processes have used, in nanoseconds.
+  uint64 cpu_nanos = 1;
+  uint32 online_cpus = 2;
+  uint64 mem_total_bytes = 3;
+  // Memory that can be given to a process without swapping.
+  uint64 mem_available_bytes = 4;
+  uint32 pids = 5;
 }
 
 // Answer to Ping.

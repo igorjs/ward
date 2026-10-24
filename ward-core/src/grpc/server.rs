@@ -1,5 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
+use std::os::unix::ffi::OsStringExt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,17 +9,23 @@ use tonic::{Request, Response, Status};
 use tracing::error;
 
 use super::attach;
+use crate::backend::commit::CommitSpec;
 use crate::pb::attach_message::Kind;
+use crate::pb::copy_to_message;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    AttachMessage, CommunicationLogEntry, CommunicationLogResponse, CreateSandboxRequest,
-    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, EgressLogEntry, EgressLogResponse,
-    ExecRequest, GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest,
-    GetVolumeRequest, HealthStatus, KillProcessRequest, ListSandboxesResponse,
+    AttachMessage, ChangeKind, CommitRequest, CommitResponse, CommunicationLogEntry,
+    CommunicationLogResponse, CopyFromChunk, CopyFromRequest, CopyToMessage, CreateSandboxRequest,
+    CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, DiffRequest, DiffResponse,
+    EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, FileChange,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
+    HealthStatus, KillProcessRequest, ListImagesResponse, ListSandboxesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
-    PublishRequest, RemoveSandboxRequest, RemoveVolumeRequest, RestartRequest,
-    RestoreSnapshotRequest, RunRequest, SandboxInfo, SnapshotInfo, StartRequest, StopRequest,
-    StreamEvent, StreamOutputRequest, SubscribeRequest, VolumeInfo, WriteStdinRequest,
+    PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest, RemoveVolumeRequest,
+    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
+    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
+    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
+    WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -53,6 +60,10 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         }
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
+        ApiError::ResourceExhausted(msg) => Status::resource_exhausted(msg.clone()),
+        ApiError::AddressInUse(msg) => {
+            Status::already_exists(format!("address already in use: {msg}"))
+        }
     }
 }
 
@@ -102,7 +113,55 @@ async fn authorized_id(
     Ok(id)
 }
 
+fn change_kind(kind: crate::backend::diff::ChangeKind) -> ChangeKind {
+    use crate::backend::diff::ChangeKind as Domain;
+    match kind {
+        Domain::Added => ChangeKind::Added,
+        Domain::Modified => ChangeKind::Modified,
+        Domain::Deleted => ChangeKind::Deleted,
+    }
+}
+
+/// Largest data frame a `CopyTo` client may send, as the proto documents.
+const MAX_COPY_DATA_BYTES: usize = crate::backend::agent::ARCHIVE_CHUNK_BYTES;
+
+/// Events queued for one `Events` client before its bridge task waits for it.
+const EVENT_STREAM_BUFFER: usize = 16;
+/// Progress lines queued for one `PullImage` client.
+const PULL_STREAM_BUFFER: usize = 16;
+/// Attribute names Docker uses on container events.
+const EVENT_IMAGE_ATTRIBUTE: &str = "image";
+const EVENT_NAME_ATTRIBUTE: &str = "name";
+const EVENT_EXIT_CODE_ATTRIBUTE: &str = "exitCode";
+
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
+
+/// Pass the data frames of a `CopyTo` stream on to the copy. A frame past
+/// the documented size, or any other kind, ends the stream with an error.
+async fn forward_copy_data<S>(
+    mut inbound: S,
+    feed: tokio::sync::mpsc::Sender<bytes::Bytes>,
+) -> Result<(), Status>
+where
+    S: tokio_stream::Stream<Item = Result<CopyToMessage, Status>> + Unpin,
+{
+    while let Some(message) = inbound.next().await {
+        match message?.kind {
+            Some(copy_to_message::Kind::Data(data)) if data.len() <= MAX_COPY_DATA_BYTES => {
+                if feed.send(bytes::Bytes::from(data)).await.is_err() {
+                    break;
+                }
+            }
+            Some(copy_to_message::Kind::Data(_)) => {
+                return Err(Status::invalid_argument(format!(
+                    "copy data frames hold at most {MAX_COPY_DATA_BYTES} bytes"
+                )));
+            }
+            _ => return Err(Status::invalid_argument("expected a data message")),
+        }
+    }
+    Ok(())
+}
 
 /// Read the caller-presented capability token off request metadata. A
 /// missing key and a value that fails ASCII/UTF-8 decoding are both
@@ -667,14 +726,227 @@ impl Ward for WardGrpcServer {
             ));
         };
         let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
-        if !start.user.is_empty() {
-            return Err(Status::unimplemented(
-                "attach with a user is not supported yet",
-            ));
-        }
         let rx = attach::serve(Arc::clone(&self.sandbox), id, start, inbound).await?;
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
+        )))
+    }
+
+    #[tracing::instrument(name = "rpc.copy_to", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn copy_to(
+        &self,
+        request: Request<tonic::Streaming<CopyToMessage>>,
+    ) -> Result<Response<()>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let mut inbound = request.into_inner();
+        let first = inbound.next().await.ok_or_else(|| {
+            Status::invalid_argument("copy stream ended before a start message")
+        })??;
+        let Some(copy_to_message::Kind::Start(start)) = first.kind else {
+            return Err(Status::invalid_argument("first copy message must be start"));
+        };
+        let id = authorized_id(&self.sandbox, &start.sandbox_id, &token).await?;
+        let (feed, chunks) = tokio::sync::mpsc::channel(crate::backend::COPY_CHANNEL_CAPACITY);
+        let pump = tokio::spawn(forward_copy_data(inbound, feed));
+        let copied = self.sandbox.copy_to(&id, &start.path, chunks).await;
+        // A copy that ended early must not leave the pump waiting on a client
+        // that keeps its stream open.
+        if copied.is_err() {
+            pump.abort();
+        }
+        // A client that broke the stream must not look like a finished copy.
+        match pump.await {
+            Ok(Ok(())) => {}
+            Ok(Err(status)) => return Err(status),
+            Err(e) if e.is_cancelled() => {}
+            Err(_) => return Err(Status::internal("internal error")),
+        }
+        copied.map_err(api_err_to_status)?;
+        Ok(Response::new(()))
+    }
+
+    type CopyFromStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<CopyFromChunk, Status>> + Send + 'static>,
+    >;
+
+    #[tracing::instrument(
+        name = "rpc.copy_from",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn copy_from(
+        &self,
+        request: Request<CopyFromRequest>,
+    ) -> Result<Response<Self::CopyFromStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let tar = self
+            .sandbox
+            .copy_from(&id, &req.path)
+            .await
+            .map_err(api_err_to_status)?;
+        let chunks = tokio_stream::wrappers::ReceiverStream::new(tar).map(|item| {
+            item.map(|data| CopyFromChunk {
+                data: data.to_vec(),
+            })
+            .map_err(api_err_to_status)
+        });
+        Ok(Response::new(Box::pin(chunks)))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.top",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn top(&self, request: Request<TopRequest>) -> Result<Response<TopResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let table = self
+            .sandbox
+            .top(&id, &req.ps_args)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(TopResponse {
+            titles: table.titles,
+            processes: table
+                .rows
+                .into_iter()
+                .map(|fields| TopProcess { fields })
+                .collect(),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.stats",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn stats(
+        &self,
+        request: Request<StatsRequest>,
+    ) -> Result<Response<StatsResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let stats = self.sandbox.stats(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(StatsResponse {
+            cpu_nanos: stats.cpu_nanos,
+            online_cpus: stats.online_cpus,
+            mem_used_bytes: stats.mem_used_bytes,
+            mem_limit_bytes: stats.mem_limit_bytes,
+            pids: stats.pids,
+            read_at: Some(prost_types::Timestamp::from(stats.read_at)),
+        }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.wait",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let exit_code = self.sandbox.wait(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(WaitResponse { exit_code }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.diff",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let changes = self.sandbox.diff(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(DiffResponse {
+            changes: changes
+                .into_iter()
+                .map(|change| FileChange {
+                    kind: change_kind(change.kind) as i32,
+                    path: change.path.into_os_string().into_vec(),
+                })
+                .collect(),
+        }))
+    }
+
+    type EventsStream = tokio_stream::wrappers::ReceiverStream<Result<PbSandboxEvent, Status>>;
+
+    #[tracing::instrument(name = "rpc.events", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn events(
+        &self,
+        request: Request<EventsRequest>,
+    ) -> Result<Response<Self::EventsStream>, Status> {
+        let req = request.into_inner();
+        let since = req.since.map(event_time).transpose()?;
+        let until = req.until.map(event_time).transpose()?;
+        let reader = self.sandbox.events().subscribe(since);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(EVENT_STREAM_BUFFER);
+        // A client that reads slowly stalls only this task. The manager
+        // never waits, and the reader reports what it missed.
+        tokio::spawn(forward_events(reader, until, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
+    }
+
+    #[tracing::instrument(name = "rpc.list_images", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn list_images(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<ListImagesResponse>, Status> {
+        let images = self
+            .sandbox
+            .list_images()
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(ListImagesResponse { images }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.commit",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn commit(
+        &self,
+        request: Request<CommitRequest>,
+    ) -> Result<Response<CommitResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let spec = CommitSpec {
+            reference: Some(req.reference).filter(|r| !r.is_empty()),
+            author: req.author,
+            message: req.message,
+            changes: req.changes,
+        };
+        let image_id = self
+            .sandbox
+            .commit_image(&id, &spec)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(CommitResponse { image_id }))
+    }
+
+    type PullImageStream = tokio_stream::wrappers::ReceiverStream<Result<PullProgress, Status>>;
+
+    #[tracing::instrument(name = "rpc.pull_image", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn pull_image(
+        &self,
+        request: Request<PullImageRequest>,
+    ) -> Result<Response<Self::PullImageStream>, Status> {
+        let reference = request.into_inner().reference;
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        tokio::spawn(stream_pull(self.sandbox.clone(), reference, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
         )))
     }
 
@@ -854,6 +1126,103 @@ fn stream_event_to_pb(evt: crate::protocol::StreamEvent) -> StreamEvent {
     }
 }
 
+fn event_time(ts: prost_types::Timestamp) -> Result<std::time::SystemTime, Status> {
+    std::time::SystemTime::try_from(ts)
+        .map_err(|_| Status::invalid_argument("event time is out of range"))
+}
+
+/// Pulls that may run at once across all clients.
+const MAX_CONCURRENT_PULLS: usize = 2;
+static PULL_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CONCURRENT_PULLS);
+
+/// Run a pull and send its progress lines to `out`, then its error if it
+/// failed. A client that hangs up aborts the pull, whose staging dir is
+/// removed on drop.
+async fn stream_pull(
+    sandbox: Arc<SandboxManager>,
+    reference: String,
+    out: tokio::sync::mpsc::Sender<Result<PullProgress, Status>>,
+) {
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pull = tokio::spawn(async move {
+        let _slot = PULL_SLOTS.acquire().await;
+        sandbox.pull_image(&reference, progress_tx).await
+    });
+    loop {
+        tokio::select! {
+            () = out.closed() => return pull.abort(),
+            line = progress_rx.recv() => {
+                let Some(line) = line else { break };
+                let line = PullProgress { id: line.id, status: line.status };
+                let _ = out.send(Ok(line)).await;
+            }
+        }
+    }
+    let failure = match pull.await {
+        Ok(Ok(_)) => return,
+        Ok(Err(e)) => api_err_to_status(e),
+        Err(e) => {
+            error!(error = %e, "pull task failed");
+            Status::internal("internal error")
+        }
+    };
+    let _ = out.send(Err(failure)).await;
+}
+
+/// Send events to `out` until `until` passes or the client hangs up.
+async fn forward_events(
+    mut reader: crate::sandbox::events::EventReader,
+    until: Option<std::time::SystemTime>,
+    out: tokio::sync::mpsc::Sender<Result<PbSandboxEvent, Status>>,
+) {
+    let deadline = until.map(|until| {
+        let left = until
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or_default();
+        tokio::time::Instant::now() + left
+    });
+    let expired = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(expired);
+    loop {
+        // `closed` notices a client that hung up while no event arrives.
+        let next = tokio::select! {
+            () = out.closed() => return,
+            () = &mut expired => return,
+            next = reader.next() => next,
+        };
+        let Some(delivered) = next else { return };
+        if until.is_some_and(|until| delivered.event.at > until) {
+            return;
+        }
+        if out.send(Ok(event_to_pb(delivered))).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn event_to_pb(delivered: crate::sandbox::events::Delivered) -> PbSandboxEvent {
+    let event = delivered.event;
+    let mut attributes = std::collections::HashMap::from([
+        (EVENT_IMAGE_ATTRIBUTE.to_string(), event.image),
+        (EVENT_NAME_ATTRIBUTE.to_string(), event.name),
+    ]);
+    if let Some(code) = event.exit_code {
+        attributes.insert(EVENT_EXIT_CODE_ATTRIBUTE.to_string(), code.to_string());
+    }
+    PbSandboxEvent {
+        action: event.action.as_str().to_string(),
+        sandbox_id: event.sandbox_id,
+        at: system_time_to_pb(event.at),
+        attributes,
+        dropped: delivered.dropped,
+    }
+}
+
 /// Convert a SystemTime into a protobuf Timestamp. Returns None for
 /// pre-epoch values (which shouldn't happen in practice but we handle
 /// gracefully rather than panic).
@@ -930,6 +1299,35 @@ mod tests {
         // Assert
         assert_eq!(pb.r#type, crate::pb::StreamEventType::Stderr as i32);
         assert_eq!(pb.line, "a\u{fffd}b");
+    }
+
+    fn data_frame(len: usize) -> Result<CopyToMessage, Status> {
+        Ok(CopyToMessage {
+            kind: Some(copy_to_message::Kind::Data(vec![0; len])),
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::at_the_cap(MAX_COPY_DATA_BYTES, None)]
+    #[case::over_the_cap(MAX_COPY_DATA_BYTES + 1, Some(tonic::Code::InvalidArgument))]
+    #[test]
+    fn given_a_copy_data_frame_when_forwarded_then_only_one_over_the_cap_is_refused(
+        #[case] len: usize,
+        #[case] refused: Option<tonic::Code>,
+    ) {
+        // Arrange
+        let (feed, mut chunks) = tokio::sync::mpsc::channel(crate::backend::COPY_CHANNEL_CAPACITY);
+        let inbound = tokio_stream::iter(vec![data_frame(len)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        // Act
+        let result = runtime.block_on(forward_copy_data(inbound, feed));
+
+        // Assert
+        assert_eq!(result.err().map(|s| s.code()), refused);
+        assert_eq!(chunks.try_recv().is_ok(), refused.is_none());
     }
 
     /// Offline image puller: materialises a minimal bin/ rootfs without
@@ -1124,5 +1522,27 @@ mod tests {
             bad.is_empty(),
             "every instrumented span must use the `rpc.<method>` name prefix; offenders: {bad:?}"
         );
+    }
+
+    #[test]
+    fn given_an_idle_events_client_when_it_hangs_up_then_the_forwarder_ends() {
+        // Arrange
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let log = crate::sandbox::events::EventLog::default();
+            let (out, rx) = tokio::sync::mpsc::channel(1);
+            let task = tokio::spawn(forward_events(log.subscribe(None), None, out));
+            tokio::task::yield_now().await;
+
+            // Act
+            drop(rx);
+
+            // Assert
+            let ended = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+            assert!(ended.is_ok(), "forwarder outlived its client");
+        });
     }
 }

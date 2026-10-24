@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use super::image::{ImageConfig, ImageStore, OFFLINE_IMAGES_ENV};
+use super::image::{CachedImage, ImageConfig, ImageStore, OFFLINE_IMAGES_ENV, PullProgress};
 use super::{Backend, BackendError, ExecMode, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
@@ -40,6 +40,10 @@ const SMOLTCP_GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
 /// Only referenced by the krunvm-gated FFI wrappers.
 #[allow(dead_code)]
 const AGENT_GUEST_PATH: &str = "/ward-agent";
+
+/// Guest paths the backend writes at boot, which `diff` ignores so a
+/// pristine sandbox shows no changes.
+const BOOT_WRITTEN_PATHS: &[&str] = &[AGENT_GUEST_PATH];
 
 /// Guest-agent argument that introduces one mount.
 #[cfg(feature = "krunvm")]
@@ -167,6 +171,18 @@ impl std::fmt::Debug for SandboxState {
             .field("smoltcp_active", &self.smoltcp.is_some())
             .field("egress_active", &self.egress.is_some());
         s.finish()
+    }
+}
+
+#[cfg(feature = "krunvm")]
+#[async_trait::async_trait]
+impl super::ports::OpenPort for ward_net::inbound::InboundHandle {
+    fn local_addr(&self) -> std::net::SocketAddr {
+        Self::local_addr(self)
+    }
+
+    async fn close(self: Box<Self>) {
+        (*self).close().await;
     }
 }
 
@@ -392,6 +408,18 @@ impl Backend for KrunvmBackend {
         self.image_store.config(image).await
     }
 
+    async fn list_images(&self) -> Result<Vec<CachedImage>> {
+        Ok(self.image_store.list().await)
+    }
+
+    async fn pull_image(
+        &self,
+        reference: &str,
+        progress: Option<tokio::sync::mpsc::UnboundedSender<PullProgress>>,
+    ) -> Result<CachedImage> {
+        self.image_store.pull(reference, progress).await
+    }
+
     /// Retrieve sandbox info by ID.
     async fn get_sandbox(&self, id: &str) -> Result<SandboxInfo> {
         self.sandboxes
@@ -528,6 +556,36 @@ impl Backend for KrunvmBackend {
     /// Count of active sandboxes.
     async fn count(&self) -> Result<usize> {
         Ok(self.sandboxes.read().await.len())
+    }
+
+    #[cfg(feature = "krunvm")]
+    async fn publish_port(
+        &self,
+        id: &str,
+        bind: std::net::SocketAddr,
+        guest_port: u16,
+    ) -> Result<super::ports::PortListener> {
+        let sandboxes = self.sandboxes.read().await;
+        let state = sandboxes
+            .get(id)
+            .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        let smoltcp = state.smoltcp.as_ref().ok_or_else(|| {
+            BackendError::InvalidArgument(
+                "port publishing needs the smoltcp network backend".to_string(),
+            )
+        })?;
+        let handle = smoltcp
+            .add_inbound(bind, guest_port)
+            .await
+            .map_err(|e| match e {
+                ward_net::Error::Listen { source, .. }
+                    if source.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    BackendError::AddressInUse(bind.to_string())
+                }
+                other => BackendError::Internal(format!("cannot publish {bind}: {other}")),
+            })?;
+        Ok(Box::new(handle))
     }
 
     /// Signal a process to terminate by sending a Kill over its agent
@@ -679,6 +737,95 @@ impl Backend for KrunvmBackend {
             .ok_or_else(|| BackendError::NotFound(snapshot_id.to_string()))
     }
 
+    async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::put_archive(stream, path.to_string(), chunks)
+            .await
+            .map_err(|e| match e.kind() {
+                // The agent answered with a refusal; anything else is transport.
+                std::io::ErrorKind::Other => BackendError::Exec(format!("copy into sandbox: {e}")),
+                _ => BackendError::Io(e),
+            })
+    }
+
+    async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(super::COPY_CHANNEL_CAPACITY);
+        tokio::spawn(super::agent::get_archive(stream, path.to_string(), tx));
+        Ok(rx)
+    }
+
+    async fn diff_sandbox(&self, sandbox_id: &str) -> Result<Vec<super::diff::FsChange>> {
+        let (image, rootfs) = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            (state.info.image.clone(), state.rootfs.clone())
+        };
+        let base = match self.image_store.cached_rootfs(&image).await? {
+            Some(base) if !image.is_empty() => base,
+            _ => {
+                return Err(BackendError::InvalidArgument(format!(
+                    "image \"{image}\" of sandbox {sandbox_id} is not cached, so there is nothing to compare with"
+                )));
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            super::diff::diff_trees(
+                &base,
+                &rootfs,
+                BOOT_WRITTEN_PATHS,
+                super::diff::DiffLimits::default(),
+            )
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("diff task: {e}")))?
+    }
+
+    async fn commit_sandbox(
+        &self,
+        sandbox_id: &str,
+        spec: &super::commit::CommitSpec,
+    ) -> Result<CachedImage> {
+        let (image, rootfs, sandbox_spec, env) = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+            (
+                state.info.image.clone(),
+                state.rootfs.clone(),
+                state.opts.spec.clone(),
+                state.opts.env.clone(),
+            )
+        };
+        let mut base = self.image_store.config(&image).await?;
+        super::commit::overlay_sandbox(&mut base, &sandbox_spec, &env);
+        self.image_store
+            .commit(&rootfs, base, spec, BOOT_WRITTEN_PATHS)
+            .await
+    }
+
+    async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<super::ProcessTable> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::top(stream, ps_args).await
+    }
+
+    async fn stats(&self, sandbox_id: &str) -> Result<super::GuestStats> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::stats(stream).await
+    }
+
     /// Exec a command inside a running sandbox.
     #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
     async fn exec(
@@ -819,6 +966,26 @@ async fn install_guest_agent(rootfs: &std::path::Path) -> Result<()> {
 }
 
 impl KrunvmBackend {
+    /// Connect to the sandbox's guest agent. Without a booted VM there is
+    /// no agent, so file copy is unavailable.
+    #[cfg_attr(not(feature = "krunvm"), allow(unused_variables))]
+    async fn agent_stream(&self, sandbox_id: &str) -> Result<tokio::net::UnixStream> {
+        #[cfg(feature = "krunvm")]
+        if self.boot_vms {
+            let sock = self.agent_socket_path(sandbox_id);
+            return connect_agent_socket_with_timeout(
+                tokio::net::UnixStream::connect(&sock),
+                &sock,
+                AGENT_CONNECT_TIMEOUT,
+            )
+            .await
+            .map_err(|e| BackendError::Internal(e.to_string()));
+        }
+        Err(BackendError::InvalidArgument(
+            "this needs a sandbox booted as a microVM".into(),
+        ))
+    }
+
     /// Host-side Unix socket path bridging to the sandbox's agent vsock.
     ///
     /// Lives in a short per-user directory because `sockaddr_un` paths are
@@ -936,9 +1103,11 @@ impl KrunvmBackend {
         let agent_socket = self.agent_socket_path(id);
         let _ = std::fs::remove_file(&agent_socket);
 
-        let (smoltcp, egress, net_fd) = if opts.egress.mode != EgressMode::Deny
-            && self.network_backend == NetworkBackendChoice::Smoltcp
-        {
+        // Published ports need the stack even when egress is denied; the
+        // proxy still denies every outbound flow in that case.
+        let wants_stack = self.network_backend == NetworkBackendChoice::Smoltcp
+            && (opts.egress.mode != EgressMode::Deny || !opts.spec.published_ports.is_empty());
+        let (smoltcp, egress, net_fd) = if wants_stack {
             // The proxy is the single source of truth for this sandbox's
             // allow/deny decisions; the spawned Stack task consults it
             // through the closure below on every flow.
@@ -1134,30 +1303,15 @@ fn archive_rootfs(rootfs: &std::path::Path, archive: &std::path::Path) -> Result
         opts.mode(0o600);
     }
     let file = opts.open(archive).map_err(BackendError::Io)?;
-    let mut builder = tar::Builder::new(file);
-    // Store symlinks as symlinks. Following them fails on the dangling links
-    // every distro rootfs has and would copy host files a link points at.
-    builder.follow_symlinks(false);
-    if rootfs.is_dir() {
-        builder
-            .append_dir_all(".", rootfs)
-            .map_err(|e| BackendError::Internal(format!("archive rootfs: {e}")))?;
-    }
-    builder
-        .finish()
-        .map_err(|e| BackendError::Internal(format!("finish archive: {e}")))?;
-    drop(builder);
+    crate::archive::pack_dir(rootfs, file)
+        .map_err(|e| BackendError::Internal(format!("archive rootfs: {e}")))?;
     Ok(std::fs::metadata(archive).map_err(BackendError::Io)?.len())
 }
 
 /// Replace `dest` with the contents of a rootfs archive.
 ///
-/// SEC-001: bare `tar::Archive::unpack` follows on-disk symlinks and can
-/// write entries outside `dest` (e.g. an archive containing a `etc ->
-/// /etc` symlink followed by files under `etc/cron.d/`). We enumerate
-/// entries explicitly, reject absolute paths, parent-traversal, and
-/// unsafe symlink/hardlink targets, then use `entry.unpack_in(dest)`
-/// (which re-validates each path against the destination root).
+/// SEC-001: entry containment, link checks and setuid stripping live in
+/// the shared `archive` module (snapshot policy).
 ///
 /// SEC-014: stage into a sibling temp dir and atomically rename on
 /// success so a partial extract does not leave `dest` half-populated.
@@ -1175,75 +1329,15 @@ fn extract_rootfs(archive: &std::path::Path, dest: &std::path::Path) -> Result<(
     std::fs::create_dir_all(&staging).map_err(BackendError::Io)?;
 
     let file = std::fs::File::open(archive).map_err(BackendError::Io)?;
-    let mut ar = tar::Archive::new(file);
-    // set_overwrite(true): tar crate replaces existing destination files
-    // instead of erroring (safe here because we extract into a fresh
-    // staging dir). set_preserve_permissions(false): drop setuid/setgid
-    // bits from tar headers. Combined with per-entry path validation
-    // below and `unpack_in` (which enforces destination containment),
-    // the extract cannot write outside `staging`.
-    ar.set_overwrite(true);
-    ar.set_preserve_permissions(false);
-
-    // Wrap the per-entry loop so we can clean up `staging` on ANY error
-    // path (including unpack_in failures) without repeating the call
-    // site at every `?`.
-    let extract_result = (|| -> Result<()> {
-        for entry in ar
-            .entries()
-            .map_err(|e| BackendError::Internal(format!("read archive: {e}")))?
-        {
-            let mut entry =
-                entry.map_err(|e| BackendError::Internal(format!("read entry: {e}")))?;
-            let path = entry
-                .path()
-                .map_err(|e| BackendError::Internal(format!("entry path: {e}")))?
-                .into_owned();
-            // Reject absolute paths and any traversal component.
-            if path.is_absolute()
-                || path.components().any(|c| {
-                    matches!(
-                        c,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                })
-            {
-                return Err(BackendError::Internal(format!(
-                    "snapshot archive contains unsafe path: {}",
-                    path.display()
-                )));
-            }
-            // Hardlinks resolve on the host, so their targets must stay inside
-            // the staging dir. Symlinks resolve inside the guest, where
-            // absolute and `..` targets are normal (`var/run -> /run`).
-            // Writing a later entry through a symlink is stopped by
-            // `unpack_in`, which refuses paths that leave the staging dir.
-            if entry.header().entry_type() == tar::EntryType::Link {
-                let link = entry
-                    .link_name()
-                    .map_err(|e| BackendError::Internal(format!("link target: {e}")))?
-                    .ok_or_else(|| BackendError::Internal("link entry missing target".into()))?
-                    .into_owned();
-                if link.is_absolute()
-                    || link
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return Err(BackendError::Internal(format!(
-                        "snapshot archive contains unsafe hardlink target: {}",
-                        link.display()
-                    )));
-                }
-            }
-            entry.unpack_in(&staging).map_err(|e| {
-                BackendError::Internal(format!("extract entry {}: {e}", path.display()))
-            })?;
-        }
-        Ok(())
-    })();
-    if let Err(e) = extract_result {
+    let unpacked = crate::archive::unpack(
+        file,
+        &staging,
+        crate::archive::Policy::Snapshot,
+        &crate::archive::Limits::snapshot(),
+    );
+    if let Err(e) = unpacked {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(e);
+        return Err(BackendError::Internal(format!("snapshot archive: {e}")));
     }
 
     // SEC-014: atomic swap. Each supported platform uses its native
@@ -1502,6 +1596,52 @@ mod tests {
         let state = table.get("sb2").expect("entry for adopted id");
         assert_eq!(state.rootfs, stored_rootfs);
         assert_eq!(state.info.status, SandboxStatus::Stopped);
+    }
+
+    // ----- diff_sandbox --------------------------------------------------
+
+    #[tokio::test]
+    async fn given_boot_file_and_user_files_when_diffed_then_only_user_changes_show() {
+        // Arrange
+        let backend = backend_in_tempdir();
+        create_sandbox(&backend, "sb1").await;
+        let rootfs = backend.sandbox_rootfs("sb1");
+        std::fs::write(rootfs.join("ward-agent"), b"agent").expect("boot file");
+
+        // Act
+        let pristine = backend.diff_sandbox("sb1").await.expect("diff pristine");
+        std::fs::write(rootfs.join("added"), b"x").expect("user file");
+        std::fs::remove_dir(rootfs.join("bin")).expect("remove dir");
+        let changed = backend.diff_sandbox("sb1").await.expect("diff changed");
+
+        // Assert
+        assert!(pristine.is_empty(), "{pristine:?}");
+        let listed: Vec<_> = changed.iter().map(|c| (c.kind, c.path.clone())).collect();
+        assert_eq!(
+            listed,
+            vec![
+                (
+                    crate::backend::diff::ChangeKind::Added,
+                    std::path::PathBuf::from("/added")
+                ),
+                (
+                    crate::backend::diff::ChangeKind::Deleted,
+                    std::path::PathBuf::from("/bin")
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_unknown_sandbox_when_diffed_then_not_found() {
+        // Arrange
+        let backend = backend_in_tempdir();
+
+        // Act
+        let result = backend.diff_sandbox("ghost").await;
+
+        // Assert
+        assert!(matches!(result, Err(BackendError::NotFound(_))));
     }
 
     // ----- stop_sandbox / start_sandbox ---------------------------------

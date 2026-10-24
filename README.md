@@ -59,7 +59,7 @@ ward exec -d <id> sleep 60               # → pid, for ward logs <id> <pid>
 ward rm -f <id>
 ```
 
-A sandbox can be named with `ward create --name web alpine` and referred to by name, id or a unique id prefix. `ward stop`, `ward start` and `ward restart` move it through its lifecycle and keep its files; `ward stop -t 30` waits up to 30 seconds for SIGTERM to work (default 10, `-t 0` kills at once, `-t -1` waits forever). `ward run -d --rm` removes the sandbox when its command ends. `ward rm` refuses a running sandbox (use `-f`), and `ward prune` removes every stopped sandbox.
+A sandbox can be named with `ward create --name web alpine` and referred to by name, id or a unique id prefix. `ward stop`, `ward start` and `ward restart` move it through its lifecycle and keep its files; `ward stop -t 30` waits up to 30 seconds for SIGTERM to work (default 10, `-t 0` kills at once, `-t -1` waits forever). `ward run -d --rm` removes the sandbox when its command ends. `ward rm` refuses a running sandbox (use `-f`), and `ward prune` removes every stopped sandbox. `ward cp` copies files either way with `docker cp` rules (`ward cp ./f web:/tmp`, `ward cp web:/etc/hosts .`); `-` reads a tar from stdin or writes one to stdout, and a `/.` suffix copies a directory's contents.
 
 ## Hello world (MCP, for agents)
 
@@ -85,6 +85,7 @@ Full CLI: `ward --help`.
 - [`docs/SPEC.md`](docs/SPEC.md); architecture index (ADRs)
 - [`docs/architecture.md`](docs/architecture.md); system diagram
 - [`docs/platforms.md`](docs/platforms.md); supported platforms + libkrun setup
+- [`docs/service.md`](docs/service.md); run wardd at login (launchd, systemd, brew services)
 - [`docs/workspace.md`](docs/workspace.md); crate layout
 - [`docs/status.md`](docs/status.md); what's shipped, what's pending
 - [`docs/why.md`](docs/why.md); why ward vs Docker / SaaS sandboxes

@@ -4,15 +4,26 @@
 
 mod attach;
 mod client;
+mod commit;
+mod cp;
+mod diff;
 mod docker;
+mod events;
+mod images;
 mod inspect;
 mod lifecycle;
 mod log_output;
 mod output;
+mod ports;
+mod pull;
 mod resources;
 mod socket;
+mod stats;
+mod template;
 mod terminal;
 mod tokens;
+mod top;
+mod wait;
 
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
@@ -88,6 +99,19 @@ struct SandboxOpts {
     /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
     #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
     cpus: String,
+    /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
+    #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
+    user: Option<String>,
+    /// Publish a TCP port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp]. Without
+    /// HOST_PORT, or with 0, the daemon picks a free one. Repeatable.
+    /// Unlike Docker, HOST_IP defaults to 127.0.0.1, not 0.0.0.0; the port
+    /// stays open while the sandbox is exited and closes on stop or rm; TCP only.
+    #[arg(
+        short = 'p',
+        long = "publish",
+        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
+    )]
+    publish: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +162,19 @@ enum Commands {
         format: Option<String>,
     },
 
+    /// Print the host address each published port is reachable on.
+    ///
+    /// With PORT (80 or 80/tcp), prints only the host address for it.
+    ///
+    /// Unlike Docker, a port without HOST_IP binds 127.0.0.1, not 0.0.0.0. It
+    /// stays open while the sandbox is exited and closes on stop or rm. TCP only.
+    Port {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// Container port, optionally with /tcp.
+        port: Option<String>,
+    },
+
     /// Print low level details of one or more sandboxes as a JSON array.
     Inspect {
         /// Sandbox names, IDs or ID prefixes.
@@ -158,6 +195,9 @@ enum Commands {
         /// Working directory.
         #[arg(short = 'w', long)]
         workdir: Option<String>,
+        /// User to run as: name|uid[:group|gid]. Defaults to the sandbox's user.
+        #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
+        user: Option<String>,
         /// Environment variables in KEY=VALUE form.
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -298,6 +338,180 @@ enum Commands {
         /// Remove a running sandbox too.
         #[arg(short, long)]
         force: bool,
+    },
+
+    /// Copy files between a sandbox and the host, as `docker cp` does.
+    ///
+    /// One of SRC and DEST is `SANDBOX:PATH`. Use `-` for SRC to read a tar
+    /// from stdin, or for DEST to write a tar to stdout. A `/.` suffix on a
+    /// directory copies its contents. A relative sandbox path starts at the
+    /// sandbox's working directory.
+    Cp {
+        /// A host path, `-` for stdin, or `SANDBOX:PATH`.
+        src: String,
+        /// A host path, `-` for stdout, or `SANDBOX:PATH`.
+        dest: String,
+        /// Copy the file a host symlink SRC points to, not the link.
+        #[arg(short = 'L', long)]
+        follow_link: bool,
+        /// Accepted for `docker cp` scripts; ownership is never carried over.
+        #[arg(short = 'a', long)]
+        archive: bool,
+        /// Accepted for `docker cp` scripts; `ward cp` prints no progress.
+        #[arg(short = 'q', long)]
+        quiet: bool,
+    },
+
+    /// List the processes of a running sandbox, as `docker top` does.
+    ///
+    /// Options after the sandbox are ps-style: none (as `ps -ef`), aux, axu,
+    /// -e, -A, -f, -ef, -Af, -o or -eo with a column list (pid, ppid, uid,
+    /// user, comm, args, cmd, time, stime, tty, stat, vsz, rss, pcpu, pmem,
+    /// c), -u USER and -p PID. Times are UTC.
+    Top {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// Options for `ps`.
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
+        ps_args: Vec<String>,
+    },
+
+    /// Show the CPU, memory and process use of running sandboxes.
+    ///
+    /// Refreshes every second until interrupted; --no-stream prints one
+    /// reading. With no sandbox named it covers every running sandbox this
+    /// user holds a token for. CPU % is of one CPU. Network and block I/O are
+    /// not measured and print `--`. --format takes a Go template over
+    /// .Container .ID .Name .CPUPerc .MemUsage .MemPerc .NetIO .BlockIO .PIDs,
+    /// `table ` prefix and `{{json .}}`.
+    Stats {
+        /// Show stopped sandboxes too, with `--` for their figures.
+        #[arg(short, long)]
+        all: bool,
+        /// Print the full sandbox ID.
+        #[arg(long)]
+        no_trunc: bool,
+        /// Print one reading instead of streaming.
+        #[arg(long)]
+        no_stream: bool,
+        /// Go template for each row.
+        #[arg(long)]
+        format: Option<String>,
+        /// Sandbox names, IDs or ID prefixes.
+        references: Vec<String>,
+    },
+
+    /// Block until sandboxes stop, then print their exit codes.
+    ///
+    /// A sandbox without a command reports 0 once it is stopped.
+    Wait {
+        /// Sandbox names, IDs or ID prefixes.
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
+
+    /// Stream sandbox events: create, start, die, stop and destroy.
+    ///
+    /// The daemon answers without a sandbox token, like `ward ps`, and keeps
+    /// only the last 1024 events in memory, destroyed sandboxes included and
+    /// none across a restart. --since replays from that history. --filter
+    /// takes type, event, container or name (a name or ID prefix), image and
+    /// label (an attribute, as key or key=value). --format takes a Go
+    /// template over .Type .Action .Status .ID .From .Scope .Time .TimeNano
+    /// .Actor.ID .Actor.Attributes.<key>, or json.
+    Events {
+        /// Replay events from this time: a duration, timestamp or Unix seconds.
+        #[arg(long)]
+        since: Option<String>,
+        /// Stop streaming at this time.
+        #[arg(long)]
+        until: Option<String>,
+        /// Only events matching name=value. Repeatable.
+        #[arg(short, long)]
+        filter: Vec<String>,
+        /// Go template for each event.
+        #[arg(long)]
+        format: Option<String>,
+    },
+
+    /// List the images in the local cache.
+    ///
+    /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
+    /// SIZE. Every cached image is a final image, so -a adds nothing.
+    /// --filter takes reference=<pattern> (`*` matches any run of characters)
+    /// and dangling=true|false; no cached image is dangling. --format takes a
+    /// Go template over .Repository .Tag .ID .Digest .CreatedAt .CreatedSince
+    /// .Size, the `table ` prefix, and `{{json .}}`.
+    Images {
+        /// Show all images. Ward keeps no intermediate images.
+        #[arg(short, long)]
+        all: bool,
+        /// Print only image IDs.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Print the full image ID.
+        #[arg(long)]
+        no_trunc: bool,
+        /// Go template for each image.
+        #[arg(long)]
+        format: Option<String>,
+        /// Only images matching name=value. Repeatable.
+        #[arg(short, long)]
+        filter: Vec<String>,
+        /// Only images of this REPOSITORY[:TAG].
+        reference: Option<String>,
+    },
+
+    /// Pull an image into the local cache.
+    ///
+    /// Progress prints like `docker pull`. A pull stops at 2 GiB of layers
+    /// and fails instead of evicting images when the cache is full.
+    Pull {
+        /// Print only the image reference once the pull is done.
+        #[arg(short, long)]
+        quiet: bool,
+        /// Image to pull: IMAGE[:TAG|@DIGEST].
+        image: String,
+    },
+
+    /// Show the paths a sandbox changed against its image, as `docker diff`
+    /// does: `A` added, `C` changed, `D` deleted.
+    Diff {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+    },
+
+    /// Save a sandbox's filesystem as a new local image, as `docker commit`
+    /// does, and print the new image id.
+    ///
+    /// The image takes the command, environment and working directory the
+    /// sandbox started with, then CHANGE on top. CHANGE accepts CMD,
+    /// ENTRYPOINT, ENV, WORKDIR and USER. A sandbox cannot be paused yet, so
+    /// the copy is taken while it runs and a file being written may be copied
+    /// part way. An unreadable file fails the commit. Device nodes, pipes and
+    /// sockets are not copied; hard links become separate files; setuid and
+    /// setgid bits are dropped; extended attributes, sparse holes and
+    /// modification times are not kept. A committed image is never evicted
+    /// from the cache. A tag already in use moves to the new image, and the
+    /// old one stays by its digest.
+    Commit {
+        /// Author of the commit, e.g. "Ada <ada@example.com>".
+        #[arg(short, long)]
+        author: Option<String>,
+        /// Commit message.
+        #[arg(short, long)]
+        message: Option<String>,
+        /// Apply a Dockerfile instruction to the image config. Repeatable.
+        #[arg(short = 'c', long = "change", value_name = "CHANGE")]
+        change: Vec<String>,
+        /// Pause the sandbox during the commit. Accepted for Docker
+        /// compatibility: pausing is not supported yet and the copy is live.
+        #[arg(short, long, default_value_t = true, action = clap::ArgAction::Set)]
+        pause: bool,
+        /// Sandbox name, ID or ID prefix.
+        container: String,
+        /// Local tag for the new image, REPOSITORY[:TAG].
+        repository: Option<String>,
     },
 
     /// Remove every stopped and exited sandbox.
@@ -447,9 +661,12 @@ fn create_request(
         .iter()
         .map(|spec| parse_mount_spec(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let published_ports = ports::parse_all(&opts.publish)?;
+    ports::warn_if_exposed(&published_ports);
     Ok(ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
+        published_ports,
         egress: Some(ward_core::pb::EgressPolicy {
             mode: egress_mode as i32,
             domains: opts.allow_domain,
@@ -457,6 +674,7 @@ fn create_request(
         resources: Some(resources),
         env: parse_env(&opts.env),
         name: opts.name.unwrap_or_default(),
+        user: opts.user.unwrap_or_default(),
         ..Default::default()
     })
 }
@@ -632,6 +850,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             inspect::ps(&mut c, options).await?;
         }
 
+        Commands::Port { reference, port } => {
+            ports::run(
+                &socket_path,
+                &token_store,
+                &reference,
+                port.as_deref(),
+                json,
+            )
+            .await?;
+        }
+
         Commands::Inspect { references } => {
             let mut c = client::connect(&socket_path).await?;
             inspect::inspect(&mut c, &token_store, &references).await?;
@@ -641,6 +870,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             id,
             command,
             workdir,
+            user,
             env,
             interactive,
             tty,
@@ -651,6 +881,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     command,
                     env: parse_env(&env),
                     workdir: workdir.unwrap_or_default(),
+                    user: user.unwrap_or_default(),
                     interactive,
                     tty,
                 };
@@ -664,6 +895,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 command,
                 working_dir: workdir.unwrap_or_default(),
                 env: parse_env(&env),
+                user: user.unwrap_or_default(),
             })?;
             let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`.
@@ -933,6 +1165,101 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Remove { refs, force } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+        }
+
+        Commands::Cp {
+            src,
+            dest,
+            follow_link,
+            ..
+        } => {
+            cp::run(&socket_path, &token_store, &src, &dest, follow_link).await?;
+        }
+
+        Commands::Top { reference, ps_args } => {
+            top::run(&socket_path, &token_store, &reference, ps_args, json).await?;
+        }
+
+        Commands::Stats {
+            all,
+            no_trunc,
+            no_stream,
+            format,
+            references,
+        } => {
+            let options = stats::Options {
+                no_stream,
+                format,
+                json,
+                all,
+                no_trunc,
+            };
+            stats::run(&socket_path, &token_store, &references, options).await?;
+        }
+
+        Commands::Wait { references } => {
+            wait::run(&socket_path, &token_store, &references, json).await?;
+        }
+
+        Commands::Events {
+            since,
+            until,
+            filter,
+            format,
+        } => {
+            let options = events::Options {
+                since,
+                until,
+                filters: filter,
+                format,
+                json,
+            };
+            events::run(&socket_path, options).await?;
+        }
+
+        Commands::Images {
+            quiet,
+            no_trunc,
+            format,
+            filter,
+            reference,
+            ..
+        } => {
+            let options = images::Options {
+                quiet,
+                no_trunc,
+                format,
+                filters: filter,
+                reference,
+                json,
+            };
+            images::run(&socket_path, options).await?;
+        }
+
+        Commands::Pull { quiet, image } => {
+            pull::run(&socket_path, &image, quiet).await?;
+        }
+
+        Commands::Diff { reference } => {
+            diff::run(&socket_path, &token_store, &reference, json).await?;
+        }
+
+        Commands::Commit {
+            author,
+            message,
+            change,
+            pause,
+            container,
+            repository,
+        } => {
+            let options = commit::Options {
+                author: author.unwrap_or_default(),
+                message: message.unwrap_or_default(),
+                changes: change,
+                pause,
+                reference: repository.unwrap_or_default(),
+            };
+            commit::run(&socket_path, &token_store, &container, options).await?;
         }
 
         Commands::Prune => {
@@ -1235,6 +1562,92 @@ mod tests {
         assert_eq!(request.entrypoint, None);
     }
 
+    #[rstest::rstest]
+    #[case::short(&["ward", "run", "-u", "1000:1000", "alpine"], "1000:1000")]
+    #[case::long(&["ward", "create", "--user", "app", "alpine"], "app")]
+    #[case::absent(&["ward", "run", "alpine"], "")]
+    fn given_user_flag_when_create_request_built_then_user_is_set(
+        #[case] args: &[&str],
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let cli = Cli::try_parse_from(args).expect("parse");
+        let (Commands::Create { image, opts, .. } | Commands::Run { image, opts, .. }) =
+            cli.command
+        else {
+            panic!("expected Create or Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(request.user, expected);
+    }
+
+    #[test]
+    fn given_repeated_publish_flags_when_create_request_built_then_each_becomes_a_mapping() {
+        // Arrange
+        let cli = Cli::try_parse_from([
+            "ward",
+            "run",
+            "-p",
+            "0:80",
+            "--publish",
+            "127.0.0.1:8443:443",
+            "alpine",
+        ])
+        .expect("parse");
+        let Commands::Run { image, opts, .. } = cli.command else {
+            panic!("expected Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let ports: Vec<_> = request
+            .published_ports
+            .iter()
+            .map(|m| (m.host_ip.as_str(), m.host_port, m.container_port))
+            .collect();
+        assert_eq!(ports, vec![("", 0, 80), ("127.0.0.1", 8443, 443)]);
+    }
+
+    #[test]
+    fn given_port_command_when_parsed_then_sandbox_and_port_are_kept() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "port", "web", "80/tcp"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Port { reference, port } => {
+                assert_eq!(
+                    (reference.as_str(), port.as_deref()),
+                    ("web", Some("80/tcp"))
+                );
+            }
+            other => panic!("expected Port, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_exec_with_user_flag_when_parsed_then_user_is_kept() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "exec", "-u", "1000", "sb", "id"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Exec { user, command, .. } => {
+                assert_eq!(
+                    (user.as_deref(), command),
+                    (Some("1000"), vec!["id".into()])
+                );
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
     #[test]
     fn given_create_with_entrypoint_flag_when_parsed_then_clap_error() {
         assert!(Cli::try_parse_from(["ward", "create", "--entrypoint", "/x", "alpine"]).is_err());
@@ -1332,6 +1745,86 @@ mod tests {
                 );
             }
             other => panic!("expected Kill, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_commit_with_docker_flags_when_parsed_then_it_holds_them() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from([
+            "ward", "commit", "-a", "Ada", "-m", "msg", "-c", "ENV A=1", "-c", "CMD sh",
+            "-p=false", "web1", "mine:v1",
+        ])
+        .expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Commit {
+                author,
+                message,
+                change,
+                pause,
+                container,
+                repository,
+            } => {
+                assert_eq!(author.as_deref(), Some("Ada"));
+                assert_eq!(message.as_deref(), Some("msg"));
+                assert_eq!(change, ["ENV A=1", "CMD sh"]);
+                assert!(!pause);
+                assert_eq!(container, "web1");
+                assert_eq!(repository.as_deref(), Some("mine:v1"));
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_commit_without_flags_when_parsed_then_it_pauses_and_has_no_tag() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["ward", "commit", "web1"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Commit {
+                pause, repository, ..
+            } => {
+                assert!(pause);
+                assert_eq!(repository, None);
+            }
+            other => panic!("expected Commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_diff_with_a_sandbox_when_parsed_then_it_holds_the_reference() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["ward", "diff", "web1"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Diff { reference } => assert_eq!(reference, "web1"),
+            other => panic!("expected Diff, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::none(&["ward", "top", "web1"], &[])]
+    #[case::ef(&["ward", "top", "web1", "-ef"], &["-ef"])]
+    #[case::aux(&["ward", "top", "web1", "aux"], &["aux"])]
+    fn given_top_with_ps_options_when_parsed_then_they_follow_the_sandbox(
+        #[case] args: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Top { reference, ps_args } => {
+                assert_eq!(reference, "web1");
+                assert_eq!(ps_args, expected);
+            }
+            other => panic!("expected Top, got {other:?}"),
         }
     }
 

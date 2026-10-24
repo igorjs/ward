@@ -34,7 +34,9 @@ use proto::{Event, Exec, Request, event, request};
 /// any payload arrived.
 const MAX_FRAME_BYTES: u32 = 2 * 1024 * 1024;
 
-async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -68,7 +70,10 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<V
 /// could ship a malformed `len = 0` frame (from a future `Request::default()`
 /// caller) to the guest, where the agent's reader would reject it as
 /// `InvalidData` and surface the failure as an opaque peer disconnect.
-async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     if bytes.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -89,7 +94,7 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> std::io:
     Ok(())
 }
 
-fn encode<M: Message>(m: &M) -> Vec<u8> {
+pub(crate) fn encode<M: Message>(m: &M) -> Vec<u8> {
     let mut buf = Vec::with_capacity(m.encoded_len());
     m.encode(&mut buf)
         .expect("encoding into a Vec is infallible");
@@ -151,7 +156,7 @@ where
             env,
             tty: mode.tty,
             raw: mode.raw,
-            ..Default::default()
+            user: mode.user,
         })),
     };
     write_frame(&mut writer, &encode(&exec)).await?;
@@ -308,6 +313,177 @@ where
             std::io::ErrorKind::InvalidData,
             "agent reply to Ping was not Pong",
         )),
+    }
+}
+
+/// Bytes of tar in one `ArchiveChunk` frame, well under the frame cap.
+pub const ARCHIVE_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn protocol_error(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
+}
+
+fn agent_failure(message: String) -> std::io::Error {
+    std::io::Error::other(format!("guest agent: {message}"))
+}
+
+/// Send `chunks` as one tar stream to unpack into the guest directory `path`.
+///
+/// # Errors
+///
+/// Returns an error if the agent refuses the tar or the connection fails.
+pub async fn put_archive<S>(
+    stream: S,
+    path: String,
+    mut chunks: mpsc::Receiver<bytes::Bytes>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::PutArchive(proto::PutArchive { path })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    while let Some(chunk) = chunks.recv().await {
+        for piece in chunk.chunks(ARCHIVE_CHUNK_BYTES) {
+            let frame = Request {
+                kind: Some(request::Kind::ArchiveChunk(proto::ArchiveChunk {
+                    data: piece.to_vec(),
+                })),
+            };
+            write_frame(&mut writer, &encode(&frame)).await?;
+        }
+    }
+    let end = Request {
+        kind: Some(request::Kind::ArchiveEnd(proto::ArchiveEnd {})),
+    };
+    write_frame(&mut writer, &encode(&end)).await?;
+    let frame = read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
+        _ => Err(protocol_error(
+            "agent answered a PutArchive with another event",
+        )),
+    }
+}
+
+/// Ask the agent for a tar of the guest `path` and pass its chunks to `out`.
+/// A failure ends the stream with an `Err` item, since chunks sent before it
+/// are incomplete.
+pub async fn get_archive<S>(
+    stream: S,
+    path: String,
+    out: mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Err(e) = relay_archive(stream, path, &out).await {
+        let _ = out.send(Err(e)).await;
+    }
+}
+
+async fn relay_archive<S>(
+    stream: S,
+    path: String,
+    out: &mpsc::Sender<std::io::Result<bytes::Bytes>>,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::GetArchive(proto::GetArchive { path })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    loop {
+        let frame = read_frame(&mut reader)
+            .await?
+            .ok_or_else(|| protocol_error("agent closed the connection mid-archive"))?;
+        match Event::decode(&frame[..]).map(|e| e.kind) {
+            Ok(Some(event::Kind::ArchiveChunk(c))) => {
+                if out.send(Ok(bytes::Bytes::from(c.data))).await.is_err() {
+                    return Ok(()); // consumer gone
+                }
+            }
+            Ok(Some(event::Kind::ArchiveDone(_))) => return Ok(()),
+            Ok(Some(event::Kind::ArchiveError(e))) => return Err(agent_failure(e.message)),
+            _ => {
+                return Err(protocol_error(
+                    "agent answered a GetArchive with another event",
+                ));
+            }
+        }
+    }
+}
+
+/// Ask the agent for the guest's process table, as `ps` with `ps_args`.
+///
+/// # Errors
+///
+/// Returns `InvalidArgument` when the agent refuses `ps_args`, and an
+/// error if the connection fails or the agent answers with anything else.
+pub async fn top<S>(stream: S, ps_args: &[String]) -> super::Result<super::ProcessTable>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::Top(proto::Top {
+            ps_args: ps_args.to_vec(),
+        })),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    let frame = read_frame(&mut reader)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::Processes(list))) => Ok(super::ProcessTable {
+            titles: list.titles,
+            rows: list.rows.into_iter().map(|row| row.fields).collect(),
+        }),
+        Ok(Some(event::Kind::TopError(refusal))) => {
+            Err(super::BackendError::InvalidArgument(refusal.message))
+        }
+        _ => Err(protocol_error("agent answered a Top with another event").into()),
+    }
+}
+
+/// How long the agent has to answer a Stats before the poll gives up.
+const STATS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ask the agent for the guest's CPU, memory and process counters.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or the agent answers with
+/// anything but a sample.
+pub async fn stats<S>(stream: S) -> super::Result<super::GuestStats>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let open = Request {
+        kind: Some(request::Kind::Stats(proto::Stats {})),
+    };
+    write_frame(&mut writer, &encode(&open)).await?;
+    let reply = tokio::time::timeout(STATS_REPLY_TIMEOUT, read_frame(&mut reader))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "agent did not answer"))?;
+    let frame =
+        reply?.ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::StatsSample(sample))) => Ok(super::GuestStats {
+            cpu_nanos: sample.cpu_nanos,
+            online_cpus: sample.online_cpus,
+            mem_total_bytes: sample.mem_total_bytes,
+            mem_available_bytes: sample.mem_available_bytes,
+            pids: sample.pids,
+        }),
+        _ => Err(protocol_error("agent answered a Stats with another event").into()),
     }
 }
 
@@ -590,6 +766,7 @@ mod tests {
             ExecMode {
                 tty: false,
                 raw: true,
+                ..Default::default()
             },
         )
         .await;
@@ -665,6 +842,7 @@ mod tests {
                 ExecMode {
                     tty: true,
                     raw: false,
+                    ..Default::default()
                 },
                 true,
                 false,
@@ -673,6 +851,7 @@ mod tests {
                 ExecMode {
                     tty: false,
                     raw: true,
+                    ..Default::default()
                 },
                 false,
                 true,
@@ -709,6 +888,7 @@ mod tests {
             ExecMode {
                 tty: true,
                 raw: false,
+                ..Default::default()
             },
         )
         .await;
@@ -785,6 +965,7 @@ mod tests {
             let mode = ExecMode {
                 tty: false,
                 raw: true,
+                ..Default::default()
             };
             let (mut handle, _kill) = drive_real(&["sleep", "30"], mode).await;
             let control = handle.control_tx.clone().expect("control channel");
@@ -812,6 +993,7 @@ mod tests {
             let mode = ExecMode {
                 tty: true,
                 raw: false,
+                ..Default::default()
             };
             let (mut handle, _kill) = drive_real(&["sh", "-c", &script], mode).await;
             let control = handle.control_tx.clone().expect("control channel");
@@ -842,6 +1024,127 @@ mod tests {
                 String::from_utf8_lossy(&output).contains(&size),
                 "got {output:?}"
             );
+        }
+    }
+
+    const TOP_ARGS: [&str; 2] = ["-o", "pid"];
+    const REFUSAL: &str = "unsupported ps option: -x";
+
+    fn top_args() -> Vec<String> {
+        TOP_ARGS.map(String::from).to_vec()
+    }
+
+    /// Fake guest for `top`: reads the opening frame, then sends `reply`.
+    async fn top_guest<S>(stream: S, reply: Option<Event>)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut r, mut w) = split(stream);
+        let frame = read_frame(&mut r).await.unwrap().expect("top frame");
+        let req = Request::decode(&frame[..]).unwrap();
+        let Some(request::Kind::Top(top)) = req.kind else {
+            panic!("expected a Top frame");
+        };
+        assert_eq!(top.ps_args, TOP_ARGS);
+        if let Some(event) = reply {
+            write_frame(&mut w, &encode(&event)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_guest_process_list_when_top_then_titles_and_rows_come_back() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let list = proto::Processes {
+            titles: vec!["PID".into(), "CMD".into()],
+            rows: vec![proto::ProcessRow {
+                fields: vec!["7".into(), "sleep 600".into()],
+            }],
+        };
+        let reply = Event {
+            kind: Some(event::Kind::Processes(list)),
+        };
+        tokio::spawn(top_guest(guest, Some(reply)));
+
+        // Act
+        let table = top(daemon, &top_args()).await.expect("top");
+
+        // Assert
+        assert_eq!(table.titles, ["PID", "CMD"]);
+        assert_eq!(table.rows, [["7", "sleep 600"]]);
+    }
+
+    #[rstest::rstest]
+    #[case::other_event(Some(event::Kind::Pong(proto::Pong {})), true)]
+    #[case::hang_up(None, true)]
+    #[case::refusal(
+        Some(event::Kind::TopError(proto::TopError { message: REFUSAL.into() })),
+        false
+    )]
+    #[tokio::test]
+    async fn given_a_guest_that_does_not_list_when_top_then_error(
+        #[case] reply: Option<event::Kind>,
+        #[case] protocol_failure: bool,
+    ) {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(top_guest(
+            guest,
+            reply.map(|kind| Event { kind: Some(kind) }),
+        ));
+
+        // Act
+        let err = top(daemon, &top_args()).await.expect_err("no list");
+
+        // Assert
+        use crate::backend::BackendError;
+        match err {
+            BackendError::Io(e) if protocol_failure => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            }
+            BackendError::InvalidArgument(message) if !protocol_failure => {
+                assert_eq!(message, REFUSAL);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::sample(Some(event::Kind::StatsSample(proto::StatsSample {
+        online_cpus: 2,
+        pids: 7,
+        ..Default::default()
+    })))]
+    #[case::other_event(Some(event::Kind::Pong(proto::Pong {})))]
+    #[case::hang_up(None)]
+    #[tokio::test]
+    async fn given_a_guest_reply_when_stats_then_a_sample_or_invalid_data(
+        #[case] reply: Option<event::Kind>,
+    ) {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let is_sample = matches!(reply, Some(event::Kind::StatsSample(_)));
+        tokio::spawn(async move {
+            let (mut r, mut w) = split(guest);
+            let frame = read_frame(&mut r).await.unwrap().expect("stats frame");
+            let req = Request::decode(&frame[..]).unwrap();
+            assert!(matches!(req.kind, Some(request::Kind::Stats(_))));
+            if let Some(kind) = reply {
+                let event = Event { kind: Some(kind) };
+                write_frame(&mut w, &encode(&event)).await.unwrap();
+            }
+        });
+
+        // Act
+        let result = stats(daemon).await;
+
+        // Assert
+        match result {
+            Ok(got) if is_sample => assert_eq!((got.online_cpus, got.pids), (2, 7)),
+            Err(crate::backend::BackendError::Io(e)) if !is_sample => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => panic!("unexpected result: {other:?}"),
         }
     }
 }

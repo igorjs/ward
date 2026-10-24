@@ -731,3 +731,269 @@ fn given_open_egress_when_guest_targets_cloud_metadata_address_then_it_is_blocke
 
     assert_eq!(status, "");
 }
+
+#[test]
+fn given_a_running_guest_process_when_top_then_one_row_has_its_pid_and_command() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    start(&d, &id, None, &["sleep", "31337"]);
+    let guest_pid = sh(&d, &id, "pgrep -f '[s]leep 31337'")
+        .stdout
+        .trim()
+        .to_string();
+
+    let mut cmd = d.cli();
+    cmd.args(["top", &id]);
+    let out = run_ok(cmd);
+
+    let header = out.lines().next().expect("header");
+    assert_eq!(
+        header.split_whitespace().collect::<Vec<_>>(),
+        ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"]
+    );
+    let rows: Vec<Vec<&str>> = out
+        .lines()
+        .skip(1)
+        .map(|l| l.split_whitespace().collect::<Vec<_>>())
+        .filter(|f| f.get(1) == Some(&guest_pid.as_str()))
+        .collect();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert_eq!(rows[0][7..], ["sleep", "31337"]);
+}
+
+const GUEST_BUSY_SECONDS: u64 = 2;
+
+/// One `ward stats --no-stream` reading: a counter from its JSON object.
+fn stat(d: &Daemon, id: &str, key: &str) -> u64 {
+    let mut cmd = d.cli();
+    cmd.args(["--json", "stats", "--no-stream", id]);
+    let value: serde_json::Value = serde_json::from_str(run_ok(cmd).trim()).expect("stats json");
+    value[key]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no {key} in {value}"))
+}
+
+#[test]
+fn given_a_guest_busy_loop_when_stats_read_twice_then_cpu_time_grew_within_wall_time_times_cpus() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    let started = Instant::now();
+    let before = stat(&d, &id, "CPUNanos");
+
+    let busy = format!(
+        "end=$(( $(date +%s) + {GUEST_BUSY_SECONDS} )); while [ $(date +%s) -lt $end ]; do :; done"
+    );
+    assert_eq!(sh(&d, &id, &busy).exit, 0);
+    let grew = stat(&d, &id, "CPUNanos") - before;
+
+    let ceiling = started.elapsed().as_nanos() * u128::from(stat(&d, &id, "OnlineCPUs"));
+    assert!(grew > 0, "cpu time did not grow");
+    assert!(
+        u128::from(grew) <= ceiling,
+        "{grew} ns of cpu over {ceiling}"
+    );
+}
+
+const USER_UID: &str = "1000";
+const USER_EXTRA_GID: &str = "1010";
+/// Adds uid 1000 to the guest's user database, in a group of its own and in
+/// one more that lists it.
+const ADD_USER: &str = "echo 'dev:x:1000:1000::/home/dev:/bin/sh' >> /etc/passwd; \
+                        echo 'dev:x:1000:' >> /etc/group; \
+                        echo 'extra:x:1010:dev' >> /etc/group";
+const EXIT_NOT_INVOKABLE: i32 = 126;
+
+/// Run `argv` through `ward exec -u USER` and return its output and exit code.
+fn exec_as(d: &Daemon, id: &str, user: &str, argv: &[&str]) -> Finished {
+    let out = d
+        .cli()
+        .args(["exec", "-u", user, id, "--"])
+        .args(argv)
+        .output()
+        .expect("run ward");
+    Finished {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit: out.status.code().expect("exit code"),
+    }
+}
+
+#[test]
+fn given_user_1000_when_run_then_id_u_prints_1000() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let mut cmd = d.cli();
+    cmd.args(["run", "--rm", "-u", "1000:1000", &image(), "id", "-u"]);
+
+    let out = run_ok(cmd);
+
+    assert_eq!(out.trim(), USER_UID);
+}
+
+#[test]
+fn given_user_1000_1000_when_exec_id_u_then_it_prints_1000() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let r = exec_as(&d, &id, "1000:1000", &["id", "-u"]);
+
+    assert_eq!((r.stdout.trim(), r.exit), (USER_UID, 0));
+}
+
+#[test]
+fn given_uid_gid_when_exec_id_g_then_only_that_group_is_listed() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "1000:1000", &["id", "-G"]);
+
+    assert_eq!(r.stdout.trim(), USER_UID, "stderr: {}", r.stderr);
+}
+
+#[test]
+fn given_bare_user_name_when_exec_id_g_then_guest_group_memberships_are_listed() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "dev", &["id", "-G"]);
+
+    let mut groups: Vec<&str> = r.stdout.split_whitespace().collect();
+    groups.sort_unstable();
+    assert_eq!(groups, [USER_UID, USER_EXTRA_GID], "stderr: {}", r.stderr);
+}
+
+#[test]
+fn given_a_root_only_workdir_when_exec_as_user_then_it_fails_after_the_drop() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, "mkdir -m 0700 /rootonly").exit, 0);
+
+    let out = d
+        .cli()
+        .args([
+            "exec",
+            "-u",
+            "1000:1000",
+            "-w",
+            "/rootonly",
+            &id,
+            "--",
+            "pwd",
+        ])
+        .output()
+        .expect("run ward");
+
+    assert_eq!(out.status.code(), Some(EXIT_NOT_INVOKABLE));
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+}
+
+#[test]
+fn given_user_name_when_exec_then_home_comes_from_passwd() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    assert_eq!(sh(&d, &id, ADD_USER).exit, 0);
+
+    let r = exec_as(&d, &id, "dev", &["sh", "-c", "echo $HOME"]);
+
+    assert_eq!(r.stdout.trim(), "/home/dev");
+}
+
+#[test]
+fn given_unknown_user_when_exec_then_exit_126_with_dockers_wording() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let r = exec_as(&d, &id, "ghost", &["id", "-u"]);
+
+    assert_eq!(r.exit, EXIT_NOT_INVOKABLE);
+    assert!(
+        r.stderr
+            .contains("unable to find user ghost: no matching entries in passwd file"),
+        "stderr: {}",
+        r.stderr
+    );
+}
+
+const GUEST_REPLY: &str = "ward-guest-reply";
+const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+const HTTP_PORT: u16 = 80;
+
+/// Guest script that answers every connection on `port` with `GUEST_REPLY`.
+fn reply_server(port: u16) -> String {
+    format!("while true; do printf '{GUEST_REPLY}' | nc -l -p {port}; done")
+}
+
+/// `ward port ID` as (container port, host port) pairs.
+fn published(d: &Daemon, id: &str) -> Vec<(u16, u16)> {
+    let mut cmd = d.cli();
+    cmd.args(["port", id]);
+    run_ok(cmd)
+        .lines()
+        .map(|line| {
+            let (container, address) = line.split_once("/tcp -> 127.0.0.1:").expect(line);
+            (container.parse().unwrap(), address.parse().unwrap())
+        })
+        .collect()
+}
+
+/// Dial the host port until the guest answers, then return what it sent.
+fn dial_reply(port: u16) -> String {
+    use std::io::Read;
+    let deadline = Instant::now() + DIAL_DEADLINE;
+    loop {
+        let mut reply = String::new();
+        let read = std::net::TcpStream::connect(("127.0.0.1", port))
+            .and_then(|mut stream| stream.read_to_string(&mut reply));
+        if read.is_ok() && !reply.is_empty() {
+            return reply;
+        }
+        assert!(Instant::now() < deadline, "no reply on host port {port}");
+        std::thread::sleep(EXIT_POLL);
+    }
+}
+
+fn refused(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port))
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+#[test]
+fn given_any_host_port_and_a_guest_server_when_the_host_port_is_dialed_then_the_reply_arrives() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-p", "0:80"]);
+    start(&d, &id, None, &["sh", "-c", &reply_server(HTTP_PORT)]);
+
+    let mappings = published(&d, &id);
+
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].0, HTTP_PORT);
+    assert_eq!(dial_reply(mappings[0].1), GUEST_REPLY);
+}
+
+#[test]
+fn given_a_published_port_when_stopped_and_started_then_it_is_refused_then_serves_on_the_same_port()
+{
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-p", "0:80"]);
+    let port = published(&d, &id)[0].1;
+
+    lifecycle(&d, "stop", &id);
+    wait_until("the host port to close", DIAL_DEADLINE, || refused(port));
+    lifecycle(&d, "start", &id);
+    start(&d, &id, None, &["sh", "-c", &reply_server(HTTP_PORT)]);
+
+    assert_eq!(published(&d, &id)[0].1, port);
+    assert_eq!(dial_reply(port), GUEST_REPLY);
+}

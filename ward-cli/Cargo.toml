@@ -18,6 +18,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 clap = { version = "4", features = ["derive", "env"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
+# Rewrites the root entry name of a directory tar for `ward cp`.
+tar = "0.4"
 # Aligned-column rendering for `ward list`, `ward volume list`, and
 # `ward snapshot list` when stdout is a TTY. Piped output stays
 # tab-separated so scripts keep working.
@@ -28,6 +30,8 @@ rustix = { version = "1", features = ["termios"] }
 tokio-stream = "0.1"
 prost-types = "0.14"
 tonic = "0.14"
+# Staging directory for a downloaded file, so a rename lands it atomically.
+tempfile = "3"
 tower = "0.5"
 ward-core = { path = "../ward-core" }
 
@@ -37,8 +41,10 @@ pretty_assertions = "1"
 rstest = "0.26"
 # Terminal tests open their own pty and signal a child process.
 rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }
-# Per-test temporary directories for the token store round-trip tests.
-tempfile = "3"
+# The `ward cp` tests' fake daemon: a hand-routed gRPC service on a Unix socket.
+http = "1"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic-prost = "0.14"
 
 [lints]
 workspace = true

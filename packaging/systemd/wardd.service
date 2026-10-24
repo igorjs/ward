@@ -1,0 +1,30 @@
+# User unit for wardd. Install as ~/.config/systemd/user/wardd.service.
+#
+# ExecStart points at where install.sh puts the binary. If you installed
+# wardd elsewhere (for example /usr/bin/wardd), edit that line.
+#
+# Hardening is deliberately light: wardd boots microVMs through libkrun
+# and needs /dev/kvm, anonymous executable memory and its own re-exec, so
+# PrivateDevices, MemoryDenyWriteExecute and syscall filters stay off.
+
+[Unit]
+Description=Ward sandbox daemon
+Documentation=https://github.com/igorjs/ward
+
+[Service]
+Type=simple
+ExecStart=%h/.ward/bin/wardd
+Restart=on-failure
+RestartSec=5
+# wardd's default socket is $XDG_RUNTIME_DIR/ward/ward.sock.
+RuntimeDirectory=ward
+RuntimeDirectoryMode=0700
+# wardd drains sandboxes for up to WARD_SHUTDOWN_TIMEOUT_SECS (30 by default).
+TimeoutStopSec=40
+Environment=WARD_LOG_LEVEL=info
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

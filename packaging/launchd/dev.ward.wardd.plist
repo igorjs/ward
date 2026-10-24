@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  User LaunchAgent for wardd. launchd does not expand ~ or $HOME, so
+  replace the two placeholders before loading:
+
+    __WARDD_PATH__  absolute path to wardd (for example /Users/you/.ward/bin/wardd)
+    __HOME__        absolute path to your home directory
+
+  Create the log directory first: mkdir -p ~/Library/Logs/ward
+  Install and start:
+    sed -e "s|__WARDD_PATH__|$HOME/.ward/bin/wardd|" -e "s|__HOME__|$HOME|g" \
+      dev.ward.wardd.plist > ~/Library/LaunchAgents/dev.ward.wardd.plist
+    launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/dev.ward.wardd.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.ward.wardd</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__WARDD_PATH__</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>WARD_LOG_LEVEL</key>
+    <string>info</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/ward/wardd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/ward/wardd.log</string>
+</dict>
+</plist>

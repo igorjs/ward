@@ -1,5 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
+pub use ward_archive as archive;
 pub mod backend;
 pub mod comms;
 pub mod config;

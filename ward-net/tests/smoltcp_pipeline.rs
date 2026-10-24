@@ -678,9 +678,12 @@ async fn given_fake_hardware_pipeline_when_guest_resolves_and_connects_then_flow
     // flow's destination port.
     assert_eq!(
         *egress_calls.lock().unwrap(),
-        vec![(DOMAIN.to_string(), RESOLVED_PORT)],
-        "egress-check callback should be called once with the domain resolved earlier \
-         in the pipeline and the flow's destination port"
+        vec![
+            (DOMAIN.to_string(), DNS_SERVER_PORT),
+            (DOMAIN.to_string(), RESOLVED_PORT)
+        ],
+        "egress-check callback should gate the DNS lookup, then the domain resolved \
+         earlier in the pipeline with the flow's destination port"
     );
 }
 

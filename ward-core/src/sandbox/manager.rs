@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
 use crate::backend::image::ImageConfig;
+use crate::backend::ports::{BackendForwarder, PortForwarder, PortListener};
 use crate::backend::{Backend, BackendError, ExecMode, ProcessControl, ProcessHandle};
 use crate::comms::Broker;
 use crate::egress::EgressProxy;
@@ -18,6 +19,8 @@ use crate::protocol::{
     ApiError, CommunicationMode, CommunicationPolicy, CreateOpts, EgressPolicy, OutputChunk,
     RawStream, ResourceLimits, StreamEvent, StreamEventKind,
 };
+use crate::sandbox::copy;
+use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 
@@ -32,7 +35,28 @@ type Result<T> = std::result::Result<T, ApiError>;
 fn backend_err(e: BackendError) -> ApiError {
     match e {
         BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
+        BackendError::InvalidArgument(message) => ApiError::InvalidRequest(message),
+        BackendError::ResourceExhausted(message) => ApiError::ResourceExhausted(message),
+        BackendError::AddressInUse(address) => ApiError::AddressInUse(address),
         other => ApiError::Backend(other.to_string()),
+    }
+}
+
+/// Pull errors name the image and the registry's complaint, never a
+/// secret, so the client sees them instead of a generic internal error.
+fn image_backend_err(e: BackendError) -> ApiError {
+    match e {
+        BackendError::Image(message) => ApiError::InvalidRequest(message),
+        other => backend_err(other),
+    }
+}
+
+fn image_to_pb(image: &crate::backend::image::CachedImage) -> crate::pb::ImageInfo {
+    crate::pb::ImageInfo {
+        reference: image.reference.clone(),
+        digest: image.digest.clone(),
+        size_bytes: image.size_bytes,
+        created_at: Some(image.pulled_at.into()),
     }
 }
 
@@ -61,6 +85,21 @@ struct SandboxEntry {
     /// minted at creation. `authorize()` compares against that hash; the
     /// token itself is never kept.
     meta: SandboxMeta,
+    /// Open while the sandbox runs; dropping them closes the host ports.
+    listeners: Vec<PortListener>,
+}
+
+/// What leaves the `entries` map when a sandbox is removed.
+struct RemovedEntry {
+    meta: SandboxMeta,
+    listeners: Vec<PortListener>,
+}
+
+/// Close every listener, returning once all their host ports are free.
+async fn close_all(listeners: Vec<PortListener>) {
+    for listener in listeners {
+        listener.close().await;
+    }
 }
 
 /// Holds a sandbox name while its creation is in flight, so two concurrent
@@ -241,6 +280,8 @@ const WAIT_STATUS_SIGNAL_MASK: i32 = 0x7f;
 const WAIT_STATUS_EXIT_MASK: i32 = 0xff;
 /// Shells report a process killed by signal N as 128 + N.
 const SIGNAL_EXIT_BASE: i32 = 128;
+/// Exit code Docker reports when a command cannot be run.
+const EXEC_FAILED_EXIT: i32 = 126;
 
 /// Seconds a stopping sandbox's main process gets to end after SIGTERM.
 pub const STOP_GRACE_SECONDS: u64 = 10;
@@ -250,6 +291,21 @@ const SIGKILL: i32 = 9;
 const MAX_SIGNAL: i32 = 64;
 /// The pid `kill_process` accepts for the sandbox's main process.
 pub const MAIN_PROCESS_PID: &str = "0";
+
+/// How often `wait` looks at the recorded state.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// One reading of a running sandbox's resource use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SandboxStats {
+    pub cpu_nanos: u64,
+    pub online_cpus: u32,
+    pub mem_used_bytes: u64,
+    pub mem_limit_bytes: u64,
+    pub pids: u32,
+    pub read_at: std::time::SystemTime,
+}
 
 /// Turn a raw `wait(2)` status into the exit code a shell would report.
 pub(crate) fn decode_wait_status(raw: i32) -> i32 {
@@ -375,24 +431,36 @@ async fn ended_within(
     }
 }
 
-/// What the daemon needs to remove a sandbox whose main process ended.
-struct AutoRemove {
+/// The shared handles a background task needs to tear a sandbox down and
+/// report what happened to it.
+#[derive(Clone)]
+struct Teardown {
+    entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
+    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
     broker: Arc<Broker>,
     backend: Arc<dyn Backend>,
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    events: EventLog,
+}
+
+fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
+    let event = SandboxEvent::new(action, meta);
+    match code {
+        Some(code) => event.with_exit_code(code),
+        None => event,
+    }
 }
 
 /// Mark a sandbox `exited` once its main process `pid` ends on its own. A
 /// stop in progress records the outcome itself, and a newer run owns the
 /// state, so both are left alone.
 async fn mark_exited_on_main_end(
-    entries: Arc<RwLock<HashMap<String, SandboxEntry>>>,
-    mains: Arc<RwLock<HashMap<String, MainProcess>>>,
+    teardown: Teardown,
     store: Option<MetaStore>,
     id: String,
     pid: String,
     mut exit: watch::Receiver<Option<i32>>,
-    auto_remove: Option<AutoRemove>,
+    auto_remove: bool,
 ) {
     let Ok(raw) = exit.wait_for(Option::is_some).await.map(|status| *status) else {
         return;
@@ -401,8 +469,8 @@ async fn mark_exited_on_main_end(
         return;
     };
     {
-        let mut entries = entries.write().await;
-        let current = mains.read().await.get(&id).map(|m| m.pid == pid);
+        let mut entries = teardown.entries.write().await;
+        let current = teardown.mains.read().await.get(&id).map(|m| m.pid == pid);
         let Some(entry) = entries.get_mut(&id) else {
             return;
         };
@@ -417,47 +485,42 @@ async fn mark_exited_on_main_end(
         )
         .await
         {
-            Ok(()) => tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited"),
+            Ok(()) => {
+                tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited");
+                let died = SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                teardown.events.emit(died);
+            }
             Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
         }
     }
     // The status is published and attached readers hold their own buffer
     // subscriptions, so removing now cannot cut their output short.
-    if let Some(auto) = auto_remove {
-        auto_remove_ended(&entries, &mains, &auto, &id, &pid).await;
+    if auto_remove {
+        auto_remove_ended(&teardown, &id, &pid).await;
     }
 }
 
 /// Remove sandbox `id` if it is still exited from the run that `pid` was.
 /// A start since the exit was recorded owns the sandbox now, so it stays.
-async fn auto_remove_ended(
-    entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
-    mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
-    auto: &AutoRemove,
-    id: &str,
-    pid: &str,
-) {
+async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
     let removed = {
-        let mut entries = entries.write().await;
+        let mut entries = teardown.entries.write().await;
         let exited = entries
             .get(id)
             .is_some_and(|entry| entry.meta.status == crate::protocol::SandboxStatus::Exited);
-        let same_run = mains.read().await.get(id).is_some_and(|m| m.pid == pid);
+        let same_run = teardown
+            .mains
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|m| m.pid == pid);
         if !(exited && same_run) {
             tracing::info!(sandbox_id = %id, "sandbox started again, keeping it");
             return;
         }
         SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
     };
-    let result = SandboxManager::finish_cleanup(
-        removed,
-        &auto.broker,
-        &auto.backend,
-        &auto.processes,
-        mains,
-        id,
-    )
-    .await;
+    let result = SandboxManager::finish_cleanup(removed, teardown, id).await;
     match result {
         Ok(()) => {
             tracing::info!(sandbox_id = %id, "auto-removed sandbox after its main process ended")
@@ -513,6 +576,8 @@ pub struct SandboxManager {
     store: Option<MetaStore>,
     /// Names claimed by creates that have not yet inserted their entry.
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
+    events: EventLog,
+    forwarder: Arc<dyn PortForwarder>,
 }
 
 impl SandboxManager {
@@ -524,6 +589,7 @@ impl SandboxManager {
         network_backend: crate::config::NetworkBackendChoice,
     ) -> Self {
         Self {
+            forwarder: Arc::new(BackendForwarder(Arc::clone(&backend))),
             backend,
             broker,
             entries: Arc::new(RwLock::new(HashMap::new())),
@@ -537,7 +603,62 @@ impl SandboxManager {
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECONDS),
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            events: EventLog::default(),
         }
+    }
+
+    /// Lifecycle events of every sandbox, for `Events` readers.
+    pub fn events(&self) -> &EventLog {
+        &self.events
+    }
+
+    fn teardown(&self) -> Teardown {
+        Teardown {
+            entries: Arc::clone(&self.entries),
+            mains: Arc::clone(&self.mains),
+            broker: Arc::clone(&self.broker),
+            backend: Arc::clone(&self.backend),
+            processes: Arc::clone(&self.processes),
+            events: self.events.clone(),
+        }
+    }
+
+    /// Report `action` for sandbox `id`. A sandbox that is gone has nothing
+    /// to report.
+    async fn emit_event(&self, id: &str, action: EventAction, exit_code: Option<i32>) {
+        // Emitting under the lock orders the event before a later removal.
+        let entries = self.entries.read().await;
+        if let Some(entry) = entries.get(id) {
+            self.events
+                .emit(event_with_code(action, &entry.meta, exit_code));
+        }
+    }
+
+    /// Report `action` from a record taken earlier, for a sandbox that may
+    /// have been removed meanwhile.
+    async fn emit_for(&self, meta: &SandboxMeta, action: EventAction, exit_code: Option<i32>) {
+        let _entries = self.entries.read().await;
+        self.events.emit(event_with_code(action, meta, exit_code));
+    }
+
+    /// Report `die` for a sandbox that was running and no longer is.
+    async fn emit_die_if_was_running(
+        &self,
+        meta: &SandboxMeta,
+        before: &crate::protocol::SandboxStatus,
+        exit_code: i32,
+    ) {
+        // An exited sandbox already reported its `die`.
+        if *before == crate::protocol::SandboxStatus::Running {
+            self.emit_for(meta, EventAction::Die, Some(exit_code)).await;
+        }
+    }
+
+    /// Record that the main process could not start and report its `die`.
+    async fn fail_main_start(&self, id: &str) {
+        self.mark_failed(id).await;
+        self.emit_event(id, EventAction::Die, Some(EXEC_FAILED_EXIT))
+            .await;
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -682,6 +803,7 @@ impl SandboxManager {
                 timeout_handle,
                 _creation_permit: permit,
                 meta,
+                listeners: Vec::new(),
             },
         );
         // No broker registration: a reloaded sandbox is not running, and
@@ -723,19 +845,15 @@ impl SandboxManager {
                 entrypoint,
                 args: &req.command,
                 workdir: &req.workdir,
+                user: &req.user,
                 env: &req.env,
             },
         );
-        if !launch.user.is_empty() {
-            tracing::warn!(
-                image = %req.image,
-                user = %launch.user,
-                "image user is not applied; commands run as the guest default"
-            );
-        }
         if req.require_command && launch.command.is_empty() {
             return Err(ApiError::InvalidRequest(NO_COMMAND_MESSAGE.to_string()));
         }
+        // The image's USER is untrusted input too.
+        crate::validate::user_spec(&launch.user)?;
         Ok(launch)
     }
 
@@ -753,6 +871,7 @@ impl SandboxManager {
         // because the failure rate matters as much as the success rate.
         let create_start = std::time::Instant::now();
         crate::validate::image_ref(&req.image)?;
+        crate::validate::user_spec(&req.user)?;
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
         }
@@ -790,6 +909,8 @@ impl SandboxManager {
         for vid in &req.volume_ids {
             crate::validate::entity_id(vid, "volume")?;
         }
+
+        let published_ports = crate::validate::published_ports(&req.published_ports)?;
 
         let name_reservation = self.reserve_name(&req.name).await?;
 
@@ -878,6 +999,7 @@ impl SandboxManager {
                 user: launch.user,
                 tty: req.tty,
                 auto_remove: req.auto_remove,
+                published_ports,
             },
         };
 
@@ -886,6 +1008,24 @@ impl SandboxManager {
             .create_sandbox(id.clone(), &opts)
             .await
             .map_err(backend_err)?;
+        let mut opts = opts;
+        let listeners = match self
+            .open_listeners(&id, &mut opts.spec.published_ports)
+            .await
+        {
+            Ok(listeners) => listeners,
+            Err(e) => {
+                if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %remove_err,
+                        "backend remove failed after a port could not be published"
+                    );
+                }
+                return Err(e);
+            }
+        };
+        info.spec.published_ports = opts.spec.published_ports.clone();
         // The backend has finished creating it, whatever it reports for a
         // sandbox it did not boot.
         info.status = crate::protocol::SandboxStatus::Running;
@@ -906,6 +1046,7 @@ impl SandboxManager {
         };
         info.started_at = meta.started_at;
         if let Err(e) = self.persist(meta.clone()).await {
+            close_all(listeners).await;
             if let Err(remove_err) = self.backend.remove_sandbox(&id).await {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -931,6 +1072,7 @@ impl SandboxManager {
                 timeout_handle,
                 _creation_permit: permit,
                 meta,
+                listeners,
             },
         );
 
@@ -946,7 +1088,12 @@ impl SandboxManager {
 
         metrics::gauge!("wardd_sandbox_active").increment(1.0);
 
+        // Before the main process starts, so its `die` cannot come first.
+        self.emit_event(&id, EventAction::Create, None).await;
+        self.emit_event(&id, EventAction::Start, None).await;
+
         if let Err(e) = self.spawn_main(&id).await {
+            self.fail_main_start(&id).await;
             if let Err(remove_err) = self.remove(&id).await {
                 tracing::warn!(
                     sandbox_id = %id,
@@ -1038,25 +1185,13 @@ impl SandboxManager {
     /// purge, broker deregistration, and the active-gauge decrement,
     /// match the user-initiated remove path exactly.
     fn spawn_timeout(&self, id: &str, after: std::time::Duration) -> tokio::task::JoinHandle<()> {
-        let entries = Arc::clone(&self.entries);
-        let broker = Arc::clone(&self.broker);
-        let backend = Arc::clone(&self.backend);
-        let processes = Arc::clone(&self.processes);
-        let mains = Arc::clone(&self.mains);
+        let teardown = self.teardown();
         let sandbox_id = id.to_string();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
             tracing::info!(sandbox_id = %sandbox_id, "sandbox timeout reached, removing");
-            if let Err(e) = Self::cleanup_sandbox_inner(
-                &entries,
-                &broker,
-                &backend,
-                &processes,
-                &mains,
-                &sandbox_id,
-                /* from_timeout = */ true,
-            )
-            .await
+            if let Err(e) =
+                Self::cleanup_sandbox_inner(&teardown, &sandbox_id, /* from_timeout = */ true).await
             {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
@@ -1087,6 +1222,27 @@ impl SandboxManager {
         let info = self.backend.get_sandbox(id).await.map_err(backend_err)?;
         let info = recorded_state(&*self.entries.read().await, redact_token(info));
         Ok(protocol_info_to_pb(info, view))
+    }
+
+    /// Images in the local cache.
+    pub async fn list_images(&self) -> Result<Vec<crate::pb::ImageInfo>> {
+        let images = self.backend.list_images().await.map_err(backend_err)?;
+        Ok(images.iter().map(image_to_pb).collect())
+    }
+
+    /// Pull an image into the cache. The messages on `progress` end when the
+    /// pull does.
+    pub async fn pull_image(
+        &self,
+        reference: &str,
+        progress: tokio::sync::mpsc::UnboundedSender<crate::backend::image::PullProgress>,
+    ) -> Result<crate::pb::ImageInfo> {
+        let image = self
+            .backend
+            .pull_image(reference, Some(progress))
+            .await
+            .map_err(image_backend_err)?;
+        Ok(image_to_pb(&image))
     }
 
     /// List all sandboxes.
@@ -1136,17 +1292,9 @@ impl SandboxManager {
     pub async fn remove(&self, id: &str) -> Result<()> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
-        Self::cleanup_sandbox_inner(
-            &self.entries,
-            &self.broker,
-            &self.backend,
-            &self.processes,
-            &self.mains,
-            id,
-            /* from_timeout = */ false,
-        )
-        .await
-        .map_err(backend_err)
+        Self::cleanup_sandbox_inner(&self.teardown(), id, /* from_timeout = */ false)
+            .await
+            .map_err(backend_err)
     }
 
     // -----------------------------------------------------------------------
@@ -1236,14 +1384,18 @@ impl SandboxManager {
     }
 
     async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
-        if !self.begin_stop(id).await? {
+        let Some((before, meta)) = self.begin_stop(id).await? else {
             tracing::info!(sandbox_id = %id, "sandbox already stopped");
             return Ok(());
-        }
+        };
         tracing::info!(sandbox_id = %id, "stopping sandbox");
+        self.close_listeners(id).await;
         let main_code = self.end_main_process(id, grace).await;
+        let died_with = main_code.unwrap_or(0);
         if let Err(e) = self.backend.stop_sandbox(id).await {
             self.mark_failed(id).await;
+            self.emit_die_if_was_running(&meta, &before, died_with)
+                .await;
             return Err(backend_err(e));
         }
         self.processes
@@ -1262,6 +1414,9 @@ impl SandboxManager {
             }
         }
         tracing::info!(sandbox_id = %id, "sandbox stopped");
+        self.emit_die_if_was_running(&meta, &before, died_with)
+            .await;
+        self.emit_for(&meta, EventAction::Stop, None).await;
         Ok(())
     }
 
@@ -1294,16 +1449,82 @@ impl SandboxManager {
             return Ok(());
         };
         tracing::info!(sandbox_id = %id, "starting sandbox");
+        // An exited sandbox still holds its ports, and a restart must be
+        // able to bind them again.
+        self.close_listeners(id).await;
         if let Err(e) = self.backend.start_sandbox(id).await {
             self.mark_failed(id).await;
             return Err(backend_err(e));
         }
-        self.commit_running_and_register(id, comms).await?;
-        if let Err(e) = self.spawn_main(id).await {
+        if let Err(e) = self.reopen_listeners(id).await {
+            if let Err(stop_err) = self.backend.stop_sandbox(id).await {
+                tracing::warn!(sandbox_id = %id, error = %stop_err, "cannot end the VM after a port failed");
+            }
             self.mark_failed(id).await;
             return Err(e);
         }
+        self.commit_running_and_register(id, comms).await?;
+        self.emit_event(id, EventAction::Start, None).await;
+        if let Err(e) = self.spawn_main(id).await {
+            self.fail_main_start(id).await;
+            return Err(e);
+        }
         tracing::info!(sandbox_id = %id, "sandbox started");
+        Ok(())
+    }
+
+    /// Open every port in `ports`, filling in the host port the OS chose for
+    /// a 0. Ports opened before a failure are closed (and freed) again.
+    async fn open_listeners(
+        &self,
+        id: &str,
+        ports: &mut [crate::protocol::PublishedPort],
+    ) -> Result<Vec<PortListener>> {
+        let mut listeners = Vec::with_capacity(ports.len());
+        for port in ports.iter_mut() {
+            if port.host_ip.is_unspecified() {
+                tracing::warn!(sandbox_id = %id, host_port = port.host_port, "publishing on all host interfaces");
+            }
+            let listener = match self
+                .forwarder
+                .open(id, port.host_addr(), port.container_port)
+                .await
+            {
+                Ok(listener) => listener,
+                Err(e) => {
+                    close_all(listeners).await;
+                    return Err(backend_err(e));
+                }
+            };
+            port.host_port = listener.local_addr().port();
+            tracing::info!(sandbox_id = %id, host_port = port.host_port, container_port = port.container_port, "published port");
+            listeners.push(listener);
+        }
+        Ok(listeners)
+    }
+
+    /// Close the sandbox's ports and wait until the host frees them.
+    async fn close_listeners(&self, id: &str) {
+        let listeners = match self.entries.write().await.get_mut(id) {
+            Some(entry) => std::mem::take(&mut entry.listeners),
+            None => return,
+        };
+        close_all(listeners).await;
+    }
+
+    /// Open the ports the sandbox was created with, on the same host ports.
+    async fn reopen_listeners(&self, id: &str) -> Result<()> {
+        let mut ports = {
+            let entries = self.entries.read().await;
+            let Some(entry) = entries.get(id) else {
+                return Ok(());
+            };
+            entry.meta.options.spec.published_ports.clone()
+        };
+        let listeners = self.open_listeners(id, &mut ports).await?;
+        if let Some(entry) = self.entries.write().await.get_mut(id) {
+            entry.listeners = listeners;
+        }
         Ok(())
     }
 
@@ -1324,6 +1545,7 @@ impl SandboxManager {
         let mode = ExecMode {
             tty: spec.tty,
             raw: true,
+            user: spec.user,
         };
         let workdir = (!spec.workdir.is_empty()).then_some(spec.workdir);
         let handle = self
@@ -1349,17 +1571,12 @@ impl SandboxManager {
         }
         tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
         tokio::spawn(mark_exited_on_main_end(
-            Arc::clone(&self.entries),
-            Arc::clone(&self.mains),
+            self.teardown(),
             self.store.clone(),
             id.to_string(),
             handle.pid.clone(),
             exit.clone(),
-            spec.auto_remove.then(|| AutoRemove {
-                broker: Arc::clone(&self.broker),
-                backend: Arc::clone(&self.backend),
-                processes: Arc::clone(&self.processes),
-            }),
+            spec.auto_remove,
         ));
         mains.insert(
             id.to_string(),
@@ -1404,6 +1621,185 @@ impl SandboxManager {
         })
     }
 
+    /// Unpack the tar in `chunks` into the directory `path` of a running
+    /// sandbox. The guest agent enforces the copy policy while it unpacks.
+    pub async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()> {
+        let id = self.copy_target(sandbox_id, path).await?;
+        let target = copy::GuestTarget::new(sandbox_id, path);
+        self.backend
+            .copy_to(&id, path, chunks)
+            .await
+            .map_err(|e| target.backend_failure(e))
+    }
+
+    /// Stream a tar of the file or directory `path` of a running sandbox.
+    /// The guest is untrusted, so each entry is checked against the copy
+    /// policy before its bytes are forwarded.
+    pub async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<mpsc::Receiver<Result<bytes::Bytes>>> {
+        let id = self.copy_target(sandbox_id, path).await?;
+        let target = copy::GuestTarget::new(sandbox_id, path);
+        let source = self
+            .backend
+            .copy_from(&id, path)
+            .await
+            .map_err(|e| target.backend_failure(e))?;
+        let limits = ward_archive::Limits::default();
+        Ok(copy::checked_relay(source, limits, target))
+    }
+
+    /// List the processes of a running sandbox. `ps_args` are the options
+    /// `docker top` passes to `ps`; the guest agent checks them.
+    pub async fn top(
+        &self,
+        sandbox_id: &str,
+        ps_args: &[String],
+    ) -> Result<crate::backend::ProcessTable> {
+        let id = self.resolve(sandbox_id).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            return Err(not_running(&id));
+        }
+        self.backend.top(&id, ps_args).await.map_err(backend_err)
+    }
+
+    /// Paths of a sandbox that differ from its image. Works in any state,
+    /// as `docker diff` does.
+    pub async fn diff(&self, sandbox_id: &str) -> Result<Vec<crate::backend::diff::FsChange>> {
+        let id = self.resolve(sandbox_id).await?;
+        self.backend.diff_sandbox(&id).await.map_err(backend_err)
+    }
+
+    /// Commit a sandbox's filesystem as a new cached image and return its id.
+    /// The copy is taken from the live rootfs: there is no way to pause a
+    /// guest, so a file being written may be copied part way.
+    pub async fn commit_image(
+        &self,
+        sandbox_id: &str,
+        spec: &crate::backend::commit::CommitSpec,
+    ) -> Result<String> {
+        let id = self.resolve(sandbox_id).await?;
+        let image = self
+            .backend
+            .commit_sandbox(&id, spec)
+            .await
+            .map_err(image_backend_err)?;
+        Ok(image.digest)
+    }
+
+    /// Read the resource use of a running sandbox. The limit is the
+    /// configured memory, or the guest's total memory when none is set.
+    pub async fn stats(&self, sandbox_id: &str) -> Result<SandboxStats> {
+        let id = self.resolve(sandbox_id).await?;
+        let memory_mb = {
+            let entries = self.entries.read().await;
+            let entry = entries
+                .get(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+            if entry.meta.status != crate::protocol::SandboxStatus::Running {
+                return Err(not_running(&id));
+            }
+            entry.meta.options.resources.memory_mb
+        };
+        // Stamped before the call so the time matches the counters read.
+        let read_at = std::time::SystemTime::now();
+        let guest = match self.backend.stats(&id).await {
+            Ok(guest) => guest,
+            Err(e) => return Err(self.stats_failure(&id, e).await),
+        };
+        let configured = u64::from(memory_mb).saturating_mul(BYTES_PER_MIB);
+        Ok(SandboxStats {
+            cpu_nanos: guest.cpu_nanos,
+            online_cpus: guest.online_cpus,
+            mem_used_bytes: guest
+                .mem_total_bytes
+                .saturating_sub(guest.mem_available_bytes),
+            mem_limit_bytes: if configured > 0 {
+                configured
+            } else {
+                guest.mem_total_bytes
+            },
+            pids: guest.pids,
+            read_at,
+        })
+    }
+
+    /// A sandbox that stopped while it was being read is not running, not a
+    /// backend failure.
+    async fn stats_failure(&self, id: &str, error: BackendError) -> ApiError {
+        match self.recorded_status(id).await {
+            Ok(status) if status != crate::protocol::SandboxStatus::Running => not_running(id),
+            _ => backend_err(error),
+        }
+    }
+
+    /// Block until the sandbox's main process has ended or the sandbox has
+    /// stopped, and return the exit code. A sandbox without a main process
+    /// reports 0 once it is stopped. A sandbox that ends and is removed
+    /// before the next look still reports the code its process left, and one
+    /// removed while running reports the SIGKILL code its `die` event carries.
+    pub async fn wait(&self, reference: &str) -> Result<i32> {
+        use crate::protocol::SandboxStatus as State;
+        let id = self.resolve(reference).await?;
+        let mut live: Option<watch::Receiver<Option<i32>>> = None;
+        loop {
+            let recorded = self
+                .entries
+                .read()
+                .await
+                .get(&id)
+                .map(|entry| (entry.meta.status.clone(), entry.meta.exit_code));
+            let Some((status, exit_code)) = recorded else {
+                let Some(exit) = live else {
+                    return Err(ApiError::SandboxNotFound(id));
+                };
+                let raw = *exit.borrow();
+                return Ok(raw.map_or(SIGNAL_EXIT_BASE + SIGKILL, decode_wait_status));
+            };
+            match status {
+                State::Exited | State::Stopped => return Ok(exit_code.unwrap_or(0)),
+                State::Failed => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "Container {id} failed to start"
+                    )));
+                }
+                State::Running => {
+                    // An earlier run's receiver already holds its status, so
+                    // only one still waiting belongs to the current run.
+                    if live.is_none() {
+                        live = self.running_main_exit(&id).await;
+                    }
+                }
+                State::Creating | State::Stopping => {}
+            }
+            tokio::time::sleep(WAIT_POLL).await;
+        }
+    }
+
+    /// The exit watch of the sandbox's main process, if it is still running.
+    async fn running_main_exit(&self, id: &str) -> Option<watch::Receiver<Option<i32>>> {
+        let mains = self.mains.read().await;
+        let exit = mains.get(id)?.exit.clone();
+        let running = exit.borrow().is_none();
+        running.then_some(exit)
+    }
+
+    async fn copy_target(&self, sandbox_id: &str, path: &str) -> Result<String> {
+        crate::validate::guest_path(path)?;
+        let id = self.resolve(sandbox_id).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            return Err(not_running(&id));
+        }
+        Ok(id)
+    }
+
     /// Send `signal` to the main process, or SIGKILL when `signal` is 0.
     pub async fn signal_main_process(&self, sandbox_id: &str, signal: i32) -> Result<()> {
         if !(0..=MAX_SIGNAL).contains(&signal) {
@@ -1442,6 +1838,20 @@ impl SandboxManager {
         }
     }
 
+    /// The user a new process runs as: the one asked for, else the
+    /// sandbox's own, like `docker exec`.
+    async fn user_for(&self, id: &str, requested: &str) -> Result<String> {
+        crate::validate::user_spec(requested)?;
+        if !requested.is_empty() {
+            return Ok(requested.to_string());
+        }
+        let entries = self.entries.read().await;
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
+        Ok(entry.meta.options.spec.user.clone())
+    }
+
     /// Start `command` in a running sandbox for an attached client, which owns
     /// the returned handle. It is not tracked as an exec process.
     pub async fn spawn_attached(
@@ -1451,9 +1861,14 @@ impl SandboxManager {
         workdir: Option<String>,
         env: HashMap<String, String>,
         tty: bool,
+        user: &str,
     ) -> Result<ProcessHandle> {
         crate::validate::exec_command(&command)?;
-        let mode = ExecMode { tty, raw: true };
+        let mode = ExecMode {
+            tty,
+            raw: true,
+            user: self.user_for(id, user).await?,
+        };
         self.backend
             .exec(id, command, workdir, env, mode)
             .await
@@ -1498,22 +1913,26 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Move a running or exited sandbox to `stopping`. `false` means it is
-    /// already stopped and there is nothing to do.
-    async fn begin_stop(&self, id: &str) -> Result<bool> {
+    /// Move a running or exited sandbox to `stopping` and return the state it
+    /// left. `None` means it is already stopped and there is nothing to do.
+    async fn begin_stop(
+        &self,
+        id: &str,
+    ) -> Result<Option<(crate::protocol::SandboxStatus, SandboxMeta)>> {
         use crate::protocol::SandboxStatus as State;
         let mut entries = self.entries.write().await;
         let entry = entries
             .get_mut(id)
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        match entry.meta.status {
-            State::Stopped => return Ok(false),
-            State::Running | State::Exited => {}
+        let before = match entry.meta.status {
+            State::Stopped => return Ok(None),
+            State::Running | State::Exited => entry.meta.status.clone(),
             ref other => return Err(wrong_state(id, other, "stop")),
-        }
+        };
         let exit_code = entry.meta.exit_code;
+        let meta = entry.meta.clone();
         self.commit(entry, State::Stopping, exit_code).await?;
-        Ok(true)
+        Ok(Some((before, meta)))
     }
 
     /// Move a stopped, exited or failed sandbox to `creating` and clear its
@@ -1547,6 +1966,7 @@ impl SandboxManager {
     /// Record a failed transition. A sandbox removed meanwhile is already
     /// gone, so this only logs when it cannot save.
     async fn mark_failed(&self, id: &str) {
+        self.close_listeners(id).await;
         if let Err(e) = self
             .set_state(id, crate::protocol::SandboxStatus::Failed)
             .await
@@ -1569,50 +1989,60 @@ impl SandboxManager {
     /// sandbox does not get torn down a second time when the timer
     /// later fires.
     async fn cleanup_sandbox_inner(
-        entries: &Arc<RwLock<HashMap<String, SandboxEntry>>>,
-        broker: &Arc<Broker>,
-        backend: &Arc<dyn Backend>,
-        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
-        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+        teardown: &Teardown,
         id: &str,
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
-        let removed = Self::detach_entry(entries.write().await.remove(id), from_timeout);
-        Self::finish_cleanup(removed, broker, backend, processes, mains, id).await
+        let removed = Self::detach_entry(teardown.entries.write().await.remove(id), from_timeout);
+        Self::finish_cleanup(removed, teardown, id).await
     }
 
     /// Stop the removed entry's timer unless that timer is the caller.
-    /// Returns whether there was an entry.
-    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> bool {
-        let Some(entry) = entry else {
-            return false;
-        };
+    /// Returns the removed sandbox's record, if there was an entry.
+    fn detach_entry(entry: Option<SandboxEntry>, from_timeout: bool) -> Option<RemovedEntry> {
+        let entry = entry?;
         if !from_timeout && let Some(handle) = entry.timeout_handle {
             handle.abort();
         }
-        true
+        Some(RemovedEntry {
+            meta: entry.meta,
+            listeners: entry.listeners,
+        })
     }
 
     /// Drop everything tied to a sandbox whose entry has left `entries`.
     async fn finish_cleanup(
-        removed: bool,
-        broker: &Arc<Broker>,
-        backend: &Arc<dyn Backend>,
-        processes: &Arc<RwLock<HashMap<String, ProcessRecord>>>,
-        mains: &Arc<RwLock<HashMap<String, MainProcess>>>,
+        mut removed: Option<RemovedEntry>,
+        teardown: &Teardown,
         id: &str,
     ) -> std::result::Result<(), BackendError> {
-        processes
+        teardown
+            .processes
             .write()
             .await
             .retain(|_, rec| rec.sandbox_id != id);
-        mains.write().await.remove(id);
-        broker.deregister_sandbox(id).await;
+        teardown.mains.write().await.remove(id);
+        teardown.broker.deregister_sandbox(id).await;
 
-        let result = backend.remove_sandbox(id).await;
-        if removed {
+        // The host ports must be free before the sandbox counts as gone, so
+        // a new sandbox can publish the same ones right away.
+        if let Some(removed) = removed.as_mut() {
+            close_all(std::mem::take(&mut removed.listeners)).await;
+        }
+        let result = teardown.backend.remove_sandbox(id).await;
+        if let Some(RemovedEntry { meta, .. }) = removed {
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
+            // Removing a running sandbox kills it, as `docker rm -f` does.
+            if meta.status == crate::protocol::SandboxStatus::Running {
+                let code = meta.exit_code.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL);
+                teardown
+                    .events
+                    .emit(SandboxEvent::new(EventAction::Die, &meta).with_exit_code(code));
+            }
+            teardown
+                .events
+                .emit(SandboxEvent::new(EventAction::Destroy, &meta));
         }
         result
     }
@@ -1679,6 +2109,7 @@ impl SandboxManager {
     pub async fn exec(&self, req: ExecRequest) -> Result<ProcessInfo> {
         let sandbox_id = self.resolve(&req.sandbox_id).await?;
         crate::validate::exec_command(&req.command)?;
+        let user = self.user_for(&sandbox_id, &req.user).await?;
         let handle = self
             .backend
             .exec(
@@ -1690,7 +2121,10 @@ impl SandboxManager {
                     Some(req.working_dir.clone())
                 },
                 req.env.clone(),
-                crate::backend::ExecMode::default(),
+                crate::backend::ExecMode {
+                    user,
+                    ..Default::default()
+                },
             )
             .await
             .map_err(backend_err)?;
@@ -1944,7 +2378,7 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
 }
 
 fn not_running(id: &str) -> ApiError {
-    ApiError::InvalidRequest(format!("sandbox {id} is not running"))
+    ApiError::InvalidRequest(format!("Container {id} is not running"))
 }
 
 fn no_main_process(id: &str) -> ApiError {
@@ -1962,6 +2396,7 @@ fn recorded_state(
         info.exit_code = entry.meta.exit_code;
         info.started_at = entry.meta.started_at;
         info.finished_at = entry.meta.finished_at;
+        info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
     }
     info
 }
@@ -2018,6 +2453,17 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         workdir: info.spec.workdir,
         user: info.spec.user,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
+        published_ports: info
+            .spec
+            .published_ports
+            .iter()
+            .map(|port| crate::pb::PortMapping {
+                host_ip: port.host_ip.to_string(),
+                host_port: u32::from(port.host_port),
+                container_port: u32::from(port.container_port),
+                protocol: crate::validate::PUBLISH_PROTOCOL.to_string(),
+            })
+            .collect(),
         entrypoint: match view {
             CommandView::Full => info
                 .spec
@@ -2949,6 +3395,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into(), "hello".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect("exec");
@@ -2975,6 +3422,7 @@ pub(crate) mod tests {
                 command: vec![],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("empty command must be rejected");
@@ -2995,6 +3443,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("malformed id");
@@ -3016,6 +3465,7 @@ pub(crate) mod tests {
                 command: vec!["echo".into()],
                 working_dir: String::new(),
                 env: Default::default(),
+                ..Default::default()
             })
             .await
             .expect_err("unknown sandbox");
@@ -4341,6 +4791,35 @@ pub(crate) mod tests {
         async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
             self.inner.kill_process(sandbox_id, pid).await
         }
+        async fn copy_to(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+            chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        ) -> crate::backend::Result<()> {
+            self.inner.copy_to(sandbox_id, path, chunks).await
+        }
+        async fn copy_from(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+        ) -> crate::backend::Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>
+        {
+            self.inner.copy_from(sandbox_id, path).await
+        }
+        async fn top(
+            &self,
+            sandbox_id: &str,
+            ps_args: &[String],
+        ) -> crate::backend::Result<crate::backend::ProcessTable> {
+            self.inner.top(sandbox_id, ps_args).await
+        }
+        async fn stats(
+            &self,
+            sandbox_id: &str,
+        ) -> crate::backend::Result<crate::backend::GuestStats> {
+            self.inner.stats(sandbox_id).await
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -4741,8 +5220,17 @@ pub(crate) mod tests {
     /// host process (on a pty when asked), so the main process tests see
     /// real output, pids and wait statuses.
     #[cfg(not(feature = "krunvm"))]
+    const BAD_USER_IMAGE: &str = "bad-user";
+    /// A control character makes the spec fail validation.
+    #[cfg(not(feature = "krunvm"))]
+    const BAD_IMAGE_USER: &str = "app\u{7}";
+
+    #[cfg(not(feature = "krunvm"))]
     struct HostBackend {
         inner: crate::backend::krunvm::KrunvmBackend,
+        fail_stop: bool,
+        /// The `user` of every exec, in order, for tests to read.
+        exec_users: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -4795,6 +5283,18 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     #[async_trait::async_trait]
     impl Backend for HostBackend {
+        async fn image_config(&self, image: &str) -> crate::backend::Result<ImageConfig> {
+            let user = if image == BAD_USER_IMAGE {
+                BAD_IMAGE_USER
+            } else {
+                ""
+            };
+            Ok(ImageConfig {
+                user: user.to_string(),
+                ..Default::default()
+            })
+        }
+
         async fn exec(
             &self,
             sandbox_id: &str,
@@ -4804,6 +5304,7 @@ pub(crate) mod tests {
             mode: ExecMode,
         ) -> crate::backend::Result<crate::backend::ProcessHandle> {
             use std::process::Stdio;
+            self.exec_users.lock().unwrap().push(mode.user.clone());
             let mut cmd = tokio::process::Command::new(&command[0]);
             cmd.args(&command[1..]).kill_on_drop(true);
             let (output_tx, output_rx) = mpsc::channel(16);
@@ -4931,6 +5432,11 @@ pub(crate) mod tests {
             self.inner.adopt_sandbox(info, opts, rootfs).await
         }
         async fn stop_sandbox(&self, id: &str) -> crate::backend::Result<()> {
+            if self.fail_stop {
+                return Err(crate::backend::BackendError::Internal(
+                    "stop refused".into(),
+                ));
+            }
             self.inner.stop_sandbox(id).await
         }
         async fn start_sandbox(&self, id: &str) -> crate::backend::Result<()> {
@@ -4941,6 +5447,43 @@ pub(crate) mod tests {
         }
         async fn kill_process(&self, sandbox_id: &str, pid: &str) -> crate::backend::Result<()> {
             self.inner.kill_process(sandbox_id, pid).await
+        }
+        async fn copy_to(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+            chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        ) -> crate::backend::Result<()> {
+            self.inner.copy_to(sandbox_id, path, chunks).await
+        }
+        async fn copy_from(
+            &self,
+            sandbox_id: &str,
+            path: &str,
+        ) -> crate::backend::Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>
+        {
+            self.inner.copy_from(sandbox_id, path).await
+        }
+        async fn top(
+            &self,
+            _sandbox_id: &str,
+            ps_args: &[String],
+        ) -> crate::backend::Result<crate::backend::ProcessTable> {
+            if ps_args.iter().any(|a| a == TOP_REFUSED_ARG) {
+                return Err(crate::backend::BackendError::InvalidArgument(
+                    TOP_REFUSAL.into(),
+                ));
+            }
+            Ok(crate::backend::ProcessTable {
+                titles: vec!["PID".into(), "CMD".into()],
+                rows: vec![vec![TOP_PID.into(), TOP_CMD.into()]],
+            })
+        }
+        async fn stats(
+            &self,
+            _sandbox_id: &str,
+        ) -> crate::backend::Result<crate::backend::GuestStats> {
+            Ok(STATS_GUEST)
         }
         async fn create_snapshot(
             &self,
@@ -4973,12 +5516,35 @@ pub(crate) mod tests {
     const TEST_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
     #[cfg(not(feature = "krunvm"))]
+    const STATS_GUEST: crate::backend::GuestStats = crate::backend::GuestStats {
+        cpu_nanos: 3_000_000_000,
+        online_cpus: 2,
+        mem_total_bytes: 512 * BYTES_PER_MIB,
+        mem_available_bytes: 112 * BYTES_PER_MIB,
+        pids: 9,
+    };
+
+    #[cfg(not(feature = "krunvm"))]
     const TEST_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
     #[cfg(not(feature = "krunvm"))]
     const HOST_MANAGER_MAX_SANDBOXES: usize = 4;
 
     #[cfg(not(feature = "krunvm"))]
     pub(crate) fn host_manager(output_cap: usize) -> Arc<SandboxManager> {
+        host_manager_with(output_cap, /* fail_stop = */ false)
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    fn host_manager_with(output_cap: usize, fail_stop: bool) -> Arc<SandboxManager> {
+        host_manager_recording(output_cap, fail_stop).0
+    }
+
+    /// A host manager plus the list of users its execs were asked to run as.
+    #[cfg(not(feature = "krunvm"))]
+    fn host_manager_recording(
+        output_cap: usize,
+        fail_stop: bool,
+    ) -> (Arc<SandboxManager>, Arc<std::sync::Mutex<Vec<String>>>) {
         use crate::backend::image::ImageStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -4986,8 +5552,13 @@ pub(crate) mod tests {
         let store = Arc::new(ImageStore::with_puller(cache_dir, 64, Arc::new(FakePuller)));
         std::mem::forget(dir);
         let inner = crate::backend::krunvm::KrunvmBackend::with_image_store_for_test(path, store);
-        let backend: Arc<dyn Backend> = Arc::new(HostBackend { inner });
-        Arc::new(
+        let exec_users = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend: Arc<dyn Backend> = Arc::new(HostBackend {
+            inner,
+            fail_stop,
+            exec_users: Arc::clone(&exec_users),
+        });
+        let manager = Arc::new(
             SandboxManager::new(
                 backend,
                 Arc::new(Broker::new()),
@@ -4997,7 +5568,8 @@ pub(crate) mod tests {
             )
             .with_output_cap(output_cap)
             .with_stop_grace(TEST_STOP_GRACE),
-        )
+        );
+        (manager, exec_users)
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -5265,6 +5837,124 @@ pub(crate) mod tests {
             assert!(std::time::Instant::now() < deadline, "got {text:?}");
             tokio::time::sleep(TEST_POLL_STEP).await;
         }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_user_on_create_when_main_process_spawns_then_the_backend_gets_it() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["true".into()],
+            user: "1000:1000".into(),
+            ..Default::default()
+        };
+
+        // Act
+        let info = mgr.create(req, "").await.expect("create");
+
+        // Assert
+        assert_eq!(info.user, "1000:1000");
+        assert_eq!(*users.lock().unwrap(), ["1000:1000"]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_image_user_that_is_invalid_when_create_then_it_is_rejected() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: BAD_USER_IMAGE.into(),
+            command: vec!["true".into()],
+            use_image_config: true,
+            ..Default::default()
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("bad image user");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+        assert!(users.lock().unwrap().is_empty());
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::sandbox_user_is_the_default("", "1000")]
+    #[case::request_overrides("2000", "2000")]
+    #[tokio::test]
+    async fn given_sandbox_user_when_exec_then_request_user_wins_else_sandbox_user(
+        #[case] requested: &str,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            user: "1000".into(),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        mgr.exec(crate::pb::ExecRequest {
+            sandbox_id: id,
+            command: vec!["true".into()],
+            user: requested.into(),
+            ..Default::default()
+        })
+        .await
+        .expect("exec");
+
+        // Assert
+        assert_eq!(*users.lock().unwrap(), [expected]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_attached_exec_with_user_when_spawned_then_the_backend_gets_it() {
+        // Arrange
+        let (mgr, users) = host_manager_recording(MAIN_OUTPUT_CAP, false);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        users.lock().unwrap().clear();
+
+        // Act
+        let handle = mgr
+            .spawn_attached(
+                &id,
+                vec!["true".into()],
+                None,
+                HashMap::new(),
+                false,
+                "1000",
+            )
+            .await;
+
+        // Assert
+        assert!(handle.is_ok());
+        assert_eq!(*users.lock().unwrap(), ["1000"]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_control_character_in_user_when_exec_then_invalid_request() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        let result = mgr
+            .exec(crate::pb::ExecRequest {
+                sandbox_id: id,
+                command: vec!["true".into()],
+                user: "app\nroot".into(),
+                ..Default::default()
+            })
+            .await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -5596,14 +6286,9 @@ pub(crate) mod tests {
         wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
         let ended_pid = mgr.main_pid(&id).await.expect("main pid");
         mgr.start(&id).await.expect("start again");
-        let auto = AutoRemove {
-            broker: Arc::clone(&mgr.broker),
-            backend: Arc::clone(&mgr.backend),
-            processes: Arc::clone(&mgr.processes),
-        };
 
         // Act
-        auto_remove_ended(&mgr.entries, &mgr.mains, &auto, &id, &ended_pid).await;
+        auto_remove_ended(&mgr.teardown(), &id, &ended_pid).await;
 
         // Assert
         assert!(mgr.get(&id).await.is_ok());
@@ -5833,4 +6518,434 @@ pub(crate) mod tests {
         assert_eq!(concat(&buffered), b"hi\n");
         assert_eq!(status, 3 << WAIT_STATUS_EXIT_SHIFT);
     }
+
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_PID: &str = "42";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_CMD: &str = "sleep 600";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_REFUSED_ARG: &str = "--sort=pid";
+    #[cfg(not(feature = "krunvm"))]
+    const TOP_REFUSAL: &str = "unsupported ps option: --sort=pid";
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_top_then_the_guest_table_is_returned() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        let table = mgr.top(&id, &[]).await.expect("top");
+
+        // Assert
+        assert_eq!(table.titles, ["PID", "CMD"]);
+        assert_eq!(table.rows, [[TOP_PID, TOP_CMD]]);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_stopped_sandbox_when_top_then_docker_not_running_error() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        // Act
+        let err = mgr.top(&id, &[]).await.expect_err("not running");
+
+        // Assert
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if *m == format!("Container {id} is not running"))
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_backend_that_refuses_the_ps_options_when_top_then_invalid_request() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+
+        // Act
+        let err = mgr
+            .top(&id, &[TOP_REFUSED_ARG.to_string()])
+            .await
+            .expect_err("refused");
+
+        // Assert
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if m == TOP_REFUSAL),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::none_configured(0, STATS_GUEST.mem_total_bytes)]
+    #[case::configured(256, 256 * BYTES_PER_MIB)]
+    #[tokio::test]
+    async fn given_a_memory_setting_when_stats_then_used_memory_and_the_limit_follow_it(
+        #[case] memory_mb: u32,
+        #[case] limit: u64,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sh".into(), "-c".into(), "read x".into()],
+            resources: Some(PbResourceLimits {
+                memory_mb,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        let stats = mgr.stats(&id).await.expect("stats");
+
+        // Assert
+        assert_eq!(stats.mem_limit_bytes, limit);
+        assert_eq!(stats.mem_used_bytes, 400 * BYTES_PER_MIB);
+        assert_eq!(stats.cpu_nanos, STATS_GUEST.cpu_nanos);
+        assert_eq!(stats.pids, STATS_GUEST.pids);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::stopped_meanwhile(true)]
+    #[case::still_running(false)]
+    #[tokio::test]
+    async fn given_a_backend_failure_when_stats_then_a_stopped_sandbox_is_not_running(
+        #[case] stop: bool,
+    ) {
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        if stop {
+            mgr.stop(&id).await.expect("stop");
+        }
+
+        let err = mgr
+            .stats_failure(&id, BackendError::Exec("agent hung up".into()))
+            .await;
+
+        assert_eq!(matches!(err, ApiError::InvalidRequest(_)), stop, "{err:?}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_sandbox_that_is_not_a_microvm_when_stats_then_an_invalid_request() {
+        let mgr = build_manager(2);
+        let id = mgr.create(create_req("alpine"), "").await.unwrap().id;
+
+        let err = mgr.stats(&id).await.expect_err("no agent");
+
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_stopped_sandbox_when_stats_then_docker_not_running_error() {
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x"], false).await;
+        mgr.stop(&id).await.expect("stop");
+
+        let err = mgr.stats(&id).await.expect_err("not running");
+
+        let want = format!("Container {id} is not running");
+        assert!(
+            matches!(&err, ApiError::InvalidRequest(m) if *m == want),
+            "{err:?}"
+        );
+    }
+
+    /// Wait on `id` in a task and return its handle.
+    #[cfg(not(feature = "krunvm"))]
+    fn spawn_wait(mgr: &Arc<SandboxManager>, id: &str) -> tokio::task::JoinHandle<Result<i32>> {
+        let (mgr, id) = (Arc::clone(mgr), id.to_string());
+        tokio::spawn(async move { mgr.wait(&id).await })
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn send_line(mgr: &SandboxManager, id: &str, line: &'static [u8]) {
+        let stdin = mgr.main_io(id).await.expect("io").stdin.expect("stdin");
+        stdin
+            .send(bytes::Bytes::from_static(line))
+            .await
+            .expect("send");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::auto_remove(true)]
+    #[case::kept(false)]
+    #[tokio::test]
+    async fn given_a_command_that_exits_4_when_waited_then_4_is_returned_even_if_it_is_removed(
+        #[case] auto_remove: bool,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sh".into(), "-c".into(), "read x; exit 4".into()],
+            auto_remove,
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        let waiter = spawn_wait(&mgr, &id);
+
+        // Act
+        send_line(&mgr, &id, b"go\n").await;
+        let got = waiter.await.expect("join").expect("wait");
+
+        // Assert
+        assert_eq!(got, 4);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_sandbox_without_command_when_waited_then_it_returns_0_only_after_stop() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &[], false).await;
+        let mut waiter = tokio::spawn({
+            let (mgr, id) = (Arc::clone(&mgr), id.clone());
+            async move { (mgr.wait(&id).await, status_of(&mgr, &id).await) }
+        });
+        let early = tokio::time::timeout(WAIT_POLL * 3, &mut waiter).await;
+        assert!(early.is_err(), "wait returned while the sandbox ran");
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        let (code, status_at_return) = waiter.await.expect("join");
+
+        // Assert
+        assert_eq!(code.expect("wait"), 0);
+        assert_eq!(status_at_return, SandboxStatus::Stopped);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_an_exited_sandbox_restarted_to_exit_m_when_waited_then_m_is_returned() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sh", "-c", "read x; exit $x"], false).await;
+        send_line(&mgr, &id, b"5\n").await;
+        assert_eq!(mgr.wait(&id).await.expect("first wait"), 5);
+        mgr.restart(&id).await.expect("restart");
+        let waiter = spawn_wait(&mgr, &id);
+
+        // Act
+        send_line(&mgr, &id, b"9\n").await;
+        let got = waiter.await.expect("join").expect("wait");
+
+        // Assert
+        assert_eq!(got, 9);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn next_actions(
+        reader: &mut crate::sandbox::events::EventReader,
+        count: usize,
+    ) -> Vec<(EventAction, Option<i32>)> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let next = tokio::time::timeout(TEST_POLL_DEADLINE, reader.next())
+                .await
+                .expect("event in time")
+                .expect("event");
+            out.push((next.event.action, next.event.exit_code));
+        }
+        out
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_short_command_when_created_ended_stopped_and_removed_then_events_come_in_order()
+     {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let mut reader = mgr.events().subscribe(None);
+        let id = create_with_command(&mgr, &["sh", "-c", "exit 3"], false).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        mgr.remove(&id).await.expect("remove");
+        let got = next_actions(&mut reader, 5).await;
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(3)),
+            (EventAction::Stop, None),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_stopped_then_die_comes_before_stop() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+        let got = next_actions(&mut reader, 4).await;
+
+        // Assert
+        let actions: Vec<EventAction> = got.iter().map(|(action, _)| *action).collect();
+        assert_eq!(
+            actions,
+            [
+                EventAction::Create,
+                EventAction::Start,
+                EventAction::Die,
+                EventAction::Stop
+            ]
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn history(mgr: &SandboxManager, count: usize) -> Vec<(EventAction, Option<i32>)> {
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+        next_actions(&mut reader, count).await
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_force_removed_then_die_137_comes_before_destroy() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        mgr.remove(&id).await.expect("remove");
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(137)),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(history(&mgr, 4).await, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_its_timeout_expires_then_die_comes_before_destroy() {
+        // Arrange
+        let mgr = build_manager(1);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            resources: Some(PbResourceLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        mgr.create(req, "").await.expect("create");
+
+        // Assert
+        let got = history(&mgr, 4).await;
+        assert_eq!(got[2], (EventAction::Die, Some(137)));
+        assert_eq!(got[3].0, EventAction::Destroy);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_command_that_cannot_run_when_created_then_start_die_126_and_destroy_follow() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["/nonexistent/ward-test-command".into()],
+            ..Default::default()
+        };
+
+        // Act
+        mgr.create(req, "").await.expect_err("exec fails");
+
+        // Assert
+        let want = [
+            (EventAction::Create, None),
+            (EventAction::Start, None),
+            (EventAction::Die, Some(126)),
+            (EventAction::Destroy, None),
+        ];
+        assert_eq!(history(&mgr, 4).await, want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_command_that_vanished_when_restarted_then_the_failed_run_ends_with_die_126() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").expect("write");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let id = create_with_command(&mgr, &[script.to_str().unwrap()], false).await;
+        mgr.stop(&id).await.expect("stop");
+        drop(dir);
+
+        // Act
+        mgr.start(&id).await.expect_err("exec fails");
+
+        // Assert
+        let got = history(&mgr, 6).await;
+        assert_eq!(
+            &got[4..],
+            [(EventAction::Start, None), (EventAction::Die, Some(126))]
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_backend_that_cannot_stop_when_stopping_then_die_is_reported_for_the_failed_sandbox()
+     {
+        // Arrange
+        let mgr = host_manager_with(MAIN_OUTPUT_CAP, /* fail_stop = */ true);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        mgr.stop(&id).await.expect_err("stop refused");
+
+        // Assert
+        let got = history(&mgr, 3).await;
+        assert_eq!(got[2].0, EventAction::Die);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_removed_sandbox_when_an_earlier_record_reports_then_the_event_is_kept() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        let meta = mgr.entries.read().await.get(&id).unwrap().meta.clone();
+        mgr.remove(&id).await.expect("remove");
+
+        // Act
+        mgr.emit_for(&meta, EventAction::Stop, None).await;
+
+        // Assert
+        let got = history(&mgr, 5).await;
+        assert_eq!(got[4].0, EventAction::Stop);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    mod ports;
 }

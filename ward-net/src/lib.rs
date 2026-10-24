@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+pub mod inbound;
 pub mod null;
 pub mod smoltcp_backend;
 
@@ -28,6 +29,13 @@ pub enum Error {
     /// The backend's external process failed to spawn or exited non-zero.
     #[error("network backend process error: {0}")]
     Process(String),
+
+    /// A host listener could not be opened; `source.kind()` says why.
+    #[error("cannot listen on {addr}: {source}")]
+    Listen {
+        addr: std::net::SocketAddr,
+        source: std::io::Error,
+    },
 
     /// The backend was asked to do something it does not implement (yet).
     #[error("network backend not implemented: {0}")]

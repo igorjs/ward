@@ -149,7 +149,14 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -200,7 +207,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -295,7 +309,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -370,7 +391,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
@@ -423,7 +451,14 @@ jobs:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -493,7 +528,14 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Check MSRV compiles
         run: cargo check --all-targets
 
@@ -614,7 +656,14 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
       - name: Run tests with coverage instrumentation
         # --no-report runs the test suite under coverage but defers report
         # generation. This lets us emit multiple output formats (lcov for

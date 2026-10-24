@@ -95,6 +95,8 @@ fn main() -> BuildResult<()> {
         "../vendor/libkrun-checksums.txt",
         "../ward-agent/src",
         "../ward-agent/Cargo.toml",
+        "../ward-archive/src",
+        "../ward-archive/Cargo.toml",
         "../proto/ward_agent.proto",
     ] {
         println!("cargo:rerun-if-changed={path}");

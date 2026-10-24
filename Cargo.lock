@@ -3574,11 +3574,26 @@ dependencies = [
  "libc",
  "prost",
  "prost-build",
+ "rstest",
  "rustix",
+ "tar",
+ "tempfile",
  "tokio",
  "tokio-vsock",
  "tracing",
  "tracing-subscriber",
+ "ward-archive",
+]
+
+[[package]]
+name = "ward-archive"
+version = "0.1.0"
+dependencies = [
+ "rstest",
+ "rustix",
+ "tar",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -3601,6 +3616,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "http",
  "hyper-util",
  "pretty_assertions",
  "prost-types",
@@ -3608,10 +3624,12 @@ dependencies = [
  "rustix",
  "serde_json",
  "tabled",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-prost",
  "tower",
  "ward-core",
 ]
@@ -3653,6 +3671,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "shlex",
  "subtle",
  "tar",
  "tempfile",
@@ -3666,6 +3685,7 @@ dependencies = [
  "tracing",
  "uuid",
  "ward-agent",
+ "ward-archive",
  "ward-bundle",
  "ward-net",
  "ward-proto",

@@ -13,10 +13,11 @@ mod common;
 use tonic::{Request, Status};
 
 use ward_core::pb::{
-    CreateSandboxRequest, CreateSnapshotRequest, ExecRequest, GetCommunicationLogRequest,
-    GetEgressLogRequest, GetSandboxRequest, KillProcessRequest, ListSnapshotsRequest,
-    PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest, StreamOutputRequest,
-    SubscribeRequest, WriteStdinRequest,
+    CommitRequest, CreateSandboxRequest, CreateSnapshotRequest, DiffRequest, ExecRequest,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, KillProcessRequest,
+    ListSnapshotsRequest, PublishRequest, RemoveSandboxRequest, RestoreSnapshotRequest, RunRequest,
+    StatsRequest, StreamOutputRequest, SubscribeRequest, TopRequest, WaitRequest,
+    WriteStdinRequest,
 };
 
 #[tokio::test]
@@ -396,4 +397,282 @@ async fn given_bad_token_when_main_process_killed_then_permission_denied(
 
     // Assert
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_top_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let top = TopRequest {
+            sandbox_id: id.clone(),
+            ps_args: Vec::new(),
+        };
+        let request = match token {
+            Some(token) => common::with_token(top, token),
+            None => Request::new(top),
+        };
+
+        // Act
+        let status = client.top(request).await.expect_err("top must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_stats_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let create = CreateSandboxRequest {
+        image: "alpine:latest".into(),
+        ..Default::default()
+    };
+    let sandbox_id = client
+        .create_sandbox(create)
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let stats = StatsRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        let stats = match token {
+            Some(token) => common::with_token(stats, token),
+            None => Request::new(stats),
+        };
+
+        // Act
+        let status = client
+            .stats(stats)
+            .await
+            .expect_err("stats must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_wait_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let create = CreateSandboxRequest {
+        image: "alpine:latest".into(),
+        ..Default::default()
+    };
+    let sandbox_id = client
+        .create_sandbox(create)
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let wait = WaitRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        let wait = match token {
+            Some(token) => common::with_token(wait, token),
+            None => Request::new(wait),
+        };
+
+        // Act
+        let status = client.wait(wait).await.expect_err("wait must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_diff_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let sandbox_id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let diff = DiffRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        let request = match token {
+            Some(token) => common::with_token(diff, token),
+            None => Request::new(diff),
+        };
+
+        // Act
+        let status = client
+            .diff(request)
+            .await
+            .expect_err("diff must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+}
+
+#[tokio::test]
+async fn given_the_right_token_when_diff_on_an_untouched_sandbox_then_it_lists_no_changes() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let created = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner();
+
+    // Act
+    let reply = client
+        .diff(common::with_token(
+            DiffRequest {
+                sandbox_id: created.id,
+            },
+            &created.token,
+        ))
+        .await
+        .expect("diff")
+        .into_inner();
+
+    // Assert
+    assert!(reply.changes.is_empty(), "{:?}", reply.changes);
+}
+
+#[tokio::test]
+async fn given_wrong_missing_or_empty_token_when_commit_then_permission_denied() {
+    // Arrange
+    let mut client = common::test_server().await;
+    let sandbox_id = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner()
+        .id;
+
+    for token in [Some("wrong"), None, Some("")] {
+        let commit = CommitRequest {
+            sandbox_id: sandbox_id.clone(),
+            reference: "mine:v1".into(),
+            ..Default::default()
+        };
+        let request = match token {
+            Some(token) => common::with_token(commit, token),
+            None => Request::new(commit),
+        };
+
+        // Act
+        let status = client
+            .commit(request)
+            .await
+            .expect_err("commit must be refused");
+
+        // Assert
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{token:?}");
+    }
+    let images = client
+        .list_images(())
+        .await
+        .expect("list")
+        .into_inner()
+        .images;
+    assert!(images.iter().all(|image| image.reference != "mine:v1"));
+}
+
+#[tokio::test]
+async fn given_the_right_token_when_commit_then_the_image_is_listed_and_a_second_commit_moves_the_tag()
+ {
+    // Arrange
+    let mut client = common::test_server().await;
+    let created = client
+        .create_sandbox(CreateSandboxRequest {
+            image: "alpine:latest".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("create")
+        .into_inner();
+    let commit = || {
+        common::with_token(
+            CommitRequest {
+                sandbox_id: created.id.clone(),
+                reference: "mine:v1".into(),
+                author: "Ada".into(),
+                ..Default::default()
+            },
+            &created.token,
+        )
+    };
+
+    // Act
+    let first = client.commit(commit()).await.expect("commit").into_inner();
+    let second = client
+        .commit(commit())
+        .await
+        .expect("recommit")
+        .into_inner();
+    let images = client
+        .list_images(())
+        .await
+        .expect("list")
+        .into_inner()
+        .images;
+
+    // Assert
+    assert!(first.image_id.starts_with("sha256:"), "{}", first.image_id);
+    assert_ne!(second.image_id, first.image_id);
+    assert!(
+        images
+            .iter()
+            .any(|image| image.reference == "mine:v1" && image.digest == second.image_id)
+    );
+    assert!(
+        images
+            .iter()
+            .all(|image| image.reference != "mine:v1" || image.digest != first.image_id)
+    );
+}
+
+#[tokio::test]
+async fn given_an_unknown_sandbox_when_commit_then_no_such_container() {
+    // Arrange
+    let mut client = common::test_server().await;
+
+    // Act
+    let status = client
+        .commit(Request::new(CommitRequest {
+            sandbox_id: "ghost".into(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("unknown");
+
+    // Assert
+    assert_eq!(status.code(), tonic::Code::NotFound);
+    assert_eq!(status.message(), "No such container: ghost");
 }

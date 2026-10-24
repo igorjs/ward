@@ -366,6 +366,7 @@ impl WardClient {
             command: argv.iter().map(|s| s.as_ref().to_string()).collect(),
             working_dir: workdir.unwrap_or("").into(),
             env: HashMap::new(),
+            user: String::new(),
         };
         let info = self
             .inner

@@ -28,6 +28,45 @@ service Ward {
   // Bidirectional stream to a sandbox process. The first client message
   // must be `start`; the token travels in call metadata.
   rpc Attach(stream AttachMessage) returns (stream AttachMessage);
+  // Unpack a tar stream into a directory of a running sandbox. The first
+  // client message must be `start`, then `data` chunks of one tar. The token
+  // travels in call metadata.
+  rpc CopyTo(stream CopyToMessage) returns (google.protobuf.Empty);
+  // Stream a tar of a file or directory of a running sandbox. The daemon
+  // checks each entry before it forwards any byte from that entry's header
+  // on; a refused tar ends the stream with an error.
+  rpc CopyFrom(CopyFromRequest) returns (stream CopyFromChunk);
+  // List the processes of a running sandbox, like `docker top`. The token
+  // travels in call metadata.
+  rpc Top(TopRequest) returns (TopResponse);
+  // One reading of a running sandbox's resource use, like one frame of
+  // `docker stats`. The token travels in call metadata.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+  // Block until the sandbox's main process ends or the sandbox stops, then
+  // return its exit code, like `docker wait`. The token travels in call
+  // metadata.
+  rpc Wait(WaitRequest) returns (WaitResponse);
+  // Paths of a sandbox that differ from its image, like `docker diff`. The
+  // token travels in call metadata.
+  rpc Diff(DiffRequest) returns (DiffResponse);
+  // Lifecycle events of every sandbox, like `docker events`. Replays the
+  // recent history from `since`, then streams live until `until`. Like
+  // ListSandboxes it needs no sandbox token: it carries only ids, names,
+  // images and event kinds. The history holds the last 1024 events, those of
+  // destroyed sandboxes included.
+  rpc Events(EventsRequest) returns (stream SandboxEvent);
+
+  // Images in the local cache, like `docker images`. Needs no sandbox token,
+  // like ListSandboxes.
+  rpc ListImages(google.protobuf.Empty) returns (ListImagesResponse);
+  // Pull an image into the local cache, streaming progress lines like
+  // `docker pull`. Needs no sandbox token. The pull stops at a size cap and
+  // fails rather than evict cached images when the cache is full.
+  rpc PullImage(PullImageRequest) returns (stream PullProgress);
+  // Save a sandbox's filesystem as a new cached image under a local tag,
+  // like `docker commit`. The token travels in call metadata. An existing
+  // tag is refused and the image cache is never evicted to make room.
+  rpc Commit(CommitRequest) returns (CommitResponse);
 
   // Snapshots
   rpc CreateSnapshot(CreateSnapshotRequest) returns (SnapshotInfo);
@@ -82,6 +121,23 @@ message CreateSandboxRequest {
   // Fail when no command results from the request and the image config.
   // Needs use_image_config.
   bool require_command = 16;
+  // Run the main process, and by default every exec, as this user:
+  // name|uid[:group|gid], like `docker run --user`. Empty uses the image's
+  // User.
+  string user = 17;
+  // Host ports to forward into the guest, like `docker run -p`.
+  repeated PortMapping published_ports = 18;
+}
+
+// A host TCP port forwarded to a guest port. In a create request `host_port`
+// 0 asks for any free port and `host_ip` empty means 127.0.0.1; in
+// SandboxInfo both are filled with the values in use.
+message PortMapping {
+  string host_ip = 1;
+  uint32 host_port = 2;
+  uint32 container_port = 3;
+  // "tcp" or empty. Other protocols are rejected.
+  string protocol = 4;
 }
 
 message GetSandboxRequest {
@@ -138,8 +194,10 @@ message SandboxInfo {
   // Leading part of `command` that came from an Entrypoint. Filled like
   // `command`.
   repeated string entrypoint = 16;
-  // The image's User. Recorded for display: the guest does not apply it.
+  // The user the main process runs as: the request's `user`, else the
+  // image's User. Empty means the guest default (root).
   string user = 17;
+  repeated PortMapping published_ports = 18;
 }
 
 enum SandboxStatus {
@@ -186,6 +244,8 @@ message ExecRequest {
   repeated string command = 2;
   string working_dir = 3;
   map<string, string> env = 4;
+  // name|uid[:group|gid]. Empty uses the sandbox's user.
+  string user = 5;
 }
 
 message RunRequest {
@@ -300,6 +360,186 @@ enum AttachStream {
 
 message AttachExit {
   int32 exit_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+// File copy messages
+// ---------------------------------------------------------------------------
+
+message CopyToMessage {
+  oneof kind {
+    CopyToStart start = 1;
+    // A slice of the tar stream; at most 1 MiB.
+    bytes data = 2;
+  }
+}
+
+message CopyToStart {
+  string sandbox_id = 1;
+  // Absolute guest directory the tar is unpacked into.
+  string path = 2;
+}
+
+message CopyFromRequest {
+  string sandbox_id = 1;
+  // Absolute guest file or directory.
+  string path = 2;
+}
+
+message CopyFromChunk {
+  bytes data = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Top messages
+// ---------------------------------------------------------------------------
+
+message TopRequest {
+  string sandbox_id = 1;
+  // ps-style options as `docker top` takes them: none (`-ef`), aux, axu, -e,
+  // -A, -f, -ef, -Af, -o/-eo LIST (pid, ppid, uid, user, comm, args, cmd,
+  // time, stime, tty, stat, vsz, rss, pcpu, pmem, c), -u USER, -p PID. Times
+  // are UTC. Any other option is refused with INVALID_ARGUMENT.
+  repeated string ps_args = 2;
+}
+
+message TopResponse {
+  repeated string titles = 1;
+  repeated TopProcess processes = 2;
+}
+
+// One process, with one field per title.
+message TopProcess {
+  repeated string fields = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Stats and wait messages
+// ---------------------------------------------------------------------------
+
+message StatsRequest {
+  string sandbox_id = 1;
+}
+
+message StatsResponse {
+  // CPU time all guest processes have used so far, in nanoseconds.
+  uint64 cpu_nanos = 1;
+  uint32 online_cpus = 2;
+  // Guest memory in use, not counting memory that can be reclaimed.
+  uint64 mem_used_bytes = 3;
+  // The configured memory limit, or the guest's total memory without one.
+  uint64 mem_limit_bytes = 4;
+  uint32 pids = 5;
+  // When the daemon took the reading, for working out rates between two.
+  google.protobuf.Timestamp read_at = 6;
+}
+
+message WaitRequest {
+  string sandbox_id = 1;
+}
+
+message WaitResponse {
+  // The main process's exit code, or 0 for a sandbox without a command.
+  int32 exit_code = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Diff messages
+// ---------------------------------------------------------------------------
+
+message DiffRequest {
+  string sandbox_id = 1;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_MODIFIED = 1;
+  CHANGE_KIND_ADDED = 2;
+  CHANGE_KIND_DELETED = 3;
+}
+
+message FileChange {
+  ChangeKind kind = 1;
+  // Absolute path inside the sandbox, as raw bytes: a guest file name need
+  // not be valid UTF-8.
+  bytes path = 2;
+}
+
+message DiffResponse {
+  // Sorted by path. A changed path's parent directories are listed as
+  // modified, as `docker diff` does.
+  repeated FileChange changes = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Image messages
+// ---------------------------------------------------------------------------
+
+message ImageInfo {
+  // The reference the image was pulled as, e.g. alpine:3.20.
+  string reference = 1;
+  // Manifest digest, e.g. sha256:...
+  string digest = 2;
+  uint64 size_bytes = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message ListImagesResponse {
+  repeated ImageInfo images = 1;
+}
+
+message PullImageRequest {
+  string reference = 1;
+}
+
+message PullProgress {
+  // The layer or tag the line is about. Empty for a line about the image.
+  string id = 1;
+  // Docker's wording, e.g. "Pull complete".
+  string status = 2;
+}
+
+message CommitRequest {
+  string sandbox_id = 1;
+  // Local tag for the new image, e.g. myapp:v2. Empty leaves it untagged.
+  string reference = 2;
+  string author = 3;
+  string message = 4;
+  // Dockerfile instructions applied to the image config: CMD, ENTRYPOINT,
+  // ENV, WORKDIR and USER.
+  repeated string changes = 5;
+  // Accepted for Docker compatibility. A sandbox cannot be paused yet, so
+  // the copy is always taken live.
+  bool pause = 6;
+}
+
+message CommitResponse {
+  // Id of the new image, e.g. sha256:...
+  string image_id = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Event messages
+// ---------------------------------------------------------------------------
+
+message EventsRequest {
+  // Replay events from this time. Unset replays none. Only a bounded recent
+  // history is kept in memory, so older events are not available.
+  google.protobuf.Timestamp since = 1;
+  // End the stream at this time. Unset streams until the client hangs up.
+  google.protobuf.Timestamp until = 2;
+}
+
+message SandboxEvent {
+  // create, start, die, stop or destroy.
+  string action = 1;
+  string sandbox_id = 2;
+  google.protobuf.Timestamp at = 3;
+  // image, name and, for die, exitCode.
+  map<string, string> attributes = 4;
+  // Events this reader missed just before this one because it read too
+  // slowly. Zero when none.
+  uint64 dropped = 5;
 }
 
 // ---------------------------------------------------------------------------

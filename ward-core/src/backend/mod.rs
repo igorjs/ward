@@ -1,8 +1,11 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 pub mod agent;
+pub mod commit;
+pub mod diff;
 pub mod image;
 pub mod krunvm;
+pub mod ports;
 
 #[cfg(feature = "krunvm")]
 pub(crate) mod krun_ffi;
@@ -22,21 +25,32 @@ pub enum BackendError {
     Exec(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    InvalidArgument(String),
+    #[error("{0}")]
+    ResourceExhausted(String),
     #[error("internal: {0}")]
     Internal(String),
+    #[error("{0}")]
+    AddressInUse(String),
 }
+
+/// Tar chunks buffered between the two ends of a file copy.
+pub const COPY_CHANNEL_CAPACITY: usize = 4;
 
 /// Convenience result alias for backend operations.
 pub type Result<T> = std::result::Result<T, BackendError>;
 
 /// How an exec should run. The default is a plain pipe child that reports
 /// line events.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecMode {
     /// Run the child on a pty.
     pub tty: bool,
     /// Report unframed `Data` events instead of lines (implied by `tty`).
     pub raw: bool,
+    /// Run as this `name|uid[:group|gid]`. Empty keeps the agent's user.
+    pub user: String,
 }
 
 /// A request to a running process, sent next to stdin and kill.
@@ -46,6 +60,24 @@ pub enum ProcessControl {
     Resize { rows: u32, cols: u32 },
     /// Deliver a signal number to the process.
     Signal(i32),
+}
+
+/// The processes of a sandbox: one row per process, one field per title.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessTable {
+    pub titles: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Guest-wide resource counters read at one instant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestStats {
+    /// CPU time all guest processes have used so far, in nanoseconds.
+    pub cpu_nanos: u64,
+    pub online_cpus: u32,
+    pub mem_total_bytes: u64,
+    pub mem_available_bytes: u64,
+    pub pids: u32,
 }
 
 /// Handle to a running process inside a sandbox.
@@ -99,6 +131,22 @@ pub trait Backend: Send + Sync + 'static {
         Ok(image::ImageConfig::default())
     }
 
+    /// Images in the local cache. Backends without a cache report none.
+    async fn list_images(&self) -> Result<Vec<image::CachedImage>> {
+        Ok(Vec::new())
+    }
+
+    /// Pull `reference` into the local image cache, reporting progress.
+    async fn pull_image(
+        &self,
+        _reference: &str,
+        _progress: Option<tokio::sync::mpsc::UnboundedSender<image::PullProgress>>,
+    ) -> Result<image::CachedImage> {
+        Err(BackendError::InvalidArgument(
+            "this backend has no image cache".to_string(),
+        ))
+    }
+
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
 
     async fn list_sandboxes(&self) -> Result<Vec<crate::protocol::SandboxInfo>>;
@@ -126,6 +174,19 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn count(&self) -> Result<usize>;
 
+    /// Forward connections on host address `bind` to TCP `guest_port` of
+    /// the running sandbox `id`. Dropping the listener closes it.
+    async fn publish_port(
+        &self,
+        _id: &str,
+        _bind: std::net::SocketAddr,
+        _guest_port: u16,
+    ) -> Result<ports::PortListener> {
+        Err(BackendError::InvalidArgument(
+            ports::NEEDS_MICROVM.to_string(),
+        ))
+    }
+
     // -- Processes ------------------------------------------------------
 
     async fn exec(
@@ -138,6 +199,52 @@ pub trait Backend: Send + Sync + 'static {
     ) -> Result<ProcessHandle>;
 
     async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()>;
+
+    // -- File copy ------------------------------------------------------
+
+    /// Unpack the tar stream `chunks` into the guest directory `path`.
+    async fn copy_to(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+        chunks: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    ) -> Result<()>;
+
+    /// Stream a tar of the guest file or directory `path`. The guest is
+    /// untrusted: callers check the tar before they use it. A failure
+    /// midway arrives as an `Err` item.
+    async fn copy_from(
+        &self,
+        sandbox_id: &str,
+        path: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>>;
+
+    // -- Introspection --------------------------------------------------
+
+    /// List the processes running inside the guest, as `ps` with `ps_args`
+    /// would. The guest refuses options it does not support.
+    async fn top(&self, sandbox_id: &str, ps_args: &[String]) -> Result<ProcessTable>;
+
+    /// Read the guest's CPU, memory and process counters.
+    async fn stats(&self, sandbox_id: &str) -> Result<GuestStats>;
+
+    /// Paths of the sandbox's rootfs that differ from its image.
+    async fn diff_sandbox(&self, _sandbox_id: &str) -> Result<Vec<diff::FsChange>> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot compare a sandbox with its image".to_string(),
+        ))
+    }
+
+    /// Commit the sandbox's rootfs as a new image in the local cache.
+    async fn commit_sandbox(
+        &self,
+        _sandbox_id: &str,
+        _spec: &commit::CommitSpec,
+    ) -> Result<image::CachedImage> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot commit a sandbox to an image".to_string(),
+        ))
+    }
 
     // -- Snapshots ------------------------------------------------------
 

@@ -18,8 +18,9 @@ use std::time::Duration;
 use smoltcp::phy::ChecksumCapabilities;
 use smoltcp::wire::{
     ArpOperation, ArpPacket, ArpRepr, DnsFlags, DnsOpcode, DnsPacket, DnsQueryType, DnsQuestion,
-    DnsRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
-    Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket, UdpRepr,
+    DnsRcode, DnsRepr, EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress,
+    IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
+    UdpRepr,
 };
 use tokio::net::TcpStream;
 use ward_net::smoltcp_backend::{Connector, Resolver, Stack};
@@ -240,6 +241,11 @@ fn encode_dns_name(name: &str) -> Vec<u8> {
 /// checksum validation smoltcp runs by default on ingress accepts it.
 /// Mirrors `smoltcp_ssrf_guard.rs`'s helper of the same shape.
 fn build_dns_query_frame(domain: &str) -> Vec<u8> {
+    build_dns_query_frame_to(domain, GATEWAY_ADDR, DNS_SERVER_PORT)
+}
+
+/// Same query, aimed at an arbitrary UDP destination.
+fn build_dns_query_frame_to(domain: &str, dst_addr: Ipv4Addr, dst_port: u16) -> Vec<u8> {
     let raw_name = encode_dns_name(domain);
     let dns_repr = DnsRepr {
         transaction_id: QUERY_TRANSACTION_ID,
@@ -254,13 +260,13 @@ fn build_dns_query_frame(domain: &str) -> Vec<u8> {
 
     let udp_repr = UdpRepr {
         src_port: GUEST_DNS_SRC_PORT,
-        dst_port: DNS_SERVER_PORT,
+        dst_port,
     };
     let ip_payload_len = udp_repr.header_len() + dns_len;
 
     let ip_repr = Ipv4Repr {
         src_addr: GUEST_ADDR,
-        dst_addr: GATEWAY_ADDR,
+        dst_addr,
         next_header: IpProtocol::Udp,
         payload_len: ip_payload_len,
         hop_limit: 64,
@@ -285,7 +291,7 @@ fn build_dns_query_frame(domain: &str) -> Vec<u8> {
     udp_repr.emit(
         &mut udp_packet,
         &IpAddress::Ipv4(GUEST_ADDR),
-        &IpAddress::Ipv4(GATEWAY_ADDR),
+        &IpAddress::Ipv4(dst_addr),
         dns_len,
         |dns_buf| dns_repr.emit(&mut DnsPacket::new_unchecked(dns_buf)),
         &ChecksumCapabilities::default(),
@@ -492,8 +498,11 @@ async fn given_allowlist_policy_when_flow_to_allowed_domain_then_fake_connector_
     );
     assert_eq!(
         *egress_calls.lock().unwrap(),
-        vec![(ALLOWED_DOMAIN.to_string(), ALLOWED_PORT)],
-        "egress-check callback should be called once with the resolved domain and destination port"
+        vec![
+            (ALLOWED_DOMAIN.to_string(), DNS_SERVER_PORT),
+            (ALLOWED_DOMAIN.to_string(), ALLOWED_PORT)
+        ],
+        "egress-check callback should gate the DNS lookup, then the flow's domain and port"
     );
 }
 
@@ -510,7 +519,7 @@ async fn given_allowlist_policy_when_flow_to_denied_domain_then_rst_and_fake_con
         call_count: Arc::clone(&call_count),
     });
     let egress_check: EgressCheckFn =
-        Box::new(|_domain: &str, _port: u16| Box::pin(async { false }));
+        Box::new(|_domain: &str, port: u16| Box::pin(async move { port == DNS_SERVER_PORT }));
     let mut stack = Stack::new(host_fd, resolver, connector, egress_check);
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
@@ -598,4 +607,59 @@ async fn given_unresolved_destination_ip_when_checked_then_denied() {
         0,
         "fake connector should never be called for a flow to an unresolved destination"
     );
+}
+
+const OUTBOUND_UDP_ADDR: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+const OUTBOUND_UDP_PORT: u16 = 5353;
+const DENY_OBSERVE_BUDGET: Duration = Duration::from_millis(300);
+
+/// Fake `Resolver` that counts lookups.
+struct CountingResolver(Arc<Mutex<u32>>);
+
+#[async_trait::async_trait]
+impl Resolver for CountingResolver {
+    async fn resolve(&self, _name: &str) -> Vec<IpAddr> {
+        *self.0.lock().unwrap() += 1;
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn given_deny_egress_when_guest_dns_tcp_and_udp_then_nothing_leaves_the_host() {
+    // Arrange: deny everything, with counting fakes to observe host calls.
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let resolver_calls = Arc::new(Mutex::new(0u32));
+    let connector_calls = Arc::new(Mutex::new(0u32));
+    let resolver = Box::new(CountingResolver(Arc::clone(&resolver_calls)));
+    let connector = Box::new(CountingConnector {
+        call_count: Arc::clone(&connector_calls),
+    });
+    let deny: EgressCheckFn = Box::new(|_: &str, _: u16| Box::pin(async { false }));
+    let mut stack = Stack::new(host_fd, resolver, connector, deny);
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // Act: a DNS query, a TCP SYN, then a UDP datagram to another port.
+    write_frame(&guest_fd, &build_dns_query_frame(ALLOWED_DOMAIN));
+    let dns_reply = poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("a denied DNS query should still be answered");
+    write_frame(&guest_fd, &build_tcp_syn_frame_to(ALLOWED_ADDR, 443));
+    let rst = poll_until_rst(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    let probe = build_dns_query_frame_to(ALLOWED_DOMAIN, OUTBOUND_UDP_ADDR, OUTBOUND_UDP_PORT);
+    write_frame(&guest_fd, &probe);
+    let until = std::time::Instant::now() + DENY_OBSERVE_BUDGET;
+    while std::time::Instant::now() < until {
+        stack.poll();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Assert
+    let eth = EthernetFrame::new_checked(&dns_reply[..]).unwrap();
+    let ip = Ipv4Packet::new_checked(eth.payload()).unwrap();
+    let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+    let dns = DnsPacket::new_checked(udp.payload()).unwrap();
+    assert_eq!(dns.rcode(), DnsRcode::Refused);
+    assert!(rst.is_some(), "a denied TCP SYN should be reset");
+    assert_eq!(*resolver_calls.lock().unwrap(), 0, "resolver was called");
+    assert_eq!(*connector_calls.lock().unwrap(), 0, "connector was called");
 }

@@ -1,0 +1,152 @@
+name: packaging
+
+# Validates the service units and the Homebrew formula under packaging/
+# and the script that rewrites the formula on release. Path filtered
+# natively: none of this depends on the Rust change detection in ci.yml.
+
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "scripts/update-formula*.sh"
+      - ".github/workflows/packaging.yml"
+  push:
+    branches: [main]
+    paths:
+      - "packaging/**"
+      - "scripts/update-formula*.sh"
+      - ".github/workflows/packaging.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Formula rewrite script ───────────────────────────────────────────
+  formula-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            codeload.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Test the formula rewrite script
+        run: bash scripts/update-formula.test.sh
+
+  # ── launchd plist + Homebrew formula on macOS ────────────────────────
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+            static.rust-lang.org:443
+            static.crates.io:443
+            index.crates.io:443
+            crates.io:443
+            formulae.brew.sh:443
+            ghcr.io:443
+            pkg-containers.githubusercontent.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Lint the launchd plist
+        run: plutil -lint packaging/launchd/dev.ward.wardd.plist
+      - name: Install protoc
+        run: brew install protobuf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build ward and wardd
+        run: cargo build --release -p ward-cli -p ward-daemon
+      # Mirror the release tarball layout (ward-<version>-<target>/bin/...)
+      # so the formula installs exactly what a release would ship.
+      - name: Stage a local release tarball
+        run: |
+          set -euo pipefail
+          target=aarch64-apple-darwin
+          stage="ward-0.0.1-${target}"
+          mkdir -p "dist/${stage}/bin"
+          cp target/release/ward target/release/wardd "dist/${stage}/bin/"
+          # ward-mcp is not built here; the formula installs it, so use a stand-in.
+          cp target/release/ward "dist/${stage}/bin/ward-mcp"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+          ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
+      - name: Point the formula at the local tarball
+        run: |
+          set -euo pipefail
+          bash scripts/update-formula.sh packaging/homebrew/ward.rb 0.0.1 "$PWD/dist" "file://$PWD/dist"
+      # Homebrew refuses formulae outside a tap, so install from a local one.
+      - name: Install the formula and run its test block
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git ward/local
+          tap_dir="$(brew --repository ward/local)"
+          cp packaging/homebrew/ward.rb "${tap_dir}/Formula/ward.rb"
+          brew install --formula ward/local/ward
+          brew test ward/local/ward
+
+  # ── systemd unit on Linux ────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+            static.rust-lang.org:443
+            static.crates.io:443
+            index.crates.io:443
+            crates.io:443
+            archive.ubuntu.com:80
+            security.ubuntu.com:80
+            esm.ubuntu.com:443
+            motd.ubuntu.com:443
+            ppa.launchpadcontent.net:443
+            azure.archive.ubuntu.com:80
+            packages.microsoft.com:443
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install protoc
+        run: |
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends protobuf-compiler libprotobuf-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build wardd
+        run: cargo build --release -p ward-daemon
+      # systemd-analyze verify checks that ExecStart exists and is
+      # executable, so point a copy of the unit at the freshly built binary.
+      - name: Verify the systemd unit
+        run: |
+          set -euo pipefail
+          install -D -m 0755 target/release/wardd "${RUNNER_TEMP}/ward/bin/wardd"
+          unit="${RUNNER_TEMP}/ward/wardd.service"
+          sed "s|^ExecStart=.*|ExecStart=${RUNNER_TEMP}/ward/bin/wardd|" \
+            packaging/systemd/wardd.service > "${unit}"
+          grep '^ExecStart=' "${unit}"
+          systemd-analyze verify "${unit}"
