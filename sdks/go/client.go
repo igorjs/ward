@@ -37,6 +37,31 @@ type Sandbox struct {
 	Status string
 }
 
+// StatusUnknown is the Sandbox.Status for a wire value this SDK predates.
+const StatusUnknown = "unknown"
+
+// sandboxStatusNames maps proto SandboxStatus values to Sandbox.Status.
+var sandboxStatusNames = map[int32]string{
+	0: "unspecified",
+	1: "creating",
+	2: "running",
+	3: "stopped",
+	4: "failed",
+	5: "exited",
+	6: "stopping",
+}
+
+// SandboxFromWire builds a Sandbox from decoded wire fields. A status the
+// SDK does not know yields StatusUnknown instead of an error, so a newer
+// daemon never breaks an older client.
+func SandboxFromWire(id, image string, status int32) Sandbox {
+	name, ok := sandboxStatusNames[status]
+	if !ok {
+		name = StatusUnknown
+	}
+	return Sandbox{ID: id, Image: image, Status: name}
+}
+
 // ExecResult is returned by Client.Run.
 type ExecResult struct {
 	PID      string

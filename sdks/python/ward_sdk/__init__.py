@@ -19,6 +19,7 @@ from ward_sdk.client import (
     StreamEvent,
     WardClient,
     default_socket_path,
+    sandbox_from_wire,
 )
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "StreamEvent",
     "WardClient",
     "default_socket_path",
+    "sandbox_from_wire",
 ]
 
 __version__ = "0.1.0"

@@ -408,6 +408,8 @@ jobs:
         run: cargo clippy --all-targets --features ward-core/krunvm -- -D warnings
       - name: Unit tests (--features krunvm)
         run: cargo test -p ward-core --lib --features krunvm
+      - name: Compile e2e test targets (--features krunvm)
+        run: RUSTFLAGS=-Dwarnings cargo test -p ward-daemon --features krunvm --test smoltcp_e2e --no-run
       - name: Bundle tests with the libraries embedded
         run: cargo test -p ward-bundle --features embed
 
@@ -561,6 +563,29 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: bash scripts/check-proto-compat.sh "origin/${BASE_REF}"
+
+  # ── SDK tests (Go, Python, TypeScript) ───────────────────────────────
+  sdk-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Go SDK tests
+        working-directory: sdks/go
+        run: go test ./...
+      - name: Python SDK tests
+        working-directory: sdks/python
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install pytest pytest-asyncio
+          PYTHONPATH=. .venv/bin/python -m pytest
+      - name: TypeScript SDK tests
+        working-directory: sdks/typescript
+        run: |
+          npm install --no-save typescript @types/node
+          npx tsc && node --test dist/
 
   # ── Supply chain audit ───────────────────────────────────────────────
   deny:

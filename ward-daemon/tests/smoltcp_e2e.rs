@@ -18,7 +18,6 @@
 mod common;
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
