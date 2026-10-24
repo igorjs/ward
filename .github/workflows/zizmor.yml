@@ -2,8 +2,7 @@ name: zizmor
 
 # Static analysis of the GitHub Actions workflows (template injection,
 # unpinned actions, excessive permissions, credential persistence).
-# Findings upload to code scanning and do not fail the job, so existing
-# findings can be fixed over time without blocking unrelated PRs.
+# The job fails on medium and higher findings.
 
 on:
   pull_request:
@@ -29,12 +28,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      security-events: write
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: audit
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          advanced-security: false
+          min-severity: medium

@@ -7,3 +7,18 @@ rules:
         "*": hash-pin
         dtolnay/rust-toolchain: ref-pin
         slsa-framework/slsa-github-generator/*: ref-pin
+  # These run on pull_request_target or issue_comment with no checkout of
+  # PR code, and only call the REST API.
+  dangerous-triggers:
+    ignore:
+      - auto-label.yml
+      - cla-dco.yml
+      - clanker-filter.yml
+  # The release cache is keyed per target and the build is also attested.
+  cache-poisoning:
+    ignore:
+      - release.yml
+  # Rolling stable toolchain tag, see unpinned-uses above.
+  ref-version-mismatch:
+    ignore:
+      - license.yml:121

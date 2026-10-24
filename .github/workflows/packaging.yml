@@ -36,7 +36,7 @@ jobs:
             github.com:443
             codeload.github.com:443
             objects.githubusercontent.com:443
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: Test the formula rewrite script
@@ -62,7 +62,7 @@ jobs:
             formulae.brew.sh:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: Lint the launchd plist
@@ -70,7 +70,7 @@ jobs:
       - name: Install protoc
         run: brew install protobuf
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build ward and wardd
         run: cargo build --release -p ward-cli -p ward-daemon
       # Mirror the release tarball layout (ward-<version>-<target>/bin/...)
@@ -128,7 +128,7 @@ jobs:
             ppa.launchpadcontent.net:443
             azure.archive.ubuntu.com:80
             packages.microsoft.com:443
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
       - name: Install protoc
@@ -136,7 +136,7 @@ jobs:
           sudo apt-get -o Acquire::Retries=5 update
           sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends protobuf-compiler libprotobuf-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build wardd
         run: cargo build --release -p ward-daemon
       # systemd-analyze verify checks that ExecStart exists and is
