@@ -39,6 +39,10 @@ service Ward {
   // List the processes of a running sandbox, like `docker top`. The token
   // travels in call metadata.
   rpc Top(TopRequest) returns (TopResponse);
+  // The destinations the sandbox's egress policy refused, most recent first.
+  // Kept after the sandbox exits, until it is removed. The token travels in
+  // call metadata.
+  rpc BlockedEgress(BlockedEgressRequest) returns (BlockedEgressResponse);
   // One reading of a running sandbox's resource use, like one frame of
   // `docker stats`. The token travels in call metadata.
   rpc Stats(StatsRequest) returns (StatsResponse);
@@ -444,6 +448,27 @@ message TopResponse {
 // One process, with one field per title.
 message TopProcess {
   repeated string fields = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Blocked egress messages
+// ---------------------------------------------------------------------------
+
+message BlockedEgressRequest {
+  string sandbox_id = 1;
+}
+
+message BlockedEgressResponse {
+  repeated BlockedDestination destinations = 1;
+}
+
+// A refused destination: a DNS name, or an IP address when no name is known.
+message BlockedDestination {
+  string host = 1;
+  // How many times the policy refused it.
+  uint64 count = 2;
+  // Unix time of the latest refusal, in seconds.
+  uint64 last_seen_unix = 3;
 }
 
 // ---------------------------------------------------------------------------

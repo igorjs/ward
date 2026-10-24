@@ -1496,6 +1496,13 @@ impl SandboxManager {
         Ok(entry.egress.log_entries().await)
     }
 
+    /// Destinations the sandbox's egress policy refused, most recent first.
+    /// Available while the sandbox is stopped, until it is removed.
+    pub async fn blocked_egress(&self, id: &str) -> Result<Vec<crate::egress::BlockedDestination>> {
+        let id = self.resolve(id).await?;
+        self.backend.blocked_egress(&id).await.map_err(backend_err)
+    }
+
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
         let id = self.resolve(id).await?;

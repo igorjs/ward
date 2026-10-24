@@ -16,6 +16,7 @@ use super::{Backend, BackendError, ExecMode, ProcessHandle, Result};
 use crate::config::NetworkBackendChoice;
 #[cfg(feature = "krunvm")]
 use crate::egress::EgressProxy;
+use crate::egress::{BlockedDestination, BlockedEgress};
 #[cfg(feature = "krunvm")]
 use crate::protocol::EgressMode;
 use crate::protocol::{CreateOpts, SandboxInfo, SandboxStatus, SnapshotInfo};
@@ -143,6 +144,9 @@ struct SandboxState {
     opts: CreateOpts,
     /// Unpacked rootfs a boot of this sandbox starts from.
     rootfs: std::path::PathBuf,
+    /// Destinations egress refused. Outlives each boot so a stopped
+    /// sandbox still reports them.
+    blocked: Arc<BlockedEgress>,
     /// Host process running this sandbox's microVM. `None` in stub builds.
     #[cfg(feature = "krunvm")]
     shim: Option<super::vmshim::ShimProcess>,
@@ -311,6 +315,7 @@ impl Backend for KrunvmBackend {
     /// `remove_sandbox` stops that process.
     async fn create_sandbox(&self, id: String, opts: &CreateOpts) -> Result<SandboxInfo> {
         let rootfs = self.sandbox_rootfs(&id);
+        let blocked = Arc::new(BlockedEgress::default());
 
         // Everything that can fail after the rootfs exists runs here, so one
         // cleanup covers a failed pull, extract or boot.
@@ -337,7 +342,9 @@ impl Backend for KrunvmBackend {
             }
 
             #[cfg(feature = "krunvm")]
-            let result: Result<Option<BootedVm>> = self.boot_if_enabled(&id, opts, &rootfs).await;
+            let result: Result<Option<BootedVm>> = self
+                .boot_if_enabled(&id, opts, &rootfs, Arc::clone(&blocked))
+                .await;
             #[cfg(not(feature = "krunvm"))]
             let result: Result<()> = Ok(());
             result
@@ -393,6 +400,7 @@ impl Backend for KrunvmBackend {
             info: info.clone(),
             opts: opts.clone(),
             rootfs,
+            blocked,
             #[cfg(feature = "krunvm")]
             shim,
             #[cfg(feature = "krunvm")]
@@ -503,6 +511,7 @@ impl Backend for KrunvmBackend {
         let state = SandboxState {
             opts,
             rootfs,
+            blocked: Arc::new(BlockedEgress::default()),
             #[cfg(feature = "krunvm")]
             shim: None,
             #[cfg(feature = "krunvm")]
@@ -532,14 +541,18 @@ impl Backend for KrunvmBackend {
         self.end_vm(id).await?;
         #[cfg(feature = "krunvm")]
         let booted = {
-            let (opts, rootfs) = {
+            let (opts, rootfs, blocked) = {
                 let sandboxes = self.sandboxes.read().await;
                 let state = sandboxes
                     .get(id)
                     .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
-                (state.opts.clone(), state.rootfs.clone())
+                (
+                    state.opts.clone(),
+                    state.rootfs.clone(),
+                    Arc::clone(&state.blocked),
+                )
             };
-            self.boot_if_enabled(id, &opts, &rootfs).await?
+            self.boot_if_enabled(id, &opts, &rootfs, blocked).await?
         };
 
         let mut sandboxes = self.sandboxes.write().await;
@@ -830,6 +843,14 @@ impl Backend for KrunvmBackend {
         super::agent::top(stream, ps_args).await
     }
 
+    async fn blocked_egress(&self, sandbox_id: &str) -> Result<Vec<BlockedDestination>> {
+        let sandboxes = self.sandboxes.read().await;
+        let state = sandboxes
+            .get(sandbox_id)
+            .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+        Ok(state.blocked.snapshot())
+    }
+
     async fn stats(&self, sandbox_id: &str) -> Result<super::GuestStats> {
         let stream = self.agent_stream(sandbox_id).await?;
         super::agent::stats(stream).await
@@ -1087,9 +1108,10 @@ impl KrunvmBackend {
         id: &str,
         opts: &CreateOpts,
         rootfs: &std::path::Path,
+        blocked: Arc<BlockedEgress>,
     ) -> Result<Option<BootedVm>> {
         if self.boot_vms {
-            Ok(Some(self.boot_vm(id, opts, rootfs).await?))
+            Ok(Some(self.boot_vm(id, opts, rootfs, blocked).await?))
         } else {
             Ok(None)
         }
@@ -1103,6 +1125,7 @@ impl KrunvmBackend {
         id: &str,
         opts: &CreateOpts,
         rootfs: &std::path::Path,
+        blocked: Arc<BlockedEgress>,
     ) -> Result<BootedVm> {
         use super::vmshim::{MountSpec, NetSpec, ShimProcess, VmSpec};
         use std::os::fd::{FromRawFd, OwnedFd};
@@ -1120,7 +1143,9 @@ impl KrunvmBackend {
             // The proxy is the single source of truth for this sandbox's
             // allow/deny decisions; the spawned Stack task consults it
             // through the closure below on every flow.
-            let egress_proxy = Arc::new(EgressProxy::new(id.to_string(), opts.egress.clone()));
+            let egress_proxy = Arc::new(
+                EgressProxy::new(id.to_string(), opts.egress.clone()).with_blocked(blocked),
+            );
             let egress_for_check = Arc::clone(&egress_proxy);
             let egress_check: Box<ward_net::smoltcp_backend::EgressCheckFn> =
                 Box::new(move |domain: &str, port: u16| {

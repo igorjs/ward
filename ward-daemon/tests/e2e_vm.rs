@@ -722,6 +722,33 @@ fn given_allowlist_egress_when_guest_requests_unlisted_host_then_it_is_blocked()
 }
 
 #[test]
+fn given_allowlist_egress_when_guest_is_blocked_then_egress_suggest_lists_the_host() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(
+        &d,
+        &[
+            "--egress",
+            "allowlist",
+            "--allow-domain",
+            "archive.ubuntu.com",
+        ],
+    );
+    http_status_line(&d, &id, "security.ubuntu.com");
+
+    let mut cmd = d.cli();
+    cmd.args(["egress", "suggest", &id]);
+    let suggested = run_ok(cmd);
+
+    assert!(
+        suggested
+            .lines()
+            .any(|l| l == "--allow-domain security.ubuntu.com"),
+        "blocked host missing from suggestions:\n{suggested}"
+    );
+}
+
+#[test]
 fn given_open_egress_when_guest_targets_cloud_metadata_address_then_it_is_blocked() {
     require_vm!();
     let d = Daemon::spawn_vm();
