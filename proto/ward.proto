@@ -198,6 +198,17 @@ message SandboxInfo {
   // image's User. Empty means the guest default (root).
   string user = 17;
   repeated PortMapping published_ports = 18;
+  // Why the sandbox last ended. Unspecified while it runs or when unknown.
+  EndReason end_reason = 19;
+}
+
+enum EndReason {
+  END_REASON_UNSPECIFIED = 0;
+  END_REASON_EXITED = 1;
+  END_REASON_SIGNAL = 2;
+  END_REASON_OOM = 3;
+  END_REASON_TIMEOUT = 4;
+  END_REASON_EGRESS_POLICY = 5;
 }
 
 enum SandboxStatus {

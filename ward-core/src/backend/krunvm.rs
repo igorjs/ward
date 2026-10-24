@@ -381,6 +381,7 @@ impl Backend for KrunvmBackend {
             exit_code: None,
             started_at: None,
             finished_at: None,
+            end_reason: None,
         };
 
         #[cfg(feature = "krunvm")]

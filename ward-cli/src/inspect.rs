@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
-use ward_core::pb::{GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
+use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
 
 use crate::lifecycle::Failures;
 use crate::{client, output, status_name};
@@ -135,6 +135,19 @@ fn state_exit_code(info: &SandboxInfo) -> i32 {
     }
 }
 
+/// Why the sandbox ended, as `inspect` and `ps --format json` name it. Empty
+/// while it runs or when the cause is unknown.
+fn reason_name(info: &SandboxInfo) -> &'static str {
+    match EndReason::try_from(info.end_reason).unwrap_or(EndReason::Unspecified) {
+        EndReason::Unspecified => "",
+        EndReason::Exited => "exited",
+        EndReason::Signal => "signal",
+        EndReason::Oom => "oom",
+        EndReason::Timeout => "timeout",
+        EndReason::EgressPolicy => "egress-policy",
+    }
+}
+
 /// Docker style status: `Up 5 minutes`, `Exited (7) 5 minutes ago`, `Created`.
 /// `Up` counts from the last start, falling back to the creation time for
 /// records that predate it. `Exited` counts from the finish and shows only the
@@ -189,6 +202,7 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "CreatedAt": created.map(created_at_text),
         "RunningFor": format!("{} ago", duration_text(elapsed)),
         "Status": status_text(info, now_seconds),
+        "Reason": reason_name(info),
         "Names": info.name,
     })
 }
@@ -261,6 +275,8 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "State": {
             "Status": status_name(info.status),
             "ExitCode": state_exit_code(info),
+            "OOMKilled": info.end_reason == EndReason::Oom as i32,
+            "Reason": reason_name(info),
             "StartedAt": state_time(&info.started_at),
             "FinishedAt": state_time(&info.finished_at),
         },
@@ -509,6 +525,7 @@ mod tests {
                 "CreatedAt": "1970-01-12 13:44:40 +0000 UTC",
                 "RunningFor": "2 minutes ago",
                 "Status": "Up 2 minutes",
+                "Reason": "",
                 "Names": "web1",
             })
         );
@@ -559,6 +576,8 @@ mod tests {
                 "State": {
                     "Status": "exited",
                     "ExitCode": 7,
+                    "OOMKilled": false,
+                    "Reason": "",
                     "StartedAt": "0001-01-01T00:00:00Z",
                     "FinishedAt": "0001-01-01T00:00:00Z",
                 },
@@ -571,6 +590,33 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[rstest::rstest]
+    #[case::unknown(EndReason::Unspecified, "", false)]
+    #[case::exited(EndReason::Exited, "exited", false)]
+    #[case::signal(EndReason::Signal, "signal", false)]
+    #[case::oom(EndReason::Oom, "oom", true)]
+    #[case::timeout(EndReason::Timeout, "timeout", false)]
+    #[case::egress(EndReason::EgressPolicy, "egress-policy", false)]
+    fn given_end_reason_when_inspected_then_state_names_it_and_oom_killed_follows(
+        #[case] reason: EndReason,
+        #[case] name: &str,
+        #[case] oom_killed: bool,
+    ) {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Exited, Some(137));
+        sandbox.end_reason = reason as i32;
+
+        // Act
+        let state = inspect_value(&sandbox)["State"].clone();
+        let listed = ps_json_object(&sandbox, NOW);
+
+        // Assert
+        assert_eq!(state["Reason"], name);
+        assert_eq!(state["OOMKilled"], oom_killed);
+        assert_eq!(listed["Reason"], name);
+        assert_eq!(listed["Status"], "Exited (137)");
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::protocol::{CreateOpts, SandboxStatus};
+use crate::protocol::{CreateOpts, EndReason, SandboxStatus};
 
 /// Directory under the data dir that holds one subdirectory per sandbox.
 const SANDBOXES_DIR: &str = "sandboxes";
@@ -33,6 +33,8 @@ pub struct SandboxMeta {
     pub started_at: Option<SystemTime>,
     #[serde(default)]
     pub finished_at: Option<SystemTime>,
+    #[serde(default)]
+    pub end_reason: Option<EndReason>,
     /// Hex SHA-256 of the capability token. The token itself is never stored.
     pub token_hash: String,
 }
@@ -224,6 +226,7 @@ mod tests {
             exit_code: None,
             started_at: None,
             finished_at: None,
+            end_reason: None,
             token_hash: hash_token(TOKEN),
         }
     }
@@ -314,6 +317,42 @@ mod tests {
         // Assert
         assert_eq!(loaded[0].status, SandboxStatus::Exited);
         assert_eq!(loaded[0].exit_code, Some(7));
+    }
+
+    #[test]
+    fn given_end_reason_when_loaded_then_it_is_kept() {
+        // Arrange
+        let (_tmp, store) = store();
+        let mut exited = meta(ID_A, SandboxStatus::Exited);
+        exited.end_reason = Some(EndReason::Signal);
+        store.save(&exited).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        assert_eq!(loaded[0].end_reason, Some(EndReason::Signal));
+    }
+
+    #[test]
+    fn given_record_without_end_reason_when_loaded_then_it_has_none() {
+        // Arrange
+        let (_tmp, store) = store();
+        let mut exited = meta(ID_A, SandboxStatus::Exited);
+        exited.end_reason = Some(EndReason::Exited);
+        store.save(&exited).unwrap();
+        let path = meta_path(&store, ID_A);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("end_reason");
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].end_reason, None);
     }
 
     #[rstest]
