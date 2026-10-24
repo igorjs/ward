@@ -79,7 +79,7 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
 
 fn is_listed(d: &Daemon, name: &str) -> bool {
     let mut cmd = d.cli();
-    cmd.arg("list");
+    cmd.args(["ps", "-a"]);
     run_ok(cmd).lines().any(|l| l.contains(name))
 }
 
