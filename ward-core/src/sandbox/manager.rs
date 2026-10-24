@@ -812,6 +812,8 @@ pub struct SandboxManager {
     forwarder: Arc<dyn PortForwarder>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
     exited_ttl: Option<std::time::Duration>,
+    /// Daemon-wide limits for fields a create request leaves at 0.
+    default_limits: crate::config::DefaultLimits,
 }
 
 impl SandboxManager {
@@ -839,7 +841,15 @@ impl SandboxManager {
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
             events: EventLog::default(),
             exited_ttl: None,
+            default_limits: crate::config::DefaultLimits::default(),
         }
+    }
+
+    /// Apply `limits` to CPU, memory and pids fields a create request
+    /// leaves at 0. A field left at 0 in `limits` stays unlimited.
+    pub fn with_default_limits(mut self, limits: crate::config::DefaultLimits) -> Self {
+        self.default_limits = limits;
+        self
     }
 
     /// Remove sandboxes that stay ended for `ttl`, unless they set their
@@ -1296,7 +1306,8 @@ impl SandboxManager {
         let resources = req
             .resources
             .map(pb_resources_to_protocol)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .with_defaults(&self.default_limits);
 
         let comms = req.comms.map(pb_comms_to_protocol).unwrap_or_default();
 
@@ -2733,6 +2744,16 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
     }
 }
 
+fn protocol_resources_to_pb(resources: &ResourceLimits) -> crate::pb::ResourceLimits {
+    crate::pb::ResourceLimits {
+        cpus: resources.cpus,
+        memory_mb: resources.memory_mb,
+        pids_max: resources.pids_max,
+        timeout_seconds: resources.timeout_seconds,
+        exited_ttl_seconds: resources.exited_ttl_seconds,
+    }
+}
+
 fn not_running(id: &str) -> ApiError {
     ApiError::InvalidRequest(format!("Container {id} is not running"))
 }
@@ -2812,7 +2833,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         image: info.image,
         created_at,
         ip_address: info.ip_address.unwrap_or_default(),
-        resources: None,
+        resources: Some(protocol_resources_to_pb(&info.resources)),
         expires_at,
         token: info.token,
         name: info.spec.name,
@@ -5584,6 +5605,77 @@ pub(crate) mod tests {
 
         // Assert
         assert!(removed, "the stopped sandbox outlived its timeout");
+    }
+
+    // ----- default limits ------------------------------------------------
+
+    const DEFAULT_LIMITS: crate::config::DefaultLimits = crate::config::DefaultLimits {
+        cpus: 2,
+        memory_mb: 1024,
+        pids_max: 512,
+    };
+
+    fn req_with_limits(cpus: u32, memory_mb: u32, pids_max: u32) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            resources: Some(PbResourceLimits {
+                cpus,
+                memory_mb,
+                pids_max,
+                ..Default::default()
+            }),
+            ..create_req("alpine")
+        }
+    }
+
+    fn manager_with_default_limits(limits: crate::config::DefaultLimits) -> SandboxManager {
+        Arc::into_inner(build_manager(2))
+            .unwrap()
+            .with_default_limits(limits)
+    }
+
+    #[tokio::test]
+    async fn given_daemon_defaults_when_request_leaves_limits_zero_then_defaults_apply() {
+        // Arrange
+        let mgr = manager_with_default_limits(DEFAULT_LIMITS);
+
+        // Act
+        let info = mgr.create(req_with_limits(0, 0, 0), "").await.unwrap();
+
+        // Assert
+        let limits = info.resources.unwrap();
+        assert_eq!(
+            (limits.cpus, limits.memory_mb, limits.pids_max),
+            (2, 1024, 512)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_daemon_defaults_when_request_sets_limits_then_request_wins() {
+        // Arrange
+        let mgr = manager_with_default_limits(DEFAULT_LIMITS);
+
+        // Act
+        let info = mgr.create(req_with_limits(4, 256, 64), "").await.unwrap();
+
+        // Assert
+        let limits = info.resources.unwrap();
+        assert_eq!(
+            (limits.cpus, limits.memory_mb, limits.pids_max),
+            (4, 256, 64)
+        );
+    }
+
+    #[tokio::test]
+    async fn given_no_daemon_defaults_when_request_leaves_limits_zero_then_they_stay_zero() {
+        // Arrange
+        let mgr = manager_with_default_limits(crate::config::DefaultLimits::default());
+
+        // Act
+        let info = mgr.create(req_with_limits(0, 0, 0), "").await.unwrap();
+
+        // Assert
+        let limits = info.resources.unwrap();
+        assert_eq!((limits.cpus, limits.memory_mb, limits.pids_max), (0, 0, 0));
     }
 
     // ----- exited TTL ----------------------------------------------------

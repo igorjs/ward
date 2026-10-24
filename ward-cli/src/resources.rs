@@ -8,6 +8,8 @@ const KIB: u64 = 1024;
 const MIB: u64 = KIB * 1024;
 const GIB: u64 = MIB * 1024;
 const TIB: u64 = GIB * 1024;
+/// Docker's marker for "no pids limit".
+const UNLIMITED_PIDS: i64 = -1;
 
 /// Parses a Docker memory size (`512m`, `1.5g`, `2GiB`, `1048576k`, plain
 /// bytes) into whole MiB, rounding down. `0` means "daemon default" and is
@@ -73,9 +75,46 @@ pub fn parse_cpus(value: &str) -> Result<u32> {
     Ok(cpus.ceil() as u32)
 }
 
+/// Maps Docker's `--pids-limit` onto the daemon's count: `0` and `-1` both
+/// mean no limit here and become `0`. Other negatives and counts beyond the
+/// wire type are rejected.
+pub fn parse_pids_limit(value: i64) -> Result<u32> {
+    match value {
+        UNLIMITED_PIDS => Ok(0),
+        n if n < 0 => bail!("invalid pids limit '{n}': use a count, 0 or -1"),
+        n => u32::try_from(n).map_err(|_| anyhow::anyhow!("pids limit '{n}' is too large")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::unset(0, 0)]
+    #[case::docker_unlimited(-1, 0)]
+    #[case::count(512, 512)]
+    fn given_pids_limit_when_parsed_then_zero_means_unlimited(
+        #[case] input: i64,
+        #[case] want: u32,
+    ) {
+        // Arrange / Act
+        let parsed = parse_pids_limit(input);
+
+        // Assert
+        assert_eq!(parsed.unwrap(), want);
+    }
+
+    #[rstest::rstest]
+    #[case::below_unlimited(-2)]
+    #[case::beyond_wire_type(i64::from(u32::MAX) + 1)]
+    fn given_bad_pids_limit_when_parsed_then_error(#[case] input: i64) {
+        // Arrange / Act
+        let parsed = parse_pids_limit(input);
+
+        // Assert
+        assert!(parsed.is_err());
+    }
 
     #[test]
     fn given_docker_sizes_when_parsed_then_mib() {

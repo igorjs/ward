@@ -26,6 +26,8 @@ pub const PS_HEADERS: [&str; 6] = [
 const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const NANOS_PER_CPU: u64 = 1_000_000_000;
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 3600;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -288,6 +290,17 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "WorkingDir": info.workdir,
             "User": info.user,
         },
+        "HostConfig": host_config(info),
+    })
+}
+
+/// Docker `HostConfig` limits. Unlimited is 0, and null for pids.
+fn host_config(info: &SandboxInfo) -> Value {
+    let resources = info.resources.unwrap_or_default();
+    json!({
+        "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
+        "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
+        "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
     })
 }
 
@@ -604,7 +617,35 @@ mod tests {
                     "WorkingDir": "",
                     "User": "",
                 },
+                "HostConfig": {
+                    "Memory": 0,
+                    "NanoCpus": 0,
+                    "PidsLimit": null,
+                },
             })
+        );
+    }
+
+    #[test]
+    fn given_limits_when_inspected_then_host_config_shows_them_in_docker_units() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            resources: Some(ward_core::pb::ResourceLimits {
+                cpus: 2,
+                memory_mb: 512,
+                pids_max: 100,
+                ..Default::default()
+            }),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let host_config = inspect_value(&sandbox)["HostConfig"].clone();
+
+        // Assert
+        assert_eq!(
+            host_config,
+            json!({"Memory": 536_870_912_u64, "NanoCpus": 2_000_000_000_u64, "PidsLimit": 100})
         );
     }
 

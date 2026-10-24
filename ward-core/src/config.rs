@@ -36,6 +36,21 @@ pub fn parse_network_backend(s: &str) -> Result<NetworkBackendChoice, String> {
     }
 }
 
+/// Limits the daemon applies to a sandbox that leaves a field at 0. Each
+/// field is off (0) unless the operator sets it, as Docker starts
+/// containers with no limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DefaultLimits {
+    pub cpus: u32,
+    pub memory_mb: u32,
+    pub pids_max: u32,
+}
+
+/// Parse a default limit: unset, unparseable or zero means no default.
+fn parse_default_limit(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
 /// Daemon configuration, sourced from environment variables with sensible defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -79,6 +94,10 @@ pub struct Config {
     /// Parsed from `WARD_EXITED_TTL_SECS`; off unless it is a positive
     /// number of seconds. A sandbox's own `--exited-ttl` takes precedence.
     pub exited_ttl: Option<std::time::Duration>,
+    /// Limits for sandboxes that request none. Parsed from
+    /// `WARD_DEFAULT_MEMORY_MB`, `WARD_DEFAULT_CPUS` and
+    /// `WARD_DEFAULT_PIDS_LIMIT`; each is off unless set above zero.
+    pub default_limits: DefaultLimits,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -97,6 +116,9 @@ pub struct ConfigEnv {
     pub ward_network_backend: Option<String>,
     pub ward_shutdown_timeout_secs: Option<String>,
     pub ward_exited_ttl_secs: Option<String>,
+    pub ward_default_memory_mb: Option<String>,
+    pub ward_default_cpus: Option<String>,
+    pub ward_default_pids_limit: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -117,6 +139,9 @@ impl Config {
             ward_network_backend: std::env::var("WARD_NETWORK_BACKEND").ok(),
             ward_shutdown_timeout_secs: std::env::var("WARD_SHUTDOWN_TIMEOUT_SECS").ok(),
             ward_exited_ttl_secs: std::env::var("WARD_EXITED_TTL_SECS").ok(),
+            ward_default_memory_mb: std::env::var("WARD_DEFAULT_MEMORY_MB").ok(),
+            ward_default_cpus: std::env::var("WARD_DEFAULT_CPUS").ok(),
+            ward_default_pids_limit: std::env::var("WARD_DEFAULT_PIDS_LIMIT").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -218,6 +243,12 @@ impl Config {
             .filter(|&secs| secs > 0)
             .map(std::time::Duration::from_secs);
 
+        let default_limits = DefaultLimits {
+            cpus: parse_default_limit(env.ward_default_cpus.as_deref()),
+            memory_mb: parse_default_limit(env.ward_default_memory_mb.as_deref()),
+            pids_max: parse_default_limit(env.ward_default_pids_limit.as_deref()),
+        };
+
         Self {
             socket_path,
             data_dir,
@@ -230,6 +261,7 @@ impl Config {
             network_backend,
             shutdown_timeout_secs,
             exited_ttl,
+            default_limits,
         }
     }
 
@@ -357,6 +389,61 @@ mod tests {
             home: Some("/home/test".to_string()),
             ..Default::default()
         }
+    }
+
+    // ----- WARD_DEFAULT_* limits -----------------------------------------
+
+    #[test]
+    fn given_no_default_limit_vars_when_from_values_then_limits_are_off() {
+        // Arrange
+        let env = env_with_home();
+
+        // Act
+        let cfg = Config::from_values(env);
+
+        // Assert
+        assert_eq!(cfg.default_limits, DefaultLimits::default());
+    }
+
+    #[test]
+    fn given_default_limit_vars_when_from_values_then_limits_are_parsed() {
+        // Arrange
+        let env = ConfigEnv {
+            ward_default_memory_mb: Some("1024".into()),
+            ward_default_cpus: Some("2".into()),
+            ward_default_pids_limit: Some("512".into()),
+            ..env_with_home()
+        };
+
+        // Act
+        let cfg = Config::from_values(env);
+
+        // Assert
+        let want = DefaultLimits {
+            cpus: 2,
+            memory_mb: 1024,
+            pids_max: 512,
+        };
+        assert_eq!(cfg.default_limits, want);
+    }
+
+    #[rstest::rstest]
+    #[case::zero("0")]
+    #[case::negative("-1")]
+    #[case::text("lots")]
+    #[case::empty("")]
+    fn given_unusable_default_limit_when_from_values_then_limit_is_off(#[case] raw: &str) {
+        // Arrange
+        let env = ConfigEnv {
+            ward_default_pids_limit: Some(raw.into()),
+            ..env_with_home()
+        };
+
+        // Act
+        let cfg = Config::from_values(env);
+
+        // Assert
+        assert_eq!(cfg.default_limits.pids_max, 0);
     }
 
     // ----- WARD_SOCKET override ------------------------------------------
