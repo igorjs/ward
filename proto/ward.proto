@@ -263,6 +263,9 @@ message ResourceLimits {
   uint32 memory_mb = 2;
   uint32 pids_max = 3;
   uint64 timeout_seconds = 4;
+  // Remove the sandbox this long after it ends. 0 uses the daemon default,
+  // which is off unless the operator sets one.
+  uint64 exited_ttl_seconds = 5;
 }
 
 // ---------------------------------------------------------------------------

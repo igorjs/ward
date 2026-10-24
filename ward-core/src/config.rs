@@ -75,6 +75,10 @@ pub struct Config {
     /// so an operator-supplied `0` cannot wedge the shutdown by
     /// timing out before the teardown loop even starts.
     pub shutdown_timeout_secs: u64,
+    /// How long a sandbox may stay ended before the daemon removes it.
+    /// Parsed from `WARD_EXITED_TTL_SECS`; off unless it is a positive
+    /// number of seconds. A sandbox's own `--exited-ttl` takes precedence.
+    pub exited_ttl: Option<std::time::Duration>,
 }
 
 /// Bag of environment-variable values used by `Config::from_values`.
@@ -92,6 +96,7 @@ pub struct ConfigEnv {
     pub ward_metrics_addr: Option<String>,
     pub ward_network_backend: Option<String>,
     pub ward_shutdown_timeout_secs: Option<String>,
+    pub ward_exited_ttl_secs: Option<String>,
     pub home: Option<String>,
     pub xdg_runtime_dir: Option<String>,
     pub user: Option<String>,
@@ -111,6 +116,7 @@ impl Config {
             ward_metrics_addr: std::env::var("WARD_METRICS_ADDR").ok(),
             ward_network_backend: std::env::var("WARD_NETWORK_BACKEND").ok(),
             ward_shutdown_timeout_secs: std::env::var("WARD_SHUTDOWN_TIMEOUT_SECS").ok(),
+            ward_exited_ttl_secs: std::env::var("WARD_EXITED_TTL_SECS").ok(),
             home: std::env::var("HOME").ok(),
             xdg_runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
             user: std::env::var("USER").ok(),
@@ -203,6 +209,15 @@ impl Config {
             .unwrap_or(30)
             .max(1);
 
+        // WARD_EXITED_TTL_SECS: unset, zero or unparseable keeps the TTL off,
+        // so a typo never removes sandboxes someone meant to keep.
+        let exited_ttl = env
+            .ward_exited_ttl_secs
+            .as_deref()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&secs| secs > 0)
+            .map(std::time::Duration::from_secs);
+
         Self {
             socket_path,
             data_dir,
@@ -214,6 +229,7 @@ impl Config {
             metrics_addr,
             network_backend,
             shutdown_timeout_secs,
+            exited_ttl,
         }
     }
 
@@ -421,6 +437,31 @@ mod tests {
     }
 
     // ----- WARD_MAX_SANDBOXES -------------------------------------------
+
+    #[rstest::rstest]
+    #[case::unset(None, None)]
+    #[case::seconds(Some("90"), Some(90))]
+    #[case::zero(Some("0"), None)]
+    #[case::garbage(Some("soon"), None)]
+    fn given_exited_ttl_env_when_from_values_then_only_a_positive_number_turns_it_on(
+        #[case] raw: Option<&str>,
+        #[case] expected_secs: Option<u64>,
+    ) {
+        // Arrange
+        let env = ConfigEnv {
+            ward_exited_ttl_secs: raw.map(Into::into),
+            ..env_with_home()
+        };
+
+        // Act
+        let cfg = Config::from_values(env);
+
+        // Assert
+        assert_eq!(
+            cfg.exited_ttl,
+            expected_secs.map(std::time::Duration::from_secs)
+        );
+    }
 
     #[test]
     fn given_no_max_sandboxes_when_from_values_then_defaults_to_256() {

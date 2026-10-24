@@ -80,27 +80,12 @@ impl Runtime {
     /// managers from the same sources.
     pub async fn from_config(cfg: &Config) -> Result<Self, Error> {
         cfg.ensure_dirs()?;
-        Ok(Self::wire(
-            cfg.data_dir.clone(),
-            cfg.max_sandboxes,
-            cfg.max_volumes,
-            cfg.max_cached_images,
-            cfg.allow_host_mounts,
-            cfg.network_backend,
-            None,
-        )
-        .await)
+        Ok(Self::wire(cfg, None).await)
     }
 
-    async fn wire(
-        data_dir: PathBuf,
-        max_sandboxes: usize,
-        max_volumes: usize,
-        max_cached_images: usize,
-        allow_host_mounts: bool,
-        network_backend: ward_core::config::NetworkBackendChoice,
-        image_store_override: Option<Arc<ImageStore>>,
-    ) -> Self {
+    async fn wire(cfg: &Config, image_store_override: Option<Arc<ImageStore>>) -> Self {
+        let data_dir = cfg.data_dir.clone();
+        let network_backend = cfg.network_backend;
         let backend: Arc<dyn Backend> = match image_store_override {
             Some(store) => Arc::new(KrunvmBackend::with_image_store_for_test(
                 data_dir.clone(),
@@ -109,7 +94,7 @@ impl Runtime {
             None => Arc::new(KrunvmBackend::new_with_network(
                 data_dir.clone(),
                 network_backend,
-                max_cached_images,
+                cfg.max_cached_images,
             )),
         };
         let broker = Arc::new(Broker::new());
@@ -117,14 +102,15 @@ impl Runtime {
             SandboxManager::new(
                 Arc::clone(&backend),
                 Arc::clone(&broker),
-                max_sandboxes,
-                allow_host_mounts,
+                cfg.max_sandboxes,
+                cfg.allow_host_mounts,
                 network_backend,
             )
+            .with_exited_ttl(cfg.exited_ttl)
             .with_data_dir(data_dir.clone()),
         );
         sandbox_manager.restore().await;
-        let volume_manager = Arc::new(VolumeManager::new(data_dir, max_volumes));
+        let volume_manager = Arc::new(VolumeManager::new(data_dir, cfg.max_volumes));
         Self {
             backend,
             broker,
@@ -260,19 +246,11 @@ impl RuntimeBuilder {
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
             shutdown_timeout_secs: 30,
+            exited_ttl: None,
         };
         cfg.ensure_dirs()?;
 
-        Ok(Runtime::wire(
-            data_dir,
-            self.max_sandboxes,
-            self.max_volumes,
-            self.max_cached_images,
-            self.allow_host_mounts,
-            ward_core::config::NetworkBackendChoice::default(),
-            self.image_store_override,
-        )
-        .await)
+        Ok(Runtime::wire(&cfg, self.image_store_override).await)
     }
 }
 
@@ -321,6 +299,7 @@ mod tests {
             metrics_addr: None,
             network_backend: ward_core::config::NetworkBackendChoice::default(),
             shutdown_timeout_secs: 30,
+            exited_ttl: None,
         };
         let rt = Runtime::from_config(&cfg).await.unwrap();
         assert!(Arc::strong_count(&rt.broker()) >= 2);

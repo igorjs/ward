@@ -60,6 +60,7 @@ fn create_request(image: &str) -> pb::CreateSandboxRequest {
             memory_mb: 256,
             pids_max: 0,
             timeout_seconds: 0,
+            exited_ttl_seconds: 0,
         }),
         env: HashMap::new(),
         comms: Some(pb::CommunicationPolicy {
