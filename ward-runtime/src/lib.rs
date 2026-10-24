@@ -107,6 +107,7 @@ impl Runtime {
                 network_backend,
             )
             .with_exited_ttl(cfg.exited_ttl)
+            .with_default_limits(cfg.default_limits)
             .with_data_dir(data_dir.clone()),
         );
         sandbox_manager.restore().await;
@@ -247,6 +248,7 @@ impl RuntimeBuilder {
             network_backend: ward_core::config::NetworkBackendChoice::default(),
             shutdown_timeout_secs: 30,
             exited_ttl: None,
+            default_limits: Default::default(),
         };
         cfg.ensure_dirs()?;
 
@@ -300,6 +302,7 @@ mod tests {
             network_backend: ward_core::config::NetworkBackendChoice::default(),
             shutdown_timeout_secs: 30,
             exited_ttl: None,
+            default_limits: Default::default(),
         };
         let rt = Runtime::from_config(&cfg).await.unwrap();
         assert!(Arc::strong_count(&rt.broker()) >= 2);

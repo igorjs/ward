@@ -132,6 +132,21 @@ pub struct ResourceLimits {
     pub exited_ttl_seconds: u64,
 }
 
+impl ResourceLimits {
+    /// Fill each CPU, memory and pids field left at 0 from `defaults`.
+    /// A field the request set is kept.
+    pub fn with_defaults(self, defaults: &crate::config::DefaultLimits) -> Self {
+        let or_default =
+            |requested: u32, default: u32| if requested == 0 { default } else { requested };
+        Self {
+            cpus: or_default(self.cpus, defaults.cpus),
+            memory_mb: or_default(self.memory_mb, defaults.memory_mb),
+            pids_max: or_default(self.pids_max, defaults.pids_max),
+            ..self
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox info / status
 // ---------------------------------------------------------------------------

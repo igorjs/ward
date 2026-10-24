@@ -52,6 +52,7 @@ Each attach session is separate. A client that disconnects only detaches and lea
 
 - `--pull=pinned`: like `missing`, but the image reference must carry an `@sha256` digest.
 - `--exited-ttl`: removes a sandbox a set time after it ends.
+- Default limits: like Docker, a sandbox has no memory, CPU or pids limit unless you set one. The operator can opt in to daemon defaults with `WARD_DEFAULT_MEMORY_MB`, `WARD_DEFAULT_CPUS` and `WARD_DEFAULT_PIDS_LIMIT`. They apply to a field a request leaves at 0, and `-m`, `--cpus` and `--pids-limit` override them. Unset or 0 means no default. `ward inspect` shows the effective values in `HostConfig`. The VM backend enforces memory and CPUs. `--pids-limit` is stored and shown but not enforced yet.
 - `State.Reason` in `inspect` and `Reason` in `ps --format json`: why the sandbox ended (`exited`, `signal`, `oom`, `timeout` or `egress-policy`).
 - `ward run-code`: runs a language snippet in a sandbox. Docker has no equivalent. The daemon does not implement it yet, so use `ward exec` for now.
 - Sandbox pub/sub (`publish`, `subscribe`), snapshots and `--comms-mode`.

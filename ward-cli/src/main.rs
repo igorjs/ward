@@ -103,6 +103,15 @@ struct SandboxOpts {
     /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
     #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
     cpus: String,
+    /// Process limit, as in Docker: 0 or -1 for unlimited. 0 uses the daemon
+    /// default, which is unlimited unless the operator sets one.
+    #[arg(
+        long = "pids-limit",
+        default_value_t = 0,
+        allow_negative_numbers = true,
+        value_name = "N"
+    )]
+    pids_limit: i64,
     /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
     #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
     user: Option<String>,
@@ -729,7 +738,7 @@ fn create_request(
     let resources = ward_core::pb::ResourceLimits {
         cpus: resources::parse_cpus(&opts.cpus)?,
         memory_mb: resources::parse_memory_mib(&opts.memory)?,
-        pids_max: 0, // 0 == "use daemon default"
+        pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
     };
@@ -1627,6 +1636,40 @@ mod tests {
         // Assert
         let limits = request.resources.expect("resources");
         assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
+    }
+
+    #[rstest::rstest]
+    #[case::unset(&[], 0)]
+    #[case::count(&["--pids-limit", "256"], 256)]
+    #[case::docker_unlimited(&["--pids-limit", "-1"], 0)]
+    #[case::equals_form(&["--pids-limit=64"], 64)]
+    fn given_pids_limit_flag_when_request_built_then_pids_max_follows(
+        #[case] flags: &[&str],
+        #[case] want: u32,
+    ) {
+        // Arrange
+        let args = ["ward", "create", "alpine"]
+            .into_iter()
+            .chain(flags.iter().copied());
+        let cli = Cli::try_parse_from(args).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(request.resources.expect("resources").pids_max, want);
+    }
+
+    #[test]
+    fn given_pids_limit_flag_on_run_when_parsed_then_it_is_accepted() {
+        // Arrange / Act
+        let cli = Cli::try_parse_from(["ward", "run", "--pids-limit", "32", "alpine", "true"]);
+
+        // Assert
+        assert!(cli.is_ok());
     }
 
     #[test]
