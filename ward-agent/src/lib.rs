@@ -13,6 +13,7 @@ use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
+use std::sync::OnceLock;
 
 use prost::Message;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -21,6 +22,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 mod archive;
+// Only the Linux build calls into it; other hosts compile it for the tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod cgroup;
 mod pty;
 mod secrets;
 mod stats;
@@ -375,6 +379,38 @@ fn run_as(
     Ok(())
 }
 
+/// The sandbox cgroup every child joins, set once at agent start.
+static PIDS_CGROUP: OnceLock<cgroup::PidsCgroup> = OnceLock::new();
+
+/// Cap the sandbox at `pids_max` processes. Without cgroup v2 and its pids
+/// controller in the guest kernel the cap is not enforced; the returned
+/// error says why and the agent keeps running.
+///
+/// # Errors
+///
+/// Fails with a plain-language reason when the cgroup cannot be set up.
+#[cfg(target_os = "linux")]
+pub fn limit_pids(pids_max: u32) -> Result<(), String> {
+    let root = Path::new(cgroup::CGROUP_ROOT);
+    cgroup::ensure_mounted(root).map_err(|e| format!("mount cgroup2: {e}"))?;
+    let group = cgroup::setup(root, pids_max).map_err(|e| e.to_string())?;
+    let _ = PIDS_CGROUP.set(group);
+    Ok(())
+}
+
+/// Make the child move itself into the sandbox cgroup before it runs, so
+/// nothing it forks can escape the cap. A failed move fails the spawn.
+fn join_pids_cgroup(cmd: &mut Command) {
+    let Some(group) = PIDS_CGROUP.get().cloned() else {
+        return;
+    };
+    // SAFETY: the closure runs between fork and exec and only makes one
+    // write(2) call, which is async-signal-safe and does not allocate.
+    unsafe {
+        cmd.pre_exec(move || group.join_self());
+    }
+}
+
 /// Start the child. It always leads its own process group (a pty child, its
 /// own session), so signals and kills reach everything it spawns.
 fn spawn_child(
@@ -389,6 +425,7 @@ fn spawn_child(
         cmd.current_dir(dir);
     }
     cmd.envs(exec.env.iter());
+    join_pids_cgroup(&mut cmd);
     if let Some(identity) = identity
         && !exec.env.contains_key(HOME_ENV)
     {
@@ -1479,18 +1516,35 @@ pub struct GuestMount {
 /// Argument that introduces one mount: `--mount <tag> <target> <ro|rw>`.
 pub const MOUNT_ARG: &str = "--mount";
 
+/// Argument that caps the sandbox's process count: `--pids-max <n>`.
+pub const PIDS_MAX_ARG: &str = "--pids-max";
+
+/// What the agent was launched with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentArgs {
+    pub mounts: Vec<GuestMount>,
+    /// Process cap for the sandbox; `None` means unlimited.
+    pub pids_max: Option<u32>,
+}
+
 /// Parse the agent's command-line arguments (without the program name).
 ///
 /// # Errors
 ///
-/// Fails on an unknown argument, a truncated `--mount`, or a mode other than
-/// `ro` or `rw`.
-pub fn parse_mount_args<I: IntoIterator<Item = String>>(
-    args: I,
-) -> Result<Vec<GuestMount>, String> {
+/// Fails on an unknown argument, a truncated `--mount`, a mode other than
+/// `ro` or `rw`, or a `--pids-max` that is not a positive number.
+pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, String> {
     let mut args = args.into_iter();
-    let mut mounts = Vec::new();
+    let mut parsed = AgentArgs::default();
     while let Some(arg) = args.next() {
+        if arg == PIDS_MAX_ARG {
+            let value = args.next().ok_or("--pids-max needs <n>")?;
+            parsed.pids_max = match value.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => return Err(format!("pids max must be a positive number, got {value:?}")),
+            };
+            continue;
+        }
         if arg != MOUNT_ARG {
             return Err(format!("unknown argument {arg:?}"));
         }
@@ -1502,13 +1556,13 @@ pub fn parse_mount_args<I: IntoIterator<Item = String>>(
             "rw" => false,
             other => return Err(format!("mount mode must be ro or rw, got {other:?}")),
         };
-        mounts.push(GuestMount {
+        parsed.mounts.push(GuestMount {
             tag,
             target,
             read_only,
         });
     }
-    Ok(mounts)
+    Ok(parsed)
 }
 
 /// Mount every share in `mounts`, creating the target directories first.
@@ -1541,18 +1595,18 @@ mod mount_arg_tests {
     }
 
     #[test]
-    fn given_no_args_when_parsed_then_no_mounts() {
-        assert_eq!(parse_mount_args(args(&[])), Ok(vec![]));
+    fn given_no_args_when_parsed_then_no_mounts_and_no_pids_cap() {
+        assert_eq!(parse_args(args(&[])), Ok(AgentArgs::default()));
     }
 
     #[test]
     fn given_two_mounts_when_parsed_then_both_returned_in_order() {
-        let parsed = parse_mount_args(args(&[
+        let parsed = parse_args(args(&[
             "--mount", "t0", "/data", "rw", "--mount", "t1", "/cfg dir", "ro",
         ]))
         .unwrap();
         assert_eq!(
-            parsed,
+            parsed.mounts,
             vec![
                 GuestMount {
                     tag: "t0".into(),
@@ -1570,17 +1624,33 @@ mod mount_arg_tests {
 
     #[test]
     fn given_truncated_mount_when_parsed_then_error() {
-        assert!(parse_mount_args(args(&["--mount", "t0", "/data"])).is_err());
+        assert!(parse_args(args(&["--mount", "t0", "/data"])).is_err());
     }
 
     #[test]
     fn given_bad_mode_when_parsed_then_error() {
-        assert!(parse_mount_args(args(&["--mount", "t0", "/d", "rwx"])).is_err());
+        assert!(parse_args(args(&["--mount", "t0", "/d", "rwx"])).is_err());
+    }
+
+    #[test]
+    fn given_pids_max_among_mounts_when_parsed_then_cap_is_set() {
+        let parsed = parse_args(args(&["--pids-max", "20", "--mount", "t0", "/d", "ro"])).unwrap();
+
+        assert_eq!(parsed.pids_max, Some(20));
+        assert_eq!(parsed.mounts.len(), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::missing(&["--pids-max"])]
+    #[case::zero(&["--pids-max", "0"])]
+    #[case::not_a_number(&["--pids-max", "many"])]
+    fn given_bad_pids_max_when_parsed_then_error(#[case] list: &[&str]) {
+        assert!(parse_args(args(list)).is_err());
     }
 
     #[test]
     fn given_unknown_flag_when_parsed_then_error() {
-        assert!(parse_mount_args(args(&["--bogus"])).is_err());
+        assert!(parse_args(args(&["--bogus"])).is_err());
     }
 }
 

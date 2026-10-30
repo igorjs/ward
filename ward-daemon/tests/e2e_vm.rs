@@ -1083,3 +1083,43 @@ fn given_a_secret_when_exec_then_the_guest_reads_it_and_inspect_never_shows_it()
         "inspect leaked the secret"
     );
 }
+
+const PIDS_LIMIT: &str = "20";
+const FORK_ATTEMPTS: u32 = 100;
+const SLEEPER_SECONDS: u32 = 2;
+const ALLOC_MEMORY: &str = "128m";
+
+#[test]
+fn given_a_pids_limit_when_a_fork_loop_runs_then_forks_fail_and_the_host_stays_responsive() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["--pids-limit", PIDS_LIMIT]);
+    let script = format!(
+        "i=0; while [ $i -lt {FORK_ATTEMPTS} ]; do sleep {SLEEPER_SECONDS} & i=$((i+1)); done; wait"
+    );
+
+    let storm = sh(&d, &id, &script);
+    let after = sh(&d, &id, "echo still-here");
+
+    assert!(
+        storm.stderr.contains("fork") || storm.stderr.contains("temporarily unavailable"),
+        "expected fork failures, got stderr {:?}",
+        storm.stderr
+    );
+    assert_eq!(after.stdout.trim(), "still-here");
+    assert_eq!(after.exit, 0);
+}
+
+#[test]
+fn given_a_memory_limit_when_a_process_allocates_without_bound_then_it_is_killed_and_the_host_stays_responsive()
+ {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-m", ALLOC_MEMORY]);
+
+    let hog = sh(&d, &id, "x=a; while :; do x=\"$x$x\"; done");
+    let after = sh(&d, &id, "echo still-here");
+
+    assert_ne!(hog.exit, 0, "the allocation loop must not finish cleanly");
+    assert_eq!(after.stdout.trim(), "still-here");
+}
