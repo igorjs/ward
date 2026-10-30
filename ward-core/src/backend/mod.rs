@@ -210,6 +210,22 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn kill_process(&self, sandbox_id: &str, pid: &str) -> Result<()>;
 
+    // -- Secrets --------------------------------------------------------
+
+    /// Write `secrets` to /run/secrets of the running sandbox as read-only
+    /// files owned by `user` (empty means root). Backends without a guest
+    /// refuse.
+    async fn put_secrets(
+        &self,
+        _sandbox_id: &str,
+        _user: &str,
+        _secrets: &[crate::pb::SecretFile],
+    ) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "secret files need a microVM".to_string(),
+        ))
+    }
+
     // -- File copy ------------------------------------------------------
 
     /// Unpack the tar stream `chunks` into the guest directory `path`.

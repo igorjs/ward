@@ -48,6 +48,11 @@ where
     let read_only = start.replay;
     match AttachMode::try_from(start.mode).unwrap_or(AttachMode::Unspecified) {
         AttachMode::MainProcess => {
+            if !start.secrets.is_empty() {
+                return Err(Status::invalid_argument(
+                    "secrets can only be sent when starting a command, not when attaching to the main process",
+                ));
+            }
             let mut io = manager.main_io(&id).await.map_err(api_err_to_status)?;
             if read_only {
                 // A watcher's stdin clone would keep the writer's EOF from landing.
@@ -70,6 +75,10 @@ where
         }
         AttachMode::Exec if !start.replay => {
             let workdir = (!start.workdir.is_empty()).then_some(start.workdir);
+            manager
+                .put_exec_secrets(&id, &start.user, &start.secrets)
+                .await
+                .map_err(api_err_to_status)?;
             let handle = manager
                 .spawn_attached(
                     &id,
@@ -878,6 +887,25 @@ mod tests {
             ReceiverStream::new(inbound),
         )
         .await;
+
+        // Assert
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn given_secrets_when_attached_to_the_main_process_then_it_is_refused() {
+        // Arrange
+        let mgr = host_manager(OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+        let (_feed, inbound) = mpsc::channel(FEED_CAPACITY);
+        let mut start = main_start(&id);
+        start.secrets = vec![crate::pb::SecretFile {
+            name: "token".into(),
+            content: b"x".to_vec(),
+        }];
+
+        // Act
+        let result = serve(mgr, id, start, ReceiverStream::new(inbound)).await;
 
         // Assert
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);

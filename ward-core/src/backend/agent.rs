@@ -23,6 +23,15 @@ use crate::protocol::{RawStream, StreamEvent, StreamEventKind};
 /// Agent protocol types, generated from `proto/ward_agent.proto`.
 pub mod proto {
     tonic::include_proto!("ward.agent.v1");
+
+    impl std::fmt::Debug for SecretFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SecretFile")
+                .field("name", &self.name)
+                .field("content", &format_args!("<{} bytes>", self.content.len()))
+                .finish()
+        }
+    }
 }
 
 use proto::{Event, Exec, Request, event, request};
@@ -367,6 +376,45 @@ where
         Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
         _ => Err(protocol_error(
             "agent answered a PutArchive with another event",
+        )),
+    }
+}
+
+/// Ask the agent to write `files` under /run/secrets, owned by `user`.
+///
+/// # Errors
+///
+/// Returns an error if the agent refuses a file or the connection fails.
+pub async fn put_secrets<S>(
+    mut stream: S,
+    user: &str,
+    files: &[crate::pb::SecretFile],
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let files = files
+        .iter()
+        .map(|f| proto::SecretFile {
+            name: f.name.clone(),
+            content: f.content.clone(),
+        })
+        .collect();
+    let open = Request {
+        kind: Some(request::Kind::PutSecrets(proto::PutSecrets {
+            user: user.to_string(),
+            files,
+        })),
+    };
+    write_frame(&mut stream, &encode(&open)).await?;
+    let frame = read_frame(&mut stream)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
+        _ => Err(protocol_error(
+            "agent answered a PutSecrets with another event",
         )),
     }
 }

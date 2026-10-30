@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 mod archive;
 mod pty;
+mod secrets;
 mod stats;
 mod top;
 mod user;
@@ -29,6 +30,15 @@ mod user;
 #[allow(clippy::doc_lazy_continuation)]
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/ward.agent.v1.rs"));
+
+    impl std::fmt::Debug for SecretFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SecretFile")
+                .field("name", &self.name)
+                .field("content", &format_args!("<{} bytes>", self.content.len()))
+                .finish()
+        }
+    }
 }
 
 use proto::{Data, Event, Exec, Exited, Line, Pong, Request, Stream, event, request};
@@ -224,7 +234,8 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
-/// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream, and
+/// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream,
+/// `PutSecrets` writes secret files, and
 /// `Top` lists the guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
@@ -260,6 +271,10 @@ where
             let mut writer = writer;
             return archive::get(scope, &get.path, &mut writer).await;
         }
+        Some(request::Kind::PutSecrets(put)) => {
+            let mut writer = writer;
+            return answer_secrets(put, &mut writer).await;
+        }
         Some(request::Kind::Top(top)) => {
             let mut writer = writer;
             return answer_top(&top.ps_args, &mut writer).await;
@@ -271,12 +286,38 @@ where
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive, GetArchive, Top or Stats",
+                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, Top or Stats",
             ));
         }
     };
 
     run_process(exec, reader, writer).await
+}
+
+async fn answer_secrets<W: AsyncWrite + Unpin>(
+    put: proto::PutSecrets,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let identity = load_identity(&put.user, Path::new(PASSWD_PATH), Path::new(GROUP_PATH));
+    let outcome = match identity {
+        Ok(identity) => {
+            tokio::task::spawn_blocking(move || {
+                secrets::install_in_guest(identity.as_ref(), &put.files)
+            })
+            .await?
+        }
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            e.to_string(),
+        )),
+    };
+    let kind = match outcome {
+        Ok(()) => event::Kind::ArchiveDone(proto::ArchiveDone {}),
+        Err(e) => event::Kind::ArchiveError(proto::ArchiveError {
+            message: e.to_string(),
+        }),
+    };
+    write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await
 }
 
 async fn answer_top<W: AsyncWrite + Unpin>(
@@ -484,6 +525,7 @@ async fn apply_request(
         | request::Kind::GetArchive(_)
         | request::Kind::ArchiveChunk(_)
         | request::Kind::ArchiveEnd(_)
+        | request::Kind::PutSecrets(_)
         | request::Kind::Top(_)
         | request::Kind::Stats(_) => {}
     }

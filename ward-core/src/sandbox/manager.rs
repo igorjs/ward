@@ -144,6 +144,7 @@ fn name_in_use(name: &str, id: Option<&str>) -> ApiError {
 }
 
 /// Docker's wording when neither the request nor the image names a command.
+const RESTART_WITHOUT_SECRETS: &str = "this sandbox was created with --secret; secrets are not kept across restarts, create it again with ward run";
 const NO_COMMAND_MESSAGE: &str = "no command specified";
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1194,7 @@ impl SandboxManager {
     /// requires proving ownership of the source.
     pub async fn create(
         &self,
-        req: crate::pb::CreateSandboxRequest,
+        mut req: crate::pb::CreateSandboxRequest,
         presented_token: &str,
     ) -> Result<PbSandboxInfo> {
         // Metrics: time the full create path (validation + backend boot +
@@ -1202,6 +1203,9 @@ impl SandboxManager {
         let create_start = std::time::Instant::now();
         crate::validate::image_ref(&req.image)?;
         crate::validate::user_spec(&req.user)?;
+        crate::validate::secrets(&req.secrets)?;
+        // Held for delivery only: never copied into the stored options.
+        let secrets = std::mem::take(&mut req.secrets);
         if let Some(ref r) = req.resources {
             crate::validate::resource_limits(r.cpus, r.memory_mb, r.pids_max, r.timeout_seconds)?;
             crate::validate::exited_ttl(r.exited_ttl_seconds)?;
@@ -1302,6 +1306,7 @@ impl SandboxManager {
         // Last, so a rejected request never pulls an image.
         let image_digest = self.resolve_image(&req).await?;
         let launch = self.resolve_launch(&req).await?;
+        let secret_owner = launch.user.clone();
 
         let resources = req
             .resources
@@ -1378,6 +1383,7 @@ impl SandboxManager {
             finished_at: None,
             end_reason: None,
             token_hash: hash_token(&token),
+            had_secrets: !secrets.is_empty(),
         };
         info.started_at = meta.started_at;
         if let Err(e) = self.persist(meta.clone()).await {
@@ -1428,7 +1434,12 @@ impl SandboxManager {
         self.emit_event(&id, EventAction::Create, None).await;
         self.emit_event(&id, EventAction::Start, None).await;
 
-        if let Err(e) = self.spawn_main(&id).await {
+        // Secrets land before the main process so it can read them at start.
+        let started = match self.put_secrets(&id, &secret_owner, &secrets).await {
+            Ok(()) => self.spawn_main(&id).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = started {
             self.fail_main_start(&id).await;
             if let Err(remove_err) = self.remove(&id).await {
                 tracing::warn!(
@@ -1456,6 +1467,40 @@ impl SandboxManager {
 
         // The creator supplied the arguments, so echoing them back is safe.
         Ok(protocol_info_to_pb(info, CommandView::Full))
+    }
+
+    /// Write `secrets` into the guest, owned by `user`. They pass through
+    /// memory only; the log line carries the count, never a name or content.
+    async fn put_secrets(
+        &self,
+        id: &str,
+        user: &str,
+        secrets: &[crate::pb::SecretFile],
+    ) -> Result<()> {
+        if secrets.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(sandbox_id = %id, count = secrets.len(), "writing secret files");
+        self.backend
+            .put_secrets(id, user, secrets)
+            .await
+            .map_err(backend_err)
+    }
+
+    /// Check and write the secrets of an exec, owned by the user the
+    /// command will run as (`requested`, else the sandbox's user).
+    pub async fn put_exec_secrets(
+        &self,
+        id: &str,
+        requested_user: &str,
+        secrets: &[crate::pb::SecretFile],
+    ) -> Result<()> {
+        crate::validate::secrets(secrets)?;
+        if secrets.is_empty() {
+            return Ok(());
+        }
+        let user = self.user_for(id, requested_user).await?;
+        self.put_secrets(id, &user, secrets).await
     }
 
     /// Claim `name` for a new sandbox. An empty name means no name and
@@ -1680,6 +1725,9 @@ impl SandboxManager {
     /// sandbox succeeds without doing anything.
     pub async fn start(&self, reference: &str) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
+        if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
+            self.refuse_if_had_secrets(&id).await?;
+        }
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
     }
@@ -1698,6 +1746,7 @@ impl SandboxManager {
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
+        self.refuse_if_had_secrets(&id).await?;
         let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
         if !failed {
             self.stop_resolved(&id, self.grace_period(grace_seconds))
@@ -1705,6 +1754,21 @@ impl SandboxManager {
         }
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
+    }
+
+    /// A fresh VM has an empty secrets directory, so a sandbox created with
+    /// secrets cannot boot again without losing them.
+    async fn refuse_if_had_secrets(&self, id: &str) -> Result<()> {
+        let had_secrets = self
+            .entries
+            .read()
+            .await
+            .get(id)
+            .is_some_and(|entry| entry.meta.had_secrets);
+        if had_secrets {
+            return Err(ApiError::InvalidRequest(RESTART_WITHOUT_SECRETS.into()));
+        }
+        Ok(())
     }
 
     async fn recorded_status(&self, id: &str) -> Result<crate::protocol::SandboxStatus> {
@@ -2476,6 +2540,8 @@ impl SandboxManager {
         let sandbox_id = self.resolve(&req.sandbox_id).await?;
         crate::validate::exec_command(&req.command)?;
         let user = self.user_for(&sandbox_id, &req.user).await?;
+        self.put_exec_secrets(&sandbox_id, &req.user, &req.secrets)
+            .await?;
         let handle = self
             .backend
             .exec(
@@ -4903,6 +4969,7 @@ pub(crate) mod tests {
             finished_at: None,
             end_reason: None,
             token_hash: hash_token(SEED_TOKEN),
+            had_secrets: false,
         };
         MetaStore::new(path).save(&meta).unwrap();
     }
@@ -6000,7 +6067,16 @@ pub(crate) mod tests {
         fail_stop: bool,
         /// The `user` of every exec, in order, for tests to read.
         exec_users: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The owner and files of every `put_secrets`, in order.
+        secrets: Arc<std::sync::Mutex<Vec<DeliveredSecrets>>>,
     }
+
+    #[cfg(not(feature = "krunvm"))]
+    type Recorded<T> = Arc<std::sync::Mutex<Vec<T>>>;
+
+    /// What one `put_secrets` call was given: the owner and the files.
+    #[cfg(not(feature = "krunvm"))]
+    type DeliveredSecrets = (String, Vec<crate::pb::SecretFile>);
 
     #[cfg(not(feature = "krunvm"))]
     fn stream_event(kind: StreamEventKind, code: Option<i32>, status: Option<i32>) -> StreamEvent {
@@ -6062,6 +6138,19 @@ pub(crate) mod tests {
                 user: user.to_string(),
                 ..Default::default()
             })
+        }
+
+        async fn put_secrets(
+            &self,
+            _sandbox_id: &str,
+            user: &str,
+            secrets: &[crate::pb::SecretFile],
+        ) -> crate::backend::Result<()> {
+            self.secrets
+                .lock()
+                .unwrap()
+                .push((user.to_string(), secrets.to_vec()));
+            Ok(())
         }
 
         async fn exec(
@@ -6329,6 +6418,22 @@ pub(crate) mod tests {
         output_cap: usize,
         fail_stop: bool,
     ) -> (Arc<SandboxManager>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (manager, exec_users, _) = host_manager_in(output_cap, fail_stop, None);
+        (manager, exec_users)
+    }
+
+    /// A host manager that persists under `state_dir` when given, plus the
+    /// users of its execs and the secrets it was asked to write.
+    #[cfg(not(feature = "krunvm"))]
+    pub(super) fn host_manager_in(
+        output_cap: usize,
+        fail_stop: bool,
+        state_dir: Option<std::path::PathBuf>,
+    ) -> (
+        Arc<SandboxManager>,
+        Recorded<String>,
+        Recorded<DeliveredSecrets>,
+    ) {
         use crate::backend::image::ImageStore;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
@@ -6337,23 +6442,26 @@ pub(crate) mod tests {
         std::mem::forget(dir);
         let inner = crate::backend::krunvm::KrunvmBackend::with_image_store_for_test(path, store);
         let exec_users = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let secrets = Arc::new(std::sync::Mutex::new(Vec::new()));
         let backend: Arc<dyn Backend> = Arc::new(HostBackend {
             inner,
             fail_stop,
             exec_users: Arc::clone(&exec_users),
+            secrets: Arc::clone(&secrets),
         });
-        let manager = Arc::new(
-            SandboxManager::new(
-                backend,
-                Arc::new(Broker::new()),
-                HOST_MANAGER_MAX_SANDBOXES,
-                /* allow_host_mounts = */ false,
-                crate::config::NetworkBackendChoice::Smoltcp,
-            )
-            .with_output_cap(output_cap)
-            .with_stop_grace(TEST_STOP_GRACE),
-        );
-        (manager, exec_users)
+        let mut manager = SandboxManager::new(
+            backend,
+            Arc::new(Broker::new()),
+            HOST_MANAGER_MAX_SANDBOXES,
+            /* allow_host_mounts = */ false,
+            crate::config::NetworkBackendChoice::Smoltcp,
+        )
+        .with_output_cap(output_cap)
+        .with_stop_grace(TEST_STOP_GRACE);
+        if let Some(dir) = state_dir {
+            manager = manager.with_data_dir(dir);
+        }
+        (Arc::new(manager), exec_users, secrets)
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -7883,4 +7991,6 @@ pub(crate) mod tests {
 
     #[cfg(not(feature = "krunvm"))]
     mod ports;
+    #[cfg(not(feature = "krunvm"))]
+    mod secrets;
 }

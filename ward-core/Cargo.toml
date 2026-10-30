@@ -87,6 +87,9 @@ rustix = { version = "1", features = ["pty", "termios"] }
 # / Backend traits with a no-op, which requires the macro at test-crate scope.
 async-trait = "0.1"
 
+# tracing-subscriber: the secret leak test captures the daemon's log output.
+tracing-subscriber = "0.3"
+
 # tokio-test: assert_ready!, assert_pending!, mock I/O streams, scripted streams.
 # Used for testing async code paths that depend on poll semantics.
 tokio-test = "0.4"

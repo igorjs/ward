@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest};
+use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest, SecretFile};
 
 use crate::attach::{self, require_exit, require_terminal};
 use crate::client::{self, Resolved};
@@ -114,6 +114,7 @@ pub struct ExecSpec {
     pub user: String,
     pub interactive: bool,
     pub tty: bool,
+    pub secrets: Vec<SecretFile>,
 }
 
 /// Runs a command in a sandbox and returns its exit code.
@@ -134,6 +135,7 @@ pub async fn exec(
         env: spec.env,
         workdir: spec.workdir,
         user: spec.user,
+        secrets: spec.secrets,
         ..Default::default()
     };
     require_exit(attach::attach(&mut c, &target, start, spec.interactive).await?)

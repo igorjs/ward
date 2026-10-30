@@ -32,10 +32,39 @@
 /// client stubs for the `ward.v1` package.
 pub mod pb {
     tonic::include_proto!("ward.v1");
+
+    impl std::fmt::Debug for SecretFile {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SecretFile")
+                .field("name", &self.name)
+                .field("content", &format_args!("<{} bytes>", self.content.len()))
+                .finish()
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn given_a_secret_when_debug_printed_then_the_content_is_not_shown() {
+        // Arrange
+        let request = super::pb::CreateSandboxRequest {
+            secrets: vec![super::pb::SecretFile {
+                name: "token".into(),
+                content: b"hunter2-value".to_vec(),
+            }],
+            ..Default::default()
+        };
+
+        // Act
+        let shown = format!("{request:?}");
+
+        // Assert
+        assert!(shown.contains("token"));
+        assert!(!shown.contains("hunter2"));
+        assert!(!shown.contains("104"), "byte values leaked: {shown}");
+    }
+
     use super::pb::{CreateSandboxRequest, SandboxInfo, SandboxStatus};
     use prost::Message;
 
@@ -102,7 +131,7 @@ mod tests {
     mod attach {
         use super::super::pb::{
             AttachData, AttachExit, AttachMessage, AttachMode, AttachReplayEnd, AttachResize,
-            AttachSignal, AttachStart, AttachStdin, AttachStream, attach_message::Kind,
+            AttachSignal, AttachStart, AttachStdin, AttachStream, SecretFile, attach_message::Kind,
         };
         use prost::Message;
 
@@ -175,6 +204,10 @@ mod tests {
                 user: "1000:1000".into(),
                 replay: true,
                 follow: true,
+                secrets: vec![SecretFile {
+                    name: "token".into(),
+                    content: b"s3cret".to_vec(),
+                }],
             };
 
             // Act

@@ -31,6 +31,7 @@ message Request {
     ArchiveEnd archive_end = 10;
     Top top = 11;
     Stats stats = 12;
+    PutSecrets put_secrets = 13;
   }
 }
 
@@ -116,6 +117,19 @@ message ArchiveDone {}
 // Agent -> daemon: the transfer failed; the message says why.
 message ArchiveError {
   string message = 1;
+}
+
+// Must be the first and only frame on a connection. The agent mounts a tmpfs
+// on /run/secrets if none is there yet, writes each file as mode 0400 owned
+// by `user` (empty = root), and answers with one ArchiveDone or ArchiveError.
+message PutSecrets {
+  string user = 1;                      // name|uid[:group|gid]
+  repeated SecretFile files = 2;
+}
+
+message SecretFile {
+  string name = 1;                      // one path component
+  bytes content = 2;
 }
 
 // Must be the first and only frame on a connection. The agent answers with
