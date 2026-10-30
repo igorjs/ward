@@ -608,7 +608,7 @@ message SandboxEvent {
   string action = 1;
   string sandbox_id = 2;
   google.protobuf.Timestamp at = 3;
-  // image, name and, for die, exitCode.
+  // image, name and, for die, exitCode and reason (an EndReason name).
   map<string, string> attributes = 4;
   // Events this reader missed just before this one because it read too
   // slowly. Zero when none.

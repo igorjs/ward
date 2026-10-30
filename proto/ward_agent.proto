@@ -198,4 +198,7 @@ message Line {
 message Exited {
   int32 code = 1;
   int32 wait_status = 2;
+  // Processes the guest kernel OOM killer ended while this one ran. 0 when
+  // none, or when the guest cannot count them.
+  uint64 oom_kills = 3;
 }

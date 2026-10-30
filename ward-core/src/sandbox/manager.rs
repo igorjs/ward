@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 
@@ -393,6 +394,9 @@ struct MainProcess {
     control_tx: Option<mpsc::Sender<ProcessControl>>,
     /// Raw `wait(2)` status, set once the process ends.
     exit: watch::Receiver<Option<i32>>,
+    /// Whether the guest OOM killer ended a process during the run. Read only
+    /// after `exit` is set, which happens after this is stored.
+    oom_killed: Arc<AtomicBool>,
 }
 
 /// Bit position of the exit code inside a raw wait(2) status.
@@ -438,12 +442,13 @@ pub(crate) fn decode_wait_status(raw: i32) -> i32 {
     }
 }
 
-/// Why a main process with raw `wait(2)` status `raw` ended.
-fn end_reason_of(raw: i32) -> EndReason {
-    if raw & WAIT_STATUS_SIGNAL_MASK == 0 {
-        EndReason::Exited
-    } else {
-        EndReason::Signal
+/// Why a main process with raw `wait(2)` status `raw` ended. A SIGKILL while
+/// the guest OOM killer was active is the OOM killer's doing.
+fn end_reason_of(raw: i32, oom_killed: bool) -> EndReason {
+    match raw & WAIT_STATUS_SIGNAL_MASK {
+        0 => EndReason::Exited,
+        SIGKILL if oom_killed => EndReason::Oom,
+        _ => EndReason::Signal,
     }
 }
 
@@ -500,11 +505,13 @@ async fn pump_main_output(
     mut events: mpsc::Receiver<StreamEvent>,
     output: Arc<OutputBuffer>,
     exit: watch::Sender<Option<i32>>,
+    oom_killed: Arc<AtomicBool>,
 ) {
     while let Some(event) = events.recv().await {
         if let Some(chunk) = event_chunk(&event) {
             output.push(chunk);
         } else {
+            oom_killed.store(event.oom_kills > 0, Ordering::Release);
             exit.send_replace(event_wait_status(&event));
             return;
         }
@@ -619,7 +626,7 @@ async fn remove_if_still_ended(teardown: &Teardown, id: &str) {
         drop(entry.ttl_handle.take());
         SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
     };
-    match SandboxManager::finish_cleanup(removed, teardown, id).await {
+    match SandboxManager::finish_cleanup(removed, teardown, id, None).await {
         Ok(()) => tracing::info!(sandbox_id = %id, "removed sandbox after its exited TTL"),
         Err(e) => {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot remove sandbox after its exited TTL")
@@ -691,6 +698,7 @@ async fn mark_exited_on_main_end(
     id: String,
     pid: String,
     mut exit: watch::Receiver<Option<i32>>,
+    oom_killed: Arc<AtomicBool>,
     auto_remove: bool,
 ) {
     let Ok(raw) = exit.wait_for(Option::is_some).await.map(|status| *status) else {
@@ -714,13 +722,15 @@ async fn mark_exited_on_main_end(
             entry,
             crate::protocol::SandboxStatus::Exited,
             Some(code),
-            raw.map(end_reason_of),
+            raw.map(|raw| end_reason_of(raw, oom_killed.load(Ordering::Acquire))),
         )
         .await
         {
             Ok(()) => {
                 tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited");
-                let died = SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                let mut died =
+                    SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                died.reason = entry.meta.end_reason;
                 teardown.events.emit(died);
             }
             Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
@@ -753,7 +763,7 @@ async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
         }
         SandboxManager::detach_entry(entries.remove(id), /* from_timeout = */ false)
     };
-    let result = SandboxManager::finish_cleanup(removed, teardown, id).await;
+    let result = SandboxManager::finish_cleanup(removed, teardown, id, None).await;
     match result {
         Ok(()) => {
             tracing::info!(sandbox_id = %id, "auto-removed sandbox after its main process ended")
@@ -1845,12 +1855,16 @@ impl SandboxManager {
     /// the sandbox has no main process, and unknown when it never reported an
     /// exit even after SIGKILL.
     async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> MainEnd {
-        let (control, mut exit) = {
+        let (control, mut exit, oom_killed) = {
             let mains = self.mains.read().await;
             let Some(main) = mains.get(id) else {
                 return MainEnd::NoMain;
             };
-            (main.control_tx.clone(), main.exit.clone())
+            (
+                main.control_tx.clone(),
+                main.exit.clone(),
+                Arc::clone(&main.oom_killed),
+            )
         };
         if let Some(control) = &control {
             let _ = control.send(ProcessControl::Signal(SIGTERM)).await;
@@ -1864,7 +1878,8 @@ impl SandboxManager {
         }
         let raw = *exit.borrow();
         raw.map_or(MainEnd::Unknown, |raw| {
-            MainEnd::Exited(decode_wait_status(raw), end_reason_of(raw))
+            let oom_killed = oom_killed.load(Ordering::Acquire);
+            MainEnd::Exited(decode_wait_status(raw), end_reason_of(raw, oom_killed))
         })
     }
 
@@ -1993,8 +2008,14 @@ impl SandboxManager {
             .map(|m| Arc::clone(&m.output))
             .unwrap_or_else(|| OutputBuffer::new(self.output_cap));
         let (exit_tx, exit) = watch::channel(None);
+        let oom_killed = Arc::new(AtomicBool::new(false));
         if let Some(events) = handle.output_rx {
-            tokio::spawn(pump_main_output(events, Arc::clone(&output), exit_tx));
+            tokio::spawn(pump_main_output(
+                events,
+                Arc::clone(&output),
+                exit_tx,
+                Arc::clone(&oom_killed),
+            ));
         }
         tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
         tokio::spawn(mark_exited_on_main_end(
@@ -2003,6 +2024,7 @@ impl SandboxManager {
             id.to_string(),
             handle.pid.clone(),
             exit.clone(),
+            Arc::clone(&oom_killed),
             spec.auto_remove,
         ));
         mains.insert(
@@ -2013,6 +2035,7 @@ impl SandboxManager {
                 stdin_tx: handle.stdin_tx,
                 control_tx: handle.control_tx,
                 exit,
+                oom_killed,
             },
         );
         Ok(())
@@ -2421,7 +2444,8 @@ impl SandboxManager {
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
         let removed = Self::detach_entry(teardown.entries.write().await.remove(id), from_timeout);
-        Self::finish_cleanup(removed, teardown, id).await
+        let reason = from_timeout.then_some(EndReason::Timeout);
+        Self::finish_cleanup(removed, teardown, id, reason).await
     }
 
     /// Stop the removed entry's timer unless that timer is the caller.
@@ -2441,10 +2465,12 @@ impl SandboxManager {
     }
 
     /// Drop everything tied to a sandbox whose entry has left `entries`.
+    /// `reason` names why a running sandbox is being killed, for its `die`.
     async fn finish_cleanup(
         mut removed: Option<RemovedEntry>,
         teardown: &Teardown,
         id: &str,
+        reason: Option<EndReason>,
     ) -> std::result::Result<(), BackendError> {
         teardown
             .processes
@@ -2466,9 +2492,9 @@ impl SandboxManager {
             // Removing a running sandbox kills it, as `docker rm -f` does.
             if meta.status == crate::protocol::SandboxStatus::Running {
                 let code = meta.exit_code.unwrap_or(SIGNAL_EXIT_BASE + SIGKILL);
-                teardown
-                    .events
-                    .emit(SandboxEvent::new(EventAction::Die, &meta).with_exit_code(code));
+                let mut died = SandboxEvent::new(EventAction::Die, &meta).with_exit_code(code);
+                died.reason = reason;
+                teardown.events.emit(died);
             }
             teardown
                 .events
@@ -6045,6 +6071,9 @@ pub(crate) mod tests {
     /// A main command that starts once, then fails slowly on later runs.
     #[cfg(not(feature = "krunvm"))]
     const FAILS_LATER_COMMAND: &str = "ward-test-fails-later";
+    /// A command naming this reports one guest OOM kill when it ends.
+    #[cfg(not(feature = "krunvm"))]
+    const OOM_MARKER: &str = "ward-test-oom";
     #[cfg(not(feature = "krunvm"))]
     const SLOW_EXEC_FAILURE: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -6085,6 +6114,7 @@ pub(crate) mod tests {
             line: String::new(),
             exit_code: code,
             wait_status: status,
+            oom_kills: 0,
             timestamp: std::time::SystemTime::now(),
             duration_ms: 0,
         }
@@ -6217,6 +6247,7 @@ pub(crate) mod tests {
                 child
             };
             drop(cmd);
+            let oom_kills = u64::from(command.iter().any(|arg| arg.contains(OOM_MARKER)));
             let pid = child.id().expect("pid").to_string();
             let (control_tx, mut control_rx) = mpsc::channel::<ProcessControl>(16);
             let os_pid = rustix::process::Pid::from_raw(pid.parse().expect("numeric pid"));
@@ -6259,11 +6290,12 @@ pub(crate) mod tests {
                 for reader in readers {
                     let _ = reader.await;
                 }
-                let event = stream_event(
+                let mut event = stream_event(
                     StreamEventKind::Exit,
                     status.code(),
                     Some(status.into_raw()),
                 );
+                event.oom_kills = oom_kills;
                 let _ = output_tx.send(event).await;
             });
             Ok(crate::backend::ProcessHandle {
@@ -7071,6 +7103,45 @@ pub(crate) mod tests {
     }
 
     #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::sigkill_after_oom_kill("kill -9 $$", PbEndReason::Oom, SIGKILL_EXIT_CODE)]
+    #[case::clean_exit_despite_oom_kill("exit 7", PbEndReason::Exited, 7)]
+    #[tokio::test]
+    async fn given_guest_oom_kill_when_main_ends_then_only_a_sigkill_reads_as_oom(
+        #[case] script: &str,
+        #[case] want: PbEndReason,
+        #[case] code: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let script = format!(": {OOM_MARKER}; {script}");
+
+        // Act
+        let id = create_with_command(&mgr, &["sh", "-c", &script], false).await;
+
+        // Assert
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        let info = mgr.get(&id).await.expect("get");
+        assert_eq!(info.end_reason, want as i32);
+        assert_eq!(info.exit_code, Some(code));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_oom_killed_main_when_it_ends_then_the_die_event_carries_the_reason() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let script = format!(": {OOM_MARKER}; kill -9 $$");
+
+        // Act
+        let id = create_with_command(&mgr, &["sh", "-c", &script], false).await;
+
+        // Assert
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        assert_eq!(die_reason(&mgr).await, Some(EndReason::Oom));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
     #[tokio::test]
     async fn given_running_command_when_stopped_then_the_reason_is_signal() {
         // Arrange
@@ -7792,6 +7863,23 @@ pub(crate) mod tests {
         next_actions(&mut reader, count).await
     }
 
+    /// The reason on the first `die` the manager has reported.
+    #[cfg(not(feature = "krunvm"))]
+    async fn die_reason(mgr: &SandboxManager) -> Option<EndReason> {
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+        loop {
+            let next = tokio::time::timeout(TEST_POLL_DEADLINE, reader.next())
+                .await
+                .expect("a die event")
+                .expect("open log");
+            if next.event.action == EventAction::Die {
+                return next.event.reason;
+            }
+        }
+    }
+
     #[cfg(not(feature = "krunvm"))]
     #[tokio::test]
     async fn given_a_running_sandbox_when_force_removed_then_die_137_comes_before_destroy() {
@@ -7833,6 +7921,41 @@ pub(crate) mod tests {
         let got = history(&mgr, 4).await;
         assert_eq!(got[2], (EventAction::Die, Some(137)));
         assert_eq!(got[3].0, EventAction::Destroy);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_its_timeout_expires_then_die_names_the_timeout() {
+        // Arrange
+        let mgr = build_manager(1);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            resources: Some(PbResourceLimits {
+                timeout_seconds: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // Act
+        mgr.create(req, "").await.expect("create");
+
+        // Assert
+        assert_eq!(die_reason(&mgr).await, Some(EndReason::Timeout));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_running_sandbox_when_force_removed_then_die_has_no_reason() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+
+        // Act
+        mgr.remove(&id).await.expect("remove");
+
+        // Assert
+        assert_eq!(die_reason(&mgr).await, None);
     }
 
     #[cfg(not(feature = "krunvm"))]

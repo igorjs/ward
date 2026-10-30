@@ -13,6 +13,7 @@ use std::time::SystemTime;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::protocol::EndReason;
 use crate::sandbox::store::SandboxMeta;
 
 /// Events the channel holds for a slow reader, and the history kept for
@@ -50,6 +51,8 @@ pub struct SandboxEvent {
     pub at: SystemTime,
     /// Set on `die`.
     pub exit_code: Option<i32>,
+    /// Set on `die` when the cause is known.
+    pub reason: Option<EndReason>,
 }
 
 impl SandboxEvent {
@@ -61,6 +64,7 @@ impl SandboxEvent {
             image: meta.options.image.clone(),
             at: SystemTime::now(),
             exit_code: None,
+            reason: None,
         }
     }
 
@@ -181,6 +185,7 @@ mod tests {
             image: String::new(),
             at: at(sandbox),
             exit_code: None,
+            reason: None,
         }
     }
 

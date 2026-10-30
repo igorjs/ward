@@ -185,6 +185,19 @@ pub enum EndReason {
     EgressPolicy,
 }
 
+impl EndReason {
+    /// The name `ward inspect` and `ward events` show.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exited => "exited",
+            Self::Signal => "signal",
+            Self::Oom => "oom",
+            Self::Timeout => "timeout",
+            Self::EgressPolicy => "egress-policy",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxStatus {
@@ -235,6 +248,8 @@ pub struct StreamEvent {
     pub exit_code: Option<i32>,
     /// Raw `wait(2)` status on an `Exit` event, when the backend reports it.
     pub wait_status: Option<i32>,
+    /// Processes the guest OOM killer ended during an `Exit` event's run.
+    pub oom_kills: u64,
     pub timestamp: SystemTime,
     pub duration_ms: u64,
 }

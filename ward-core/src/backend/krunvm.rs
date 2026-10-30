@@ -1515,6 +1515,7 @@ fn stub_exec_handle(pid: String, sandbox_id: &str, command: Vec<String>) -> Proc
                 line: format!("stub: {cmd_for_log}"),
                 exit_code: None,
                 wait_status: None,
+                oom_kills: 0,
                 timestamp: std::time::SystemTime::now(),
                 duration_ms: 0,
             })
@@ -1526,6 +1527,7 @@ fn stub_exec_handle(pid: String, sandbox_id: &str, command: Vec<String>) -> Proc
                 line: String::new(),
                 exit_code: Some(0),
                 wait_status: Some(0),
+                oom_kills: 0,
                 timestamp: std::time::SystemTime::now(),
                 duration_ms: started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
             })
