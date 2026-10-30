@@ -392,15 +392,16 @@ fn run_as(
 /// The sandbox cgroup every child joins, set once at agent start.
 static SANDBOX_CGROUP: OnceLock<cgroup::SandboxCgroup> = OnceLock::new();
 
-/// Cap the sandbox at `pids_max` processes. Without cgroup v2 and its pids
-/// controller in the guest kernel the cap is not enforced; the returned
-/// error says why and the agent keeps running.
+/// Put the sandbox in one cgroup, capped at `pids_max` processes when given,
+/// with memory accounting so OOM kills are counted. Without cgroup v2 and
+/// its pids controller in the guest kernel the cap is not enforced; the
+/// returned error says why and the agent keeps running.
 ///
 /// # Errors
 ///
 /// Fails with a plain-language reason when the cgroup cannot be set up.
 #[cfg(target_os = "linux")]
-pub fn limit_pids(pids_max: u32) -> Result<(), String> {
+pub fn setup_cgroup(pids_max: Option<u32>) -> Result<(), String> {
     let root = Path::new(cgroup::CGROUP_ROOT);
     cgroup::ensure_mounted(root).map_err(|e| format!("mount cgroup2: {e}"))?;
     let group = cgroup::setup(root, pids_max).map_err(|e| e.to_string())?;
@@ -409,7 +410,7 @@ pub fn limit_pids(pids_max: u32) -> Result<(), String> {
 }
 
 /// Make the child move itself into the sandbox cgroup before it runs, so
-/// nothing it forks can escape the cap. A failed move fails the spawn.
+/// nothing it forks can escape the cap or the OOM accounting. A failed move fails the spawn.
 fn join_pids_cgroup(cmd: &mut Command) {
     let Some(group) = SANDBOX_CGROUP.get().cloned() else {
         return;
@@ -598,17 +599,19 @@ async fn settled_oom_kills(
     counter: &oom::OomCounter,
     before: oom::OomReading,
     status: Option<ExitStatus>,
-) -> u64 {
-    let mut kills = oom::kills_since(before, counter.read());
+) -> (u64, oom::OomReading) {
+    let mut after = counter.read();
+    let mut kills = oom::kills_since(before, after);
     let killed = status.and_then(|s| s.signal()) == Some(SIGKILL_NUMBER);
     for _ in 0..OOM_REREADS {
         if kills > 0 || !killed {
             break;
         }
         tokio::time::sleep(OOM_REREAD_DELAY).await;
-        kills = oom::kills_since(before, counter.read());
+        after = counter.read();
+        kills = oom::kills_since(before, after);
     }
-    kills
+    (kills, after)
 }
 
 /// The OOM kill counter for this guest.
@@ -760,7 +763,13 @@ where
 
     // Drain output before announcing exit so every byte precedes Exited.
     drain_outputs(output_tasks, exec.tty).await;
-    let oom_kills = settled_oom_kills(&oom_counter, oom_before, status).await;
+    let (oom_kills, oom_after) = settled_oom_kills(&oom_counter, oom_before, status).await;
+    tracing::info!(
+        before = ?oom_before,
+        after = ?oom_after,
+        oom_kills,
+        "process ended, OOM kill counters"
+    );
     let _ = event_tx.send(exit_event(status, oom_kills)).await;
 
     drop(event_tx);

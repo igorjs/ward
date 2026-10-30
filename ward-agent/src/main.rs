@@ -27,11 +27,13 @@ async fn main() -> std::io::Result<()> {
     let args = ward_agent::parse_args(std::env::args().skip(1))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     ward_agent::mount_all(&args.mounts)?;
-    if let Some(pids_max) = args.pids_max {
-        match ward_agent::limit_pids(pids_max) {
-            Ok(()) => tracing::info!(pids_max, "sandbox pids limit enforced"),
-            Err(e) => tracing::warn!(pids_max, error = %e, "sandbox pids limit NOT enforced"),
-        }
+    match ward_agent::setup_cgroup(args.pids_max) {
+        Ok(()) => tracing::info!(pids_max = ?args.pids_max, "sandbox cgroup ready"),
+        Err(e) => tracing::warn!(
+            pids_max = ?args.pids_max,
+            error = %e,
+            "sandbox cgroup NOT set up: no pids limit and OOM kills counted guest-wide"
+        ),
     }
     if ward_agent::net::interface_present() {
         match ward_agent::net::configure() {

@@ -25,6 +25,7 @@ const PIDS_MAX_FILE: &str = "pids.max";
 const PIDS_CONTROLLER: &str = "pids";
 const ENABLE_PIDS: &str = "+pids";
 const MEMORY_CONTROLLER: &str = "memory";
+const ENABLE_MEMORY: &str = "+memory";
 const ENABLE_PIDS_AND_MEMORY: &str = "+pids +memory";
 /// Writing pid 0 to `cgroup.procs` moves the writing process itself.
 const SELF_PID: &[u8] = b"0";
@@ -96,28 +97,29 @@ pub fn ensure_mounted(root: &Path) -> io::Result<()> {
     .map_err(io::Error::from)
 }
 
-/// Create the sandbox cgroup under `root` with a cap of `pids_max`.
+/// Create the sandbox cgroup under `root`, capped at `pids_max` processes
+/// when given. The memory controller is enabled where available so the
+/// cgroup reports OOM kills, with or without a cap.
 ///
 /// # Errors
 ///
-/// [`CgroupError::Unsupported`] when `root` is not a cgroup v2 hierarchy
-/// with the pids controller; [`CgroupError::Io`] when the kernel refuses a
-/// step.
-pub fn setup(root: &Path, pids_max: u32) -> Result<SandboxCgroup, CgroupError> {
+/// [`CgroupError::Unsupported`] when `root` is not a cgroup v2 hierarchy, or
+/// lacks the pids controller a cap needs; [`CgroupError::Io`] when the kernel
+/// refuses a step.
+pub fn setup(root: &Path, pids_max: Option<u32>) -> Result<SandboxCgroup, CgroupError> {
     let controllers = std::fs::read_to_string(root.join(CONTROLLERS_FILE)).map_err(|e| {
         CgroupError::Unsupported(format!("no cgroup v2 at {}: {e}", root.display()))
     })?;
-    if !controllers.split_whitespace().any(|c| c == PIDS_CONTROLLER) {
+    let has = |name: &str| controllers.split_whitespace().any(|c| c == name);
+    if pids_max.is_some() && !has(PIDS_CONTROLLER) {
         return Err(CgroupError::Unsupported(
             "the pids controller is not built in".to_string(),
         ));
     }
-    let memory = controllers
-        .split_whitespace()
-        .any(|c| c == MEMORY_CONTROLLER)
-        && enable_controllers(root, ENABLE_PIDS_AND_MEMORY).is_ok();
-    if !memory {
-        enable_controllers(root, ENABLE_PIDS).map_err(io_step("enable pids controller"))?;
+    let pids = pids_max.is_some();
+    let memory = has(MEMORY_CONTROLLER) && enable_controllers(root, pids, true).is_ok();
+    if !memory && pids {
+        enable_controllers(root, true, false).map_err(io_step("enable pids controller"))?;
     }
 
     let group = group_dir(root);
@@ -126,8 +128,10 @@ pub fn setup(root: &Path, pids_max: u32) -> Result<SandboxCgroup, CgroupError> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(io_step("create cgroup")(e)),
     }
-    write_file(&group.join(PIDS_MAX_FILE), &pids_max.to_string())
-        .map_err(io_step("write pids.max"))?;
+    if let Some(pids_max) = pids_max {
+        write_file(&group.join(PIDS_MAX_FILE), &pids_max.to_string())
+            .map_err(io_step("write pids.max"))?;
+    }
     let procs = OpenOptions::new()
         .write(true)
         .open(group.join(PROCS_FILE))
@@ -143,7 +147,15 @@ pub fn group_dir(root: &Path) -> PathBuf {
     root.join(SANDBOX_GROUP)
 }
 
-fn enable_controllers(root: &Path, enable: &str) -> io::Result<()> {
+/// Turn on the wanted controllers for the cgroups below `root` in one write,
+/// so the kernel applies all of them or none.
+fn enable_controllers(root: &Path, pids: bool, memory: bool) -> io::Result<()> {
+    let enable = match (pids, memory) {
+        (true, true) => ENABLE_PIDS_AND_MEMORY,
+        (true, false) => ENABLE_PIDS,
+        (false, true) => ENABLE_MEMORY,
+        (false, false) => return Ok(()),
+    };
     write_file(&root.join(SUBTREE_CONTROL_FILE), enable)
 }
 
@@ -172,7 +184,7 @@ mod tests {
     fn given_pids_controller_when_setup_then_cap_and_subtree_are_written() {
         let root = fake_root("cpu memory pids\n");
 
-        let cgroup = setup(root.path(), 20);
+        let cgroup = setup(root.path(), Some(20));
 
         assert!(cgroup.is_ok());
         let group = root.path().join(SANDBOX_GROUP);
@@ -187,10 +199,37 @@ mod tests {
     }
 
     #[test]
+    fn given_no_cap_when_setup_then_memory_is_enabled_and_pids_max_is_untouched() {
+        let root = fake_root("cpu memory pids\n");
+
+        let cgroup = setup(root.path(), None).unwrap();
+
+        let group = root.path().join(SANDBOX_GROUP);
+        assert_eq!(cgroup.memory_dir(), Some(group.as_path()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(SUBTREE_CONTROL_FILE)).unwrap(),
+            ENABLE_MEMORY
+        );
+        assert_eq!(
+            std::fs::read_to_string(group.join(PIDS_MAX_FILE)).unwrap(),
+            "max"
+        );
+    }
+
+    #[test]
+    fn given_no_cap_and_no_memory_controller_when_setup_then_it_still_succeeds() {
+        let root = fake_root("cpu\n");
+
+        let cgroup = setup(root.path(), None).unwrap();
+
+        assert_eq!(cgroup.memory_dir(), None);
+    }
+
+    #[test]
     fn given_no_pids_controller_when_setup_then_unsupported() {
         let root = fake_root("cpu memory\n");
 
-        let err = setup(root.path(), 20).err().expect("must fail");
+        let err = setup(root.path(), Some(20)).err().expect("must fail");
 
         assert!(matches!(err, CgroupError::Unsupported(_)), "{err}");
         assert!(err.to_string().contains("pids controller"));
@@ -200,7 +239,7 @@ mod tests {
     fn given_no_cgroup_v2_when_setup_then_unsupported() {
         let root = tempfile::tempdir().unwrap();
 
-        let err = setup(root.path(), 20).err().expect("must fail");
+        let err = setup(root.path(), Some(20)).err().expect("must fail");
 
         assert!(matches!(err, CgroupError::Unsupported(_)), "{err}");
     }
@@ -209,8 +248,8 @@ mod tests {
     fn given_existing_group_when_setup_twice_then_it_succeeds() {
         let root = fake_root("pids");
 
-        assert!(setup(root.path(), 20).is_ok());
-        assert!(setup(root.path(), 30).is_ok());
+        assert!(setup(root.path(), Some(20)).is_ok());
+        assert!(setup(root.path(), Some(30)).is_ok());
 
         let group = root.path().join(SANDBOX_GROUP);
         assert_eq!(
@@ -222,7 +261,7 @@ mod tests {
     #[test]
     fn given_cgroup_when_join_self_then_pid_zero_is_written_to_procs() {
         let root = fake_root("pids");
-        let cgroup = setup(root.path(), 20).unwrap();
+        let cgroup = setup(root.path(), Some(20)).unwrap();
 
         cgroup.join_self().unwrap();
 

@@ -111,7 +111,7 @@ mod tests {
         if let Some(events) = events {
             std::fs::write(group.join(MEMORY_EVENTS_FILE), events).unwrap();
         }
-        let cgroup = crate::cgroup::setup(root.path(), 20).unwrap();
+        let cgroup = crate::cgroup::setup(root.path(), Some(20)).unwrap();
         (root, cgroup)
     }
 
