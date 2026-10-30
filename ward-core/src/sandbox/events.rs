@@ -28,6 +28,7 @@ pub enum EventAction {
     Die,
     Stop,
     Destroy,
+    Update,
 }
 
 impl EventAction {
@@ -38,6 +39,7 @@ impl EventAction {
             Self::Die => "die",
             Self::Stop => "stop",
             Self::Destroy => "destroy",
+            Self::Update => "update",
         }
     }
 }

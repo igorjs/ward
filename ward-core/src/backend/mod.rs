@@ -261,6 +261,12 @@ pub trait Backend: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Add `domains` to the egress allowlist of the sandbox, live and for
+    /// later boots. Backends with no policed network have nothing to change.
+    async fn add_egress_allow(&self, _sandbox_id: &str, _domains: &[String]) -> Result<()> {
+        Ok(())
+    }
+
     /// Read the guest's CPU, memory and process counters.
     async fn stats(&self, sandbox_id: &str) -> Result<GuestStats>;
 
