@@ -49,6 +49,9 @@ const BOOT_WRITTEN_PATHS: &[&str] = &[AGENT_GUEST_PATH];
 /// Guest-agent argument that introduces one mount.
 #[cfg(feature = "krunvm")]
 const AGENT_MOUNT_ARG: &str = "--mount";
+/// Guest-agent argument that caps the sandbox's process count.
+#[cfg(feature = "krunvm")]
+const AGENT_PIDS_MAX_ARG: &str = "--pids-max";
 /// Mode words the guest agent accepts after a mount target.
 #[cfg(feature = "krunvm")]
 const MOUNT_MODE_RO: &str = "ro";
@@ -1208,6 +1211,13 @@ impl KrunvmBackend {
                 path: std::path::PathBuf::from(&m.source),
                 read_only: m.readonly,
             });
+        }
+
+        if opts.resources.pids_max > 0 {
+            exec_args.extend([
+                AGENT_PIDS_MAX_ARG.to_string(),
+                opts.resources.pids_max.to_string(),
+            ]);
         }
 
         let (net, inherit) = match net_fd {
