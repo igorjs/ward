@@ -847,6 +847,7 @@ mod tests {
             line: String::new(),
             exit_code: None,
             wait_status: None,
+            oom_kills: 0,
             timestamp: std::time::SystemTime::now(),
             duration_ms: 0,
         };

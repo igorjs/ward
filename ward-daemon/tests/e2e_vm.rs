@@ -259,6 +259,42 @@ fn given_workdir_when_exec_then_command_runs_there() {
     assert_eq!(r.stdout.trim(), "/etc");
 }
 
+const OOM_MEMORY: &str = "128m";
+const OOM_EXIT_CODE: i64 = 137;
+const OOM_DEADLINE: Duration = Duration::from_secs(120);
+/// Doubles a shell variable until the guest kernel kills the process.
+const ALLOCATE_FOREVER: &str = "x=0123456789; while :; do x=$x$x; done";
+
+#[test]
+fn given_a_memory_hungry_main_process_when_the_guest_runs_out_then_inspect_reports_oom() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let mut cmd = d.cli();
+    cmd.args([
+        "run",
+        "-d",
+        "-m",
+        OOM_MEMORY,
+        &image(),
+        "sh",
+        "-c",
+        ALLOCATE_FOREVER,
+    ]);
+    let id = run_ok(cmd).trim().to_string();
+
+    wait_until("the sandbox to exit", OOM_DEADLINE, || {
+        listed(&d, &id).is_some_and(|row| row.to_lowercase().contains("exited"))
+    });
+
+    let mut inspect = d.cli();
+    inspect.args(["inspect", &id]);
+    let found: serde_json::Value = serde_json::from_str(&run_ok(inspect)).expect("inspect json");
+    let state = &found[0]["State"];
+    assert_eq!(state["OOMKilled"], true, "{state}");
+    assert_eq!(state["Reason"], "oom", "{state}");
+    assert_eq!(state["ExitCode"], OOM_EXIT_CODE, "{state}");
+}
+
 #[test]
 fn given_memory_and_cpus_when_create_then_guest_sees_them() {
     require_vm!();

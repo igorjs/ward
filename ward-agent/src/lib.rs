@@ -25,6 +25,7 @@ mod archive;
 // Only the Linux build calls into it; other hosts compile it for the tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod cgroup;
+mod oom;
 mod pty;
 mod secrets;
 mod stats;
@@ -232,7 +233,11 @@ fn synthetic_exit_event(code: i32) -> Event {
 
 fn exited_event(code: i32, wait_status: i32) -> Event {
     Event {
-        kind: Some(event::Kind::Exited(Exited { code, wait_status })),
+        kind: Some(event::Kind::Exited(Exited {
+            code,
+            wait_status,
+            oom_kills: 0,
+        })),
     }
 }
 
@@ -380,7 +385,7 @@ fn run_as(
 }
 
 /// The sandbox cgroup every child joins, set once at agent start.
-static PIDS_CGROUP: OnceLock<cgroup::PidsCgroup> = OnceLock::new();
+static SANDBOX_CGROUP: OnceLock<cgroup::SandboxCgroup> = OnceLock::new();
 
 /// Cap the sandbox at `pids_max` processes. Without cgroup v2 and its pids
 /// controller in the guest kernel the cap is not enforced; the returned
@@ -394,14 +399,14 @@ pub fn limit_pids(pids_max: u32) -> Result<(), String> {
     let root = Path::new(cgroup::CGROUP_ROOT);
     cgroup::ensure_mounted(root).map_err(|e| format!("mount cgroup2: {e}"))?;
     let group = cgroup::setup(root, pids_max).map_err(|e| e.to_string())?;
-    let _ = PIDS_CGROUP.set(group);
+    let _ = SANDBOX_CGROUP.set(group);
     Ok(())
 }
 
 /// Make the child move itself into the sandbox cgroup before it runs, so
 /// nothing it forks can escape the cap. A failed move fails the spawn.
 fn join_pids_cgroup(cmd: &mut Command) {
-    let Some(group) = PIDS_CGROUP.get().cloned() else {
+    let Some(group) = SANDBOX_CGROUP.get().cloned() else {
         return;
     };
     // SAFETY: the closure runs between fork and exec and only makes one
@@ -570,11 +575,20 @@ async fn apply_request(
 
 /// The `Exited` event for a finished `wait`. A failed wait has no kernel
 /// status, so it is reported like any other agent-side failure.
-fn exit_event(status: Option<ExitStatus>) -> Event {
-    match status {
+fn exit_event(status: Option<ExitStatus>, oom_kills: u64) -> Event {
+    let mut event = match status {
         Some(s) => exited_event(s.code().unwrap_or(EXIT_UNKNOWN), s.into_raw()),
         None => synthetic_exit_event(EXIT_UNKNOWN),
+    };
+    if let Some(event::Kind::Exited(exited)) = &mut event.kind {
+        exited.oom_kills = oom_kills;
     }
+    event
+}
+
+/// The OOM kill counter for this guest.
+fn oom_counter() -> oom::OomCounter {
+    oom::OomCounter::for_cgroup(SANDBOX_CGROUP.get())
 }
 
 /// Wait for the output pumps. On a pty a background job in another process
@@ -667,6 +681,8 @@ where
         }
     };
 
+    let oom_counter = oom_counter();
+    let oom_before = oom_counter.read();
     let (mut child, io) = match spawn_child(&exec, identity.as_ref()) {
         Ok(spawned) => spawned,
         Err(e) => {
@@ -719,7 +735,8 @@ where
 
     // Drain output before announcing exit so every byte precedes Exited.
     drain_outputs(output_tasks, exec.tty).await;
-    let _ = event_tx.send(exit_event(status)).await;
+    let oom_kills = oom::kills_since(oom_before, oom_counter.read());
+    let _ = event_tx.send(exit_event(status, oom_kills)).await;
 
     drop(event_tx);
     frame_task.abort();
@@ -1267,7 +1284,7 @@ mod tests {
         let expected = synthetic_exit_event(EXIT_UNKNOWN);
 
         // Act
-        let event = exit_event(None);
+        let event = exit_event(None, 0);
 
         // Assert
         assert_eq!(event, expected);
@@ -1713,6 +1730,7 @@ mod proto_compat_tests {
             kind: Some(event::Kind::Exited(Exited {
                 code: -1,
                 wait_status: WAIT_STATUS_SIGKILL,
+                oom_kills: 0,
             })),
         };
 

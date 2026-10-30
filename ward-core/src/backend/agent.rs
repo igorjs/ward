@@ -233,6 +233,7 @@ where
                     line: l.text,
                     exit_code: None,
                     wait_status: None,
+                    oom_kills: 0,
                     timestamp: now(),
                     duration_ms: 0,
                 },
@@ -241,6 +242,7 @@ where
                     line: l.text,
                     exit_code: None,
                     wait_status: None,
+                    oom_kills: 0,
                     timestamp: now(),
                     duration_ms: 0,
                 },
@@ -257,6 +259,7 @@ where
                         line: String::new(),
                         exit_code: None,
                         wait_status: None,
+                        oom_kills: 0,
                         timestamp: now(),
                         duration_ms: 0,
                     }
@@ -268,6 +271,7 @@ where
                             line: String::new(),
                             exit_code: Some(x.code),
                             wait_status: raw_wait_status(x.code, x.wait_status),
+                            oom_kills: x.oom_kills,
                             timestamp: now(),
                             duration_ms: started
                                 .elapsed()
@@ -856,6 +860,27 @@ mod tests {
     const TEST_ROWS: u32 = 40;
     const TEST_COLS: u32 = 80;
 
+    #[tokio::test]
+    async fn given_exited_event_with_oom_kills_when_drive_then_the_count_is_carried() {
+        // Arrange
+        let (daemon, agent) = tokio::io::duplex(64 * 1024);
+        let ev = Event {
+            kind: Some(event::Kind::Exited(Exited {
+                code: -1,
+                wait_status: 9,
+                oom_kills: 2,
+            })),
+        };
+        tokio::spawn(fake_agent(agent, vec![ev], false));
+
+        // Act
+        let (handle, _kill) = drive_with(daemon, ExecMode::default()).await;
+        let events = collect(handle.output_rx.unwrap()).await;
+
+        // Assert
+        assert_eq!(events[0].oom_kills, 2);
+    }
+
     #[rstest::rstest]
     #[case::old_agent_failure(3, 0, None)]
     #[case::old_agent_signal_death(-1, 0, None)]
@@ -870,7 +895,11 @@ mod tests {
         // Arrange
         let (daemon, agent) = tokio::io::duplex(64 * 1024);
         let ev = Event {
-            kind: Some(event::Kind::Exited(Exited { code, wait_status })),
+            kind: Some(event::Kind::Exited(Exited {
+                code,
+                wait_status,
+                oom_kills: 0,
+            })),
         };
         tokio::spawn(fake_agent(agent, vec![ev], false));
 

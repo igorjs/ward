@@ -134,6 +134,7 @@ const PULL_STREAM_BUFFER: usize = 16;
 const EVENT_IMAGE_ATTRIBUTE: &str = "image";
 const EVENT_NAME_ATTRIBUTE: &str = "name";
 const EVENT_EXIT_CODE_ATTRIBUTE: &str = "exitCode";
+const EVENT_REASON_ATTRIBUTE: &str = "reason";
 
 const TOKEN_METADATA_KEY: &str = "x-ward-sandbox-token";
 
@@ -1158,6 +1159,7 @@ impl PbEventBridge {
                             line: tail,
                             exit_code: None,
                             wait_status: None,
+                            oom_kills: 0,
                             timestamp: evt.timestamp,
                             duration_ms: 0,
                         }));
@@ -1299,6 +1301,12 @@ fn event_to_pb(delivered: crate::sandbox::events::Delivered) -> PbSandboxEvent {
     if let Some(code) = event.exit_code {
         attributes.insert(EVENT_EXIT_CODE_ATTRIBUTE.to_string(), code.to_string());
     }
+    if let Some(reason) = event.reason {
+        attributes.insert(
+            EVENT_REASON_ATTRIBUTE.to_string(),
+            reason.as_str().to_string(),
+        );
+    }
     PbSandboxEvent {
         action: event.action.as_str().to_string(),
         sandbox_id: event.sandbox_id,
@@ -1374,6 +1382,7 @@ mod tests {
             line: String::new(),
             exit_code: None,
             wait_status: None,
+            oom_kills: 0,
             timestamp: std::time::SystemTime::now(),
             duration_ms: 0,
         };
@@ -1395,6 +1404,7 @@ mod tests {
             line: String::new(),
             exit_code: None,
             wait_status: None,
+            oom_kills: 0,
             timestamp: std::time::SystemTime::now(),
             duration_ms: 0,
         }

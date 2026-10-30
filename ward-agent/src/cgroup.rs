@@ -2,7 +2,9 @@
 
 //! Process count limit for the sandbox, enforced with a cgroup v2 pids
 //! controller. Every process the agent spawns joins one cgroup, so a fork
-//! past the cap fails with EAGAIN inside the guest and the VM stays up.
+//! past the cap fails with EAGAIN inside the guest and the VM stays up. The
+//! memory controller is enabled too, where the guest has it, so the cgroup
+//! reports OOM kills.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -22,6 +24,8 @@ const PROCS_FILE: &str = "cgroup.procs";
 const PIDS_MAX_FILE: &str = "pids.max";
 const PIDS_CONTROLLER: &str = "pids";
 const ENABLE_PIDS: &str = "+pids";
+const MEMORY_CONTROLLER: &str = "memory";
+const ENABLE_PIDS_AND_MEMORY: &str = "+pids +memory";
 /// Writing pid 0 to `cgroup.procs` moves the writing process itself.
 const SELF_PID: &[u8] = b"0";
 
@@ -54,11 +58,18 @@ fn io_step(step: &'static str) -> impl FnOnce(io::Error) -> CgroupError {
 
 /// Handle on the sandbox cgroup. Clones share one `cgroup.procs` descriptor.
 #[derive(Clone)]
-pub struct PidsCgroup {
+pub struct SandboxCgroup {
     procs: Arc<OwnedFd>,
+    /// Set when the memory controller is on, so `memory.events` exists.
+    memory_dir: Option<PathBuf>,
 }
 
-impl PidsCgroup {
+impl SandboxCgroup {
+    /// The cgroup directory, if its memory controller is enabled.
+    pub fn memory_dir(&self) -> Option<&Path> {
+        self.memory_dir.as_deref()
+    }
+
     /// Move the calling process into the cgroup. Safe between fork and
     /// exec: one `write(2)`, no allocation.
     pub fn join_self(&self) -> io::Result<()> {
@@ -92,7 +103,7 @@ pub fn ensure_mounted(root: &Path) -> io::Result<()> {
 /// [`CgroupError::Unsupported`] when `root` is not a cgroup v2 hierarchy
 /// with the pids controller; [`CgroupError::Io`] when the kernel refuses a
 /// step.
-pub fn setup(root: &Path, pids_max: u32) -> Result<PidsCgroup, CgroupError> {
+pub fn setup(root: &Path, pids_max: u32) -> Result<SandboxCgroup, CgroupError> {
     let controllers = std::fs::read_to_string(root.join(CONTROLLERS_FILE)).map_err(|e| {
         CgroupError::Unsupported(format!("no cgroup v2 at {}: {e}", root.display()))
     })?;
@@ -101,10 +112,15 @@ pub fn setup(root: &Path, pids_max: u32) -> Result<PidsCgroup, CgroupError> {
             "the pids controller is not built in".to_string(),
         ));
     }
-    write_file(&root.join(SUBTREE_CONTROL_FILE), ENABLE_PIDS)
-        .map_err(io_step("enable pids controller"))?;
+    let memory = controllers
+        .split_whitespace()
+        .any(|c| c == MEMORY_CONTROLLER)
+        && enable_controllers(root, ENABLE_PIDS_AND_MEMORY).is_ok();
+    if !memory {
+        enable_controllers(root, ENABLE_PIDS).map_err(io_step("enable pids controller"))?;
+    }
 
-    let group: PathBuf = root.join(SANDBOX_GROUP);
+    let group = group_dir(root);
     match std::fs::create_dir(&group) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -116,9 +132,19 @@ pub fn setup(root: &Path, pids_max: u32) -> Result<PidsCgroup, CgroupError> {
         .write(true)
         .open(group.join(PROCS_FILE))
         .map_err(io_step("open cgroup.procs"))?;
-    Ok(PidsCgroup {
+    Ok(SandboxCgroup {
         procs: Arc::new(procs.into()),
+        memory_dir: memory.then_some(group),
     })
+}
+
+/// The sandbox cgroup's directory under `root`.
+pub fn group_dir(root: &Path) -> PathBuf {
+    root.join(SANDBOX_GROUP)
+}
+
+fn enable_controllers(root: &Path, enable: &str) -> io::Result<()> {
+    write_file(&root.join(SUBTREE_CONTROL_FILE), enable)
 }
 
 fn write_file(path: &Path, text: &str) -> io::Result<()> {
@@ -156,7 +182,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join(SUBTREE_CONTROL_FILE)).unwrap(),
-            ENABLE_PIDS
+            ENABLE_PIDS_AND_MEMORY
         );
     }
 
