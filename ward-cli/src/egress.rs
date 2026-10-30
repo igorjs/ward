@@ -1,21 +1,18 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 //! `ward egress suggest SANDBOX`: turn blocked destinations into
-//! `--allow-domain` flags.
+//! `--allow-domain` flags, or add them to the sandbox's allowlist.
 
 use std::net::IpAddr;
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde_json::json;
-use ward_core::pb::{BlockedDestination, BlockedEgressRequest};
+use tonic::transport::Channel;
+use ward_core::pb::ward_client::WardClient;
+use ward_core::pb::{AddEgressAllowRequest, BlockedDestination, BlockedEgressRequest};
 
 use crate::client;
-
-/// A running sandbox's allowlist is fixed when it is created, so `--apply`
-/// has nothing to update.
-const APPLY_UNSUPPORTED: &str = "--apply is not supported: a sandbox's egress allowlist is fixed \
-     when it is created. Recreate the sandbox with the suggested --allow-domain flags";
 
 /// Host names the guest asked for are untrusted, and the output is meant to
 /// be pasted into a shell, so only plain DNS name characters pass.
@@ -26,22 +23,39 @@ fn is_safe_name(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-/// Splits blocked hosts into `--allow-domain` flags (one per name) and the
-/// IP addresses an allowlist cannot express.
-fn flags_and_ips(destinations: &[BlockedDestination]) -> (Vec<String>, Vec<String>) {
-    let mut flags = Vec::new();
+/// Splits blocked hosts into the DNS names an allowlist can hold and the IP
+/// addresses it cannot express.
+fn names_and_ips(destinations: &[BlockedDestination]) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
     let mut ips = Vec::new();
     for d in destinations {
         if d.host.parse::<IpAddr>().is_ok() {
             ips.push(d.host.clone());
         } else if is_safe_name(&d.host) {
-            flags.push(format!("--allow-domain {}", d.host));
+            names.push(d.host.clone());
         }
     }
-    (flags, ips)
+    (names, ips)
 }
 
-/// Prints the flags that would allow what `reference` was refused.
+fn allow_flags(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .map(|name| format!("--allow-domain {name}"))
+        .collect()
+}
+
+fn warn_about_ips(ips: &[String]) {
+    if !ips.is_empty() {
+        eprintln!(
+            "Blocked by IP address, which an allowlist cannot match: {}",
+            ips.join(", ")
+        );
+    }
+}
+
+/// Prints the flags that would allow what `reference` was refused, or with
+/// `apply` adds those hosts to its allowlist.
 pub async fn suggest(
     socket: &str,
     token_store: &Path,
@@ -49,16 +63,17 @@ pub async fn suggest(
     apply: bool,
     json: bool,
 ) -> Result<()> {
-    if apply {
-        bail!(APPLY_UNSUPPORTED);
-    }
     let mut c = client::connect(socket).await?;
     let target = client::resolve(&mut c, token_store, reference).await?;
     let request = target.request(BlockedEgressRequest {
         sandbox_id: target.id.clone(),
     })?;
     let reply = c.blocked_egress(request).await?.into_inner();
-    let (flags, ips) = flags_and_ips(&reply.destinations);
+    let (names, ips) = names_and_ips(&reply.destinations);
+    if apply {
+        return apply_names(&mut c, &target, reference, names, &ips, json).await;
+    }
+    let flags = allow_flags(&names);
     if json {
         println!("{}", json!({"AllowDomainFlags": flags, "BlockedIPs": ips}));
         return Ok(());
@@ -66,14 +81,41 @@ pub async fn suggest(
     for flag in &flags {
         println!("{flag}");
     }
-    if !ips.is_empty() {
-        eprintln!(
-            "Blocked by IP address, which an allowlist cannot match: {}",
-            ips.join(", ")
-        );
-    }
+    warn_about_ips(&ips);
     if flags.is_empty() && ips.is_empty() {
         eprintln!("No blocked destinations recorded for {reference}");
+    }
+    Ok(())
+}
+
+/// Adds `names` to the sandbox's allowlist and prints what the daemon added.
+async fn apply_names(
+    c: &mut WardClient<Channel>,
+    target: &client::Resolved,
+    reference: &str,
+    names: Vec<String>,
+    ips: &[String],
+    json: bool,
+) -> Result<()> {
+    let added = if names.is_empty() {
+        Vec::new()
+    } else {
+        let request = target.request(AddEgressAllowRequest {
+            sandbox_id: target.id.clone(),
+            domains: names,
+        })?;
+        c.add_egress_allow(request).await?.into_inner().added
+    };
+    if json {
+        println!("{}", json!({"Added": added, "BlockedIPs": ips}));
+        return Ok(());
+    }
+    for name in &added {
+        println!("Added {name} to the egress allowlist of {reference}");
+    }
+    warn_about_ips(ips);
+    if added.is_empty() {
+        eprintln!("Nothing to add to the egress allowlist of {reference}");
     }
     Ok(())
 }
@@ -96,11 +138,11 @@ mod tests {
         let blocked = [dest("pypi.org"), dest("files.pythonhosted.org")];
 
         // Act
-        let (flags, ips) = flags_and_ips(&blocked);
+        let (names, ips) = names_and_ips(&blocked);
 
         // Assert
         assert_eq!(
-            flags,
+            allow_flags(&names),
             [
                 "--allow-domain pypi.org",
                 "--allow-domain files.pythonhosted.org"
@@ -110,39 +152,28 @@ mod tests {
     }
 
     #[test]
-    fn given_ip_host_when_formatted_then_listed_apart_from_flags() {
+    fn given_ip_host_when_split_then_listed_apart_from_names() {
         // Arrange
-        let blocked = [dest("203.0.113.9"), dest("2001:db8::1")];
+        let blocked = [dest("203.0.113.9"), dest("2001:db8::1"), dest("pypi.org")];
 
         // Act
-        let (flags, ips) = flags_and_ips(&blocked);
+        let (names, ips) = names_and_ips(&blocked);
 
         // Assert
-        assert!(flags.is_empty());
+        assert_eq!(names, ["pypi.org"]);
         assert_eq!(ips, ["203.0.113.9", "2001:db8::1"]);
     }
 
     #[test]
-    fn given_shell_metacharacters_when_formatted_then_name_is_dropped() {
+    fn given_shell_metacharacters_when_split_then_name_is_dropped() {
         // Arrange
         let blocked = [dest("a.com;rm -rf ~"), dest("$(id).evil.com")];
 
         // Act
-        let (flags, ips) = flags_and_ips(&blocked);
+        let (names, ips) = names_and_ips(&blocked);
 
         // Assert
-        assert!(flags.is_empty());
+        assert!(names.is_empty());
         assert!(ips.is_empty());
-    }
-
-    #[tokio::test]
-    async fn given_apply_when_suggest_then_fails_before_connecting() {
-        // Arrange / Act
-        let err = suggest("/nonexistent.sock", Path::new("/x"), "sb", true, false)
-            .await
-            .expect_err("apply must fail");
-
-        // Assert
-        assert!(err.to_string().contains("--apply is not supported"));
     }
 }

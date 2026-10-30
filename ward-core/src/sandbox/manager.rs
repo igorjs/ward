@@ -1686,6 +1686,61 @@ impl SandboxManager {
         self.backend.blocked_egress(&id).await.map_err(backend_err)
     }
 
+    /// Add `domains` to the allowlist of a sandbox created with egress
+    /// allowlist, for the running VM and for later boots. Returns the names
+    /// that were new. Open egress has nothing to add; deny egress has no
+    /// network to extend.
+    pub async fn add_egress_allow(&self, id: &str, domains: Vec<String>) -> Result<Vec<String>> {
+        use crate::protocol::EgressMode;
+
+        crate::validate::egress_domains(&domains)?;
+        let id = self.resolve(id).await?;
+        let mut entries = self.entries.write().await;
+        let entry = entries
+            .get_mut(&id)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+        match entry.meta.options.egress.mode {
+            EgressMode::Open => return Ok(Vec::new()),
+            EgressMode::Deny => {
+                return Err(ApiError::InvalidRequest(
+                    "sandbox was created with egress deny; recreate it with --egress allowlist"
+                        .into(),
+                ));
+            }
+            EgressMode::Allowlist => {}
+        }
+
+        let mut added: Vec<String> = Vec::new();
+        for domain in domains {
+            if !entry.meta.options.egress.domains.contains(&domain) && !added.contains(&domain) {
+                added.push(domain);
+            }
+        }
+        if added.is_empty() {
+            return Ok(added);
+        }
+        let total = entry.meta.options.egress.domains.len() + added.len();
+        if total > crate::validate::MAX_EGRESS_DOMAINS {
+            return Err(ApiError::InvalidRequest(format!(
+                "the allowlist is limited to {} domains",
+                crate::validate::MAX_EGRESS_DOMAINS
+            )));
+        }
+
+        let mut next = entry.meta.clone();
+        next.options.egress.domains.extend(added.iter().cloned());
+        self.persist(next.clone()).await?;
+        entry.meta = next;
+        self.backend
+            .add_egress_allow(&id, &added)
+            .await
+            .map_err(backend_err)?;
+        tracing::info!(sandbox = %id, added = added.len(), "egress allowlist extended");
+        self.events
+            .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
+        Ok(added)
+    }
+
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
         let id = self.resolve(id).await?;
@@ -8112,6 +8167,7 @@ pub(crate) mod tests {
         assert_eq!(got[4].0, EventAction::Stop);
     }
 
+    mod egress;
     #[cfg(not(feature = "krunvm"))]
     mod ports;
     #[cfg(not(feature = "krunvm"))]
