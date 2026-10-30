@@ -775,6 +775,21 @@ impl Backend for KrunvmBackend {
             })
     }
 
+    async fn put_secrets(
+        &self,
+        sandbox_id: &str,
+        user: &str,
+        secrets: &[crate::pb::SecretFile],
+    ) -> Result<()> {
+        let stream = self.agent_stream(sandbox_id).await?;
+        super::agent::put_secrets(stream, user, secrets)
+            .await
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::Other => BackendError::Exec(format!("write secrets: {e}")),
+                _ => BackendError::Io(e),
+            })
+    }
+
     async fn copy_from(
         &self,
         sandbox_id: &str,

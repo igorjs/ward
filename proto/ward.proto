@@ -134,6 +134,17 @@ message CreateSandboxRequest {
   // When to pull `image`, like `docker run --pull`. Unspecified means
   // missing. Ignored when `from_snapshot` is set.
   PullPolicy pull_policy = 19;
+  // Files written to /run/secrets before the main process starts. The daemon
+  // keeps them in memory only and never stores or reports them.
+  repeated SecretFile secrets = 20;
+}
+
+// A secret delivered to the guest as the read-only file /run/secrets/<name>
+// (mode 0400, owned by the process user). Its content is never logged,
+// stored, or shown by inspect, ps or events.
+message SecretFile {
+  string name = 1;
+  bytes content = 2;
 }
 
 // Mirrors Docker's `--pull` values, plus `pinned`.
@@ -283,6 +294,8 @@ message ExecRequest {
   map<string, string> env = 4;
   // name|uid[:group|gid]. Empty uses the sandbox's user.
   string user = 5;
+  // Files written to /run/secrets before the command starts.
+  repeated SecretFile secrets = 6;
 }
 
 message RunRequest {
@@ -361,6 +374,8 @@ message AttachStart {
   string user = 7;
   bool replay = 8;  // read-only: replay buffered output, ignore stdin
   bool follow = 9;  // keep streaming live output after the replay
+  // Exec mode only: files written to /run/secrets before the command starts.
+  repeated SecretFile secrets = 10;
 }
 
 message AttachStdin {

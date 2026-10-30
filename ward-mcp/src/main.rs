@@ -317,6 +317,7 @@ impl Server {
             working_dir: args.working_dir.unwrap_or_default(),
             env: HashMap::new(),
             user: String::new(),
+            secrets: Vec::new(),
         };
         let info = self
             .runtime
@@ -372,6 +373,7 @@ impl Server {
             working_dir: args.working_dir.unwrap_or_default(),
             env: HashMap::new(),
             user: String::new(),
+            secrets: Vec::new(),
         };
         let mgr = self.runtime.sandbox_manager();
         let proc_info = mgr

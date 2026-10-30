@@ -368,6 +368,7 @@ impl WardClient {
             working_dir: workdir.unwrap_or("").into(),
             env: HashMap::new(),
             user: String::new(),
+            secrets: Vec::new(),
         };
         let info = self
             .inner

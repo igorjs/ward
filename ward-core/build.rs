@@ -18,6 +18,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
+        // Hand-written in backend/agent.rs so the content never reaches a log line.
+        .skip_debug(["ward.agent.v1.SecretFile"])
         .compile_protos(&["../proto/ward_agent.proto"], &["../proto"])?;
 
     Ok(())

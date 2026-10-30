@@ -1024,3 +1024,62 @@ fn given_a_published_port_when_stopped_and_started_then_it_is_refused_then_serve
     assert_eq!(published(&d, &id)[0].1, port);
     assert_eq!(dial_reply(port), GUEST_REPLY);
 }
+
+const SECRET_VALUE: &str = "hunter2-correct-horse-battery-staple";
+const SECRET_NAME: &str = "db-password";
+const SECRET_USER: &str = "1000:1000";
+const SECRET_MODE_AND_OWNER: &str = "400:1000";
+
+fn secret_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    let path = dir.path().join(SECRET_NAME);
+    std::fs::write(&path, SECRET_VALUE).expect("write secret file");
+    path
+}
+
+fn read_secret_script() -> String {
+    format!("cat /run/secrets/{SECRET_NAME}; stat -c '%a:%u' /run/secrets/{SECRET_NAME}")
+}
+
+#[test]
+fn given_a_secret_when_run_then_the_guest_reads_it_as_a_read_only_file_of_the_user() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = secret_file(&dir);
+
+    let mut cmd = d.cli();
+    cmd.args(["run", "--user", SECRET_USER, "--secret"])
+        .arg(&file)
+        .arg(image())
+        .args(["sh", "-c", &read_secret_script()]);
+    let out = run_ok(cmd);
+
+    assert!(out.contains(SECRET_VALUE), "got {out:?}");
+    assert!(out.contains(SECRET_MODE_AND_OWNER), "got {out:?}");
+}
+
+#[test]
+fn given_a_secret_when_exec_then_the_guest_reads_it_and_inspect_never_shows_it() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = secret_file(&dir);
+    let id = create(&d, &[]);
+
+    let mut cmd = d.cli();
+    cmd.args(["exec", "--user", SECRET_USER, "--secret"])
+        .arg(&file)
+        .arg(&id)
+        .args(["sh", "-c", &read_secret_script()]);
+    let out = run_ok(cmd);
+    let mut inspect = d.cli();
+    inspect.args(["inspect", &id]);
+    let inspected = run_ok(inspect);
+
+    assert!(out.contains(SECRET_VALUE), "got {out:?}");
+    assert!(out.contains(SECRET_MODE_AND_OWNER), "got {out:?}");
+    assert!(
+        !inspected.contains(SECRET_VALUE),
+        "inspect leaked the secret"
+    );
+}

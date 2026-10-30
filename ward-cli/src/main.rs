@@ -18,6 +18,7 @@ mod output;
 mod ports;
 mod pull;
 mod resources;
+mod secrets;
 mod socket;
 mod stats;
 mod template;
@@ -196,6 +197,9 @@ enum Commands {
         /// unless --from-snapshot is also set.
         #[arg(long)]
         source_sandbox: Option<String>,
+        /// Accepted only to explain that secrets need run or exec.
+        #[arg(long = "secret", hide = true, value_name = "FILE")]
+        secret: Vec<String>,
     },
 
     /// List all sandboxes.
@@ -267,6 +271,10 @@ enum Commands {
         /// -i and -t, since nothing attaches to the command.
         #[arg(short, long)]
         detach: bool,
+        /// Give the command a secret file at /run/secrets/NAME, read from
+        /// FILE on this host. NAME defaults to the base name of FILE.
+        #[arg(long, value_name = "[NAME=]FILE")]
+        secret: Vec<String>,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -297,6 +305,10 @@ enum Commands {
         /// Print the sandbox ID and leave the command running.
         #[arg(short, long)]
         detach: bool,
+        /// Give the command a secret file at /run/secrets/NAME, read from
+        /// FILE on this host. NAME defaults to the base name of FILE.
+        #[arg(long, value_name = "[NAME=]FILE")]
+        secret: Vec<String>,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -856,7 +868,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             comms_group,
             from_snapshot,
             source_sandbox,
+            secret,
         } => {
+            secrets::refuse_on_create(&secret)?;
             let comms_mode_pb = match comms_mode.as_str() {
                 "deny" => ward_core::pb::CommunicationMode::Deny,
                 "group" => ward_core::pb::CommunicationMode::Group,
@@ -962,9 +976,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             interactive,
             tty,
             detach,
+            secret,
         } => {
+            let secrets = secrets::load_all(&secret)?;
             if !detach {
                 let spec = docker::ExecSpec {
+                    secrets,
                     command,
                     env: parse_env(&env),
                     workdir: workdir.unwrap_or_default(),
@@ -983,6 +1000,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 working_dir: workdir.unwrap_or_default(),
                 env: parse_env(&env),
                 user: user.unwrap_or_default(),
+                secrets,
             })?;
             let resp = c.exec(request).await?.into_inner();
             // pid is the handle the user passes back to `ward logs <id> <pid>`.
@@ -1004,8 +1022,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tty,
             rm,
             detach,
+            secret,
         } => {
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
+            request.secrets = secrets::load_all(&secret)?;
             request.command = command;
             request.use_image_config = true;
             request.entrypoint = entrypoint;

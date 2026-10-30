@@ -37,6 +37,10 @@ pub struct SandboxMeta {
     pub end_reason: Option<EndReason>,
     /// Hex SHA-256 of the capability token. The token itself is never stored.
     pub token_hash: String,
+    /// Whether creation delivered secret files. Only the fact, never the
+    /// content: it lets a later start refuse a VM that would lack them.
+    #[serde(default)]
+    pub had_secrets: bool,
 }
 
 /// Hex SHA-256 of a capability token.
@@ -230,6 +234,7 @@ mod tests {
             finished_at: None,
             end_reason: None,
             token_hash: hash_token(TOKEN),
+            had_secrets: false,
         }
     }
 

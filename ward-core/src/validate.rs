@@ -369,6 +369,58 @@ pub fn user_spec(spec: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Most secret files one request may carry.
+pub const MAX_SECRETS: usize = 16;
+/// Largest secret file in bytes. With `MAX_SECRETS` this keeps the one
+/// agent frame that carries them under the frame cap.
+pub const MAX_SECRET_BYTES: usize = 64 * 1024;
+/// Longest secret name in bytes, the limit of a file name on Linux.
+pub const MAX_SECRET_NAME_LEN: usize = 255;
+
+/// Validate the name of a secret file: one path component, so it cannot
+/// leave /run/secrets.
+pub fn secret_name(name: &str) -> Result<(), ApiError> {
+    if name.is_empty()
+        || name.len() > MAX_SECRET_NAME_LEN
+        || name.chars().all(|c| c == '.')
+        || name.contains(['/', '\0'])
+        || name.chars().any(char::is_control)
+    {
+        return Err(ApiError::InvalidRequest(format!(
+            "secret name must be 1 to {MAX_SECRET_NAME_LEN} bytes with no slash, \
+             control character, or only dots: {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the secret files of a request: count, names, no duplicate name
+/// and size. Messages name the secret, never its content.
+pub fn secrets(files: &[crate::pb::SecretFile]) -> Result<(), ApiError> {
+    if files.len() > MAX_SECRETS {
+        return Err(ApiError::InvalidRequest(format!(
+            "at most {MAX_SECRETS} secrets can be given"
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for file in files {
+        secret_name(&file.name)?;
+        if file.content.len() > MAX_SECRET_BYTES {
+            return Err(ApiError::InvalidRequest(format!(
+                "secret {:?} is over {MAX_SECRET_BYTES} bytes",
+                file.name
+            )));
+        }
+        if !seen.insert(file.name.as_str()) {
+            return Err(ApiError::InvalidRequest(format!(
+                "secret {:?} is given more than once",
+                file.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Most ports one sandbox may publish.
 const MAX_PUBLISHED_PORTS: usize = 64;
 /// The only protocol a port may be published with.
@@ -538,6 +590,46 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::plain("db-password", true)]
+    #[case::with_dot("tls.key", true)]
+    #[case::empty("", false)]
+    #[case::dot(".", false)]
+    #[case::dots("..", false)]
+    #[case::slash("a/b", false)]
+    #[case::nul("a\0b", false)]
+    #[case::newline("a\nb", false)]
+    fn given_a_secret_name_when_validated_then_only_one_component_passes(
+        #[case] name: &str,
+        #[case] valid: bool,
+    ) {
+        // Act
+        let result = secret_name(name);
+
+        // Assert
+        assert_eq!(result.is_ok(), valid);
+    }
+
+    #[test]
+    fn given_oversized_duplicate_or_too_many_secrets_when_validated_then_each_is_refused() {
+        // Arrange
+        let file = |name: &str, size: usize| crate::pb::SecretFile {
+            name: name.into(),
+            content: vec![b'x'; size],
+        };
+        let too_many: Vec<_> = (0..=MAX_SECRETS).map(|i| file(&i.to_string(), 1)).collect();
+
+        // Act
+        let big = secrets(&[file("a", MAX_SECRET_BYTES + 1)]);
+        let dup = secrets(&[file("a", 1), file("a", 1)]);
+        let many = secrets(&too_many);
+        let fine = secrets(&[file("a", MAX_SECRET_BYTES), file("b", 0)]);
+
+        // Assert
+        assert!(big.is_err() && dup.is_err() && many.is_err());
+        assert!(fine.is_ok());
+    }
 
     #[rstest]
     #[case::udp("", 8080, 53, "udp", false)]
