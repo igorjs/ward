@@ -48,6 +48,11 @@ pub mod proto {
 
 use proto::{Data, Event, Exec, Exited, Line, Pong, Request, Stream, event, request};
 
+/// How often, and how far apart, a SIGKILL death with no OOM kill is re-read.
+const OOM_REREADS: u32 = 5;
+const OOM_REREAD_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+const SIGKILL_NUMBER: i32 = 9;
+
 /// Where the guest kernel exposes process state.
 const PROC_ROOT: &str = "/proc";
 
@@ -586,6 +591,26 @@ fn exit_event(status: Option<ExitStatus>, oom_kills: u64) -> Event {
     event
 }
 
+/// OOM kills during the run. The kernel can bump its counter just after the
+/// victim is reaped, so a SIGKILL death with a zero count is re-read a few
+/// times before it is believed.
+async fn settled_oom_kills(
+    counter: &oom::OomCounter,
+    before: oom::OomReading,
+    status: Option<ExitStatus>,
+) -> u64 {
+    let mut kills = oom::kills_since(before, counter.read());
+    let killed = status.and_then(|s| s.signal()) == Some(SIGKILL_NUMBER);
+    for _ in 0..OOM_REREADS {
+        if kills > 0 || !killed {
+            break;
+        }
+        tokio::time::sleep(OOM_REREAD_DELAY).await;
+        kills = oom::kills_since(before, counter.read());
+    }
+    kills
+}
+
 /// The OOM kill counter for this guest.
 fn oom_counter() -> oom::OomCounter {
     oom::OomCounter::for_cgroup(SANDBOX_CGROUP.get())
@@ -735,7 +760,7 @@ where
 
     // Drain output before announcing exit so every byte precedes Exited.
     drain_outputs(output_tasks, exec.tty).await;
-    let oom_kills = oom::kills_since(oom_before, oom_counter.read());
+    let oom_kills = settled_oom_kills(&oom_counter, oom_before, status).await;
     let _ = event_tx.send(exit_event(status, oom_kills)).await;
 
     drop(event_tx);
