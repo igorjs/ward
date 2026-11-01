@@ -44,7 +44,7 @@ Each attach session is separate. A client that disconnects only detaches and lea
 - `ward ps` supports `-a`, `-q` and `--format json`. Other Go templates and `--filter` are not supported.
 - `ward stats` does not measure network or block I/O. NET I/O and BLOCK I/O print `--`.
 - `ward images -a` adds nothing, and no image is dangling. Ward keeps no intermediate images.
-- `ward commit --pause` is accepted, but the copy is live. The commit does not keep hard links, extended attributes, sparse holes or modification times, and it skips device nodes and pipes. See [#256](https://github.com/igorjs/ward/issues/256).
+- `ward commit --pause` is accepted, but the copy is live. The commit keeps hard links, sparse holes, modification times (whole seconds), `user.*` extended attributes, file capabilities, FIFOs and device nodes. Sockets are left out, as in Docker. Creating a device node needs privilege, so an unprivileged daemon leaves it out, and macOS hosts leave out FIFOs and device nodes. Extended attributes in other namespaces (SELinux labels, ACLs) are not kept, and setting a file capability needs `CAP_SETFCAP`. Where the daemon cannot set an attribute, the commit still succeeds without it.
 - `ward cp` ignores `-a` and `-q`. A copy into a sandbox is checked by the guest while it unpacks, so a tar that fails midway leaves the entries already written, as in Docker. A guest that cannot finish a copy reports an internal error with its own reason.
 - `ward pull` and image storage have gaps: one cache entry per digest, no re-resolve of tags, no eviction on create. See [#252](https://github.com/igorjs/ward/issues/252).
 

@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod commit;
+mod commit_meta;
 pub mod diff;
 pub mod image;
 pub mod krunvm;
