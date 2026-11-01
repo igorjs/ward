@@ -39,13 +39,15 @@ fn backend_err(e: BackendError) -> ApiError {
         BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
         BackendError::InvalidArgument(message) => ApiError::InvalidRequest(message),
         BackendError::ResourceExhausted(message) => ApiError::ResourceExhausted(message),
+        BackendError::ImageNotFound(message) => ApiError::ImageNotFound(message),
+        BackendError::Unavailable(message) => ApiError::Unavailable(message),
         BackendError::AddressInUse(address) => ApiError::AddressInUse(address),
         other => ApiError::Backend(other.to_string()),
     }
 }
 
-/// Pull errors name the image and the registry's complaint, never a
-/// secret, so the client sees them instead of a generic internal error.
+/// Image errors are built from the request and the cache, never from
+/// registry text, so the client sees them instead of a generic internal error.
 fn image_backend_err(e: BackendError) -> ApiError {
     match e {
         BackendError::Image(message) => ApiError::InvalidRequest(message),

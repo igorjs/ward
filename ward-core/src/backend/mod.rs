@@ -22,6 +22,12 @@ pub enum BackendError {
     PathNotFound(String),
     #[error("image error: {0}")]
     Image(String),
+    /// The registry has no such image; the text is Docker's wording.
+    #[error("{0}")]
+    ImageNotFound(String),
+    /// The registry or the network did not answer.
+    #[error("{0}")]
+    Unavailable(String),
     #[error("spawn failed: {0}")]
     Spawn(String),
     #[error("exec failed: {0}")]

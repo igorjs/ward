@@ -23,13 +23,15 @@
 //! to its rootfs in place, and a shared inode would let one sandbox change
 //! the image cache and every later sandbox built from it.
 
+use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use flate2::read::GzDecoder;
-use oci_client::errors::OciDistributionError;
+use oci_client::errors::{OciDistributionError, OciErrorCode};
 use std::io::ErrorKind::FileTooLarge;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -95,6 +97,54 @@ pub struct CacheMeta {
     /// Made by a commit. Such an image is never evicted from the cache.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub committed: bool,
+    /// Other references naming this image besides `image_ref`, e.g. a second
+    /// tag that resolved to the same digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+
+impl CacheMeta {
+    fn has_ref(&self, reference: &str) -> bool {
+        self.digest == reference
+            || self.image_ref == reference
+            || self.aliases.iter().any(|alias| alias == reference)
+    }
+
+    /// Whether the image has no reference of its own and is named by digest.
+    fn is_untagged(&self) -> bool {
+        self.image_ref == self.digest
+    }
+
+    /// Every reference naming the image, or its digest when it has none.
+    fn refs(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.image_ref.as_str()).chain(self.aliases.iter().map(String::as_str))
+    }
+
+    fn add_ref(&mut self, reference: &str) {
+        if self.has_ref(reference) {
+            return;
+        }
+        if self.is_untagged() {
+            self.image_ref = reference.to_string();
+        } else {
+            self.aliases.push(reference.to_string());
+        }
+    }
+
+    /// The same image without `reference`. An image left with no reference
+    /// is named by its digest.
+    fn without_ref(&self, reference: &str) -> Self {
+        let mut meta = self.clone();
+        meta.aliases.retain(|alias| alias != reference);
+        if meta.image_ref == reference {
+            meta.image_ref = if meta.aliases.is_empty() {
+                meta.digest.clone()
+            } else {
+                meta.aliases.remove(0)
+            };
+        }
+        meta
+    }
 }
 
 /// The parts of an OCI image config a sandbox's main process starts from.
@@ -188,6 +238,13 @@ pub trait ImagePuller: Send + Sync + std::fmt::Debug {
     ) -> Result<PulledImage> {
         self.pull(reference, dest).await
     }
+
+    /// The digest `reference` points to in the registry right now, fetched
+    /// without downloading layers. `None` when the puller cannot tell, so
+    /// the caller pulls to find out.
+    async fn resolve_digest(&self, _reference: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// One progress line of a pull, in Docker's wording.
@@ -258,7 +315,33 @@ impl PullSession {
 /// Real puller: talks to an OCI registry over HTTPS, then unpacks each
 /// layer tarball into the destination rootfs.
 #[derive(Debug, Default)]
-pub struct OciPuller;
+pub struct OciPuller {
+    /// `host:port` registries reached over plain HTTP, for local test registries.
+    http_registries: Vec<String>,
+}
+
+impl OciPuller {
+    /// A puller that reaches `registry` (`host:port`) over plain HTTP.
+    pub fn with_http_registry(registry: impl Into<String>) -> Self {
+        Self {
+            http_registries: vec![registry.into()],
+        }
+    }
+
+    /// Parse `reference`, enforce the registry allowlist and build a client.
+    fn client_for(&self, reference: &str) -> Result<(oci_client::Client, oci_client::Reference)> {
+        let image_ref: oci_client::Reference = reference.parse().map_err(|e| {
+            BackendError::Image(format!("invalid image reference {reference}: {e}"))
+        })?;
+        check_registry_allowlist(&image_ref)?;
+        let client = oci_client::Client::new(oci_client::client::ClientConfig {
+            platform_resolver: Some(Box::new(linux_host_arch_resolver)),
+            protocol: oci_client::client::ClientProtocol::HttpsExcept(self.http_registries.clone()),
+            ..Default::default()
+        });
+        Ok((client, image_ref))
+    }
+}
 
 #[async_trait::async_trait]
 impl ImagePuller for OciPuller {
@@ -285,65 +368,16 @@ impl ImagePuller for OciPuller {
         #[cfg(debug_assertions)]
         if std::env::var(OFFLINE_IMAGES_ENV).as_deref() == Ok("1") {
             std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
-            // Derive a stable fake digest from the reference so distinct
-            // image refs get distinct cache entries even in offline mode.
-            let hash: u64 = reference
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
             return Ok(PulledImage {
-                digest: format!("sha256:{hash:016x}"),
+                digest: offline_digest(reference),
                 config: offline_image_config()?,
             });
         }
 
         use oci_client::manifest;
         use oci_client::secrets::RegistryAuth;
-        use oci_client::{Client, Reference};
 
-        let image_ref: Reference = reference.parse().map_err(|e| {
-            BackendError::Image(format!("invalid image reference {reference}: {e}"))
-        })?;
-
-        // SEC-019 (part 1): registry allowlist enforcement.
-        // WARD_REGISTRY_ALLOWLIST is comma-separated; unset OR
-        // empty-after-trim = allow any registry (the documented
-        // operator opt-out; the daemon emits a startup warn for the
-        // empty-string case so a typo does not silently disable the
-        // check). When set with content, image_ref.registry()
-        // (defaults to docker.io for unqualified refs) is checked
-        // against the list. The lookup tolerates legacy / pasted
-        // forms (`https://`, trailing slash, `index.docker.io` ->
-        // `docker.io`) so an operator who pastes a URL into the env
-        // var does not get a silently-rejecting daemon.
-        //
-        // Read per-pull deliberately: pulls are network-bound (hundreds
-        // of ms minimum) so a 50-ns env-var read is irrelevant, and
-        // staying out of Config keeps the OciPuller composable in
-        // tests without a startup config dance.
-        //
-        // Cosign signature verification (the second half of SEC-019) is
-        // tracked separately; it requires `sigstore-rs`, a larger
-        // dep evaluation.
-        if let Ok(raw) = std::env::var("WARD_REGISTRY_ALLOWLIST")
-            && !raw.trim().is_empty()
-            && !is_registry_allowed(image_ref.registry(), &raw)
-        {
-            return Err(BackendError::Image(format!(
-                "registry {} is not in WARD_REGISTRY_ALLOWLIST ({}); \
-                 set WARD_REGISTRY_ALLOWLIST to include {} (e.g. \
-                 \"docker.io,ghcr.io,{}\"), or unset the variable to \
-                 allow any registry",
-                image_ref.registry(),
-                raw,
-                image_ref.registry(),
-                image_ref.registry(),
-            )));
-        }
-
-        let client = Client::new(oci_client::client::ClientConfig {
-            platform_resolver: Some(Box::new(linux_host_arch_resolver)),
-            ..Default::default()
-        });
+        let (client, image_ref) = self.client_for(reference)?;
         let auth = RegistryAuth::Anonymous;
         let accepted = [
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
@@ -400,6 +434,66 @@ impl ImagePuller for OciPuller {
 
         Ok(PulledImage { digest, config })
     }
+
+    async fn resolve_digest(&self, reference: &str) -> Result<Option<String>> {
+        #[cfg(debug_assertions)]
+        if std::env::var(OFFLINE_IMAGES_ENV).as_deref() == Ok("1") {
+            return Ok(Some(offline_digest(reference)));
+        }
+
+        use oci_client::manifest::OciManifest;
+        let (client, image_ref) = self.client_for(reference)?;
+        let (manifest, digest) = with_retry(reference, || {
+            client.pull_manifest(&image_ref, &oci_client::secrets::RegistryAuth::Anonymous)
+        })
+        .await?;
+        // An index points at one manifest per platform: the pull stores the
+        // one for this host, so that is the digest to compare.
+        Ok(match manifest {
+            OciManifest::Image(_) => Some(digest),
+            OciManifest::ImageIndex(index) => linux_host_arch_resolver(&index.manifests),
+        })
+    }
+}
+
+/// Refuse a registry that `WARD_REGISTRY_ALLOWLIST` does not list.
+fn check_registry_allowlist(image_ref: &oci_client::Reference) -> Result<()> {
+    // SEC-019 (part 1): registry allowlist enforcement.
+    // WARD_REGISTRY_ALLOWLIST is comma-separated; unset OR
+    // empty-after-trim = allow any registry (the documented
+    // operator opt-out; the daemon emits a startup warn for the
+    // empty-string case so a typo does not silently disable the
+    // check). When set with content, image_ref.registry()
+    // (defaults to docker.io for unqualified refs) is checked
+    // against the list. The lookup tolerates legacy / pasted
+    // forms (`https://`, trailing slash, `index.docker.io` ->
+    // `docker.io`) so an operator who pastes a URL into the env
+    // var does not get a silently-rejecting daemon.
+    //
+    // Read per-pull deliberately: pulls are network-bound (hundreds
+    // of ms minimum) so a 50-ns env-var read is irrelevant, and
+    // staying out of Config keeps the OciPuller composable in
+    // tests without a startup config dance.
+    //
+    // Cosign signature verification (the second half of SEC-019) is
+    // tracked separately; it requires `sigstore-rs`, a larger
+    // dep evaluation.
+    if let Ok(raw) = std::env::var("WARD_REGISTRY_ALLOWLIST")
+        && !raw.trim().is_empty()
+        && !is_registry_allowed(image_ref.registry(), &raw)
+    {
+        tracing::warn!(
+            registry = image_ref.registry(),
+            allowlist = %raw,
+            "registry is not in WARD_REGISTRY_ALLOWLIST"
+        );
+        return Err(BackendError::Image(format!(
+            "registry {} is not allowed by this daemon's registry allowlist",
+            image_ref.registry()
+        )));
+    }
+
+    Ok(())
 }
 
 /// Write `stream` to `path`, refusing more than `declared` bytes.
@@ -441,6 +535,16 @@ fn layer_id(digest: &str) -> String {
         .collect()
 }
 
+/// A stable fake digest derived from the reference, so distinct references
+/// get distinct cache entries in offline mode.
+#[cfg(debug_assertions)]
+fn offline_digest(reference: &str) -> String {
+    let hash: u64 = reference
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    format!("sha256:{hash:016x}")
+}
+
 /// Debug builds only: JSON `ImageConfig` that offline pulls report, so tests
 /// can give a synthetic image a command. Unset means an empty config.
 #[cfg(debug_assertions)]
@@ -471,7 +575,7 @@ where
     loop {
         match attempt_once().await {
             Ok(value) => return Ok(value),
-            Err(e) if attempt < PULL_ATTEMPTS && !is_oversized(&e) => {
+            Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) => {
                 let delay = PULL_RETRY_BASE_DELAY * attempt;
                 tracing::warn!(
                     reference,
@@ -481,12 +585,80 @@ where
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => {
-                return Err(BackendError::Image(format!(
-                    "pull {reference} failed after {PULL_ATTEMPTS} attempts: {e}"
-                )));
-            }
+            Err(e) => return Err(pull_error(reference, e)),
         }
+    }
+}
+
+/// Whether the registry said the manifest or repository does not exist.
+fn is_unknown_image(e: &OciDistributionError) -> bool {
+    use oci_client::errors::OciErrorCode::{ManifestUnknown, NameUnknown, NotFound};
+    match e {
+        OciDistributionError::ImageManifestNotFoundError(_) => true,
+        OciDistributionError::ServerError { code, .. } => *code == NOT_FOUND_STATUS,
+        OciDistributionError::RegistryError { envelope, .. } => envelope
+            .errors
+            .iter()
+            .any(|e| matches!(e.code, ManifestUnknown | NameUnknown | NotFound)),
+        _ => false,
+    }
+}
+
+/// Registries answer an anonymous pull of a missing or private repository
+/// with an authorisation failure, which Docker reports as access denied.
+fn is_access_denied(e: &OciDistributionError) -> bool {
+    matches!(
+        e,
+        OciDistributionError::UnauthorizedError { .. }
+            | OciDistributionError::AuthenticationFailure(_)
+    )
+}
+
+/// Whether the registry or the network failed to answer, or asked the client
+/// to slow down. Only these are worth retrying.
+fn is_unreachable(e: &OciDistributionError) -> bool {
+    match e {
+        OciDistributionError::RequestError(_) => true,
+        OciDistributionError::IoError(io) => io.kind() != FileTooLarge,
+        OciDistributionError::ServerError { code, .. } => {
+            *code >= SERVER_ERROR_STATUS || *code == TOO_MANY_REQUESTS_STATUS
+        }
+        OciDistributionError::RegistryError { envelope, .. } => envelope
+            .errors
+            .iter()
+            .any(|e| e.code == OciErrorCode::Toomanyrequests),
+        _ => false,
+    }
+}
+
+const NOT_FOUND_STATUS: u16 = 404;
+const SERVER_ERROR_STATUS: u16 = 500;
+const TOO_MANY_REQUESTS_STATUS: u16 = 429;
+
+/// Translate a registry failure into the backend error that picks the gRPC
+/// code, in Docker's wording where Docker has one.
+fn pull_error(reference: &str, e: OciDistributionError) -> BackendError {
+    // The source error can carry request URLs, so it stays in the log.
+    tracing::warn!(reference, error = %e, "image pull failed");
+    if is_oversized(&e) {
+        BackendError::ResourceExhausted(format!(
+            "a layer of {reference} is larger than its manifest declares"
+        ))
+    } else if is_unknown_image(&e) {
+        BackendError::ImageNotFound(format!(
+            "manifest for {reference} not found: manifest unknown"
+        ))
+    } else if is_access_denied(&e) {
+        BackendError::ImageNotFound(format!(
+            "pull access denied for {reference}, repository does not exist \
+             or may require 'docker login'"
+        ))
+    } else if is_unreachable(&e) {
+        BackendError::Unavailable(format!("could not reach the registry for {reference}"))
+    } else {
+        BackendError::Internal(format!(
+            "pull {reference} failed: unexpected registry response"
+        ))
     }
 }
 
@@ -592,13 +764,7 @@ impl<R: Read> Read for BoundedReader<R> {
         let n = self.inner.read(buf)?;
         self.total += n as u64;
         if self.total > self.limit {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "decompressed image exceeds {} GiB limit; refusing to unpack",
-                    MAX_UNPACKED_IMAGE_BYTES / GIB,
-                ),
-            ));
+            return Err(std::io::Error::new(FileTooLarge, unpack_limit_message()));
         }
         Ok(n)
     }
@@ -631,14 +797,19 @@ fn unpack_into<'a, R: Read + 'a>(
 
     let entries = archive
         .entries()
-        .map_err(|e| BackendError::Image(format!("read layer tar: {e}")))?;
+        .map_err(|e| unpack_error("read layer tar", e))?;
 
     for entry in entries {
-        let mut entry = entry.map_err(|e| BackendError::Image(format!("read tar entry: {e}")))?;
+        let mut entry = entry.map_err(|e| unpack_error("read tar entry", e))?;
         let path = entry
             .path()
-            .map_err(|e| BackendError::Image(format!("decode tar entry path: {e}")))?
+            .map_err(|e| unpack_error("decode tar entry path", e))?
             .into_owned();
+        // `/etc/.wh.foo` and `./etc/.wh.foo` name the same file as `etc/.wh.foo`.
+        let path: PathBuf = path
+            .components()
+            .filter(|c| !matches!(c, Component::RootDir | Component::CurDir))
+            .collect();
 
         match classify_entry(&path) {
             EntryKind::OpaqueWhiteout(dir) => apply_opaque_whiteout(dest, &dir)?,
@@ -646,11 +817,30 @@ fn unpack_into<'a, R: Read + 'a>(
             EntryKind::Normal => {
                 entry
                     .unpack_in(dest)
-                    .map_err(|e| BackendError::Image(format!("unpack tar entry: {e}")))?;
+                    .map_err(|e| unpack_error("unpack tar entry", e))?;
             }
         }
     }
     Ok(())
+}
+
+/// A failed unpack. Hitting the unpacked-size cap is a resource limit, not a
+/// bad image.
+fn unpack_error(context: &str, e: std::io::Error) -> BackendError {
+    if e.kind() == FileTooLarge {
+        BackendError::ResourceExhausted(unpack_limit_message())
+    } else {
+        // The source error can name host paths, so it stays in the log.
+        tracing::warn!(context, error = %e, "layer unpack failed");
+        BackendError::Internal(format!("{context} failed"))
+    }
+}
+
+fn unpack_limit_message() -> String {
+    format!(
+        "decompressed image exceeds {} GiB limit; refusing to unpack",
+        MAX_UNPACKED_IMAGE_BYTES / GIB
+    )
 }
 
 enum EntryKind {
@@ -687,7 +877,7 @@ fn classify_entry(path: &Path) -> EntryKind {
 /// not an error: a layer may whiteout something a sibling layer never
 /// created, which OCI treats as a no-op.
 fn apply_whiteout(dest: &Path, target: &Path) -> Result<()> {
-    let Some(full) = confined_path(dest, target) else {
+    let Some(full) = resolve_in_root(dest, target, false) else {
         return Ok(());
     };
     remove_path(&full)
@@ -696,7 +886,7 @@ fn apply_whiteout(dest: &Path, target: &Path) -> Result<()> {
 /// Clear the contents of a directory named by an opaque whiteout, keeping
 /// the directory itself.
 fn apply_opaque_whiteout(dest: &Path, dir: &Path) -> Result<()> {
-    let Some(full) = confined_path(dest, dir) else {
+    let Some(full) = resolve_in_root(dest, dir, true) else {
         return Ok(());
     };
     if !std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) {
@@ -722,15 +912,64 @@ fn remove_path(path: &Path) -> Result<()> {
     }
 }
 
-/// Like [`safe_join`], but `None` when a parent is a symlink or missing: an
-/// earlier layer's symlink would lead a delete out of `base`.
-fn confined_path(base: &Path, rel: &Path) -> Option<PathBuf> {
-    let full = safe_join(base, rel)?;
-    full.parent()?
-        .ancestors()
-        .take_while(|dir| *dir != base)
-        .all(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
-        .then_some(full)
+/// Symlinks followed while resolving one path, like the kernel's ELOOP cap.
+const MAX_SYMLINK_HOPS: u32 = 40;
+const PARENT_DIR: &str = "..";
+
+/// Resolve `rel` inside `root` the way a chroot would: a symlink met on the
+/// way is followed, an absolute target restarts at `root` and a `..` stops at
+/// `root`, so the result never leaves it. The last component is kept as is
+/// unless `follow_last`, so a whiteout removes a symlink, not what it points
+/// to. `None` when a component is missing, is not a directory, or the
+/// symlinks loop.
+fn resolve_in_root(root: &Path, rel: &Path, follow_last: bool) -> Option<PathBuf> {
+    safe_join(root, rel)?;
+    let mut pending: VecDeque<OsString> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    let last = if follow_last {
+        None
+    } else {
+        pending.pop_back()
+    };
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(name) = pending.pop_front() {
+        if name == PARENT_DIR {
+            resolved.pop();
+            continue;
+        }
+        let candidate = root.join(&resolved).join(&name);
+        let meta = std::fs::symlink_metadata(&candidate).ok()?;
+        if meta.is_symlink() {
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return None;
+            }
+            let target = std::fs::read_link(&candidate).ok()?;
+            if target.is_absolute() {
+                resolved.clear();
+            }
+            for comp in target.components().rev() {
+                match comp {
+                    Component::Normal(part) => pending.push_front(part.to_os_string()),
+                    Component::ParentDir => pending.push_front(OsString::from(PARENT_DIR)),
+                    _ => {}
+                }
+            }
+        } else if meta.is_dir() {
+            resolved.push(name);
+        } else {
+            return None;
+        }
+    }
+    let mut full = root.join(resolved);
+    full.extend(last);
+    Some(full)
 }
 
 /// Join `rel` onto `base`, returning `None` if `rel` is absolute or contains
@@ -797,6 +1036,12 @@ impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         self.0.store(true, Ordering::Relaxed);
     }
+}
+
+/// The `meta.json` of a cache entry, or `None` when missing or unreadable.
+fn read_meta(entry_dir: &Path) -> Option<CacheMeta> {
+    let bytes = std::fs::read(entry_dir.join("meta.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Atomically write `meta` to `path` via a sibling temp file.
@@ -921,7 +1166,21 @@ pub struct ImageStore {
     max_cache_bytes: u64,
     /// Makes the room check and the move into the cache one step.
     install_lock: Mutex<()>,
+    /// Sandbox id to the digest of the image it runs. Eviction spares these.
+    holders: Mutex<HashMap<String, String>>,
 }
+
+/// What an install does when the image does not fit in the cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnFull {
+    /// Refuse, leaving the cache as it is.
+    Fail,
+    /// Evict the least recently used images that nothing needs.
+    Evict,
+}
+
+const UP_TO_DATE_STATUS: &str = "Image is up to date";
+const DOWNLOADED_STATUS: &str = "Downloaded newer image";
 
 /// Prefix of the cache directories a pull or commit is still filling.
 const STAGING_PREFIX: &str = ".tmp-";
@@ -954,7 +1213,7 @@ impl Drop for StagingDir {
 impl ImageStore {
     /// Production constructor: pulls from real registries.
     pub fn new(cache_dir: PathBuf, max_cached_images: usize) -> Self {
-        Self::with_puller(cache_dir, max_cached_images, Arc::new(OciPuller))
+        Self::with_puller(cache_dir, max_cached_images, Arc::new(OciPuller::default()))
     }
 
     /// Construct with an injected puller. Tests use this to stay offline.
@@ -971,6 +1230,7 @@ impl ImageStore {
             max_pull_bytes: MAX_PULL_BYTES,
             max_cache_bytes: MAX_CACHE_BYTES,
             install_lock: Mutex::new(()),
+            holders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -981,19 +1241,57 @@ impl ImageStore {
         self
     }
 
+    /// Record that sandbox `sandbox_id` runs the cached image `reference`
+    /// names, so eviction spares it until the sandbox is released. A moved
+    /// tag does not unprotect it: the hold is on the digest.
+    pub fn hold(&self, sandbox_id: &str, reference: &str) {
+        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(Some((_, meta))) = self.find_cache_entry_by_ref(reference) {
+            self.hold_digest(sandbox_id, &meta.digest);
+        }
+    }
+
+    fn hold_digest(&self, sandbox_id: &str, digest: &str) {
+        self.holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sandbox_id.to_string(), digest.to_string());
+    }
+
+    pub fn release(&self, sandbox_id: &str) {
+        self.holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(sandbox_id);
+    }
+
+    fn is_held(&self, digest: &str) -> bool {
+        self.holders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|held| held == digest)
+    }
+
+    /// Whether eviction must spare `meta`: a committed image, or one a
+    /// sandbox runs.
+    fn is_protected(&self, meta: &CacheMeta) -> bool {
+        meta.committed || self.is_held(&meta.digest)
+    }
+
     /// Return the shared cache rootfs path for `reference`, pulling and
     /// unpacking from the registry if the image is not already on disk.
     ///
     /// On cache hit the `meta.json::last_used_at` timestamp is refreshed so
     /// LRU eviction keeps recently-used entries alive.
     pub async fn ensure(&self, reference: &str) -> Result<PathBuf> {
-        Ok(self.ensure_entry(reference, false).await?.0)
+        Ok(self.ensure_entry(reference, false, None).await?.0)
     }
 
     /// The runtime config of `reference`, pulling the image on a cache miss
     /// and again when the cached entry predates the config.
     pub async fn config(&self, reference: &str) -> Result<ImageConfig> {
-        let (_, meta) = self.ensure_entry(reference, true).await?;
+        let (_, meta) = self.ensure_entry(reference, true, None).await?;
         Ok(meta.config.unwrap_or_default())
     }
 
@@ -1005,7 +1303,9 @@ impl ImageStore {
                 .find_cache_entry_by_ref(reference)?
                 .map(|(_, meta)| meta.digest)
                 .ok_or_else(|| {
-                    BackendError::Image(format!("Unable to find image '{reference}' locally"))
+                    BackendError::ImageNotFound(format!(
+                        "Unable to find image '{reference}' locally"
+                    ))
                 }),
             PullPolicy::Always => self.refresh(reference).await,
             PullPolicy::Pinned if !is_pinned(reference) => {
@@ -1014,7 +1314,7 @@ impl ImageStore {
                 )))
             }
             PullPolicy::Pinned | PullPolicy::Missing | PullPolicy::Unspecified => {
-                Ok(self.ensure_entry(reference, false).await?.1.digest)
+                Ok(self.ensure_entry(reference, false, None).await?.1.digest)
             }
         }
     }
@@ -1022,17 +1322,9 @@ impl ImageStore {
     /// Pull `reference` again and move its tag to what the registry has now.
     /// The previous image stays in the cache under its digest.
     async fn refresh(&self, reference: &str) -> Result<String> {
-        let mut session = self.session(None)?;
+        let mut session = self.session(None, OnFull::Evict)?;
         let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
-        let previous = self.find_cache_entry_by_ref(reference)?;
-        let (_, meta) = self.install_entry(staging, reference, pulled)?;
-        if let Some((dir, old)) = previous.filter(|(_, old)| old.digest != meta.digest) {
-            let untagged = CacheMeta {
-                image_ref: old.digest.clone(),
-                ..old
-            };
-            write_meta_json(&dir.join("meta.json"), &untagged)?;
-        }
+        let (_, meta) = self.install_entry(staging, reference, pulled, OnFull::Evict, None)?;
         Ok(meta.digest)
     }
 
@@ -1062,103 +1354,203 @@ impl ImageStore {
 
     /// The cache entry for `reference` as it is after this call, pulled if
     /// absent. With `need_config`, an entry that has no config yet is
-    /// refreshed from the registry, keeping its layers.
+    /// refreshed from the registry, keeping its layers. `holder` is a sandbox
+    /// that runs the image, held before the entry can be evicted.
     async fn ensure_entry(
         &self,
         reference: &str,
         need_config: bool,
+        holder: Option<&str>,
     ) -> Result<(PathBuf, CacheMeta)> {
         // Fast path: already on disk.
-        if let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? {
-            if need_config && meta.config.is_none() {
-                let mut session = self.session(None)?;
+        if let Some((_, meta)) = self.find_cache_entry_by_ref(reference)? {
+            let config = if need_config && meta.config.is_none() {
+                let mut session = self.session(None, OnFull::Evict)?;
                 let (_staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
-                meta.config = Some(pulled.config);
+                Some(pulled.config)
+            } else {
+                None
+            };
+            if let Some(entry) = self.touch_entry(reference, config, holder)? {
+                return Ok(entry);
             }
-            meta.last_used_at = chrono::Utc::now();
-            write_meta_json(&entry_dir.join("meta.json"), &meta)?;
-            return Ok((entry_dir.join("rootfs"), meta));
         }
 
         // Slow path: pull into a temp dir, move to final location on success.
-        let mut session = self.session(None)?;
+        let mut session = self.session(None, OnFull::Evict)?;
         let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
-        self.install_entry(staging, reference, pulled)
+        self.install_entry(staging, reference, pulled, OnFull::Evict, holder)
+    }
+
+    /// Mark the entry for `reference` as just used, fill in a missing
+    /// `config` and hold it for `holder`. `None` when it is no longer cached.
+    fn touch_entry(
+        &self,
+        reference: &str,
+        config: Option<ImageConfig>,
+        holder: Option<&str>,
+    ) -> Result<Option<(PathBuf, CacheMeta)>> {
+        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? else {
+            return Ok(None);
+        };
+        if meta.config.is_none() {
+            meta.config = config;
+        }
+        meta.last_used_at = chrono::Utc::now();
+        write_meta_json(&entry_dir.join("meta.json"), &meta)?;
+        if let Some(sandbox_id) = holder {
+            self.hold_digest(sandbox_id, &meta.digest);
+        }
+        Ok(Some((entry_dir.join("rootfs"), meta)))
     }
 
     /// Move a pulled staging dir into the cache under its digest and record
-    /// it. The staging dir is removed if the image does not fit.
+    /// it. `reference` moves off any other image that held it. The staging
+    /// dir is removed if the image does not fit.
     fn install_entry(
         &self,
         staging: StagingDir,
         reference: &str,
         pulled: PulledImage,
+        on_full: OnFull,
+        holder: Option<&str>,
     ) -> Result<(PathBuf, CacheMeta)> {
         let PulledImage { digest, config } = pulled;
         let size_bytes = dir_size_bytes(&staging.0.join("rootfs")).unwrap_or(0);
-        let entry_name = digest_to_dir_name(&digest);
-        let entry_dir = self.cache_dir.join(&entry_name);
+        let entry_dir = self.cache_dir.join(digest_to_dir_name(&digest));
 
         // Room is measured under the lock, against what other installs left.
         let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.session(None)?.check_cache_room(size_bytes)?;
-
-        // If a concurrent call already moved the same digest into place,
-        // discard our staging dir and reuse the existing entry.
-        if !entry_dir.exists() {
-            std::fs::rename(&staging.0, &entry_dir).map_err(BackendError::Io)?;
+        let now = chrono::Utc::now();
+        // If the digest is already cached, discard our staging dir and add
+        // the reference to the entry that is there.
+        let mut meta = match read_meta(&entry_dir) {
+            Some(existing) => existing,
+            None => {
+                match on_full {
+                    OnFull::Fail => self.session(None, on_full)?.check_cache_room(size_bytes)?,
+                    OnFull::Evict => self.evict_for(size_bytes)?,
+                }
+                std::fs::rename(&staging.0, &entry_dir).map_err(BackendError::Io)?;
+                CacheMeta {
+                    image_ref: digest.clone(),
+                    digest,
+                    size_bytes,
+                    last_used_at: now,
+                    layer_count: 0,
+                    config: None,
+                    created_at: Some(now),
+                    author: None,
+                    comment: None,
+                    committed: false,
+                    aliases: Vec::new(),
+                }
+            }
+        };
+        self.untag_others(reference, &meta.digest)?;
+        meta.add_ref(reference);
+        meta.config = Some(config);
+        meta.last_used_at = now;
+        write_meta_json(&entry_dir.join("meta.json"), &meta)?;
+        if let Some(sandbox_id) = holder {
+            self.hold_digest(sandbox_id, &meta.digest);
         }
 
-        let now = chrono::Utc::now();
-        let meta = CacheMeta {
-            image_ref: reference.to_string(),
-            digest,
-            size_bytes,
-            last_used_at: now,
-            layer_count: 0,
-            config: Some(config),
-            created_at: Some(now),
-            author: None,
-            comment: None,
-            committed: false,
-        };
-        write_meta_json(&entry_dir.join("meta.json"), &meta)?;
-
         // Evict LRU entries if the cache count now exceeds the configured bound.
-        self.run_lru_eviction()?;
+        self.run_lru_eviction(&meta.digest)?;
 
         Ok((entry_dir.join("rootfs"), meta))
     }
 
+    /// Take `reference` off every image except the one with `digest`, as a
+    /// tag moves. An image left with no reference stays under its digest.
+    fn untag_others(&self, reference: &str, digest: &str) -> Result<()> {
+        for (dir, meta) in self.scan_cache_entries()? {
+            if meta.digest != digest && meta.has_ref(reference) {
+                write_meta_json(&dir.join("meta.json"), &meta.without_ref(reference))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Evict least recently used images that nothing needs until `needed`
+    /// more bytes fit in the cache. Call with the install lock held.
+    fn evict_for(&self, needed: u64) -> Result<()> {
+        let mut entries = self.scan_cache_entries()?;
+        let mut used: u64 = entries.iter().map(|(_, meta)| meta.size_bytes).sum();
+        entries.retain(|(_, meta)| !self.is_protected(meta));
+        entries.sort_by_key(|(_, meta)| meta.last_used_at);
+        for (dir, meta) in entries {
+            if used.saturating_add(needed) <= self.max_cache_bytes {
+                break;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => used = used.saturating_sub(meta.size_bytes),
+                Err(e) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to remove cache entry while making room"
+                ),
+            }
+        }
+        if used.saturating_add(needed) > self.max_cache_bytes {
+            return Err(BackendError::ResourceExhausted(format!(
+                "image cache is full: {needed} bytes do not fit in the {} bytes left",
+                self.max_cache_bytes.saturating_sub(used)
+            )));
+        }
+        Ok(())
+    }
+
     /// Pull `reference` into the cache like `docker pull`, reporting
-    /// progress lines to `progress`. Nothing is cached if the pull fails, and
-    /// no cached image is evicted to make room.
+    /// progress lines to `progress`. A cached tag is checked against the
+    /// registry and pulled again only if it moved. Nothing is cached if the
+    /// pull fails, and no cached image is evicted to make room.
     pub async fn pull(
         &self,
         reference: &str,
         progress: Option<UnboundedSender<PullProgress>>,
     ) -> Result<CachedImage> {
         let parsed = validate_reference(reference)?;
-        let mut session = self.session(progress)?;
+        let mut session = self.session(progress, OnFull::Fail)?;
         session.report(
             parsed.tag().unwrap_or_default(),
             &format!("Pulling from {}", parsed.repository()),
         );
-        let (meta, status) = match self.find_cache_entry_by_ref(reference)? {
-            Some((entry_dir, mut meta)) => {
-                meta.last_used_at = chrono::Utc::now();
-                write_meta_json(&entry_dir.join("meta.json"), &meta)?;
-                (meta, "Image is up to date")
-            }
+        let cached = self.find_cache_entry_by_ref(reference)?;
+        let latest = match &cached {
+            Some(_) if !is_pinned(reference) => self.puller.resolve_digest(reference).await?,
+            _ => None,
+        };
+        let current = cached.filter(|(_, meta)| {
+            is_pinned(reference) || latest.as_deref() == Some(meta.digest.as_str())
+        });
+        let touched = match current {
+            Some(_) => self.touch_entry(reference, None, None)?,
+            None => None,
+        };
+        let (meta, status) = match touched {
+            Some((_, meta)) => (meta, UP_TO_DATE_STATUS),
             None => {
+                let previous = self.find_cache_entry_by_ref(reference)?;
                 let (staging, pulled) = self.pull_into_temp(reference, &mut session).await?;
-                let (_, meta) = self.install_entry(staging, reference, pulled)?;
-                (meta, "Downloaded newer image")
+                let unchanged = previous.is_some_and(|(_, old)| old.digest == pulled.digest);
+                let (_, meta) =
+                    self.install_entry(staging, reference, pulled, OnFull::Fail, None)?;
+                (
+                    meta,
+                    if unchanged {
+                        UP_TO_DATE_STATUS
+                    } else {
+                        DOWNLOADED_STATUS
+                    },
+                )
             }
         };
         session.report("", &format!("Digest: {}", meta.digest));
         session.report("", &format!("Status: {status} for {reference}"));
-        self.cached_image(&meta)
+        Ok(self.cached_image(&meta, reference))
     }
 
     /// Commit the rootfs of a sandbox as a new image, like `docker commit`.
@@ -1200,7 +1592,7 @@ impl ImageStore {
         skip: &[&str],
         cancel: &AtomicBool,
     ) -> Result<CachedImage> {
-        let room = self.session(None)?.cache_room;
+        let room = self.session(None, OnFull::Fail)?.cache_room;
         let limits = CopyLimits {
             max_bytes: room.min(commit::MAX_COMMIT_BYTES),
             ..CopyLimits::default()
@@ -1240,6 +1632,7 @@ impl ImageStore {
             author: Some(spec.author.clone()).filter(|a| !a.is_empty()),
             comment: Some(spec.message.clone()).filter(|m| !m.is_empty()),
             committed: true,
+            aliases: Vec::new(),
         };
         write_meta_json(&staging.0.join("meta.json"), &meta)?;
 
@@ -1249,18 +1642,15 @@ impl ImageStore {
         if cancel.load(Ordering::Relaxed) {
             return Err(BackendError::Internal("commit cancelled".to_string()));
         }
-        self.session(None)?.check_cache_room(size_bytes)?;
+        self.session(None, OnFull::Fail)?
+            .check_cache_room(size_bytes)?;
         let previous = match &spec.reference {
             Some(reference) => self.find_cache_entry_by_ref(reference)?,
             None => None,
         };
         // The old image keeps its place under its digest; the tag moves.
-        if let Some((dir, old)) = &previous {
-            let untagged = CacheMeta {
-                image_ref: old.digest.clone(),
-                ..old.clone()
-            };
-            write_meta_json(&dir.join("meta.json"), &untagged)?;
+        if let (Some((dir, old)), Some(reference)) = (&previous, &spec.reference) {
+            write_meta_json(&dir.join("meta.json"), &old.without_ref(reference))?;
         }
         let entry_dir = self.cache_dir.join(digest_to_dir_name(&meta.digest));
         if let Err(e) = std::fs::rename(&staging.0, &entry_dir) {
@@ -1269,14 +1659,20 @@ impl ImageStore {
             }
             return Err(BackendError::Io(e));
         }
-        self.cached_image(&meta)
+        Ok(self.cached_image(&meta, &meta.image_ref))
     }
 
-    /// A pull session limited by the pull cap and the room left in the cache.
-    fn session(&self, progress: Option<UnboundedSender<PullProgress>>) -> Result<PullSession> {
+    /// A pull session limited by the pull cap and the room left in the
+    /// cache. With `OnFull::Evict`, the room counts what eviction can free.
+    fn session(
+        &self,
+        progress: Option<UnboundedSender<PullProgress>>,
+        on_full: OnFull,
+    ) -> Result<PullSession> {
         let used: u64 = self
             .scan_cache_entries()?
             .iter()
+            .filter(|(_, meta)| on_full == OnFull::Fail || self.is_protected(meta))
             .map(|(_, meta)| meta.size_bytes)
             .sum();
         Ok(PullSession::new(
@@ -1286,15 +1682,16 @@ impl ImageStore {
         ))
     }
 
-    fn cached_image(&self, meta: &CacheMeta) -> Result<CachedImage> {
+    /// `meta` seen as the image named `reference`.
+    fn cached_image(&self, meta: &CacheMeta, reference: &str) -> CachedImage {
         let entry_dir = self.cache_dir.join(digest_to_dir_name(&meta.digest));
-        Ok(CachedImage {
-            reference: meta.image_ref.clone(),
+        CachedImage {
+            reference: reference.to_string(),
             rootfs_path: entry_dir.join("rootfs"),
             digest: meta.digest.clone(),
             pulled_at: meta.created_at.unwrap_or(meta.last_used_at).into(),
             size_bytes: meta.size_bytes,
-        })
+        }
     }
 
     /// Materialize the image rootfs for `reference` into `dest` (the
@@ -1303,9 +1700,19 @@ impl ImageStore {
     /// Each file is copied from the cache entry, so the sandbox copy is
     /// independent: neither guest writes nor cache eviction affect the other.
     ///
+    /// The image is held for `sandbox_id` before it can be evicted; the
+    /// caller releases it if the sandbox is never created.
+    ///
     /// This is the entry point called by the krunvm backend.
-    pub async fn prepare_sandbox_rootfs(&self, reference: &str, dest: &Path) -> Result<()> {
-        let cache_rootfs = self.ensure(reference).await?;
+    pub async fn prepare_sandbox_rootfs(
+        &self,
+        sandbox_id: &str,
+        reference: &str,
+        dest: &Path,
+    ) -> Result<()> {
+        let (cache_rootfs, _) = self
+            .ensure_entry(reference, false, Some(sandbox_id))
+            .await?;
         let dest_owned = dest.to_path_buf();
         tokio::task::spawn_blocking(move || create_private_parent(&dest_owned))
             .await
@@ -1336,22 +1743,36 @@ impl ImageStore {
             .map(|(entry_dir, _)| entry_dir.join("rootfs")))
     }
 
-    /// Remove an image from the cache, deleting its directory. Per-sandbox
-    /// rootfs copies made from this entry are unaffected.
+    /// Remove `reference` from the cache like `docker rmi`: an image that
+    /// other references still name loses only this one, otherwise its
+    /// directory is deleted. Removing by digest deletes the image. An image a
+    /// sandbox runs is never deleted. Per-sandbox rootfs copies are unaffected.
     pub async fn remove(&self, reference: &str) -> Result<()> {
-        let (entry_dir, _) = self
+        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (entry_dir, meta) = self
             .find_cache_entry_by_ref(reference)?
-            .ok_or_else(|| BackendError::Image(format!("not cached: {reference}")))?;
-        std::fs::remove_dir_all(&entry_dir).map_err(BackendError::Io)?;
-        Ok(())
+            .ok_or_else(|| BackendError::ImageNotFound(format!("No such image: {reference}")))?;
+        let rest = meta.without_ref(reference);
+        if reference != meta.digest && !rest.is_untagged() {
+            return write_meta_json(&entry_dir.join("meta.json"), &rest);
+        }
+        if self.is_held(&meta.digest) {
+            return Err(BackendError::InvalidArgument(format!(
+                "conflict: unable to remove {reference}, a container is using its image"
+            )));
+        }
+        std::fs::remove_dir_all(&entry_dir).map_err(BackendError::Io)
     }
 
-    /// List all cached images read from disk.
+    /// List all cached images read from disk, one row per reference.
     pub async fn list(&self) -> Vec<CachedImage> {
         self.scan_cache_entries()
             .unwrap_or_default()
             .iter()
-            .filter_map(|(_, meta)| self.cached_image(meta).ok())
+            .flat_map(|(_, meta)| {
+                meta.refs()
+                    .map(|reference| self.cached_image(meta, reference))
+            })
             .collect()
     }
 
@@ -1379,15 +1800,12 @@ impl ImageStore {
             if dir_name.starts_with(STAGING_PREFIX) {
                 continue;
             }
-            let meta_path = entry_dir.join("meta.json");
-            let Ok(bytes) = std::fs::read(&meta_path) else {
-                continue;
-            };
-            let Ok(meta) = serde_json::from_slice::<CacheMeta>(&bytes) else {
-                continue;
-            };
-            entries.push((entry_dir, meta));
+            if let Some(meta) = read_meta(&entry_dir) {
+                entries.push((entry_dir, meta));
+            }
         }
+        // Directory order is arbitrary; a stable one keeps lookups repeatable.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(entries)
     }
 
@@ -1396,19 +1814,20 @@ impl ImageStore {
         Ok(self
             .scan_cache_entries()?
             .into_iter()
-            .find(|(_, meta)| meta.image_ref == reference))
+            .find(|(_, meta)| meta.has_ref(reference)))
     }
 
     /// Evict the least-recently-used cache entries until the count is within
-    /// `max_cached_images`. Eviction removes the full cache entry directory.
-    fn run_lru_eviction(&self) -> Result<()> {
+    /// `max_cached_images`, sparing committed and held images and
+    /// `keep_digest`, the image just installed.
+    fn run_lru_eviction(&self, keep_digest: &str) -> Result<()> {
         let mut entries = self.scan_cache_entries()?;
         if self.max_cached_images == 0 || entries.len() <= self.max_cached_images {
             return Ok(());
         }
         // Oldest first (ascending last_used_at).
         let to_evict = entries.len() - self.max_cached_images;
-        entries.retain(|(_, meta)| !meta.committed);
+        entries.retain(|(_, meta)| !self.is_protected(meta) && meta.digest != keep_digest);
         entries.sort_by_key(|(_, meta)| meta.last_used_at);
         for (entry_dir, _) in entries.into_iter().take(to_evict) {
             // Best-effort: a failed eviction must not fail the pull that
@@ -1762,6 +2181,8 @@ mod tests {
     struct RecordingPuller {
         layer_bytes: u64,
         calls: std::sync::atomic::AtomicUsize,
+        /// Digests the "registry" serves for a reference, when not derived.
+        digests: Mutex<HashMap<String, String>>,
     }
 
     impl RecordingPuller {
@@ -1769,7 +2190,28 @@ mod tests {
             Arc::new(Self {
                 layer_bytes,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                digests: Mutex::new(HashMap::new()),
             })
+        }
+
+        /// Make the registry serve `digest` for `reference` from now on.
+        fn point(&self, reference: &str, digest: &str) {
+            self.digests
+                .lock()
+                .expect("digests")
+                .insert(reference.to_string(), digest.to_string());
+        }
+
+        fn digest_of(&self, reference: &str) -> String {
+            let hash: u64 = reference
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            self.digests
+                .lock()
+                .expect("digests")
+                .get(reference)
+                .cloned()
+                .unwrap_or_else(|| format!("sha256:{hash:016x}"))
         }
 
         fn calls(&self) -> usize {
@@ -1798,10 +2240,11 @@ mod tests {
             session.charge(self.layer_bytes)?;
             std::fs::write(dest.join("layer"), vec![0u8; self.layer_bytes as usize])
                 .map_err(BackendError::Io)?;
-            let hash: u64 = reference
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Ok(PulledImage::without_config(format!("sha256:{hash:016x}")))
+            Ok(PulledImage::without_config(self.digest_of(reference)))
+        }
+
+        async fn resolve_digest(&self, reference: &str) -> Result<Option<String>> {
+            Ok(Some(self.digest_of(reference)))
         }
     }
 
@@ -1910,6 +2353,518 @@ mod tests {
         assert_eq!(puller.calls(), 1);
     }
 
+    // ----- several references on one image --------------------------------
+
+    #[tokio::test]
+    async fn given_two_tags_on_one_digest_when_pulled_then_both_list_and_resolve_from_one_entry() {
+        // Arrange
+        let puller = RecordingPuller::new(10);
+        puller.point("alpine:latest", "sha256:aaaa");
+        puller.point("alpine:3.20", "sha256:aaaa");
+        let (store, tmp) = limited_store(puller.clone(), SMALL_CAP, SMALL_CAP * 10);
+
+        // Act
+        store.pull("alpine:latest", None).await.expect("latest");
+        store.pull("alpine:3.20", None).await.expect("3.20");
+
+        // Assert
+        let mut references: Vec<_> = store
+            .list()
+            .await
+            .into_iter()
+            .map(|i| i.reference)
+            .collect();
+        references.sort();
+        assert_eq!(references, vec!["alpine:3.20", "alpine:latest"]);
+        assert!(store.is_cached("alpine:latest").await);
+        assert!(store.is_cached("alpine:3.20").await);
+        assert_eq!(cache_dir_names(tmp.path()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn given_an_image_with_two_tags_when_one_is_removed_then_the_other_stays() {
+        // Arrange
+        let puller = RecordingPuller::new(10);
+        puller.point("alpine:latest", "sha256:aaaa");
+        puller.point("alpine:3.20", "sha256:aaaa");
+        let (store, _tmp) = limited_store(puller, SMALL_CAP, SMALL_CAP * 10);
+        store.pull("alpine:latest", None).await.expect("latest");
+        store.pull("alpine:3.20", None).await.expect("3.20");
+
+        // Act
+        store.remove("alpine:latest").await.expect("untag");
+
+        // Assert
+        assert!(!store.is_cached("alpine:latest").await);
+        assert!(store.is_cached("alpine:3.20").await);
+    }
+
+    #[test]
+    fn given_meta_json_without_aliases_when_parsed_then_it_has_none() {
+        // Arrange
+        let json = r#"{"image_ref":"a:1","digest":"sha256:aa","size_bytes":1,
+            "last_used_at":"2026-01-01T00:00:00Z","layer_count":0}"#;
+
+        // Act
+        let meta: CacheMeta = serde_json::from_str(json).expect("old metadata");
+
+        // Assert
+        assert!(meta.aliases.is_empty());
+        assert!(meta.has_ref("a:1"));
+    }
+
+    // ----- re-resolving a tag ---------------------------------------------
+
+    #[tokio::test]
+    async fn given_a_tag_that_moved_when_pulled_then_it_is_pulled_and_the_old_image_stays_by_digest()
+     {
+        // Arrange
+        let puller = RecordingPuller::new(10);
+        let (store, _tmp) = limited_store(puller.clone(), SMALL_CAP, SMALL_CAP * 10);
+        let first = store.pull("alpine:3", None).await.expect("first");
+        puller.point("alpine:3", "sha256:bbbb");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Act
+        let second = store.pull("alpine:3", Some(tx)).await.expect("second");
+
+        // Assert
+        let mut last = String::new();
+        while let Some(line) = rx.recv().await {
+            last = line.status;
+        }
+        assert_eq!(last, "Status: Downloaded newer image for alpine:3");
+        assert_eq!(second.digest, "sha256:bbbb");
+        assert_eq!(puller.calls(), 2);
+        let listed: HashMap<_, _> = store
+            .list()
+            .await
+            .into_iter()
+            .map(|i| (i.digest, i.reference))
+            .collect();
+        assert_eq!(listed[&second.digest], "alpine:3");
+        assert_eq!(listed[&first.digest], first.digest);
+    }
+
+    // ----- eviction by bytes on create ------------------------------------
+
+    #[tokio::test]
+    async fn given_a_full_cache_when_a_sandbox_image_is_ensured_then_the_least_recently_used_is_evicted()
+     {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(100), u64::MAX, 250);
+        store.ensure("a").await.expect("a");
+        store.ensure("b").await.expect("b");
+
+        // Act
+        store.ensure("c").await.expect("c makes room");
+
+        // Assert
+        assert!(!store.is_cached("a").await);
+        assert!(store.is_cached("b").await);
+        assert!(store.is_cached("c").await);
+    }
+
+    #[tokio::test]
+    async fn given_a_full_cache_when_the_oldest_image_is_held_by_a_sandbox_then_it_is_spared() {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(100), u64::MAX, 250);
+        store.ensure("a").await.expect("a");
+        store.ensure("b").await.expect("b");
+        store.hold("sandbox-1", "a");
+
+        // Act
+        store.ensure("c").await.expect("c makes room");
+
+        // Assert
+        assert!(store.is_cached("a").await);
+        assert!(!store.is_cached("b").await);
+    }
+
+    #[tokio::test]
+    async fn given_every_image_held_when_a_sandbox_image_is_ensured_then_the_cache_is_full() {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(100), u64::MAX, 250);
+        store.ensure("a").await.expect("a");
+        store.ensure("b").await.expect("b");
+        store.hold("sandbox-1", "a");
+        store.hold("sandbox-2", "b");
+
+        // Act
+        let error = store.ensure("c").await.expect_err("nothing to evict");
+
+        // Assert
+        assert!(
+            matches!(error, BackendError::ResourceExhausted(_)),
+            "{error}"
+        );
+        assert!(store.is_cached("a").await && store.is_cached("b").await);
+    }
+
+    // ----- error mapping --------------------------------------------------
+
+    fn server_error(code: u16) -> OciDistributionError {
+        OciDistributionError::ServerError {
+            code,
+            url: "http://registry.test/v2/".to_string(),
+            message: String::new(),
+        }
+    }
+
+    fn io_error(kind: std::io::ErrorKind) -> OciDistributionError {
+        OciDistributionError::IoError(std::io::Error::from(kind))
+    }
+
+    #[rstest::rstest]
+    #[case::not_found(server_error(404), "manifest for alpine:x not found: manifest unknown")]
+    #[case::denied(
+        OciDistributionError::UnauthorizedError { url: String::new() },
+        "pull access denied for alpine:x"
+    )]
+    fn given_a_registry_that_lacks_the_image_when_mapped_then_it_is_not_found_in_dockers_words(
+        #[case] error: OciDistributionError,
+        #[case] wording: &str,
+    ) {
+        // Act
+        let mapped = pull_error("alpine:x", error);
+
+        // Assert
+        assert!(
+            matches!(&mapped, BackendError::ImageNotFound(m) if m.starts_with(wording)),
+            "{mapped}"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::reset(io_error(std::io::ErrorKind::ConnectionReset))]
+    #[case::unavailable(server_error(503))]
+    fn given_a_network_failure_when_mapped_then_it_is_unavailable(
+        #[case] error: OciDistributionError,
+    ) {
+        // Act
+        let mapped = pull_error("alpine:x", error);
+
+        // Assert
+        assert!(matches!(mapped, BackendError::Unavailable(_)), "{mapped}");
+    }
+
+    #[test]
+    fn given_a_blob_longer_than_declared_when_mapped_then_it_is_resource_exhausted() {
+        // Act
+        let mapped = pull_error("alpine:x", io_error(FileTooLarge));
+
+        // Assert
+        assert!(
+            matches!(mapped, BackendError::ResourceExhausted(_)),
+            "{mapped}"
+        );
+    }
+
+    #[test]
+    fn given_a_layer_over_the_unpack_cap_when_unpacked_then_it_is_resource_exhausted() {
+        // Arrange
+        let dest = TempDir::new().expect("tempdir");
+        let layer = gzip_layer(&[("big", &[0u8; 4096])]);
+
+        // Act
+        let error = unpack_into(layer.as_slice(), GZIP_MEDIA, dest.path(), 16).expect_err("cap");
+
+        // Assert
+        assert!(
+            matches!(error, BackendError::ResourceExhausted(_)),
+            "{error}"
+        );
+    }
+
+    // ----- whiteouts through symlinks -------------------------------------
+
+    fn rootfs_with_usr_bin() -> TempDir {
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("usr/bin")).expect("usr/bin");
+        std::fs::write(root.path().join("usr/bin/ls"), b"x").expect("ls");
+        root
+    }
+
+    #[rstest::rstest]
+    #[case::relative("usr/bin")]
+    #[case::absolute("/usr/bin")]
+    fn given_a_symlinked_parent_inside_the_rootfs_when_whiteout_then_the_target_is_removed(
+        #[case] link_target: &str,
+    ) {
+        // Arrange
+        let root = rootfs_with_usr_bin();
+        std::os::unix::fs::symlink(link_target, root.path().join("bin")).expect("symlink");
+
+        // Act
+        unpack_layer(&gzip_marker("bin/.wh.ls"), GZIP_MEDIA, root.path()).expect("unpack");
+
+        // Assert
+        assert!(!root.path().join("usr/bin/ls").exists());
+        assert!(root.path().join("bin").is_symlink());
+    }
+
+    #[test]
+    fn given_a_symlinked_parent_when_opaque_whiteout_then_the_directory_behind_it_is_cleared() {
+        // Arrange
+        let root = rootfs_with_usr_bin();
+        std::os::unix::fs::symlink("usr/bin", root.path().join("bin")).expect("symlink");
+
+        // Act
+        unpack_layer(&gzip_marker("bin/.wh..wh..opq"), GZIP_MEDIA, root.path()).expect("unpack");
+
+        // Assert
+        assert!(root.path().join("usr/bin").is_dir());
+        assert!(!root.path().join("usr/bin/ls").exists());
+    }
+
+    #[rstest::rstest]
+    #[case::dotdot("../../outside")]
+    #[case::absolute_host_path("OUTSIDE")]
+    fn given_a_symlink_that_aims_outside_when_whiteout_through_it_then_nothing_outside_is_removed(
+        #[case] link_target: &str,
+    ) {
+        // Arrange
+        let sandbox = TempDir::new().expect("tempdir");
+        let root = sandbox.path().join("rootfs/nested");
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("victim"), b"x").expect("victim");
+        let target = link_target.replace("OUTSIDE", outside.to_str().expect("utf8"));
+        std::os::unix::fs::symlink(target, root.join("evil")).expect("symlink");
+
+        // Act
+        unpack_layer(&gzip_marker("evil/.wh.victim"), GZIP_MEDIA, &root).expect("unpack");
+
+        // Assert
+        assert!(outside.join("victim").exists());
+    }
+
+    #[test]
+    fn given_a_symlink_loop_when_whiteout_through_it_then_it_is_skipped() {
+        // Arrange
+        let root = TempDir::new().expect("tempdir");
+        std::os::unix::fs::symlink("b", root.path().join("a")).expect("a");
+        std::os::unix::fs::symlink("a", root.path().join("b")).expect("b");
+
+        // Act
+        let result = unpack_layer(&gzip_marker("a/.wh.x"), GZIP_MEDIA, root.path());
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    // ----- count eviction spares what must stay ---------------------------
+
+    impl ImageStore {
+        /// Ensure and hold `reference`; returns the digest it is cached by.
+        async fn pull_for_hold(&self, reference: &str) -> String {
+            self.ensure(reference).await.expect("ensure");
+            self.hold("sandbox-1", reference);
+            self.find_cache_entry_by_ref(reference)
+                .expect("scan")
+                .expect("cached")
+                .1
+                .digest
+        }
+    }
+
+    fn mark_committed(store: &ImageStore, reference: &str) {
+        let (dir, mut meta) = store
+            .find_cache_entry_by_ref(reference)
+            .expect("scan")
+            .expect("cached");
+        meta.committed = true;
+        write_meta_json(&dir.join("meta.json"), &meta).expect("write meta");
+    }
+
+    #[tokio::test]
+    async fn given_all_old_images_committed_when_a_new_one_is_pulled_over_the_count_then_it_is_kept()
+     {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 2, Arc::new(FakePuller));
+        for name in ["a", "b", "c"] {
+            store.ensure(name).await.expect("seed");
+            mark_committed(&store, name);
+        }
+
+        // Act
+        store.ensure("new").await.expect("new image");
+
+        // Assert
+        assert!(store.is_cached("new").await);
+        assert!(store.is_cached("a").await);
+    }
+
+    #[tokio::test]
+    async fn given_an_old_image_held_by_a_sandbox_when_the_count_is_passed_then_it_survives() {
+        // Arrange
+        let tmp = TempDir::new().expect("tempdir");
+        let store = ImageStore::with_puller(tmp.path().to_path_buf(), 2, Arc::new(FakePuller));
+        store.ensure("a").await.expect("a");
+        store.hold("sandbox-1", "a");
+        store.ensure("b").await.expect("b");
+
+        // Act
+        store.ensure("c").await.expect("c");
+
+        // Assert
+        assert!(store.is_cached("a").await);
+        assert!(!store.is_cached("b").await);
+        assert!(store.is_cached("c").await);
+    }
+
+    #[tokio::test]
+    async fn given_a_held_image_whose_tag_moved_when_room_is_needed_then_it_is_still_spared() {
+        // Arrange
+        let puller = RecordingPuller::new(100);
+        let (store, _tmp) = limited_store(puller.clone(), u64::MAX, 250);
+        let held = store.pull_for_hold("a").await;
+        puller.point("a", "sha256:moved");
+        store
+            .resolve("a", PullPolicy::Always)
+            .await
+            .expect("move tag");
+
+        // Act
+        store.ensure("c").await.expect("c makes room");
+
+        // Assert
+        assert!(store.is_cached(&held).await);
+    }
+
+    // ----- remove ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn given_a_tagged_image_when_removed_by_digest_then_the_image_is_deleted() {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(10), SMALL_CAP, SMALL_CAP * 10);
+        let image = store.pull("alpine:3", None).await.expect("pull");
+
+        // Act
+        store.remove(&image.digest).await.expect("remove by digest");
+
+        // Assert
+        assert!(!store.is_cached("alpine:3").await);
+    }
+
+    #[tokio::test]
+    async fn given_an_image_a_sandbox_runs_when_removed_then_it_is_refused() {
+        // Arrange
+        let (store, _tmp) = limited_store(RecordingPuller::new(10), SMALL_CAP, SMALL_CAP * 10);
+        store.pull("alpine:3", None).await.expect("pull");
+        store.hold("sandbox-1", "alpine:3");
+
+        // Act
+        let error = store.remove("alpine:3").await.expect_err("held");
+
+        // Assert
+        assert!(matches!(error, BackendError::InvalidArgument(_)), "{error}");
+        assert!(store.is_cached("alpine:3").await);
+    }
+
+    #[tokio::test]
+    async fn given_an_uncached_reference_when_removed_then_it_is_not_found() {
+        // Arrange
+        let (store, _tmp) = store_in_tempdir();
+
+        // Act
+        let error = store.remove("ghost").await.expect_err("missing");
+
+        // Assert
+        assert!(matches!(error, BackendError::ImageNotFound(_)), "{error}");
+    }
+
+    // ----- no detail leaks into messages ----------------------------------
+
+    #[test]
+    fn given_a_source_error_with_a_signed_url_when_mapped_then_the_message_has_no_url() {
+        // Arrange
+        let leaky = OciDistributionError::ServerError {
+            code: 503,
+            url: "https://registry.test/v2/x/blobs/sha256:aa?X-Signature=secret".to_string(),
+            message: "token=secret".to_string(),
+        };
+
+        // Act
+        let message = pull_error("alpine:x", leaky).to_string();
+
+        // Assert
+        assert!(
+            !message.contains("secret") && !message.contains("registry.test"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn given_a_broken_layer_when_unpacked_then_the_message_has_no_host_path() {
+        // Arrange
+        let dest = TempDir::new().expect("tempdir");
+
+        // Act
+        let error =
+            unpack_layer(b"not a tarball", "application/x-tar", dest.path()).expect_err("garbage");
+
+        // Assert
+        assert!(matches!(error, BackendError::Internal(_)), "{error}");
+        assert!(
+            !error
+                .to_string()
+                .contains(dest.path().to_str().expect("utf8"))
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::too_many_requests(server_error(429))]
+    #[case::server_error(server_error(500))]
+    fn given_a_throttled_or_failing_registry_when_mapped_then_it_is_unavailable(
+        #[case] error: OciDistributionError,
+    ) {
+        // Act
+        let mapped = pull_error("alpine:x", error);
+
+        // Assert
+        assert!(matches!(mapped, BackendError::Unavailable(_)), "{mapped}");
+    }
+
+    #[test]
+    fn given_a_client_error_when_checked_then_it_is_not_retried() {
+        assert!(!is_unreachable(&server_error(400)));
+        assert!(!is_unreachable(&io_error(FileTooLarge)));
+        assert!(is_unreachable(&server_error(503)));
+    }
+
+    #[test]
+    fn given_an_absolute_whiteout_path_when_unpacked_then_it_applies() {
+        // Arrange
+        let root = TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("etc")).expect("etc");
+        std::fs::write(root.path().join("etc/foo"), b"x").expect("foo");
+        let layer = raw_layer_with_name("/etc/.wh.foo");
+
+        // Act
+        unpack_layer(&layer, GZIP_MEDIA, root.path()).expect("unpack");
+
+        // Assert
+        assert!(!root.path().join("etc/foo").exists());
+    }
+
+    /// A gzipped layer whose one entry has `name` written verbatim, so an
+    /// absolute path survives the tar builder.
+    fn raw_layer_with_name(name: &str) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut tar_bytes = header.as_bytes().to_vec();
+        tar_bytes.extend(vec![0u8; 1024]);
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&tar_bytes).expect("gzip");
+        encoder.finish().expect("finish gzip")
+    }
+
     // ----- LRU eviction --------------------------------------------------
 
     #[tokio::test]
@@ -1971,7 +2926,7 @@ mod tests {
         let evictor = ImageStore::with_puller(tmp.path().to_path_buf(), 1, Arc::new(FakePuller));
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let result = metrics::with_local_recorder(&recorder, || evictor.run_lru_eviction());
+        let result = metrics::with_local_recorder(&recorder, || evictor.run_lru_eviction(""));
 
         // Restore permissions before any assertion can panic, so the
         // tempdir can still clean itself up on drop.
@@ -2019,9 +2974,12 @@ mod tests {
 
         // Pull image-a and materialize it into sandbox1.
         store
-            .prepare_sandbox_rootfs("image-a", &sandbox_rootfs)
+            .prepare_sandbox_rootfs("sb", "image-a", &sandbox_rootfs)
             .await
             .expect("prepare sandbox rootfs");
+
+        // The sandbox is gone from the host's view: nothing holds the image.
+        store.release("sb");
 
         // Verify sandbox got the materialized content.
         assert!(
@@ -2055,16 +3013,6 @@ mod tests {
         assert!(!rootfs.exists());
     }
 
-    #[tokio::test]
-    async fn given_uncached_reference_when_remove_then_returns_image_error() {
-        let (store, _tmp) = store_in_tempdir();
-        let err = store.remove("ghost:latest").await.expect_err("remove");
-        match err {
-            BackendError::Image(msg) => assert!(msg.contains("ghost:latest"), "got: {msg}"),
-            other => panic!("expected Image, got {other:?}"),
-        }
-    }
-
     // ----- list ----------------------------------------------------------
 
     #[tokio::test]
@@ -2095,7 +3043,7 @@ mod tests {
         let (store, tmp) = store_in_tempdir();
         let sandbox_dest = tmp.path().join("sandbox-xyz").join("rootfs");
         store
-            .prepare_sandbox_rootfs("alpine:latest", &sandbox_dest)
+            .prepare_sandbox_rootfs("sb", "alpine:latest", &sandbox_dest)
             .await
             .expect("prepare_sandbox_rootfs");
 
@@ -2650,7 +3598,7 @@ mod tests {
             .expect("commit");
         let dest = TempDir::new().expect("dest");
         store
-            .prepare_sandbox_rootfs("mine:v1", dest.path())
+            .prepare_sandbox_rootfs("sb", "mine:v1", dest.path())
             .await
             .expect("prepare");
         let config = store.config("mine:v1").await.expect("config");
