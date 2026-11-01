@@ -44,13 +44,15 @@ The CLA bot will record your signature automatically. You only need to do this o
 
 ## Architecture
 
-Before making non-trivial changes, skim the ADRs under [`docs/adr/`](docs/adr/). [`docs/SPEC.md`](docs/SPEC.md) is the table of contents. Each ADR is short (~50–100 lines) and explains *why* a piece of the system is shaped the way it is. Particularly useful starting points:
+Before making non-trivial changes, read [`docs/architecture.md`](docs/architecture.md) for how the layers fit together (including how to add a `Backend`), and skim the ADRs under [`docs/adr/`](docs/adr/). [`docs/SPEC.md`](docs/SPEC.md) is the table of contents. Each ADR is short (~50–100 lines) and explains *why* a piece of the system is shaped the way it is. Particularly useful starting points:
 
 - [ADR-001](docs/adr/001-project-scope.md) — what's in/out of scope
 - [ADR-003](docs/adr/003-isolation-backend.md) — libkrun and the `krunvm` feature flag
 - [ADR-004](docs/adr/004-ipc-protocol.md) — gRPC + proto schema source of truth
 - [ADR-011](docs/adr/011-cross-sandbox-comms.md) — the pub/sub broker
 - [ADR-012](docs/adr/012-backend-trait.md) — the `Backend` trait abstraction
+
+For running the daemon, see [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ## Development
 
