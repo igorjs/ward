@@ -383,8 +383,12 @@ pub enum ApiError {
     SnapshotNotFound(String),
     #[error("process not found: {0}")]
     ProcessNotFound(String),
-    #[error("image not found: {0}")]
+    /// The registry has no such image; the text is Docker's wording.
+    #[error("{0}")]
     ImageNotFound(String),
+    /// The registry or the network did not answer.
+    #[error("{0}")]
+    Unavailable(String),
     /// A path inside a sandbox does not exist; the text is Docker's wording.
     #[error("{0}")]
     PathNotFound(String),

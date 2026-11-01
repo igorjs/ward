@@ -50,7 +50,8 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
-        ApiError::ImageNotFound(id) => Status::not_found(format!("image not found: {id}")),
+        ApiError::ImageNotFound(msg) => Status::not_found(msg.clone()),
+        ApiError::Unavailable(msg) => Status::unavailable(msg.clone()),
         ApiError::PathNotFound(msg) => Status::not_found(msg.clone()),
         ApiError::InvalidRequest(msg) => Status::invalid_argument(msg.clone()),
         ApiError::GuestIo(detail) => {
@@ -1568,6 +1569,30 @@ mod tests {
         // Assert
         assert_eq!(status.code(), tonic::Code::NotFound);
         assert_eq!(status.message(), "No such container: web");
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_manifest(
+        ApiError::ImageNotFound("manifest for x:1 not found: manifest unknown".into()),
+        tonic::Code::NotFound,
+        "manifest for x:1 not found: manifest unknown"
+    )]
+    #[case::registry_down(
+        ApiError::Unavailable("could not reach the registry for x:1".into()),
+        tonic::Code::Unavailable,
+        "could not reach the registry for x:1"
+    )]
+    fn given_a_pull_failure_when_mapped_then_the_code_matches_the_cause(
+        #[case] err: ApiError,
+        #[case] code: tonic::Code,
+        #[case] message: &str,
+    ) {
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), message);
     }
 
     #[rstest::rstest]

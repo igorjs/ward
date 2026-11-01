@@ -340,7 +340,7 @@ impl Backend for KrunvmBackend {
                 // registry on cache miss) and copy it into the sandbox rootfs.
                 // This is the standard path for every `ward create` invocation.
                 self.image_store
-                    .prepare_sandbox_rootfs(&opts.image, &rootfs)
+                    .prepare_sandbox_rootfs(&id, &opts.image, &rootfs)
                     .await?;
             }
 
@@ -357,12 +357,14 @@ impl Backend for KrunvmBackend {
         let booted = match prepared {
             Ok(booted) => booted,
             Err(e) => {
+                self.image_store.release(&id);
                 self.remove_sandbox_dir(&id).await;
                 return Err(e);
             }
         };
         #[cfg(not(feature = "krunvm"))]
         if let Err(e) = prepared {
+            self.image_store.release(&id);
             self.remove_sandbox_dir(&id).await;
             return Err(e);
         }
@@ -473,6 +475,7 @@ impl Backend for KrunvmBackend {
             .await
             .remove(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        self.image_store.release(id);
 
         #[cfg(feature = "krunvm")]
         teardown_vm(id, state.shim.take(), state.smoltcp.take()).await;
@@ -523,6 +526,7 @@ impl Backend for KrunvmBackend {
             egress: None,
             info,
         };
+        self.image_store.hold(&state.info.id, &state.opts.image);
         self.sandboxes
             .write()
             .await
