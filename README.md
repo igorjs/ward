@@ -83,7 +83,8 @@ Full CLI: `ward --help`.
 ## Documentation
 
 - [`docs/SPEC.md`](docs/SPEC.md); architecture index (ADRs)
-- [`docs/architecture.md`](docs/architecture.md); system diagram
+- [`docs/architecture.md`](docs/architecture.md); layers, Backend trait, broker, process lifecycle
+- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md); run wardd in production: env vars, systemd, launchd, logs, multi-tenant notes
 - [`docs/platforms.md`](docs/platforms.md); supported platforms + libkrun setup
 - [`docs/service.md`](docs/service.md); run wardd at login (launchd, systemd, brew services)
 - [`docs/workspace.md`](docs/workspace.md); crate layout
