@@ -385,8 +385,14 @@ pub enum ApiError {
     ProcessNotFound(String),
     #[error("image not found: {0}")]
     ImageNotFound(String),
+    /// A path inside a sandbox does not exist; the text is Docker's wording.
+    #[error("{0}")]
+    PathNotFound(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
+    /// The guest started a copy and could not finish it.
+    #[error("sandbox i/o error: {0}")]
+    GuestIo(String),
     #[error("backend error: {0}")]
     Backend(String),
     #[error("internal error: {0}")]

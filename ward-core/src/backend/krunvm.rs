@@ -772,8 +772,10 @@ impl Backend for KrunvmBackend {
         super::agent::put_archive(stream, path.to_string(), chunks)
             .await
             .map_err(|e| match e.kind() {
-                // The agent answered with a refusal; anything else is transport.
-                std::io::ErrorKind::Other => BackendError::Exec(format!("copy into sandbox: {e}")),
+                // The agent answered with an error; anything else is transport.
+                std::io::ErrorKind::NotFound => BackendError::PathNotFound(path.to_string()),
+                std::io::ErrorKind::InvalidInput => BackendError::InvalidArgument(e.to_string()),
+                std::io::ErrorKind::Other => BackendError::Exec(e.to_string()),
                 _ => BackendError::Io(e),
             })
     }

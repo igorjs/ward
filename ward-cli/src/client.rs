@@ -53,6 +53,18 @@ pub async fn connect(socket_path: &str) -> Result<WardClient<Channel>> {
 /// Docker's prefix for an error the daemon returned.
 const DAEMON_ERROR_PREFIX: &str = "Error response from daemon: ";
 
+/// A local failure that Docker prints as a bare line, with no `Error:` lead.
+#[derive(Debug)]
+pub struct PlainError(pub String);
+
+impl std::fmt::Display for PlainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlainError {}
+
 /// The daemon could not be reached on its socket.
 #[derive(Debug)]
 pub struct DaemonUnreachable {
@@ -98,6 +110,9 @@ fn is_server_status(status: &tonic::Status) -> bool {
 pub fn daemon_error_line(error: &anyhow::Error) -> Option<String> {
     if let Some(unreachable) = error.downcast_ref::<DaemonUnreachable>() {
         return Some(unreachable.to_string());
+    }
+    if let Some(plain) = error.downcast_ref::<PlainError>() {
+        return Some(plain.to_string());
     }
     error
         .downcast_ref::<tonic::Status>()

@@ -336,8 +336,17 @@ fn protocol_error(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.to_string())
 }
 
-fn agent_failure(message: String) -> std::io::Error {
-    std::io::Error::other(format!("guest agent: {message}"))
+/// The agent's error as an I/O error whose kind carries why it failed:
+/// `NotFound`, `InvalidInput` for a refusal, `Other` for the rest.
+fn agent_failure(failure: proto::ArchiveError) -> std::io::Error {
+    let kind = match failure.kind() {
+        proto::ArchiveErrorKind::NotFound => std::io::ErrorKind::NotFound,
+        proto::ArchiveErrorKind::Refused => std::io::ErrorKind::InvalidInput,
+        proto::ArchiveErrorKind::Failed | proto::ArchiveErrorKind::Unspecified => {
+            std::io::ErrorKind::Other
+        }
+    };
+    std::io::Error::new(kind, format!("guest agent: {}", failure.message))
 }
 
 /// Send `chunks` as one tar stream to unpack into the guest directory `path`.
@@ -377,7 +386,7 @@ where
         .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
     match Event::decode(&frame[..]).map(|e| e.kind) {
         Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
-        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e)),
         _ => Err(protocol_error(
             "agent answered a PutArchive with another event",
         )),
@@ -416,7 +425,7 @@ where
         .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
     match Event::decode(&frame[..]).map(|e| e.kind) {
         Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
-        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e.message)),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e)),
         _ => Err(protocol_error(
             "agent answered a PutSecrets with another event",
         )),
@@ -462,7 +471,7 @@ where
                 }
             }
             Ok(Some(event::Kind::ArchiveDone(_))) => return Ok(()),
-            Ok(Some(event::Kind::ArchiveError(e))) => return Err(agent_failure(e.message)),
+            Ok(Some(event::Kind::ArchiveError(e))) => return Err(agent_failure(e)),
             _ => {
                 return Err(protocol_error(
                     "agent answered a GetArchive with another event",
