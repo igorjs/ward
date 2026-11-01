@@ -23,6 +23,14 @@ const MAX_GROUP_LEN: usize = 64;
 /// Longest `name|uid[:group|gid]` spec. Names in `/etc/passwd` are far shorter.
 const MAX_USER_SPEC_LEN: usize = 256;
 
+/// Most domains one egress allowlist may hold.
+pub const MAX_EGRESS_DOMAINS: usize = 256;
+/// Longest DNS name (RFC 1035), wildcard prefix included.
+const MAX_DOMAIN_LEN: usize = 253;
+/// Longest DNS label (RFC 1035).
+const MAX_DOMAIN_LABEL_LEN: usize = 63;
+const WILDCARD_PREFIX: &str = "*.";
+
 /// Longest sandbox name, and so the longest name, id or id prefix a lookup
 /// may carry.
 pub const MAX_SANDBOX_NAME_LEN: usize = 64;
@@ -573,6 +581,40 @@ pub fn publish_payload(payload: &[u8]) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validate hosts to add to an egress allowlist: at least one, each a DNS
+/// name with an optional leading `*.`.
+pub fn egress_domains(domains: &[String]) -> Result<(), ApiError> {
+    if domains.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "at least one domain is required".into(),
+        ));
+    }
+    if domains.len() > MAX_EGRESS_DOMAINS {
+        return Err(ApiError::InvalidRequest(format!(
+            "at most {MAX_EGRESS_DOMAINS} domains can be added at once"
+        )));
+    }
+    domains.iter().try_for_each(|d| egress_domain(d))
+}
+
+fn egress_domain(domain: &str) -> Result<(), ApiError> {
+    let name = domain.strip_prefix(WILDCARD_PREFIX).unwrap_or(domain);
+    let label_ok = |label: &str| {
+        (1..=MAX_DOMAIN_LABEL_LEN).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if domain.len() > MAX_DOMAIN_LEN || !name.split('.').all(label_ok) {
+        return Err(ApiError::InvalidRequest(format!(
+            "{domain:?} is not a valid domain (use a DNS name such as api.example.com or *.example.com)"
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 //
@@ -590,6 +632,49 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case::name("api.example.com", true)]
+    #[case::wildcard("*.example.com", true)]
+    #[case::single_label("localhost", true)]
+    #[case::empty("", false)]
+    #[case::bare_wildcard("*", false)]
+    #[case::wildcard_only_prefix("*.", false)]
+    #[case::inner_wildcard("a.*.com", false)]
+    #[case::space("a b.com", false)]
+    #[case::scheme("https://a.com", false)]
+    #[case::port("a.com:443", false)]
+    #[case::path("a.com/x", false)]
+    #[case::leading_hyphen("-a.com", false)]
+    #[case::empty_label("a..com", false)]
+    #[case::trailing_dot("a.com.", false)]
+    fn given_a_domain_when_validated_then_only_dns_names_pass(
+        #[case] domain: &str,
+        #[case] valid: bool,
+    ) {
+        // Act
+        let result = egress_domains(&[domain.to_string()]);
+
+        // Assert
+        assert_eq!(result.is_ok(), valid);
+    }
+
+    #[test]
+    fn given_empty_or_oversized_domain_list_when_validated_then_refused() {
+        // Arrange
+        let too_many = vec!["a.com".to_string(); MAX_EGRESS_DOMAINS + 1];
+        let long_label = format!("{}.com", "a".repeat(MAX_DOMAIN_LABEL_LEN + 1));
+
+        // Act
+        let empty = egress_domains(&[]);
+        let many = egress_domains(&too_many);
+        let label = egress_domains(&[long_label]);
+
+        // Assert
+        assert!(empty.is_err());
+        assert!(many.is_err());
+        assert!(label.is_err());
+    }
 
     #[rstest]
     #[case::plain("db-password", true)]

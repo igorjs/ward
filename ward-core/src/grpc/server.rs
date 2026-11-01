@@ -14,18 +14,19 @@ use crate::pb::attach_message::Kind;
 use crate::pb::copy_to_message;
 use crate::pb::ward_server::Ward;
 use crate::pb::{
-    AttachMessage, BlockedDestination, BlockedEgressRequest, BlockedEgressResponse, ChangeKind,
-    CommitRequest, CommitResponse, CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk,
-    CopyFromRequest, CopyToMessage, CreateSandboxRequest, CreateSnapshotRequest,
-    CreateVolumeRequest, DaemonInfo, DiffRequest, DiffResponse, EgressLogEntry, EgressLogResponse,
-    EventsRequest, ExecRequest, FileChange, GetCommunicationLogRequest, GetEgressLogRequest,
-    GetSandboxRequest, GetVolumeRequest, HealthStatus, KillProcessRequest, ListImagesResponse,
-    ListSandboxesResponse, ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse,
-    Message, ProcessInfo, PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest,
-    RemoveVolumeRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
-    SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
-    StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
-    TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
+    AddEgressAllowRequest, AddEgressAllowResponse, AttachMessage, BlockedDestination,
+    BlockedEgressRequest, BlockedEgressResponse, ChangeKind, CommitRequest, CommitResponse,
+    CommunicationLogEntry, CommunicationLogResponse, CopyFromChunk, CopyFromRequest, CopyToMessage,
+    CreateSandboxRequest, CreateSnapshotRequest, CreateVolumeRequest, DaemonInfo, DiffRequest,
+    DiffResponse, EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, FileChange,
+    GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
+    HealthStatus, KillProcessRequest, ListImagesResponse, ListSandboxesResponse,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
+    PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest, RemoveVolumeRequest,
+    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
+    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
+    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
+    WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::ApiError;
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -853,6 +854,26 @@ impl Ward for WardGrpcServer {
                 })
                 .collect(),
         }))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.add_egress_allow",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn add_egress_allow(
+        &self,
+        request: Request<AddEgressAllowRequest>,
+    ) -> Result<Response<AddEgressAllowResponse>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let added = self
+            .sandbox
+            .add_egress_allow(&id, req.domains)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(AddEgressAllowResponse { added }))
     }
 
     #[tracing::instrument(

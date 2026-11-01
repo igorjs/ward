@@ -43,6 +43,11 @@ service Ward {
   // Kept after the sandbox exits, until it is removed. The token travels in
   // call metadata.
   rpc BlockedEgress(BlockedEgressRequest) returns (BlockedEgressResponse);
+  // Add hosts to the egress allowlist of a sandbox created with
+  // `--egress allowlist`, effective at once and kept across restarts. The
+  // token travels in call metadata. A sandbox created with egress deny is
+  // refused, and one with open egress has nothing to add.
+  rpc AddEgressAllow(AddEgressAllowRequest) returns (AddEgressAllowResponse);
   // One reading of a running sandbox's resource use, like one frame of
   // `docker stats`. The token travels in call metadata.
   rpc Stats(StatsRequest) returns (StatsResponse);
@@ -475,6 +480,17 @@ message BlockedEgressRequest {
 
 message BlockedEgressResponse {
   repeated BlockedDestination destinations = 1;
+}
+
+message AddEgressAllowRequest {
+  string sandbox_id = 1;
+  // DNS names, each optionally with a leading `*.`.
+  repeated string domains = 2;
+}
+
+message AddEgressAllowResponse {
+  // The names this call added; ones already allowed are left out.
+  repeated string added = 1;
 }
 
 // A refused destination: a DNS name, or an IP address when no name is known.

@@ -24,7 +24,11 @@ There is no `ward build` and no Dockerfile support yet. Ward runs images from a 
 
 Ward has three modes: `deny` (default), `allowlist` and `open`. In `allowlist` mode the sandbox's DNS resolver answers REFUSED for any name not on the list. The host resolver is an outbound path, so it does not see those names.
 
-`ward egress suggest SANDBOX` has no Docker equivalent. It prints an `--allow-domain` flag for each host the sandbox was refused, and lists blocked IP addresses on stderr. The record is kept after the sandbox exits, until `rm`. `--apply` is not supported yet because the allowlist is fixed at create time.
+`ward egress suggest SANDBOX` has no Docker equivalent. It prints an `--allow-domain` flag for each host the sandbox was refused, and lists blocked IP addresses on stderr. The record is kept after the sandbox exits, until `rm`. 
+
+`ward egress suggest SANDBOX --apply` adds the suggested names to the sandbox's allowlist. It takes effect at once, without a restart, and the names are kept across daemon restarts. IP addresses are skipped. It works only on a sandbox created with `--egress allowlist`: a `deny` sandbox has no network device, so it must be recreated, and an `open` sandbox has nothing to add. An allowlist holds at most 256 names.
+
+A `deny` sandbox without published ports records nothing for `suggest`. The guest has no network card, so there is no outbound attempt for Ward to see. With published ports the stack runs and refusals are recorded.
 
 ## Secrets in process lists
 

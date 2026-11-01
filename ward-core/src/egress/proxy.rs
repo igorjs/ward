@@ -3,7 +3,7 @@
 //! Per-sandbox egress proxy with domain allowlist enforcement.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -61,7 +61,9 @@ pub struct LogEntry {
 #[derive(Debug)]
 pub struct EgressProxy {
     sandbox_id: String,
-    policy: EgressPolicy,
+    /// Swapped in place so a running sandbox picks up allowlist additions.
+    /// Held only for a short, non-awaiting read or write.
+    policy: std::sync::RwLock<EgressPolicy>,
     log: Arc<RwLock<VecDeque<LogEntry>>>,
     /// Maximum number of log entries retained in memory.
     log_capacity: usize,
@@ -73,7 +75,7 @@ impl EgressProxy {
     pub fn new(sandbox_id: String, policy: EgressPolicy) -> Self {
         Self {
             sandbox_id,
-            policy,
+            policy: std::sync::RwLock::new(policy),
             log: Arc::new(RwLock::new(VecDeque::new())),
             log_capacity: 1_000,
             blocked: Arc::new(BlockedEgress::default()),
@@ -92,14 +94,16 @@ impl EgressProxy {
     pub async fn check(&self, domain: &str, port: u16) -> bool {
         use crate::protocol::EgressMode;
 
-        let allowed = match self.policy.mode {
-            EgressMode::Deny => false,
-            EgressMode::Open => true,
-            EgressMode::Allowlist => self
-                .policy
-                .domains
-                .iter()
-                .any(|pattern| matches_domain(pattern, domain)),
+        let allowed = {
+            let policy = self.policy.read().unwrap_or_else(PoisonError::into_inner);
+            match policy.mode {
+                EgressMode::Deny => false,
+                EgressMode::Open => true,
+                EgressMode::Allowlist => policy
+                    .domains
+                    .iter()
+                    .any(|pattern| matches_domain(pattern, domain)),
+            }
         };
 
         // Metrics: labelled by decision so operators can alert on the
@@ -121,8 +125,19 @@ impl EgressProxy {
     }
 
     /// Update the proxy policy at runtime (e.g. after a hot-patch).
-    pub async fn set_policy(&mut self, policy: EgressPolicy) {
-        self.policy = policy;
+    pub async fn set_policy(&self, policy: EgressPolicy) {
+        *self.policy.write().unwrap_or_else(PoisonError::into_inner) = policy;
+    }
+
+    /// Add `domains` to the allowlist, skipping ones already present. Takes
+    /// effect on the next check; it has no effect on other modes.
+    pub fn allow_domains(&self, domains: &[String]) {
+        let mut policy = self.policy.write().unwrap_or_else(PoisonError::into_inner);
+        for domain in domains {
+            if !policy.domains.contains(domain) {
+                policy.domains.push(domain.clone());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -750,7 +765,7 @@ mod tests {
     #[tokio::test]
     async fn given_existing_proxy_when_policy_updated_to_open_then_subsequent_check_allows() {
         // Arrange: start in Deny mode
-        let mut proxy = build_proxy(EgressMode::Deny, vec![]);
+        let proxy = build_proxy(EgressMode::Deny, vec![]);
         assert!(!proxy.check("example.com", 443).await, "precondition");
 
         // Act: flip policy at runtime
@@ -769,7 +784,7 @@ mod tests {
     #[tokio::test]
     async fn given_existing_proxy_when_policy_updated_then_old_log_preserved() {
         // Arrange: log a denied attempt under the original policy
-        let mut proxy = build_proxy(EgressMode::Deny, vec![]);
+        let proxy = build_proxy(EgressMode::Deny, vec![]);
         let _ = proxy.check("blocked.com", 443).await;
 
         // Act: change policy and log another attempt
@@ -788,6 +803,51 @@ mod tests {
         assert!(!log[0].allowed);
         assert_eq!(log[1].domain, "allowed.com");
         assert!(log[1].allowed);
+    }
+
+    // ----- allow_domains: runtime allowlist additions ---------------------
+
+    #[tokio::test]
+    async fn given_blocked_host_when_domain_allowed_then_next_check_passes_and_others_stay_blocked()
+    {
+        // Arrange: a proxy shared the way the network stack holds it
+        let proxy = Arc::new(build_proxy(EgressMode::Allowlist, vec!["a.example"]));
+        let stack_view = Arc::clone(&proxy);
+        assert!(!stack_view.check("b.example", 443).await, "precondition");
+
+        // Act
+        proxy.allow_domains(&["b.example".to_string()]);
+
+        // Assert
+        assert!(stack_view.check("b.example", 443).await);
+        assert!(stack_view.check("a.example", 443).await);
+        assert!(!stack_view.check("c.example", 443).await);
+    }
+
+    #[tokio::test]
+    async fn given_wildcard_added_when_subdomain_checked_then_allowed() {
+        // Arrange
+        let proxy = build_proxy(EgressMode::Allowlist, vec![]);
+
+        // Act
+        proxy.allow_domains(&["*.cdn.net".to_string()]);
+
+        // Assert
+        assert!(proxy.check("static.cdn.net", 443).await);
+        assert!(!proxy.check("cdn.net", 443).await);
+    }
+
+    #[test]
+    fn given_domain_already_listed_when_allowed_again_then_not_duplicated() {
+        // Arrange
+        let proxy = build_proxy(EgressMode::Allowlist, vec!["a.example"]);
+
+        // Act
+        proxy.allow_domains(&["a.example".to_string(), "a.example".to_string()]);
+
+        // Assert
+        let policy = proxy.policy.read().unwrap();
+        assert_eq!(policy.domains, vec!["a.example"]);
     }
 
     // ----- forward-proxy server -------------------------------------------

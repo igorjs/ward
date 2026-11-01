@@ -869,6 +869,23 @@ impl Backend for KrunvmBackend {
         Ok(state.blocked.snapshot())
     }
 
+    async fn add_egress_allow(&self, sandbox_id: &str, domains: &[String]) -> Result<()> {
+        let mut sandboxes = self.sandboxes.write().await;
+        let state = sandboxes
+            .get_mut(sandbox_id)
+            .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+        for domain in domains {
+            if !state.opts.egress.domains.contains(domain) {
+                state.opts.egress.domains.push(domain.clone());
+            }
+        }
+        #[cfg(feature = "krunvm")]
+        if let Some(proxy) = &state.egress {
+            proxy.allow_domains(domains);
+        }
+        Ok(())
+    }
+
     async fn stats(&self, sandbox_id: &str) -> Result<super::GuestStats> {
         let stream = self.agent_stream(sandbox_id).await?;
         super::agent::stats(stream).await

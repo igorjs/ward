@@ -785,6 +785,36 @@ fn given_allowlist_egress_when_guest_is_blocked_then_egress_suggest_lists_the_ho
 }
 
 #[test]
+fn given_blocked_host_when_egress_suggest_applied_then_the_same_request_now_succeeds() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(
+        &d,
+        &[
+            "--egress",
+            "allowlist",
+            "--allow-domain",
+            "archive.ubuntu.com",
+        ],
+    );
+    assert_eq!(http_status_line(&d, &id, "security.ubuntu.com"), "");
+
+    let mut cmd = d.cli();
+    cmd.args(["egress", "suggest", &id, "--apply"]);
+    let applied = run_ok(cmd);
+
+    assert!(
+        applied.contains("Added security.ubuntu.com"),
+        "host missing from the applied list:\n{applied}"
+    );
+    let status = http_status_line(&d, &id, "security.ubuntu.com");
+    assert!(
+        status.starts_with("HTTP/"),
+        "no HTTP response after apply: {status:?}"
+    );
+}
+
+#[test]
 fn given_open_egress_when_guest_targets_cloud_metadata_address_then_it_is_blocked() {
     require_vm!();
     let d = Daemon::spawn_vm();

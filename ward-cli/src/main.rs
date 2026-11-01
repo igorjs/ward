@@ -639,8 +639,9 @@ enum EgressCommands {
     Suggest {
         /// Sandbox name, ID or ID prefix.
         reference: String,
-        /// Add the hosts to the sandbox's allowlist. Not supported yet: the
-        /// allowlist is fixed when the sandbox is created.
+        /// Add the hosts to the sandbox's allowlist at once, and keep them
+        /// across restarts. Needs a sandbox created with `--egress
+        /// allowlist`. IP addresses are skipped.
         #[arg(long)]
         apply: bool,
     },
