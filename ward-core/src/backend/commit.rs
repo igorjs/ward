@@ -7,20 +7,26 @@
 //! copied as a link and never followed, and an entry swapped for another
 //! type after it was listed is skipped. Owner and mode come from the opened
 //! fd. Setuid and setgid bits are dropped, as the snapshot policy does.
-//! Device nodes, FIFOs and sockets are not copied. Hard links become
-//! separate files, and extended attributes, sparse holes and modification
-//! times are not kept. An entry the daemon cannot read fails the commit.
+//! Like `docker commit`, the copy keeps hard links, sparse holes, whole-second
+//! modification times, user extended attributes and file capabilities, FIFOs
+//! and device nodes. Sockets are left out. A device node needs privilege to
+//! create, so an unprivileged daemon leaves it out. An entry the daemon cannot
+//! read fails the commit.
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustix::fs::{self, AtFlags, FileType, Gid, Mode, OFlags, Stat, Uid};
 use rustix::io::Errno;
 
+use super::commit_meta::{
+    copy_xattrs, make_special, next_data_run, restore_times, restore_times_at,
+};
 use super::diff::{DIR_FLAGS, file_type, list_names, open_file, open_root, stat_at};
 use super::image::ImageConfig;
 use super::{BackendError, Result};
@@ -91,25 +97,49 @@ pub fn copy_tree(
     limits: CopyLimits,
     cancel: &AtomicBool,
 ) -> std::result::Result<u64, CopyError> {
-    let mut copy = Copy {
-        skip,
-        limits,
-        cancel,
-        visited: 0,
-        copied_bytes: 0,
-    };
+    copy_tree_with(src, dst, skip, limits, cancel, &|_| {})
+}
+
+/// `copy_tree` with a hook called with each guest path after its type is read
+/// and before it is opened, so tests can swap the entry in that window.
+fn copy_tree_with(
+    src: &Path,
+    dst: &Path,
+    skip: &[&str],
+    limits: CopyLimits,
+    cancel: &AtomicBool,
+    before_open: &dyn Fn(&Path),
+) -> std::result::Result<u64, CopyError> {
     let (src, dst) = (
         open_root(src).map_err(CopyError::Backend)?,
         open_root(dst).map_err(CopyError::Backend)?,
     );
+    let mut copy = Copy {
+        skip,
+        limits,
+        cancel,
+        before_open,
+        dst_root: &dst,
+        linked: HashMap::new(),
+        visited: 0,
+        copied_bytes: 0,
+    };
     copy.copy_dir(&src, &dst, Path::new(""), 1)?;
     Ok(copy.copied_bytes)
 }
+
+/// Identity of an inode on the source: device and inode number.
+type InodeId = (i128, i128);
 
 struct Copy<'a> {
     skip: &'a [&'a str],
     limits: CopyLimits,
     cancel: &'a AtomicBool,
+    before_open: &'a dyn Fn(&Path),
+    dst_root: &'a OwnedFd,
+    /// Where each multiply-linked source inode was first copied, relative to
+    /// `dst_root`, so its other names become links to that copy.
+    linked: HashMap<InodeId, PathBuf>,
     visited: usize,
     copied_bytes: u64,
 }
@@ -131,11 +161,15 @@ impl Copy<'_> {
             let Some(stat) = stat_at(src, &name).map_err(|e| unreadable(&child, e))? else {
                 continue;
             };
+            (self.before_open)(&child);
             match file_type(&stat) {
                 FileType::Directory => self.copy_subdir(src, dst, &name, &child, depth)?,
                 FileType::RegularFile => self.copy_file(src, dst, &name, &child)?,
                 FileType::Symlink => copy_link(src, dst, &name, &child, &stat)?,
-                // FIFOs, sockets and devices are recreated by the guest.
+                kind @ (FileType::Fifo | FileType::CharacterDevice | FileType::BlockDevice) => {
+                    copy_special(dst, &name, &child, kind, &stat)?;
+                }
+                // Docker leaves sockets out of a commit too.
                 _ => {}
             }
         }
@@ -164,7 +198,7 @@ impl Copy<'_> {
         let copy =
             fs::openat(dst, name, DIR_FLAGS, Mode::empty()).map_err(|e| unreadable(rel, e))?;
         self.copy_dir(&inner, &copy, rel, depth + 1)?;
-        restore_owner_and_mode(&copy, &stat).map_err(|e| unreadable(rel, e))
+        restore_metadata(&inner, &copy, &stat).map_err(|e| unreadable(rel, e))
     }
 
     /// A file that vanished or was swapped for a link or special file since
@@ -176,7 +210,7 @@ impl Copy<'_> {
         name: &OsStr,
         rel: &Path,
     ) -> std::result::Result<(), CopyError> {
-        let mut input = match open_file(src, name) {
+        let input = match open_file(src, name) {
             Ok(file) => file,
             Err(Errno::NOENT | Errno::LOOP) => return Ok(()),
             Err(errno) => return Err(unreadable(rel, errno)),
@@ -186,26 +220,64 @@ impl Copy<'_> {
         if file_type(&stat) != FileType::RegularFile {
             return Ok(());
         }
-        let mut output = File::from(
+        let id = inode_id(&stat);
+        if stat.st_nlink > 1
+            && let Some(first) = self.linked.get(&id)
+        {
+            return fs::linkat(self.dst_root, first, dst, name, AtFlags::empty())
+                .map_err(|e| unreadable(rel, e));
+        }
+        let output = File::from(
             fs::openat(dst, name, CREATE_FLAGS, Mode::RUSR | Mode::WUSR)
                 .map_err(|e| unreadable(rel, e))?,
         );
-        let mut chunk = vec![0u8; COPY_CHUNK_BYTES];
-        loop {
-            self.check_cancelled()?;
-            let read = input.read(&mut chunk).map_err(|e| unreadable(rel, e))?;
-            if read == 0 {
-                break;
-            }
-            self.copied_bytes += read as u64;
-            if self.copied_bytes > self.limits.max_bytes {
-                return Err(CopyError::TooLarge);
-            }
-            output
-                .write_all(&chunk[..read])
-                .map_err(|e| unreadable(rel, e))?;
+        self.copy_data(&input, &output, stat.st_size, rel)?;
+        restore_metadata(&input, &output, &stat).map_err(|e| unreadable(rel, e))?;
+        if stat.st_nlink > 1 {
+            self.linked.insert(id, rel.to_path_buf());
         }
-        restore_owner_and_mode(&output, &stat).map_err(|e| unreadable(rel, e))
+        Ok(())
+    }
+
+    /// Copy only the data runs of `input`, so holes stay holes, then set the
+    /// length. Only data bytes count against the byte cap.
+    fn copy_data(
+        &mut self,
+        input: &File,
+        output: &File,
+        size: i64,
+        rel: &Path,
+    ) -> std::result::Result<(), CopyError> {
+        let size = u64::try_from(size).unwrap_or(0);
+        let mut chunk = vec![0u8; COPY_CHUNK_BYTES];
+        let mut pos = 0;
+        while let Some((start, end)) =
+            next_data_run(input, pos, size).map_err(|e| unreadable(rel, e))?
+        {
+            let mut at = start;
+            while at < end {
+                self.check_cancelled()?;
+                let want = chunk
+                    .len()
+                    .min(usize::try_from(end - at).unwrap_or(usize::MAX));
+                let read = input
+                    .read_at(&mut chunk[..want], at)
+                    .map_err(|e| unreadable(rel, e))?;
+                if read == 0 {
+                    break;
+                }
+                self.copied_bytes += read as u64;
+                if self.copied_bytes > self.limits.max_bytes {
+                    return Err(CopyError::TooLarge);
+                }
+                output
+                    .write_all_at(&chunk[..read], at)
+                    .map_err(|e| unreadable(rel, e))?;
+                at += read as u64;
+            }
+            pos = end;
+        }
+        output.set_len(size).map_err(|e| unreadable(rel, e))
     }
 
     fn is_skipped(&self, rel: &Path) -> bool {
@@ -260,7 +332,30 @@ fn copy_link(
         Err(errno) => return Err(unreadable(rel, errno)),
     };
     fs::symlinkat(target.as_c_str(), dst, name).map_err(|e| unreadable(rel, e))?;
-    // Best effort: only a privileged daemon may give the link away.
+    give_away(dst, name, stat);
+    let _ = restore_times_at(dst, name, stat);
+    Ok(())
+}
+
+/// Recreate a FIFO or device node from the type recorded when it was listed;
+/// the source node is never opened.
+fn copy_special(
+    dst: &OwnedFd,
+    name: &OsStr,
+    rel: &Path,
+    kind: FileType,
+    stat: &Stat,
+) -> std::result::Result<(), CopyError> {
+    let mode = Mode::from_raw_mode(stat.st_mode).difference(PRIVILEGE_BITS);
+    if make_special(dst, name, kind, mode, stat).map_err(|e| unreadable(rel, e))? {
+        give_away(dst, name, stat);
+        restore_times_at(dst, name, stat).map_err(|e| unreadable(rel, e))?;
+    }
+    Ok(())
+}
+
+/// Best effort: only a privileged daemon may give a node away.
+fn give_away(dst: &OwnedFd, name: &OsStr, stat: &Stat) {
     let _ = fs::chownat(
         dst,
         name,
@@ -268,21 +363,29 @@ fn copy_link(
         Some(Gid::from_raw(stat.st_gid)),
         AtFlags::SYMLINK_NOFOLLOW,
     );
-    Ok(())
 }
 
-/// Give the copy the owner and mode of the inode that was copied, without
-/// setuid and setgid. Ownership only changes for a privileged daemon.
-fn restore_owner_and_mode(fd: impl AsFd, stat: &Stat) -> std::result::Result<(), Errno> {
+fn inode_id(stat: &Stat) -> InodeId {
+    (i128::from(stat.st_dev), i128::from(stat.st_ino))
+}
+
+/// Give the copy the owner, extended attributes, mode and times of the inode
+/// that was copied, without setuid and setgid. Ownership only changes for a
+/// privileged daemon. Attributes go on before the mode, which may revoke the
+/// daemon's write access, and after the owner, which clears file capabilities
+/// when it changes.
+fn restore_metadata(from: impl AsFd, to: impl AsFd, stat: &Stat) -> std::result::Result<(), Errno> {
     let _ = fs::fchown(
-        &fd,
+        &to,
         Some(Uid::from_raw(stat.st_uid)),
         Some(Gid::from_raw(stat.st_gid)),
     );
+    copy_xattrs(&from, &to);
     fs::fchmod(
-        &fd,
+        &to,
         Mode::from_raw_mode(stat.st_mode).difference(PRIVILEGE_BITS),
-    )
+    )?;
+    restore_times(&to, stat)
 }
 
 /// What a commit records besides the files.
@@ -407,7 +510,8 @@ pub fn overlay_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use rstest::rstest;
+    use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 
     fn tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let root = tempfile::tempdir().expect("tempdir");
@@ -668,6 +772,197 @@ mod tests {
             };
             assert!(error.to_string().contains(&format!("/{name}")), "{error}");
         }
+    }
+
+    #[test]
+    fn given_hard_linked_names_when_copied_then_they_share_one_inode_and_count_once() {
+        // Arrange
+        let (_root, src, dst) = tree();
+        std::fs::create_dir(src.join("sub")).expect("dir");
+        std::fs::write(src.join("a"), b"shared").expect("file");
+        std::fs::hard_link(src.join("a"), src.join("sub/b")).expect("link");
+        std::fs::write(src.join("c"), b"alone").expect("file");
+
+        // Act
+        let bytes = copy(&src, &dst, &[], CopyLimits::default()).expect("copy");
+
+        // Assert
+        let inode = |p: &str| std::fs::metadata(dst.join(p)).expect("meta");
+        assert_eq!(inode("a").ino(), inode("sub/b").ino());
+        assert_eq!(inode("a").nlink(), 2);
+        assert_ne!(inode("a").ino(), inode("c").ino());
+        assert_eq!(bytes, 6 + 5);
+    }
+
+    #[test]
+    fn given_mtimes_with_nanoseconds_when_copied_then_whole_seconds_are_kept() {
+        // Arrange
+        let (_root, src, dst) = tree();
+        std::fs::create_dir(src.join("d")).expect("dir");
+        std::fs::write(src.join("d/f"), b"x").expect("file");
+        symlink("f", src.join("d/l")).expect("link");
+        let time = rustix::fs::Timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 987_654_321,
+        };
+        let times = rustix::fs::Timestamps {
+            last_access: time,
+            last_modification: time,
+        };
+        for name in ["d/f", "d/l", "d"] {
+            rustix::fs::utimensat(
+                rustix::fs::CWD,
+                src.join(name),
+                &times,
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .expect("set times");
+        }
+
+        // Act
+        copy(&src, &dst, &[], CopyLimits::default()).expect("copy");
+
+        // Assert
+        for name in ["d/f", "d/l", "d"] {
+            let meta = std::fs::symlink_metadata(dst.join(name)).expect("meta");
+            assert_eq!(meta.mtime(), 1_700_000_000, "{name}");
+            assert_eq!(meta.mtime_nsec(), 0, "{name}");
+        }
+    }
+
+    #[test]
+    fn given_a_sparse_file_when_copied_then_the_holes_are_not_filled() {
+        // Arrange
+        const LEN: u64 = 16 * 1024 * 1024;
+        let (_root, src, dst) = tree();
+        let file = File::create(src.join("sparse")).expect("file");
+        file.write_all_at(b"head", 0).expect("head");
+        file.write_all_at(b"tail", LEN - 4).expect("tail");
+        drop(file);
+        let first_run = |path: &Path| {
+            let file = File::open(path).expect("open");
+            next_data_run(&file, 0, LEN).expect("run")
+        };
+        if first_run(&src.join("sparse")) == Some((0, LEN)) {
+            return; // this filesystem does not report holes
+        }
+
+        // Act
+        let bytes = copy(&src, &dst, &[], CopyLimits::default()).expect("copy");
+
+        // Assert
+        let copied = std::fs::metadata(dst.join("sparse")).expect("meta");
+        assert_eq!(copied.len(), LEN);
+        assert_ne!(
+            first_run(&dst.join("sparse")),
+            Some((0, LEN)),
+            "holes filled"
+        );
+        assert!(bytes < LEN / 2, "holes counted against the cap");
+        let content = std::fs::read(dst.join("sparse")).expect("read");
+        assert_eq!(&content[..4], b"head");
+        assert_eq!(&content[content.len() - 4..], b"tail");
+    }
+
+    #[test]
+    fn given_a_user_xattr_when_copied_then_the_copy_keeps_it() {
+        // Arrange
+        let (_root, src, dst) = tree();
+        std::fs::write(src.join("f"), b"x").expect("file");
+        let file = File::open(src.join("f")).expect("open");
+        if rustix::fs::fsetxattr(&file, "user.ward", b"kept", rustix::fs::XattrFlags::empty())
+            .is_err()
+        {
+            return; // this filesystem has no user xattrs
+        }
+
+        // Act
+        copy(&src, &dst, &[], CopyLimits::default()).expect("copy");
+
+        // Assert
+        let copied = File::open(dst.join("f")).expect("open");
+        let mut value = [0u8; 8];
+        let len = rustix::fs::fgetxattr(&copied, "user.ward", value.as_mut_slice()).expect("xattr");
+        assert_eq!(&value[..len], b"kept");
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    #[test]
+    fn given_a_fifo_when_copied_then_a_fifo_is_recreated() {
+        use std::os::unix::fs::FileTypeExt;
+
+        // Arrange
+        let (_root, src, dst) = tree();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            src.join("pipe"),
+            Mode::from_raw_mode(0o640),
+        )
+        .expect("fifo");
+
+        // Act
+        copy(&src, &dst, &[], CopyLimits::default()).expect("copy");
+
+        // Assert
+        let meta = std::fs::symlink_metadata(dst.join("pipe")).expect("meta");
+        assert!(meta.file_type().is_fifo());
+        assert_eq!(meta.mode() & 0o7777, 0o640);
+    }
+
+    #[rstest]
+    #[case::dir_swapped_for_link("d", true)]
+    #[case::file_swapped_for_link("d", false)]
+    fn given_an_entry_swapped_for_a_symlink_after_listing_when_copied_then_it_is_not_followed(
+        #[case] name: &str,
+        #[case] is_dir: bool,
+    ) {
+        // Arrange
+        let (root, src, dst) = tree();
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside");
+        std::fs::write(outside.join("secret"), b"host secret").expect("secret");
+        if is_dir {
+            std::fs::create_dir(src.join(name)).expect("dir");
+            std::fs::write(src.join(name).join("inner"), b"guest").expect("inner");
+        } else {
+            std::fs::write(src.join(name), b"guest").expect("file");
+        }
+        let target = if is_dir {
+            outside.clone()
+        } else {
+            outside.join("secret")
+        };
+        let swap = |rel: &Path| {
+            if rel == Path::new(name) {
+                let path = src.join(name);
+                if is_dir {
+                    std::fs::remove_dir_all(&path).expect("remove dir");
+                } else {
+                    std::fs::remove_file(&path).expect("remove file");
+                }
+                symlink(&target, &path).expect("swap");
+            }
+        };
+
+        // Act
+        copy_tree_with(
+            &src,
+            &dst,
+            &[],
+            CopyLimits::default(),
+            &AtomicBool::new(false),
+            &swap,
+        )
+        .expect("copy");
+
+        // Assert
+        assert!(
+            std::fs::symlink_metadata(src.join(name))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!dst.join(name).exists(), "the link target was copied");
+        assert!(std::fs::read_dir(&dst).expect("dst").next().is_none());
     }
 
     #[test]
