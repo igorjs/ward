@@ -17,6 +17,9 @@ pub(crate) mod vmshim;
 pub enum BackendError {
     #[error("sandbox not found: {0}")]
     NotFound(String),
+    /// A path inside the sandbox does not exist.
+    #[error("path not found in the sandbox: {0}")]
+    PathNotFound(String),
     #[error("image error: {0}")]
     Image(String),
     #[error("spawn failed: {0}")]

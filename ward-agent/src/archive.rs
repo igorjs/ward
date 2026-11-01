@@ -10,7 +10,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use ward_archive::{Limits, Policy};
 
-use super::proto::{ArchiveChunk, ArchiveDone, ArchiveError, Event, event, request};
+use super::proto::{
+    ArchiveChunk, ArchiveDone, ArchiveError, ArchiveErrorKind, Event, event, request,
+};
 use super::{decode_request, encode_event, read_frame, write_frame};
 
 /// Tar bytes carried by one `ArchiveChunk`, well under the frame cap.
@@ -67,6 +69,25 @@ fn invalid(message: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+/// How the daemon should report a failed transfer.
+fn error_kind(e: &io::Error) -> ArchiveErrorKind {
+    match e.kind() {
+        io::ErrorKind::NotFound => ArchiveErrorKind::NotFound,
+        io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ArchiveErrorKind::Refused,
+        _ => ArchiveErrorKind::Failed,
+    }
+}
+
+/// Keep the kind of a real I/O failure; a refused tar becomes `InvalidData`
+/// and a failed unpack of one entry becomes `Other`.
+fn archive_io(e: ward_archive::ArchiveError) -> io::Error {
+    match e {
+        ward_archive::ArchiveError::Io(source) => source,
+        e @ ward_archive::ArchiveError::Unpack { .. } => io::Error::other(e),
+        refused => io::Error::new(io::ErrorKind::InvalidData, refused),
+    }
+}
+
 async fn send<W: AsyncWrite + Unpin>(w: &mut W, kind: event::Kind) -> io::Result<()> {
     write_frame(w, &encode_event(&Event { kind: Some(kind) })).await
 }
@@ -76,6 +97,7 @@ async fn finish<W: AsyncWrite + Unpin>(w: &mut W, outcome: io::Result<()>) -> io
     let kind = match outcome {
         Ok(()) => event::Kind::ArchiveDone(ArchiveDone {}),
         Err(e) => event::Kind::ArchiveError(ArchiveError {
+            kind: error_kind(&e).into(),
             message: e.to_string(),
         }),
     };
@@ -142,7 +164,7 @@ async fn receive<R: AsyncRead + Unpin>(
     unpacker
         .await
         .map_err(io::Error::other)?
-        .map_err(io::Error::other)?;
+        .map_err(archive_io)?;
     fed
 }
 
@@ -196,12 +218,12 @@ async fn transmit<W: AsyncWrite + Unpin>(
 // `pack_dir` applies fixed entry, byte and depth caps of its own.
 fn pack(source: &Path, writer: ChunkWriter) -> io::Result<()> {
     let mut writer = if source.is_dir() {
-        ward_archive::pack_dir(source, writer).map_err(io::Error::other)?
+        ward_archive::pack_dir(source, writer).map_err(archive_io)?
     } else if source.is_file() {
         let name = source
             .file_name()
             .ok_or_else(|| invalid("guest path has no file name".into()))?;
-        ward_archive::pack_file(source, Path::new(name), writer).map_err(io::Error::other)?
+        ward_archive::pack_file(source, Path::new(name), writer).map_err(archive_io)?
     } else {
         return Err(invalid("guest path is not a file or directory".into()));
     };
@@ -299,6 +321,9 @@ mod tests {
     const CAP: usize = 3;
     /// Bytes per chunk frame, small so a tar spans several frames.
     const TEST_CHUNK: usize = 700;
+    /// Direction flags for the parameterised failure test.
+    const GET: bool = true;
+    const PUT: bool = false;
 
     fn frame(kind: request::Kind) -> Vec<u8> {
         Request { kind: Some(kind) }.encode_to_vec()
@@ -428,6 +453,71 @@ mod tests {
         // Assert
         assert!(result.is_err());
         assert!(!base.path().join("evil").exists());
+    }
+
+    /// The kind the agent put on the closing error frame of a transfer.
+    async fn failure_kind(scope: &Scope, frames: Vec<Vec<u8>>) -> ArchiveErrorKind {
+        match exchange(scope, frames).await.pop().and_then(|e| e.kind) {
+            Some(event::Kind::ArchiveError(e)) => e.kind(),
+            other => panic!("no error frame: {other:?}"),
+        }
+    }
+
+    fn put_frames(path: &str, tar: &[u8]) -> Vec<Vec<u8>> {
+        vec![
+            frame(request::Kind::PutArchive(PutArchive { path: path.into() })),
+            frame(request::Kind::ArchiveChunk(ArchiveChunk {
+                data: tar.to_vec(),
+            })),
+            frame(request::Kind::ArchiveEnd(ArchiveEnd {})),
+        ]
+    }
+
+    #[rstest]
+    #[case::get_missing(GET, "/missing", ArchiveErrorKind::NotFound)]
+    #[case::get_relative(GET, "relative", ArchiveErrorKind::Refused)]
+    #[case::put_missing_dir(PUT, "/missing", ArchiveErrorKind::NotFound)]
+    #[case::put_regular_file(PUT, "/plain", ArchiveErrorKind::Refused)]
+    #[tokio::test]
+    async fn given_a_failing_transfer_when_it_ends_then_the_error_frame_names_why(
+        #[case] direction: bool,
+        #[case] path: &str,
+        #[case] expected: ArchiveErrorKind,
+    ) {
+        // Arrange
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("plain"), b"x").unwrap();
+        let scope = scope_in(root.path(), Limits::default());
+        let frames = if direction == GET {
+            vec![frame(request::Kind::GetArchive(GetArchive {
+                path: path.into(),
+            }))]
+        } else {
+            put_frames(path, &build(vec![file("f", 1)]))
+        };
+
+        // Act
+        let kind = failure_kind(&scope, frames).await;
+
+        // Assert
+        assert_eq!(kind, expected);
+    }
+
+    #[tokio::test]
+    async fn given_a_tar_over_the_byte_cap_when_put_then_the_error_kind_is_refused() {
+        // Arrange
+        let root = tempfile::tempdir().unwrap();
+        let limits = Limits {
+            max_total_bytes: BYTE_CAP,
+            ..Limits::default()
+        };
+        let frames = put_frames("/", &build(vec![file("big", OVER_BYTE_CAP)]));
+
+        // Act
+        let kind = failure_kind(&scope_in(root.path(), limits), frames).await;
+
+        // Assert
+        assert_eq!(kind, ArchiveErrorKind::Refused);
     }
 
     #[tokio::test]

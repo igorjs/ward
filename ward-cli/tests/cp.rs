@@ -77,7 +77,7 @@ impl tonic::server::ServerStreamingService<CopyFromRequest> for CopyFrom {
         let path = request.into_inner().path;
         std::future::ready(match self.0.served.get(&path) {
             None if path == FLAKY_PATH => Err(tonic::Status::unavailable("daemon is restarting")),
-            None => Err(tonic::Status::invalid_argument(format!(
+            None => Err(tonic::Status::not_found(format!(
                 "Could not find the file {path} in container {SANDBOX_ID}"
             ))),
             Some(tar) => {
@@ -404,6 +404,57 @@ async fn given_a_host_dir_when_cp_to_a_missing_guest_path_then_the_dir_is_rename
     let uploads = fixture.uploads.lock().unwrap();
     assert_eq!(uploads[0].path, "/tmp");
     assert_eq!(entry_names(&uploads[0].tar), ["newdir", "newdir/a.txt"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn given_a_host_dir_contents_when_cp_to_a_missing_guest_path_then_the_dir_is_created() {
+    // Arrange
+    let fixture = Fixture::start(&[]).await;
+    let src = fixture.work().join("src");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), FILE_BODY).unwrap();
+
+    // Act
+    let output = fixture.ward(&["cp", "src/.", "sb:/tmp/newdir"], None).await;
+
+    // Assert
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let uploads = fixture.uploads.lock().unwrap();
+    assert_eq!(uploads[0].path, "/tmp");
+    assert_eq!(entry_names(&uploads[0].tar), ["newdir", "newdir/a.txt"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn given_a_host_dir_contents_when_cp_to_a_guest_file_then_a_dir_cannot_replace_it() {
+    // Arrange
+    let fixture = Fixture::start(&[("/f", tar_of(vec![file_entry("f", FILE_BODY)]))]).await;
+    std::fs::create_dir(fixture.work().join("src")).unwrap();
+
+    // Act
+    let output = fixture.ward(&["cp", "src/.", "sb:/f"], None).await;
+
+    // Assert
+    assert!(stderr_of(&output).contains("cannot copy a directory to a file"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn given_a_missing_host_source_when_cp_up_then_the_error_is_docker_lstat_wording() {
+    // Arrange
+    let fixture = Fixture::start(&[]).await;
+
+    // Act
+    let output = fixture.ward(&["cp", "nope", "sb:/tmp"], None).await;
+
+    // Assert
+    let message = stderr_of(&output);
+    assert!(message.starts_with("lstat /"), "{message}");
+    assert!(
+        message
+            .trim_end()
+            .ends_with("/nope: no such file or directory"),
+        "{message}"
+    );
+    assert!(fixture.uploads.lock().unwrap().is_empty());
 }
 
 fn exec_entry<'a>(name: &str, body: &'a [u8]) -> (Header, &'a [u8]) {

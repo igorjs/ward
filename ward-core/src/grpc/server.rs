@@ -51,7 +51,11 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
         ApiError::ImageNotFound(id) => Status::not_found(format!("image not found: {id}")),
+        ApiError::PathNotFound(msg) => Status::not_found(msg.clone()),
         ApiError::InvalidRequest(msg) => Status::invalid_argument(msg.clone()),
+        ApiError::GuestIo(detail) => {
+            Status::internal(format!("the sandbox could not complete the copy: {detail}"))
+        }
         ApiError::Backend(detail) => {
             error!(error = %detail, "backend error");
             Status::internal("internal error")
@@ -1564,6 +1568,30 @@ mod tests {
         // Assert
         assert_eq!(status.code(), tonic::Code::NotFound);
         assert_eq!(status.message(), "No such container: web");
+    }
+
+    #[rstest::rstest]
+    #[case::missing_path(
+        ApiError::PathNotFound("Could not find the file /x in container c".into()),
+        tonic::Code::NotFound,
+        "Could not find the file /x in container c"
+    )]
+    #[case::guest_io(
+        ApiError::GuestIo("disk full".into()),
+        tonic::Code::Internal,
+        "the sandbox could not complete the copy: disk full"
+    )]
+    fn given_a_copy_failure_when_mapped_then_the_code_and_message_tell_it_apart(
+        #[case] err: ApiError,
+        #[case] code: tonic::Code,
+        #[case] message: &str,
+    ) {
+        // Act
+        let status = api_err_to_status(err);
+
+        // Assert
+        assert_eq!(status.code(), code);
+        assert_eq!(status.message(), message);
     }
 
     #[test]

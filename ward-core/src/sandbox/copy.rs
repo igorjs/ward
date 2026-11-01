@@ -22,8 +22,6 @@ const BLOCK_SIZE: usize = 512;
 const TRAILER_LIMIT_BYTES: usize = 16 * BLOCK_SIZE;
 /// How long the guest may send nothing before the copy is abandoned.
 const IDLE_DEADLINE: Duration = Duration::from_secs(30);
-/// What the guest says when a path does not exist (Linux `strerror`).
-const MISSING_PATH_TEXT: &str = "No such file or directory";
 
 /// The sandbox and guest path a copy names, for error messages.
 pub(super) struct GuestTarget {
@@ -39,31 +37,37 @@ impl GuestTarget {
         }
     }
 
-    /// Map a backend failure of a copy into the sandbox. An `Exec` error is
-    /// the guest refusing the request; anything else is on our side.
+    /// Map a backend failure of a copy into the sandbox. A missing path or a
+    /// refusal is the caller's; an `Exec` error is the guest failing to
+    /// finish; anything else is on our side.
     pub(super) fn backend_failure(&self, e: BackendError) -> ApiError {
         match e {
             BackendError::NotFound(id) => ApiError::SandboxNotFound(id),
+            BackendError::PathNotFound(_) => self.missing(),
             BackendError::InvalidArgument(detail) => ApiError::InvalidRequest(detail),
-            BackendError::Exec(detail) if detail.contains(MISSING_PATH_TEXT) => self.missing(),
-            BackendError::Exec(detail) => ApiError::InvalidRequest(detail),
+            BackendError::Exec(detail) => ApiError::GuestIo(detail),
             other => ApiError::Backend(other.to_string()),
         }
     }
 
     /// Docker's wording, so scripts that know it recognise the error.
     fn missing(&self) -> ApiError {
-        ApiError::InvalidRequest(format!(
+        ApiError::PathNotFound(format!(
             "Could not find the file {} in container {}",
             self.path, self.container
         ))
     }
 
     /// A refused archive is the caller's problem; a failure to read it is not.
+    /// The guest's own errors reach here as I/O errors whose kind says why.
     fn relay_failure(&self, e: ArchiveError) -> ApiError {
         match e {
-            ArchiveError::Io(io) if io.to_string().contains(MISSING_PATH_TEXT) => self.missing(),
-            ArchiveError::Io(io) => ApiError::Backend(format!("copy from sandbox: {io}")),
+            ArchiveError::Io(io) => match io.kind() {
+                io::ErrorKind::NotFound => self.missing(),
+                io::ErrorKind::InvalidInput => ApiError::InvalidRequest(io.to_string()),
+                io::ErrorKind::Other => ApiError::GuestIo(io.to_string()),
+                _ => ApiError::Backend(format!("copy from sandbox: {io}")),
+            },
             refused => ApiError::InvalidRequest(format!("cannot copy from the sandbox: {refused}")),
         }
     }
@@ -350,6 +354,47 @@ mod tests {
         drain(checked_relay(source, limits, target())).await
     }
 
+    /// Answer a `GetArchive` with an agent error of `kind`.
+    async fn serve_error<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        kind: proto::ArchiveErrorKind,
+    ) {
+        read_frame(&mut stream).await.unwrap().unwrap();
+        let failure = event::Kind::ArchiveError(proto::ArchiveError {
+            message: "boom".into(),
+            kind: kind.into(),
+        });
+        write_frame(&mut stream, &frame(failure)).await.unwrap();
+    }
+
+    #[rstest]
+    #[case::missing(
+        proto::ArchiveErrorKind::NotFound,
+        "Could not find the file /data in container c1"
+    )]
+    #[case::refused(proto::ArchiveErrorKind::Refused, "invalid request: guest agent: boom")]
+    #[case::failed(
+        proto::ArchiveErrorKind::Failed,
+        "sandbox i/o error: guest agent: boom"
+    )]
+    #[tokio::test]
+    async fn given_an_agent_error_when_copied_from_then_the_kind_picks_the_api_error(
+        #[case] kind: proto::ArchiveErrorKind,
+        #[case] expected: &str,
+    ) {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(SMALL_CHUNK * 4);
+        tokio::spawn(serve_error(guest, kind));
+        let (tx, source) = mpsc::channel(COPY_CHANNEL_CAPACITY);
+        tokio::spawn(agent::get_archive(daemon, GUEST_DIR.into(), tx));
+
+        // Act
+        let (_, failure) = drain(checked_relay(source, Limits::default(), target())).await;
+
+        // Assert
+        assert_eq!(failure.unwrap().to_string(), expected);
+    }
+
     /// A GNU long-name entry: a `L` record holding `name`, then a file.
     fn long_named(name: &str, body: &[u8]) -> Vec<u8> {
         let mut name_bytes = name.as_bytes().to_vec();
@@ -489,24 +534,40 @@ mod tests {
 
     #[rstest]
     #[case::missing(
-        target().relay_failure(ArchiveError::Io(io::Error::other("guest agent: No such file or directory"))),
-        "invalid request: Could not find the file /data in container c1"
+        target().relay_failure(ArchiveError::Io(io::ErrorKind::NotFound.into())),
+        "Could not find the file /data in container c1"
+    )]
+    #[case::guest_refusal(
+        target().relay_failure(ArchiveError::Io(io::ErrorKind::InvalidInput.into())),
+        "invalid request: invalid input parameter"
+    )]
+    #[case::guest_failure(
+        target().relay_failure(ArchiveError::Io(io::Error::other("disk full"))),
+        "sandbox i/o error: disk full"
     )]
     #[case::read_failure(
         target().relay_failure(ArchiveError::Io(io::ErrorKind::BrokenPipe.into())),
         "backend error: copy from sandbox: broken pipe"
     )]
+    #[case::transport_failure(
+        target().backend_failure(BackendError::Io(io::ErrorKind::BrokenPipe.into())),
+        "backend error: io error: broken pipe"
+    )]
     #[case::refused(
         target().relay_failure(ArchiveError::UnsafePath("x".into())),
         "invalid request: cannot copy from the sandbox: archive entry has an unsafe path: x"
     )]
-    #[case::exec_missing(
-        target().backend_failure(BackendError::Exec("guest agent: No such file or directory".into())),
-        "invalid request: Could not find the file /data in container c1"
+    #[case::path_missing(
+        target().backend_failure(BackendError::PathNotFound("/data".into())),
+        "Could not find the file /data in container c1"
     )]
-    #[case::exec_refusal(
-        target().backend_failure(BackendError::Exec("guest path is not a directory".into())),
+    #[case::refusal(
+        target().backend_failure(BackendError::InvalidArgument("guest path is not a directory".into())),
         "invalid request: guest path is not a directory"
+    )]
+    #[case::guest_failure_on_put(
+        target().backend_failure(BackendError::Exec("guest agent: disk full".into())),
+        "sandbox i/o error: guest agent: disk full"
     )]
     fn given_a_failure_when_mapped_then_only_a_refusal_or_missing_path_is_the_callers(
         #[case] mapped: ApiError,

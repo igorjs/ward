@@ -36,6 +36,8 @@ const GUEST_ROOT: &str = "/";
 const SYMLINK_MODE: u32 = 0o777;
 /// How the daemon starts the error for a path that is not in the sandbox.
 const MISSING_PATH_PREFIX: &str = "Could not find the file";
+/// Rust appends the errno to an I/O error's text; Go does not.
+const OS_ERROR_SUFFIX: &str = " (os error";
 /// Prefix of the scratch directory a downloaded file is unpacked into.
 const STAGING_PREFIX: &str = ".ward-cp-";
 
@@ -142,8 +144,9 @@ fn guest_placement(shape: Shape, base: &str, dest: &str, existing: Existing) -> 
     };
     match (shape, existing) {
         (Shape::Contents, Existing::Dir) => Ok(inside(None)),
-        (Shape::Contents, _) => bail!("no such directory in the sandbox: {dest}"),
-        (Shape::Dir, Existing::File) => bail!("cannot copy a directory to a file"),
+        (Shape::Contents | Shape::Dir, Existing::File) => {
+            bail!("cannot copy a directory to a file")
+        }
         (_, Existing::Dir) => Ok(inside(Some(base))),
         (Shape::File | Shape::Link, _) if dest.ends_with('/') => {
             bail!("no such directory in the sandbox: {dest}")
@@ -159,6 +162,23 @@ fn guest_placement(shape: Shape, base: &str, dest: &str, existing: Existing) -> 
             })
         }
     }
+}
+
+/// Docker's `lstat PATH: reason` for a host source it cannot read, with the
+/// path made absolute and the reason in Go's lowercase wording.
+fn lstat_failure(path: &str, error: &io::Error) -> anyhow::Error {
+    let shown = std::path::absolute(path).unwrap_or_else(|_| PathBuf::from(path));
+    let text = error.to_string();
+    let reason = text.split(OS_ERROR_SUFFIX).next().unwrap_or(&text);
+    let mut chars = reason.chars();
+    let reason = chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect::<String>())
+        .unwrap_or_default();
+    anyhow::Error::new(client::PlainError(format!(
+        "lstat {}: {reason}",
+        shown.display()
+    )))
 }
 
 struct HostSource {
@@ -180,7 +200,7 @@ fn host_source(raw: &str, follow: bool) -> Result<HostSource> {
     } else {
         std::fs::symlink_metadata(&path)
     }
-    .with_context(|| format!("cannot stat {path}"))?;
+    .map_err(|e| lstat_failure(&path, &e))?;
     if contents && !meta.is_dir() {
         bail!("not a directory: {path}");
     }
@@ -306,8 +326,7 @@ async fn probe(c: &mut WardClient<Channel>, target: &Resolved, path: &str) -> Re
 }
 
 fn is_missing_path(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::InvalidArgument
-        && status.message().starts_with(MISSING_PATH_PREFIX)
+    status.code() == tonic::Code::NotFound && status.message().starts_with(MISSING_PATH_PREFIX)
 }
 
 fn copy_from_request(target: &Resolved, path: &str) -> CopyFromRequest {
@@ -410,7 +429,7 @@ fn pack(source: &HostSource, name: Option<&str>, writer: ChunkWriter) -> io::Res
             let name = name.unwrap_or(&source.base);
             archive::pack_file(&source.path, Path::new(name), writer).map_err(archive_io)?
         }
-        (Shape::Dir, Some(name)) => pack_renamed(&source.path, name, writer)?,
+        (Shape::Dir | Shape::Contents, Some(name)) => pack_renamed(&source.path, name, writer)?,
         _ => archive::pack_dir(&source.path, writer).map_err(archive_io)?,
     };
     writer.flush()

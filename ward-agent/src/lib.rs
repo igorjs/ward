@@ -329,6 +329,7 @@ async fn answer_secrets<W: AsyncWrite + Unpin>(
         Ok(()) => event::Kind::ArchiveDone(proto::ArchiveDone {}),
         Err(e) => event::Kind::ArchiveError(proto::ArchiveError {
             message: e.to_string(),
+            ..Default::default()
         }),
     };
     write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await

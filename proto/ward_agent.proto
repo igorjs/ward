@@ -117,6 +117,16 @@ message ArchiveDone {}
 // Agent -> daemon: the transfer failed; the message says why.
 message ArchiveError {
   string message = 1;
+  ArchiveErrorKind kind = 2;            // unspecified from agents that predate it
+}
+
+// Why a transfer failed, so the daemon can tell a missing path and a refusal
+// from a guest I/O failure.
+enum ArchiveErrorKind {
+  ARCHIVE_ERROR_KIND_UNSPECIFIED = 0;
+  ARCHIVE_ERROR_KIND_NOT_FOUND = 1;     // a path does not exist
+  ARCHIVE_ERROR_KIND_REFUSED = 2;       // the path or the tar breaks a rule
+  ARCHIVE_ERROR_KIND_FAILED = 3;        // the guest could not read or write
 }
 
 // Must be the first and only frame on a connection. The agent mounts a tmpfs
