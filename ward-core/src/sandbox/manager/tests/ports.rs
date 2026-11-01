@@ -22,6 +22,16 @@ const LOOPBACK: &str = "127.0.0.1";
 const ALL_INTERFACES: &str = "0.0.0.0";
 /// A documentation address no host owns, used to find the outbound interface.
 const PROBE_PEER: &str = "192.0.2.1:9";
+/// Longest the LAN reachability probe waits for a connect.
+const LAN_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Every test binds port 0 and some re-bind a freed port. The OS hands a
+/// freed port to the next bind, so parallel tests would steal each other's.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().await
+}
 
 struct FakeForwarder {
     /// Bind address and guest port of every `open`.
@@ -150,6 +160,7 @@ async fn create_published(mgr: &SandboxManager, command: &[&str]) -> (String, u1
 
 #[tokio::test]
 async fn given_any_host_port_and_a_guest_server_when_host_port_is_dialed_then_the_reply_arrives() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, fwd) = port_manager();
 
@@ -164,6 +175,7 @@ async fn given_any_host_port_and_a_guest_server_when_host_port_is_dialed_then_th
 
 #[tokio::test]
 async fn given_two_published_ports_when_the_sandbox_is_read_then_both_mappings_are_listed() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, _) = port_manager();
     let ports = vec![
@@ -192,6 +204,7 @@ async fn given_two_published_ports_when_the_sandbox_is_read_then_both_mappings_a
 
 #[tokio::test]
 async fn given_no_host_address_when_published_then_it_binds_loopback_and_refuses_other_addresses() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, fwd) = port_manager();
 
@@ -204,14 +217,17 @@ async fn given_no_host_address_when_published_then_it_binds_loopback_and_refuses
     if outbound.connect(PROBE_PEER).is_ok() {
         let local = outbound.local_addr().unwrap().ip();
         if !local.is_loopback() {
-            let refused = TcpStream::connect((local, port)).await;
-            assert!(refused.is_err(), "reachable on {local}");
+            // A silent drop counts as unreachable, so bound the wait.
+            let attempt =
+                tokio::time::timeout(LAN_PROBE_TIMEOUT, TcpStream::connect((local, port))).await;
+            assert!(!matches!(attempt, Ok(Ok(_))), "reachable on {local}");
         }
     }
 }
 
 #[tokio::test]
 async fn given_an_explicit_host_address_when_published_then_that_address_is_bound() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, fwd) = port_manager();
     let ports = vec![mapping(ALL_INTERFACES, ANY_PORT, HTTP_PORT)];
@@ -225,6 +241,7 @@ async fn given_an_explicit_host_address_when_published_then_that_address_is_boun
 
 #[tokio::test]
 async fn given_a_host_port_in_use_when_creating_then_it_fails_naming_the_port_and_leaves_nothing() {
+    let _serial = serial().await;
     // Arrange
     let tmp = tempfile::tempdir().unwrap();
     let (mgr, _) = manager_with_backend(tmp.path(), 2);
@@ -249,6 +266,7 @@ async fn given_a_host_port_in_use_when_creating_then_it_fails_naming_the_port_an
 
 #[tokio::test]
 async fn given_an_exited_sandbox_when_restarted_then_the_same_host_port_serves_again() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, _) = port_manager();
     let (id, port) = create_published(&mgr, &["sh", "-c", "exit 0"]).await;
@@ -263,6 +281,7 @@ async fn given_an_exited_sandbox_when_restarted_then_the_same_host_port_serves_a
 
 #[tokio::test]
 async fn given_a_published_port_when_stopped_and_started_then_it_reopens_on_the_same_host_port() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, fwd) = port_manager();
     let (id, port) = create_published(&mgr, &[]).await;
@@ -279,6 +298,7 @@ async fn given_a_published_port_when_stopped_and_started_then_it_reopens_on_the_
 
 #[tokio::test]
 async fn given_a_published_port_when_the_sandbox_stops_then_connections_are_refused() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, _) = port_manager();
     let (id, port) = create_published(&mgr, &[]).await;
@@ -294,6 +314,7 @@ async fn given_a_published_port_when_the_sandbox_stops_then_connections_are_refu
 
 #[tokio::test]
 async fn given_a_removed_sandbox_when_the_same_host_port_is_published_at_once_then_it_succeeds() {
+    let _serial = serial().await;
     // Arrange: the fake frees a port only when its task ends, so a
     // listener that is merely dropped still holds it for a while.
     let (mgr, _) = port_manager();
@@ -311,6 +332,7 @@ async fn given_a_removed_sandbox_when_the_same_host_port_is_published_at_once_th
 #[tokio::test]
 async fn given_a_busy_host_port_when_starting_then_it_fails_naming_the_port_and_a_later_start_works()
  {
+    let _serial = serial().await;
     // Arrange
     let (mgr, _) = port_manager();
     let (id, port) = create_published(&mgr, &[]).await;
@@ -331,6 +353,7 @@ async fn given_a_busy_host_port_when_starting_then_it_fails_naming_the_port_and_
 
 #[tokio::test]
 async fn given_the_stub_backend_when_publishing_then_create_fails_and_nothing_is_listed() {
+    let _serial = serial().await;
     // Arrange
     let mgr = build_manager(2);
     let ports = vec![mapping("", ANY_PORT, HTTP_PORT)];
@@ -345,6 +368,7 @@ async fn given_the_stub_backend_when_publishing_then_create_fails_and_nothing_is
 
 #[tokio::test]
 async fn given_no_published_ports_when_created_then_the_forwarder_is_not_used() {
+    let _serial = serial().await;
     // Arrange
     let (mgr, fwd) = port_manager();
 
