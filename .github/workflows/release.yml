@@ -438,6 +438,65 @@ jobs:
           fail_on_unmatched_files: true
           prerelease: ${{ contains(needs.resolve.outputs.tag, 'dev-') }}
 
+  # ── Publish the Go SDK module tag ───────────────────────────────────
+  # The generated stubs are gitignored on main. Go resolves the nested
+  # module from the tag sdks/go/vX.Y.Z, so this job commits the stubs on
+  # a detached HEAD at the release commit and pushes only that new tag.
+  go-sdk:
+    needs: [resolve, publish]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Credentials stay persisted only here: the job pushes one tag.
+          persist-credentials: true # zizmor: ignore[artipacked]
+      - name: Install protoc
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
+      - name: Install protobuf Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate Go SDK stubs
+        working-directory: sdks/go
+        run: ./generate.sh
+      - name: Test the Go SDK
+        working-directory: sdks/go
+        run: |
+          go vet ./...
+          go test -race ./...
+      - name: Tag the stubs commit
+        env:
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          go_tag="sdks/go/v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${go_tag}" >/dev/null; then
+            echo "${go_tag} already exists; not moving it."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --detach "${GITHUB_SHA}"
+          git add -f sdks/go/wardpb/*.pb.go
+          git commit -m "build(sdk-go): add generated stubs for v${version}"
+          git tag "${go_tag}"
+          git push origin "refs/tags/${go_tag}"
+
   # ── Update the Homebrew formula for a tagged release ───────────────
   # Rewrites packaging/homebrew/ward.rb with the release version and the
   # per-target checksums, uploads it as an artefact, and pushes it to the
