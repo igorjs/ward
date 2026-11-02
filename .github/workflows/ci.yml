@@ -164,6 +164,10 @@ jobs:
           done
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      # Compile only: benches are not run in CI because shared runners are too
+      # noisy for timing, but they must keep building.
+      - name: Benches compile
+        run: cargo bench --no-run
 
   # ── Unit + integration tests ────────────────────────────────────────
   # Fast tier: ward-core unit tests (inline #[cfg(test)] modules) and
