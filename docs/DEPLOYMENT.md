@@ -220,6 +220,18 @@ Secrets don't appear in logs. See [`docker-differences.md`](docker-differences.m
 
 Set `WARD_METRICS_ADDR=127.0.0.1:9100` to expose `/metrics`. The endpoint has no authentication, so bind it to loopback, or put it behind a firewall or reverse proxy. Broker counters include `wardd_broker_publish_total`, `wardd_broker_deliver_total` and `wardd_broker_drop_total`. Alert on the drop counter rising.
 
+While metrics are on, the daemon reads every running sandbox every 15 seconds and exports these series, each labelled with `sandbox_id`:
+
+| Series | Meaning |
+|---|---|
+| `ward_sandbox_cpu_seconds_total` | CPU seconds all guest processes have used. |
+| `ward_sandbox_memory_bytes` | Guest memory in use. |
+| `ward_sandbox_memory_peak_bytes` | Highest memory use seen. |
+| `ward_sandbox_block_read_bytes_total`, `ward_sandbox_block_write_bytes_total` | Bytes read from and written to block devices. |
+| `ward_sandbox_net_rx_bytes_total`, `ward_sandbox_net_tx_bytes_total` | Ethernet bytes the guest received and sent through the host network stack. |
+
+The cumulative series are gauges, because they restart from zero when a sandbox restarts. Use `rate()` or `increase()`, which handle the reset. A stopped or removed sandbox stops updating and its series leave the output after about 45 seconds, so the label count stays at the number of running sandboxes.
+
 ## Shutdown and restart
 
 On SIGTERM or SIGINT the daemon stops taking RPCs, drains the ones in flight, and removes every sandbox. If that takes longer than `WARD_SHUTDOWN_TIMEOUT_SECS`, it removes the socket and exits with status 1.

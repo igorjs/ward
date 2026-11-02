@@ -88,6 +88,10 @@ pub struct GuestStats {
     pub mem_total_bytes: u64,
     pub mem_available_bytes: u64,
     pub pids: u32,
+    /// Highest memory the sandbox has used. 0 when the guest cannot say.
+    pub mem_peak_bytes: u64,
+    pub block_read_bytes: u64,
+    pub block_write_bytes: u64,
 }
 
 /// Handle to a running process inside a sandbox.
@@ -275,6 +279,12 @@ pub trait Backend: Send + Sync + 'static {
     /// later boots. Backends with no policed network have nothing to change.
     async fn add_egress_allow(&self, _sandbox_id: &str, _domains: &[String]) -> Result<()> {
         Ok(())
+    }
+
+    /// Bytes the guest has received and sent through the host network stack
+    /// since it last started. Backends with no network stack report zero.
+    async fn net_bytes(&self, _sandbox_id: &str) -> Result<ward_net::NetBytes> {
+        Ok(ward_net::NetBytes::default())
     }
 
     /// Read the guest's CPU, memory and process counters.

@@ -14,6 +14,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 
 use prost::Message;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -295,7 +296,12 @@ where
         }
         Some(request::Kind::Stats(_)) => {
             let mut writer = writer;
-            return answer_stats(Path::new(PROC_ROOT), &mut writer).await;
+            return answer_stats(
+                Path::new(PROC_ROOT),
+                SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir),
+                &mut writer,
+            )
+            .await;
         }
         _ => {
             return Err(std::io::Error::new(
@@ -351,12 +357,21 @@ async fn answer_top<W: AsyncWrite + Unpin>(
     write_frame(writer, &encode_event(&event)).await
 }
 
+/// Highest memory use any Stats reply has seen, for guests whose cgroup does
+/// not report a peak.
+static MEM_PEAK_SEEN: AtomicU64 = AtomicU64::new(0);
+
 async fn answer_stats<W: AsyncWrite + Unpin>(
     proc_root: &Path,
+    group: Option<&Path>,
     writer: &mut W,
 ) -> std::io::Result<()> {
     let event = Event {
-        kind: Some(event::Kind::StatsSample(stats::sample(proc_root)?)),
+        kind: Some(event::Kind::StatsSample(stats::sample(
+            proc_root,
+            group,
+            &MEM_PEAK_SEEN,
+        )?)),
     };
     write_frame(writer, &encode_event(&event)).await
 }

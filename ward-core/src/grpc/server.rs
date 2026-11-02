@@ -912,6 +912,11 @@ impl Ward for WardGrpcServer {
             mem_limit_bytes: stats.mem_limit_bytes,
             pids: stats.pids,
             read_at: Some(prost_types::Timestamp::from(stats.read_at)),
+            mem_peak_bytes: stats.mem_peak_bytes,
+            block_read_bytes: stats.block_read_bytes,
+            block_write_bytes: stats.block_write_bytes,
+            net_rx_bytes: stats.net_rx_bytes,
+            net_tx_bytes: stats.net_tx_bytes,
         }))
     }
 

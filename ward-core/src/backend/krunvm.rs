@@ -892,6 +892,19 @@ impl Backend for KrunvmBackend {
         Ok(())
     }
 
+    async fn net_bytes(&self, sandbox_id: &str) -> Result<ward_net::NetBytes> {
+        let sandboxes = self.sandboxes.read().await;
+        let state = sandboxes
+            .get(sandbox_id)
+            .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?;
+        #[cfg(feature = "krunvm")]
+        if let Some(stack) = &state.smoltcp {
+            return Ok(stack.net_bytes());
+        }
+        let _ = state;
+        Ok(ward_net::NetBytes::default())
+    }
+
     async fn stats(&self, sandbox_id: &str) -> Result<super::GuestStats> {
         let stream = self.agent_stream(sandbox_id).await?;
         super::agent::stats(stream).await

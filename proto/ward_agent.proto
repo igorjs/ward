@@ -179,6 +179,12 @@ message StatsSample {
   // Memory that can be given to a process without swapping.
   uint64 mem_available_bytes = 4;
   uint32 pids = 5;
+  // Highest memory the sandbox has used, in bytes. 0 when unknown.
+  uint64 mem_peak_bytes = 6;
+  // Bytes the sandbox's processes have read from and written to block
+  // devices.
+  uint64 block_read_bytes = 7;
+  uint64 block_write_bytes = 8;
 }
 
 // Answer to Ping.

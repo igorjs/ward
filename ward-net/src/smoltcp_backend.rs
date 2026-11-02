@@ -50,6 +50,7 @@ use tokio::sync::mpsc;
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::counters::{NetBytes, NetCounters};
 use crate::inbound::{
     InboundFlow, InboundHandle, InboundTuning, LocalPorts, MAX_INBOUND_TOTAL, NewInbound,
     start_listener,
@@ -133,11 +134,17 @@ const MIN_ETHERNET_FRAME_LEN: usize = 14;
 /// an `OwnedFd` (typically one end of an `AF_UNIX SOCK_DGRAM` pair).
 pub struct RawFdDevice {
     fd: OwnedFd,
+    counters: Arc<NetCounters>,
 }
 
 impl RawFdDevice {
     pub fn new(fd: OwnedFd) -> RawFdDevice {
-        RawFdDevice { fd }
+        Self::with_counters(fd, Arc::default())
+    }
+
+    /// Counts the frames it moves into `counters`.
+    pub fn with_counters(fd: OwnedFd, counters: Arc<NetCounters>) -> RawFdDevice {
+        RawFdDevice { fd, counters }
     }
 }
 
@@ -197,11 +204,13 @@ impl Device for RawFdDevice {
                 );
                 continue;
             }
+            self.counters.add_tx(n as usize);
             let frame = buf[..n as usize].to_vec();
             return Some((
                 RawFdRxToken { frame },
                 RawFdTxToken {
                     fd: self.fd.as_raw_fd(),
+                    counters: Arc::clone(&self.counters),
                 },
             ));
         }
@@ -210,6 +219,7 @@ impl Device for RawFdDevice {
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
         Some(RawFdTxToken {
             fd: self.fd.as_raw_fd(),
+            counters: Arc::clone(&self.counters),
         })
     }
 
@@ -240,6 +250,7 @@ impl RxToken for RawFdRxToken {
 /// consumed.
 pub struct RawFdTxToken {
     fd: RawFd,
+    counters: Arc<NetCounters>,
 }
 
 impl TxToken for RawFdTxToken {
@@ -268,12 +279,15 @@ impl TxToken for RawFdTxToken {
             // next protocol-level retry covers the loss, matching how
             // ingress already drops a datagram it can't use rather than
             // erroring the whole poll loop.
-        } else if (sent as usize) != buf.len() {
-            tracing::warn!(
-                sent,
-                expected = buf.len(),
-                "short write sending an Ethernet frame to the guest"
-            );
+        } else {
+            self.counters.add_rx(sent as usize);
+            if (sent as usize) != buf.len() {
+                tracing::warn!(
+                    sent,
+                    expected = buf.len(),
+                    "short write sending an Ethernet frame to the guest"
+                );
+            }
         }
         result
     }
@@ -772,6 +786,7 @@ pub struct Stack {
     /// Address of the first DHCP lease: the single guest inbound
     /// connections target. Unset until the guest has asked for one.
     guest_addr: Arc<OnceLock<Ipv4Addr>>,
+    counters: Arc<NetCounters>,
 }
 
 impl Stack {
@@ -781,7 +796,8 @@ impl Stack {
         connector: Box<dyn Connector>,
         egress_check: Box<EgressCheckFn>,
     ) -> Stack {
-        let mut device = RawFdDevice::new(fd);
+        let counters = Arc::<NetCounters>::default();
+        let mut device = RawFdDevice::with_counters(fd, Arc::clone(&counters));
         let config = Config::new(HardwareAddress::Ethernet(INTERFACE_HARDWARE_ADDR));
         let mut interface = Interface::new(config, &mut device, Instant::now());
         interface.update_ip_addrs(|ip_addrs| {
@@ -850,6 +866,7 @@ impl Stack {
             inbound_wake: Arc::new(Notify::new()),
             inbound_active_at: None,
             guest_addr: Arc::new(OnceLock::new()),
+            counters,
         }
     }
 
@@ -1620,9 +1637,15 @@ pub struct SmoltcpHandle {
     pub cmd_tx: mpsc::Sender<StackCommand>,
     inbound_total: Arc<Semaphore>,
     guest_addr: Arc<OnceLock<Ipv4Addr>>,
+    counters: Arc<NetCounters>,
 }
 
 impl SmoltcpHandle {
+    /// Bytes the guest has received and sent through this stack so far.
+    pub fn net_bytes(&self) -> NetBytes {
+        self.counters.snapshot()
+    }
+
     /// Publishes `guest_port` on `host_addr`: every connection accepted on
     /// the host is relayed to the guest at the address of its first DHCP
     /// lease; until the guest has one, connections are reset. Pass port 0 to let the OS choose and read it from
@@ -1837,6 +1860,7 @@ pub async fn spawn_for_sandbox_with_tuning(
     stack.set_inbound_tuning(tuning);
     let guest_addr = Arc::clone(&stack.guest_addr);
     let wake = Arc::clone(&stack.inbound_wake);
+    let counters = Arc::clone(&stack.counters);
     let task = tokio::task::spawn(async move {
         loop {
             let interval = if stack.inbound_is_active() {
@@ -1864,6 +1888,7 @@ pub async fn spawn_for_sandbox_with_tuning(
         cmd_tx,
         inbound_total: Arc::new(Semaphore::new(MAX_INBOUND_TOTAL)),
         guest_addr,
+        counters,
     })
 }
 

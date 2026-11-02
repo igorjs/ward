@@ -97,6 +97,11 @@ fn stats(fake: &FakeWard, request: StatsRequest) -> Result<StatsResponse, tonic:
         mem_used_bytes: 16 * MIB,
         mem_limit_bytes: 64 * MIB,
         pids: 4,
+        net_rx_bytes: 1200,
+        net_tx_bytes: 3_400_000,
+        block_read_bytes: 0,
+        block_write_bytes: 5_000_000,
+        mem_peak_bytes: 20 * MIB,
         read_at: Some(prost_types::Timestamp {
             seconds: SECONDS_PER_READING * count as i64,
             nanos: 0,
@@ -209,7 +214,7 @@ async fn given_two_readings_when_stats_then_the_row_holds_the_rate_between_them(
     // Half a second of CPU over one second, and 16 of 64 MiB.
     assert_eq!(
         row.collect::<Vec<_>>().join(" "),
-        "web1 web1 50.00% 16MiB / 64MiB 25.00% -- -- 4"
+        "web1 web1 50.00% 16MiB / 64MiB 25.00% 1.2kB / 3.4MB 0B / 5MB 4"
     );
 }
 
