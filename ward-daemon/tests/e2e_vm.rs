@@ -26,6 +26,7 @@ const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
 const DEFAULT_IMAGE: &str = "alpine:3.20";
 const EXIT_POLL: Duration = Duration::from_millis(100);
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(10);
+const STATS_TIMEOUT: Duration = Duration::from_secs(20);
 const LARGE_OUTPUT_BYTES: usize = 1_000_000;
 
 /// Return early unless the operator opted in to real-VM tests.
@@ -1214,15 +1215,21 @@ fn given_a_guest_that_writes_a_file_when_stats_then_block_io_written_is_not_zero
     let d = Daemon::spawn_vm();
     let id = create(&d, &[]);
 
-    let r = sh(
+    // Stays alive after the write so the agent's sampler sees the process.
+    start(
         &d,
         &id,
-        "dd if=/dev/zero of=/root/blockio.bin bs=1M count=16 conv=fsync 2>/dev/null; sync",
+        None,
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/root/blockio.bin bs=1M count=8 2>/dev/null; sync; sleep 30",
+        ],
     );
-    let block_io = stats_field(&d, &id, "BlockIO");
 
-    assert_eq!(r.exit, 0, "{}", r.stderr);
-    assert_ne!(second_half(&block_io), "0B", "BLOCK I/O was {block_io:?}");
+    wait_until("BLOCK I/O written to be non-zero", STATS_TIMEOUT, || {
+        second_half(&stats_field(&d, &id, "BlockIO")) != "0B"
+    });
 }
 
 #[test]

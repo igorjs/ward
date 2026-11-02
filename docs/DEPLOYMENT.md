@@ -227,7 +227,7 @@ While metrics are on, the daemon reads every running sandbox every 15 seconds an
 | `ward_sandbox_cpu_seconds_total` | CPU seconds all guest processes have used. |
 | `ward_sandbox_memory_bytes` | Guest memory in use. |
 | `ward_sandbox_memory_peak_bytes` | Highest memory use seen. |
-| `ward_sandbox_block_read_bytes_total`, `ward_sandbox_block_write_bytes_total` | Bytes read from and written to block devices. |
+| `ward_sandbox_block_read_bytes_total`, `ward_sandbox_block_write_bytes_total` | Device bytes from the cgroup `io.stat`; where that is empty (virtiofs, tmpfs), the bytes passed to read and write calls instead. |
 | `ward_sandbox_net_rx_bytes_total`, `ward_sandbox_net_tx_bytes_total` | Ethernet bytes the guest received and sent through the host network stack. |
 
 The cumulative series are gauges, because they restart from zero when a sandbox restarts. Use `rate()` or `increase()`, which handle the reset. A stopped or removed sandbox stops updating and its series leave the output after about 45 seconds, so the label count stays at the number of running sandboxes.
