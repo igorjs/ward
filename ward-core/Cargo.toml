@@ -117,6 +117,25 @@ proptest = "1"
 # asserting on side effects the recorder facade doesn't otherwise expose.
 metrics-util = "0.20"
 
+# criterion: statistical benchmarks under benches/. Default features off
+# drops plotters and rayon; cargo_bench_support keeps `cargo bench` working.
+criterion = { version = "0.8", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
+# tower + hyper-util: the gRPC bench connects a client over a Unix socket.
+tower = "0.5"
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[[bench]]
+name = "broker"
+harness = false
+
+[[bench]]
+name = "grpc"
+harness = false
+
+[[bench]]
+name = "sandbox_cycle"
+harness = false
+
 
 [lints]
 workspace = true
