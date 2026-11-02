@@ -61,10 +61,10 @@ async fn allocate_sparse_image(path: &Path, size_mb: u32) -> Result<()> {
     let file = opts
         .open(path)
         .await
-        .map_err(|e| ApiError::Internal(format!("create volume image {}: {e}", path.display())))?;
+        .map_err(|e| ApiError::from_io(&format!("create volume image {}", path.display()), &e))?;
     file.set_len(len)
         .await
-        .map_err(|e| ApiError::Internal(format!("size volume image to {len} bytes: {e}")))?;
+        .map_err(|e| ApiError::from_io(&format!("size volume image to {len} bytes"), &e))?;
     Ok(())
 }
 
@@ -79,11 +79,11 @@ async fn run_mkfs_ext4(path: &Path) -> Result<()> {
         .await
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::Internal(
+                ApiError::Unavailable(
                     "mkfs.ext4 not found; ext4 volume images require Linux (e2fsprogs)".to_string(),
                 )
             } else {
-                ApiError::Internal(format!("spawn mkfs.ext4: {e}"))
+                ApiError::from_io("spawn mkfs.ext4", &e)
             }
         })?;
     if !output.status.success() {
@@ -166,7 +166,7 @@ impl VolumeManager {
 
         tokio::fs::create_dir_all(&mount_path)
             .await
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            .map_err(|e| ApiError::from_io("create volume directory", &e))?;
 
         // Allocate the fixed-size ext4 image the sandbox will mount. The
         // image lives inside the volume's directory and is attached to a
@@ -223,7 +223,7 @@ impl VolumeManager {
         if entry.mount_path.exists() {
             tokio::fs::remove_dir_all(&entry.mount_path)
                 .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
+                .map_err(|e| ApiError::from_io("remove volume directory", &e))?;
         }
 
         Ok(())

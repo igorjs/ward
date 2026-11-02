@@ -15,6 +15,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::protocol::EndReason;
 use crate::sandbox::store::SandboxMeta;
+use crate::sync::LockUnpoisoned;
 
 /// Events the channel holds for a slow reader, and the history kept for
 /// replays.
@@ -136,10 +137,7 @@ impl EventLog {
 
     fn lock_history(&self) -> std::sync::MutexGuard<'_, VecDeque<SandboxEvent>> {
         // A poisoned history only means an emitter panicked mid-push.
-        self.shared
-            .history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.shared.history.lock_unpoisoned()
     }
 }
 
