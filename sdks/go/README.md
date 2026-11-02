@@ -4,23 +4,47 @@ Go client for the [ward](https://github.com/igorjs/ward) sandbox daemon.
 Wraps the gRPC API at [`proto/ward.proto`](../../proto/ward.proto) with
 an idiomatic `Client` struct.
 
-> **Status: pre-release, first-cut scaffold.** Tracked in
+> **Status: pre-release.** Covers sandbox lifecycle (create, get, list,
+> start, stop, remove), exec, run and output streaming. The generated gRPC
+> stubs in `wardpb` expose every other RPC. Tracked in
 > [issue #41](https://github.com/igorjs/ward/issues/41).
 
-## Install (when published)
+## Install
 
 ```sh
-go get github.com/igorjs/ward/sdks/go@latest
+go get github.com/igorjs/ward/sdks/go@v0.1.0
 ```
 
-For local development:
+The module lives in a subdirectory of the repo, so release tags carry the
+directory prefix: `sdks/go/v0.1.0`. Those tags include the generated gRPC
+stubs in `wardpb`, so there is no codegen step to use the SDK. The stubs are
+not committed on `main`, so do not use `@main` or a pseudo-version.
+
+## Local development
+
+The stubs in `wardpb` are generated and gitignored. Install the
+prerequisites, generate them, then build and test:
 
 ```sh
+# protoc: brew install protobuf  (or: apt-get install protobuf-compiler)
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
 cd sdks/go
-buf generate  # or: protoc-gen-go-grpc directly
-go build ./...
-go test ./...
+./generate.sh
+go vet ./...
+go test -race ./...
 ```
+
+Rerun `./generate.sh` after any change to `proto/ward.proto`.
+
+## Capability tokens
+
+`CreateSandbox` returns the sandbox's token once, in `Sandbox.Token`. Pass it
+to every call that acts on the sandbox (`Run`, `Exec`, `StreamOutput`,
+`StartSandbox`, `StopSandbox`, `RemoveSandbox`). The client sends it in the
+`x-ward-sandbox-token` metadata header. `ListSandboxes` needs no token, and
+`GetSandbox` takes an optional one.
 
 ## Quick start
 
@@ -50,13 +74,16 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.RemoveSandbox(ctx, sb.ID)
+	defer client.RemoveSandbox(ctx, sb.ID, sb.Token)
 
-	result, err := client.Run(ctx, sb.ID, []string{"echo", "hello"})
+	result, err := client.Run(ctx, sb.ID, []string{"echo", "hello"}, sb.Token)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Println(result.Stdout)
+	if result.ExitCode != nil {
+		log.Println("exit code:", *result.ExitCode)
+	}
 }
 ```
 

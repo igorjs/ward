@@ -590,9 +590,32 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/go.mod
+          cache: false
+      - name: Install protoc
+        run: |
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=5 update \
+              && sudo timeout 180 apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y protobuf-compiler \
+              && break
+            [ "$attempt" = 3 ] && exit 1
+            sleep 15
+          done
+      - name: Install protobuf Go plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Generate Go SDK stubs
+        working-directory: sdks/go
+        run: ./generate.sh
       - name: Go SDK tests
         working-directory: sdks/go
-        run: go test ./...
+        run: |
+          go vet ./...
+          go test -race ./...
       - name: Python SDK tests
         working-directory: sdks/python
         run: |
