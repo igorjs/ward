@@ -28,7 +28,7 @@ use crate::pb::{
     StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
     WaitRequest, WaitResponse, WriteStdinRequest,
 };
-use crate::protocol::ApiError;
+use crate::protocol::{ApiError, ISSUES_URL};
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
 use crate::utf8::Utf8Stream;
 use crate::volume::VolumeManager;
@@ -59,11 +59,11 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         }
         ApiError::Backend(detail) => {
             error!(error = %detail, "backend error");
-            Status::internal("internal error")
+            internal_status("the sandbox backend failed")
         }
         ApiError::Internal(detail) => {
             error!(error = %detail, "internal error");
-            Status::internal("internal error")
+            internal_status("unexpected daemon state")
         }
         ApiError::PermissionDenied(msg) => Status::permission_denied(msg.clone()),
         ApiError::AmbiguousReference(msg) => Status::failed_precondition(msg.clone()),
@@ -72,6 +72,14 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
             Status::already_exists(format!("address already in use: {msg}"))
         }
     }
+}
+
+/// A genuine daemon bug. `cause` is a short fixed phrase: the detail goes to
+/// the logs, so no path, token or secret reaches the client.
+pub(super) fn internal_status(cause: &str) -> Status {
+    Status::internal(format!(
+        "internal error: {cause}. This is a daemon bug, please report it at {ISSUES_URL}"
+    ))
 }
 
 /// Docker's wording, so scripts and users that know it recognise the error.
@@ -769,7 +777,10 @@ impl Ward for WardGrpcServer {
             Ok(Ok(())) => {}
             Ok(Err(status)) => return Err(status),
             Err(e) if e.is_cancelled() => {}
-            Err(_) => return Err(Status::internal("internal error")),
+            Err(e) => {
+                error!(error = %e, "copy task failed");
+                return Err(internal_status("the copy task failed"));
+            }
         }
         copied.map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -1276,7 +1287,7 @@ async fn stream_pull(
         Ok(Err(e)) => api_err_to_status(e),
         Err(e) => {
             error!(error = %e, "pull task failed");
-            Status::internal("internal error")
+            internal_status("the pull task failed")
         }
     };
     let _ = out.send(Err(failure)).await;
@@ -1396,6 +1407,60 @@ mod tests {
     use crate::sandbox::SandboxManager;
     use crate::volume::VolumeManager;
     use std::path::Path;
+
+    #[test]
+    fn api_errors_map_to_the_user_facing_status_text() {
+        let report = format!("This is a daemon bug, please report it at {ISSUES_URL}");
+        let cases = [
+            (
+                ApiError::SandboxNotFound("web".into()),
+                tonic::Code::NotFound,
+                "No such container: web".to_string(),
+            ),
+            (
+                ApiError::ResourceExhausted("no space left on device, free disk space and retry".into()),
+                tonic::Code::ResourceExhausted,
+                "no space left on device, free disk space and retry".to_string(),
+            ),
+            (
+                ApiError::from_io("save", &std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                tonic::Code::PermissionDenied,
+                "the daemon cannot write to its data directory, check its ownership and permissions"
+                    .to_string(),
+            ),
+            (
+                ApiError::AddressInUse("127.0.0.1:8080".into()),
+                tonic::Code::AlreadyExists,
+                "address already in use: 127.0.0.1:8080".to_string(),
+            ),
+            (
+                ApiError::Unavailable("registry unreachable".into()),
+                tonic::Code::Unavailable,
+                "registry unreachable".to_string(),
+            ),
+            (
+                ApiError::Backend("/secret/path failed".into()),
+                tonic::Code::Internal,
+                format!("internal error: the sandbox backend failed. {report}"),
+            ),
+            (
+                ApiError::Internal("token abc123 leaked".into()),
+                tonic::Code::Internal,
+                format!("internal error: unexpected daemon state. {report}"),
+            ),
+        ];
+        for (err, code, message) in cases {
+            // Arrange
+            let label = format!("{err:?}");
+
+            // Act
+            let status = api_err_to_status(err);
+
+            // Assert
+            assert_eq!(status.code(), code, "{label}");
+            assert_eq!(status.message(), message, "{label}");
+        }
+    }
 
     #[test]
     fn given_raw_stderr_event_when_mapped_to_pb_then_lossy_stderr_line() {

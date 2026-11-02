@@ -25,8 +25,13 @@ use crate::sandbox::copy;
 use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
+use crate::sync::LockUnpoisoned;
 
 type Result<T> = std::result::Result<T, ApiError>;
+
+/// Shown when the backend cannot start the sandbox; the cause is only logged.
+const BACKEND_SPAWN_FAILED: &str = "the sandbox backend could not start the sandbox, check the daemon logs and that the host \
+     has enough memory and virtualization support";
 
 /// Translate a BackendError to the appropriate ApiError variant so that
 /// the gRPC layer can map it to the correct status code. The critical
@@ -42,6 +47,11 @@ fn backend_err(e: BackendError) -> ApiError {
         BackendError::ImageNotFound(message) => ApiError::ImageNotFound(message),
         BackendError::Unavailable(message) => ApiError::Unavailable(message),
         BackendError::AddressInUse(address) => ApiError::AddressInUse(address),
+        BackendError::Io(io) => ApiError::from_io("backend i/o", &io),
+        BackendError::Spawn(detail) => {
+            tracing::error!(error = %detail, "backend could not start the sandbox");
+            ApiError::Unavailable(BACKEND_SPAWN_FAILED.to_string())
+        }
         other => ApiError::Backend(other.to_string()),
     }
 }
@@ -69,7 +79,7 @@ fn image_to_pb(image: &crate::backend::image::CachedImage) -> crate::pb::ImageIn
 fn snapshot_backend_err(e: BackendError) -> ApiError {
     match e {
         BackendError::NotFound(id) => ApiError::SnapshotNotFound(id),
-        other => ApiError::Backend(other.to_string()),
+        other => backend_err(other),
     }
 }
 
@@ -119,10 +129,7 @@ struct NameReservation {
 impl NameReservation {
     /// `None` when another create already holds `name`.
     fn claim(pending: &Arc<std::sync::Mutex<HashSet<String>>>, name: &str) -> Option<Self> {
-        let claimed = pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name.to_string());
+        let claimed = pending.lock_unpoisoned().insert(name.to_string());
         claimed.then(|| Self {
             pending: Arc::clone(pending),
             name: name.to_string(),
@@ -132,10 +139,7 @@ impl NameReservation {
 
 impl Drop for NameReservation {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.name);
+        self.pending.lock_unpoisoned().remove(&self.name);
     }
 }
 
@@ -234,7 +238,7 @@ impl OutputBuffer {
     }
 
     fn push(&self, chunk: OutputChunk) {
-        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.state.lock_unpoisoned();
         let state = &mut *guard;
         state.total += chunk.bytes.len() as u64;
         // Same stream and same millisecond: one chunk, so a burst of tiny
@@ -279,7 +283,7 @@ impl OutputBuffer {
     /// Everything buffered so far plus a feed of what follows. Both are
     /// taken under one lock, so no chunk is missed or repeated.
     fn subscribe(self: &Arc<Self>) -> (Vec<OutputChunk>, OutputFeed) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_unpoisoned();
         let feed = OutputFeed {
             rx: state.live.subscribe(),
             next: state.total,
@@ -292,7 +296,7 @@ impl OutputBuffer {
     /// The retained bytes from stream offset `from` on, the count of bytes
     /// before them that were already dropped, and the offset they end at.
     fn read_from(&self, from: u64) -> (Vec<OutputChunk>, u64, u64) {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.state.lock_unpoisoned();
         let start = state.retained_start();
         let mut at = start;
         let mut out = Vec::new();
@@ -528,7 +532,7 @@ async fn persist_meta(store: Option<&MetaStore>, meta: SandboxMeta) -> Result<()
     tokio::task::spawn_blocking(move || store.save(&meta))
         .await
         .map_err(|e| ApiError::Internal(format!("persist task for sandbox {id}: {e}")))?
-        .map_err(|e| ApiError::Internal(format!("cannot persist sandbox {id}: {e}")))
+        .map_err(|e| ApiError::from_io(&format!("persist sandbox {id}"), &e))
 }
 
 /// Write the new state to disk, then adopt it in memory, so a failed write
@@ -5629,7 +5633,7 @@ pub(crate) mod tests {
         let result = mgr.start(&created.id).await;
 
         // Assert
-        assert!(matches!(result, Err(ApiError::Backend(_))));
+        assert!(matches!(result, Err(ApiError::Unavailable(ref m)) if m == BACKEND_SPAWN_FAILED));
         assert_eq!(status_of(&mgr, &created.id).await, SandboxStatus::Failed);
         let reloaded = restart(tmp.path()).await;
         assert_eq!(

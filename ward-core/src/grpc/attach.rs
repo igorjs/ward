@@ -96,9 +96,9 @@ where
                 control: handle.control_tx,
             };
             let reaper = io.control.clone();
-            let output = handle
-                .output_rx
-                .ok_or_else(|| Status::internal("internal error"))?;
+            let output = handle.output_rx.ok_or_else(|| {
+                super::server::internal_status("the exec output stream is missing")
+            })?;
             run(
                 pump_exec(output, reaper, tx),
                 forward_input(manager, id, false, false, inbound, io),

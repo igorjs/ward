@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use crate::sync::LockUnpoisoned;
+
 /// Most distinct hosts remembered per sandbox. A guest can probe unlimited
 /// names, so the least recently seen host makes room for a new one.
 pub const MAX_BLOCKED_HOSTS: usize = 256;
@@ -29,7 +31,7 @@ impl BlockedEgress {
     /// Notes a refusal of `host` at `now`. Names compare case-insensitively.
     pub fn record(&self, host: &str, now: SystemTime) {
         let host = host.to_ascii_lowercase();
-        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hosts = self.hosts.lock_unpoisoned();
         if let Some(seen) = hosts.get_mut(&host) {
             seen.count += 1;
             seen.last_seen = now;
@@ -55,7 +57,7 @@ impl BlockedEgress {
 
     /// Every remembered host, most recently seen first, then by name.
     pub fn snapshot(&self) -> Vec<BlockedDestination> {
-        let hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        let hosts = self.hosts.lock_unpoisoned();
         let mut all: Vec<_> = hosts.values().cloned().collect();
         all.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(a.host.cmp(&b.host)));
         all

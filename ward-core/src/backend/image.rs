@@ -40,6 +40,7 @@ use tokio_stream::{Stream, StreamExt};
 use super::commit::{self, CommitSpec, CopyError, CopyLimits};
 use super::{BackendError, Result};
 use crate::pb::PullPolicy;
+use crate::sync::LockUnpoisoned;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// A pull stops once the layers it downloads add up to this many bytes.
@@ -1245,7 +1246,7 @@ impl ImageStore {
     /// names, so eviction spares it until the sandbox is released. A moved
     /// tag does not unprotect it: the hold is on the digest.
     pub fn hold(&self, sandbox_id: &str, reference: &str) {
-        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.install_lock.lock_unpoisoned();
         if let Ok(Some((_, meta))) = self.find_cache_entry_by_ref(reference) {
             self.hold_digest(sandbox_id, &meta.digest);
         }
@@ -1253,22 +1254,17 @@ impl ImageStore {
 
     fn hold_digest(&self, sandbox_id: &str, digest: &str) {
         self.holders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .insert(sandbox_id.to_string(), digest.to_string());
     }
 
     pub fn release(&self, sandbox_id: &str) {
-        self.holders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(sandbox_id);
+        self.holders.lock_unpoisoned().remove(sandbox_id);
     }
 
     fn is_held(&self, digest: &str) -> bool {
         self.holders
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .lock_unpoisoned()
             .values()
             .any(|held| held == digest)
     }
@@ -1390,7 +1386,7 @@ impl ImageStore {
         config: Option<ImageConfig>,
         holder: Option<&str>,
     ) -> Result<Option<(PathBuf, CacheMeta)>> {
-        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.install_lock.lock_unpoisoned();
         let Some((entry_dir, mut meta)) = self.find_cache_entry_by_ref(reference)? else {
             return Ok(None);
         };
@@ -1421,7 +1417,7 @@ impl ImageStore {
         let entry_dir = self.cache_dir.join(digest_to_dir_name(&digest));
 
         // Room is measured under the lock, against what other installs left.
-        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.install_lock.lock_unpoisoned();
         let now = chrono::Utc::now();
         // If the digest is already cached, discard our staging dir and add
         // the reference to the entry that is there.
@@ -1638,7 +1634,7 @@ impl ImageStore {
 
         // The room and the tag owner are read again under the lock: another
         // commit or pull may have changed either since the first look.
-        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.install_lock.lock_unpoisoned();
         if cancel.load(Ordering::Relaxed) {
             return Err(BackendError::Internal("commit cancelled".to_string()));
         }
@@ -1748,7 +1744,7 @@ impl ImageStore {
     /// directory is deleted. Removing by digest deletes the image. An image a
     /// sandbox runs is never deleted. Per-sandbox rootfs copies are unaffected.
     pub async fn remove(&self, reference: &str) -> Result<()> {
-        let _guard = self.install_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = self.install_lock.lock_unpoisoned();
         let (entry_dir, meta) = self
             .find_cache_entry_by_ref(reference)?
             .ok_or_else(|| BackendError::ImageNotFound(format!("No such image: {reference}")))?;

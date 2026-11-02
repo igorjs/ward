@@ -373,6 +373,9 @@ pub fn default_runtimes() -> Vec<LanguageRuntime> {
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Where users report a daemon bug.
+pub const ISSUES_URL: &str = "https://github.com/igorjs/ward/issues";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ApiError {
     #[error("sandbox not found: {0}")]
@@ -412,6 +415,24 @@ pub enum ApiError {
     ResourceExhausted(String),
     #[error("address already in use: {0}")]
     AddressInUse(String),
+}
+
+impl ApiError {
+    /// Translate a failed I/O call into what the user can act on. `context`
+    /// names the operation and stays in the logs, never in the client text.
+    pub fn from_io(context: &str, e: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        match e.kind() {
+            ErrorKind::StorageFull => Self::ResourceExhausted(
+                "no space left on device, free disk space and retry".to_string(),
+            ),
+            ErrorKind::PermissionDenied => Self::PermissionDenied(
+                "the daemon cannot write to its data directory, check its ownership and permissions"
+                    .to_string(),
+            ),
+            _ => Self::Internal(format!("{context}: {e}")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +562,35 @@ mod tests {
             original_len,
             "duplicate runtime names: {names:?}"
         );
+    }
+
+    // ----- ApiError from I/O ----------------------------------------------
+
+    #[test]
+    fn from_io_maps_common_failures_to_actionable_variants() {
+        use std::io::{Error, ErrorKind};
+        let cases = [
+            (
+                ErrorKind::StorageFull,
+                "resource exhausted: no space left on device, free disk space and retry",
+            ),
+            (
+                ErrorKind::PermissionDenied,
+                "permission denied: the daemon cannot write to its data directory, \
+                 check its ownership and permissions",
+            ),
+            (ErrorKind::Other, "internal error: save state: boom"),
+        ];
+        for (kind, expected) in cases {
+            // Arrange
+            let io = Error::new(kind, "boom");
+
+            // Act
+            let err = ApiError::from_io("save state", &io);
+
+            // Assert
+            assert_eq!(err.to_string(), expected, "{kind:?}");
+        }
     }
 
     // ----- ApiError display rendering -------------------------------------
