@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 
 PKG="github.com/igorjs/ward/sdks/go/wardpb"
 
+mkdir -p wardpb
+
 # The proto is append-only and carries no go_package, so the Go package
 # is mapped here instead.
 protoc \
