@@ -456,6 +456,10 @@ jobs:
         with:
           # Credentials stay persisted only here: the job pushes one tag.
           persist-credentials: true # zizmor: ignore[artipacked]
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/go.mod
+          cache: false
       - name: Install protoc
         run: |
           for attempt in 1 2 3; do
@@ -467,7 +471,7 @@ jobs:
           done
       - name: Install protobuf Go plugins
         run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Generate Go SDK stubs

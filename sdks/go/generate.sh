@@ -5,7 +5,7 @@
 # The stubs are not committed on main: generate them locally and in CI.
 # Release tags (sdks/go/vX.Y.Z) carry them, so `go get` needs no codegen.
 # Needs protoc plus protoc-gen-go and protoc-gen-go-grpc on PATH:
-#   go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+#   go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
 #   go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
 set -euo pipefail
 

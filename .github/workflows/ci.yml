@@ -590,8 +590,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
-      # The runner's preinstalled Go is used; go.mod's toolchain line
-      # makes Go fetch a newer one if the image ever falls behind.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: sdks/go/go.mod
+          cache: false
       - name: Install protoc
         run: |
           for attempt in 1 2 3; do
@@ -603,7 +605,7 @@ jobs:
           done
       - name: Install protobuf Go plugins
         run: |
-          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
           go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Generate Go SDK stubs
