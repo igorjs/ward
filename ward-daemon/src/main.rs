@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 use ward_core::config::Config;
 use ward_core::grpc::WardGrpcServer;
 use ward_core::pb::ward_server::WardServer;
+use ward_core::sandbox::resource_metrics;
 use ward_core::validate::MAX_PUBLISH_PAYLOAD_BYTES;
 use ward_runtime::Runtime;
 
@@ -107,7 +108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // can instrument unconditionally without paying for it when
     // metrics aren't scraped.
     if let Some(addr) = cfg.metrics_addr {
-        metrics_exporter_prometheus::PrometheusBuilder::new()
+        prometheus_builder(resource_metrics::SERIES_IDLE_TIMEOUT)
             .with_http_listener(addr)
             .install()
             .map_err(|e| format!("install prometheus exporter on {addr}: {e}"))?;
@@ -137,6 +138,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // the same Backend / Broker / SandboxManager / VolumeManager.
     // Runtime::from_config also calls cfg.ensure_dirs() internally.
     let runtime = Runtime::from_config(&cfg).await?;
+
+    if cfg.metrics_addr.is_some() {
+        resource_metrics::spawn_collector(runtime.sandbox_manager());
+    }
 
     let grpc_service = WardGrpcServer::new(runtime.sandbox_manager(), runtime.volume_manager());
 
@@ -298,9 +303,56 @@ fn compute_max_total_streams(max_sandboxes: usize) -> usize {
         .min(MAX_SANITY_CEILING)
 }
 
+/// The exporter drops per-sandbox gauges that stop updating, so a removed
+/// sandbox leaves the scrape output.
+fn prometheus_builder(idle: std::time::Duration) -> metrics_exporter_prometheus::PrometheusBuilder {
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .idle_timeout(metrics_util::MetricKindMask::GAUGE, Some(idle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_a_sandbox_that_stops_reporting_when_scraped_then_its_series_disappear() {
+        // Arrange
+        const IDLE: std::time::Duration = std::time::Duration::from_millis(20);
+        let recorder = prometheus_builder(IDLE).build_recorder();
+        let handle = recorder.handle();
+        let stats = ward_core::sandbox::SandboxStats {
+            cpu_nanos: 1_000_000_000,
+            online_cpus: 1,
+            mem_used_bytes: 7,
+            mem_limit_bytes: 8,
+            pids: 1,
+            read_at: std::time::SystemTime::UNIX_EPOCH,
+            mem_peak_bytes: 9,
+            block_read_bytes: 1,
+            block_write_bytes: 2,
+            net_rx_bytes: 3,
+            net_tx_bytes: 4,
+        };
+        metrics::with_local_recorder(&recorder, || resource_metrics::record("sb-1", &stats));
+
+        // Act
+        let live = handle.render();
+        std::thread::sleep(IDLE * 3);
+        let _ = handle.render();
+        std::thread::sleep(IDLE * 3);
+        let gone = handle.render();
+
+        // Assert
+        assert!(
+            live.contains("ward_sandbox_net_rx_bytes_total{sandbox_id=\"sb-1\"} 3"),
+            "{live}"
+        );
+        assert!(
+            live.contains("ward_sandbox_cpu_seconds_total{sandbox_id=\"sb-1\"} 1"),
+            "{live}"
+        );
+        assert!(!gone.contains("sb-1"), "{gone}");
+    }
 
     #[test]
     fn given_max_sandboxes_zero_when_compute_then_floors_at_two() {

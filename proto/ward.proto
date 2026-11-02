@@ -521,6 +521,15 @@ message StatsResponse {
   uint32 pids = 5;
   // When the daemon took the reading, for working out rates between two.
   google.protobuf.Timestamp read_at = 6;
+  // Highest memory the sandbox has used, in bytes. 0 when unknown.
+  uint64 mem_peak_bytes = 7;
+  // Bytes read from and written to block devices.
+  uint64 block_read_bytes = 8;
+  uint64 block_write_bytes = 9;
+  // Ethernet bytes the guest received and sent through the host network
+  // stack since the sandbox last started.
+  uint64 net_rx_bytes = 10;
+  uint64 net_tx_bytes = 11;
 }
 
 message WaitRequest {

@@ -4,8 +4,9 @@ mod copy;
 pub mod events;
 mod launch;
 mod manager;
+pub mod resource_metrics;
 pub mod store;
 #[cfg(all(test, not(feature = "krunvm")))]
 pub(crate) use manager::tests::{create_with_command, host_manager};
-pub use manager::{MAIN_PROCESS_PID, ProcessIo, STOP_GRACE_SECONDS, SandboxManager};
+pub use manager::{MAIN_PROCESS_PID, ProcessIo, STOP_GRACE_SECONDS, SandboxManager, SandboxStats};
 pub(crate) use manager::{decode_wait_status, event_chunk, event_wait_status};

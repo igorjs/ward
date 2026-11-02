@@ -4,7 +4,8 @@
 //! controller. Every process the agent spawns joins one cgroup, so a fork
 //! past the cap fails with EAGAIN inside the guest and the VM stays up. The
 //! memory controller is enabled too, where the guest has it, so the cgroup
-//! reports OOM kills.
+//! reports OOM kills and its peak memory. The io controller is enabled the
+//! same way, for block I/O accounting.
 
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -23,10 +24,8 @@ const SUBTREE_CONTROL_FILE: &str = "cgroup.subtree_control";
 const PROCS_FILE: &str = "cgroup.procs";
 const PIDS_MAX_FILE: &str = "pids.max";
 const PIDS_CONTROLLER: &str = "pids";
-const ENABLE_PIDS: &str = "+pids";
 const MEMORY_CONTROLLER: &str = "memory";
-const ENABLE_MEMORY: &str = "+memory";
-const ENABLE_PIDS_AND_MEMORY: &str = "+pids +memory";
+const IO_CONTROLLER: &str = "io";
 /// Writing pid 0 to `cgroup.procs` moves the writing process itself.
 const SELF_PID: &[u8] = b"0";
 
@@ -61,11 +60,18 @@ fn io_step(step: &'static str) -> impl FnOnce(io::Error) -> CgroupError {
 #[derive(Clone)]
 pub struct SandboxCgroup {
     procs: Arc<OwnedFd>,
+    dir: PathBuf,
     /// Set when the memory controller is on, so `memory.events` exists.
     memory_dir: Option<PathBuf>,
 }
 
 impl SandboxCgroup {
+    /// The cgroup directory. Controller files such as `io.stat` exist in it
+    /// only for the controllers that are on.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The cgroup directory, if its memory controller is enabled.
     pub fn memory_dir(&self) -> Option<&Path> {
         self.memory_dir.as_deref()
@@ -116,11 +122,13 @@ pub fn setup(root: &Path, pids_max: Option<u32>) -> Result<SandboxCgroup, Cgroup
             "the pids controller is not built in".to_string(),
         ));
     }
-    let pids = pids_max.is_some();
-    let memory = has(MEMORY_CONTROLLER) && enable_controllers(root, pids, true).is_ok();
-    if !memory && pids {
-        enable_controllers(root, true, false).map_err(io_step("enable pids controller"))?;
-    }
+    let enabled = enable_controllers(
+        root,
+        pids_max.is_some(),
+        has(MEMORY_CONTROLLER),
+        has(IO_CONTROLLER),
+    )
+    .map_err(io_step("enable pids controller"))?;
 
     let group = group_dir(root);
     match std::fs::create_dir(&group) {
@@ -138,7 +146,8 @@ pub fn setup(root: &Path, pids_max: Option<u32>) -> Result<SandboxCgroup, Cgroup
         .map_err(io_step("open cgroup.procs"))?;
     Ok(SandboxCgroup {
         procs: Arc::new(procs.into()),
-        memory_dir: memory.then_some(group),
+        memory_dir: enabled.memory.then(|| group.clone()),
+        dir: group,
     })
 }
 
@@ -147,16 +156,40 @@ pub fn group_dir(root: &Path) -> PathBuf {
     root.join(SANDBOX_GROUP)
 }
 
-/// Turn on the wanted controllers for the cgroups below `root` in one write,
-/// so the kernel applies all of them or none.
-fn enable_controllers(root: &Path, pids: bool, memory: bool) -> io::Result<()> {
-    let enable = match (pids, memory) {
-        (true, true) => ENABLE_PIDS_AND_MEMORY,
-        (true, false) => ENABLE_PIDS,
-        (false, true) => ENABLE_MEMORY,
-        (false, false) => return Ok(()),
-    };
-    write_file(&root.join(SUBTREE_CONTROL_FILE), enable)
+/// Controllers that ended up on for the cgroups below the root.
+struct Enabled {
+    memory: bool,
+}
+
+/// Turn on the wanted controllers in one write per attempt, so the kernel
+/// applies all of them or none. Memory and io are best effort: a refused
+/// write is retried without io, then without memory. Only the pids
+/// controller, when a cap needs it, is required.
+fn enable_controllers(root: &Path, pids: bool, memory: bool, io: bool) -> io::Result<Enabled> {
+    let attempts = [(memory, io), (memory, false), (false, false)];
+    let mut last = Ok(());
+    for (memory, io) in attempts {
+        let wanted = [(pids, "pids"), (memory, "memory"), (io, "io")];
+        let line = wanted
+            .iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, name)| format!("+{name}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        last = if line.is_empty() {
+            Ok(())
+        } else {
+            write_file(&root.join(SUBTREE_CONTROL_FILE), &line)
+        };
+        if last.is_ok() {
+            return Ok(Enabled { memory });
+        }
+    }
+    if pids {
+        last.map(|()| Enabled { memory: false })
+    } else {
+        Ok(Enabled { memory: false })
+    }
 }
 
 fn write_file(path: &Path, text: &str) -> io::Result<()> {
@@ -194,8 +227,21 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(root.path().join(SUBTREE_CONTROL_FILE)).unwrap(),
-            ENABLE_PIDS_AND_MEMORY
+            "+pids +memory"
         );
+    }
+
+    #[test]
+    fn given_io_controller_when_setup_then_it_is_enabled_with_the_others() {
+        let root = fake_root("cpu io memory pids\n");
+
+        let cgroup = setup(root.path(), None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(SUBTREE_CONTROL_FILE)).unwrap(),
+            "+memory +io"
+        );
+        assert_eq!(cgroup.dir(), root.path().join(SANDBOX_GROUP));
     }
 
     #[test]
@@ -208,7 +254,7 @@ mod tests {
         assert_eq!(cgroup.memory_dir(), Some(group.as_path()));
         assert_eq!(
             std::fs::read_to_string(root.path().join(SUBTREE_CONTROL_FILE)).unwrap(),
-            ENABLE_MEMORY
+            "+memory"
         );
         assert_eq!(
             std::fs::read_to_string(group.join(PIDS_MAX_FILE)).unwrap(),

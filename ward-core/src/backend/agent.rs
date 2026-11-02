@@ -543,6 +543,9 @@ where
             mem_total_bytes: sample.mem_total_bytes,
             mem_available_bytes: sample.mem_available_bytes,
             pids: sample.pids,
+            mem_peak_bytes: sample.mem_peak_bytes,
+            block_read_bytes: sample.block_read_bytes,
+            block_write_bytes: sample.block_write_bytes,
         }),
         _ => Err(protocol_error("agent answered a Stats with another event").into()),
     }

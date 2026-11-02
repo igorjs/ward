@@ -171,3 +171,22 @@ fn given_device_when_transmit_then_frame_appears_on_fd() {
     // Assert
     assert_eq!(observed, frame.to_vec());
 }
+
+#[test]
+fn given_frames_in_both_directions_when_moved_then_counters_record_each_direction() {
+    // Arrange
+    let (guest_end, host_end) = socketpair_dgram();
+    let counters = std::sync::Arc::new(ward_net::NetCounters::default());
+    let mut device = RawFdDevice::with_counters(host_end, std::sync::Arc::clone(&counters));
+    let from_guest = [0u8; 60];
+    write_frame(&guest_end, &from_guest);
+
+    // Act
+    let (rx_token, _) = device.receive(Instant::now()).expect("a frame is pending");
+    rx_token.consume(|_| ());
+    let tx_token = device.transmit(Instant::now()).expect("transmit token");
+    tx_token.consume(100, |_| ());
+
+    // Assert
+    assert_eq!(counters.snapshot(), ward_net::NetBytes { rx: 100, tx: 60 });
+}

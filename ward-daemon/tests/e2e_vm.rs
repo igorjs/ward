@@ -26,6 +26,7 @@ const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
 const DEFAULT_IMAGE: &str = "alpine:3.20";
 const EXIT_POLL: Duration = Duration::from_millis(100);
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(10);
+const STATS_TIMEOUT: Duration = Duration::from_secs(20);
 const LARGE_OUTPUT_BYTES: usize = 1_000_000;
 
 /// Return early unless the operator opted in to real-VM tests.
@@ -1188,4 +1189,69 @@ fn given_a_memory_limit_when_a_process_allocates_without_bound_then_it_is_killed
 
     assert_ne!(hog.exit, 0, "the allocation loop must not finish cleanly");
     assert_eq!(after.stdout.trim(), "still-here");
+}
+
+/// One `--format` field of `ward stats` for a running sandbox.
+fn stats_field(d: &Daemon, id: &str, name: &str) -> String {
+    let mut cmd = d.cli();
+    cmd.args([
+        "stats",
+        "--no-stream",
+        "--format",
+        &format!("{{{{.{name}}}}}"),
+        id,
+    ]);
+    run_ok(cmd).trim().to_string()
+}
+
+/// The second half of a `"<in> / <out>"` stats value.
+fn second_half(value: &str) -> &str {
+    value.split(" / ").nth(1).unwrap_or(value)
+}
+
+#[test]
+fn given_a_guest_that_writes_a_file_when_stats_then_block_io_written_is_not_zero() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    // Stays alive after the write so the agent's sampler sees the process.
+    start(
+        &d,
+        &id,
+        None,
+        &[
+            "sh",
+            "-c",
+            "dd if=/dev/zero of=/root/blockio.bin bs=1M count=8 2>/dev/null; sync; sleep 30",
+        ],
+    );
+
+    wait_until("BLOCK I/O written to be non-zero", STATS_TIMEOUT, || {
+        second_half(&stats_field(&d, &id, "BlockIO")) != "0B"
+    });
+}
+
+#[test]
+fn given_a_guest_that_fetches_a_page_when_stats_then_net_io_is_not_zero() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(
+        &d,
+        &[
+            "--egress",
+            "allowlist",
+            "--allow-domain",
+            "archive.ubuntu.com",
+        ],
+    );
+
+    let status = http_status_line(&d, &id, "archive.ubuntu.com");
+    let net_io = stats_field(&d, &id, "NetIO");
+
+    assert!(status.starts_with("HTTP/"), "no HTTP response: {status:?}");
+    assert!(
+        net_io.split(" / ").all(|half| half != "0B"),
+        "NET I/O was {net_io:?}"
+    );
 }

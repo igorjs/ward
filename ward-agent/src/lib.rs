@@ -13,7 +13,8 @@ use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use prost::Message;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -295,7 +296,12 @@ where
         }
         Some(request::Kind::Stats(_)) => {
             let mut writer = writer;
-            return answer_stats(Path::new(PROC_ROOT), &mut writer).await;
+            return answer_stats(
+                Path::new(PROC_ROOT),
+                SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir),
+                &mut writer,
+            )
+            .await;
         }
         _ => {
             return Err(std::io::Error::new(
@@ -351,12 +357,30 @@ async fn answer_top<W: AsyncWrite + Unpin>(
     write_frame(writer, &encode_event(&event)).await
 }
 
+/// Highest memory use any Stats reply has seen, for guests whose cgroup does
+/// not report a peak.
+static MEM_PEAK_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Process I/O seen so far, kept so exited processes still count.
+static PROCESS_IO: LazyLock<Mutex<stats::IoLedger>> = LazyLock::new(Mutex::default);
+
+/// How often the sandbox processes' I/O is read, so short-lived ones are
+/// still counted.
+#[cfg(target_os = "linux")]
+const PROCESS_IO_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 async fn answer_stats<W: AsyncWrite + Unpin>(
     proc_root: &Path,
+    group: Option<&Path>,
     writer: &mut W,
 ) -> std::io::Result<()> {
     let event = Event {
-        kind: Some(event::Kind::StatsSample(stats::sample(proc_root)?)),
+        kind: Some(event::Kind::StatsSample(stats::sample(
+            proc_root,
+            group,
+            &MEM_PEAK_SEEN,
+            &PROCESS_IO,
+        )?)),
     };
     write_frame(writer, &encode_event(&event)).await
 }
@@ -407,7 +431,23 @@ pub fn setup_cgroup(pids_max: Option<u32>) -> Result<(), String> {
     cgroup::ensure_mounted(root).map_err(|e| format!("mount cgroup2: {e}"))?;
     let group = cgroup::setup(root, pids_max).map_err(|e| e.to_string())?;
     let _ = SANDBOX_CGROUP.set(group);
+    spawn_process_io_sampler();
     Ok(())
+}
+
+/// Read the sandbox processes' I/O on a timer for the life of the agent.
+#[cfg(target_os = "linux")]
+fn spawn_process_io_sampler() {
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(PROCESS_IO_INTERVAL);
+            let group = SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir);
+            PROCESS_IO
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .update(Path::new(PROC_ROOT), group);
+        }
+    });
 }
 
 /// Make the child move itself into the sandbox cgroup before it runs, so

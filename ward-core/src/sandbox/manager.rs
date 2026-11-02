@@ -438,6 +438,11 @@ pub struct SandboxStats {
     pub mem_limit_bytes: u64,
     pub pids: u32,
     pub read_at: std::time::SystemTime,
+    pub mem_peak_bytes: u64,
+    pub block_read_bytes: u64,
+    pub block_write_bytes: u64,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
 }
 
 /// Turn a raw `wait(2)` status into the exit code a shell would report.
@@ -2222,6 +2227,7 @@ impl SandboxManager {
             Ok(guest) => guest,
             Err(e) => return Err(self.stats_failure(&id, e).await),
         };
+        let net = self.backend.net_bytes(&id).await.unwrap_or_default();
         let configured = u64::from(memory_mb).saturating_mul(BYTES_PER_MIB);
         Ok(SandboxStats {
             cpu_nanos: guest.cpu_nanos,
@@ -2236,6 +2242,11 @@ impl SandboxManager {
             },
             pids: guest.pids,
             read_at,
+            mem_peak_bytes: guest.mem_peak_bytes,
+            block_read_bytes: guest.block_read_bytes,
+            block_write_bytes: guest.block_write_bytes,
+            net_rx_bytes: net.rx,
+            net_tx_bytes: net.tx,
         })
     }
 
@@ -6451,6 +6462,9 @@ pub(crate) mod tests {
         ) -> crate::backend::Result<crate::backend::GuestStats> {
             Ok(STATS_GUEST)
         }
+        async fn net_bytes(&self, _sandbox_id: &str) -> crate::backend::Result<ward_net::NetBytes> {
+            Ok(STATS_NET)
+        }
         async fn create_snapshot(
             &self,
             sandbox_id: &str,
@@ -6488,7 +6502,13 @@ pub(crate) mod tests {
         mem_total_bytes: 512 * BYTES_PER_MIB,
         mem_available_bytes: 112 * BYTES_PER_MIB,
         pids: 9,
+        mem_peak_bytes: 300 * BYTES_PER_MIB,
+        block_read_bytes: 4096,
+        block_write_bytes: 8192,
     };
+
+    #[cfg(not(feature = "krunvm"))]
+    const STATS_NET: ward_net::NetBytes = ward_net::NetBytes { rx: 111, tx: 222 };
 
     #[cfg(not(feature = "krunvm"))]
     const TEST_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
@@ -7713,6 +7733,13 @@ pub(crate) mod tests {
         assert_eq!(stats.mem_used_bytes, 400 * BYTES_PER_MIB);
         assert_eq!(stats.cpu_nanos, STATS_GUEST.cpu_nanos);
         assert_eq!(stats.pids, STATS_GUEST.pids);
+        assert_eq!(stats.mem_peak_bytes, STATS_GUEST.mem_peak_bytes);
+        assert_eq!(stats.block_read_bytes, STATS_GUEST.block_read_bytes);
+        assert_eq!(stats.block_write_bytes, STATS_GUEST.block_write_bytes);
+        assert_eq!(
+            (stats.net_rx_bytes, stats.net_tx_bytes),
+            (STATS_NET.rx, STATS_NET.tx)
+        );
     }
 
     #[cfg(not(feature = "krunvm"))]

@@ -19,9 +19,12 @@
 
 use std::path::PathBuf;
 
+pub mod counters;
 pub mod inbound;
 pub mod null;
 pub mod smoltcp_backend;
+
+pub use counters::{NetBytes, NetCounters};
 
 /// Errors surfaced by network backends.
 #[derive(Debug, thiserror::Error)]

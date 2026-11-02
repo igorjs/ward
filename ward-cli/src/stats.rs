@@ -3,8 +3,9 @@
 //! `ward stats`, laid out like `docker stats`.
 //!
 //! CPU % comes from the guest's cumulative CPU time between two readings, so
-//! 100% is one busy CPU. The guest has no per-sandbox network or block I/O
-//! counters to read, so those two columns print `--`.
+//! 100% is one busy CPU. NET I/O is what the guest received and sent through
+//! the host network stack, BLOCK I/O what its processes read from and wrote
+//! to block devices; both use Docker's decimal units.
 
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
@@ -31,8 +32,12 @@ const NANOS_PER_SECOND: f64 = 1e9;
 const PERCENT: f64 = 100.0;
 const BYTE_UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 const BYTES_PER_UNIT: f64 = 1024.0;
-/// Docker prints byte sizes with this many significant digits.
+/// Docker prints memory sizes with this many significant digits.
 const SIZE_DIGITS: usize = 4;
+/// Docker prints network and block I/O in decimal units, with fewer digits.
+const IO_UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
+const BYTES_PER_IO_UNIT: f64 = 1000.0;
+const IO_DIGITS: usize = 3;
 const JSON_FORMAT: &str = "json";
 /// Each `--format` field with the header a `table` template gives it.
 const FIELDS: [(&str, &str); 9] = [
@@ -113,13 +118,27 @@ fn format_bytes(bytes: u64) -> String {
 /// `bytes` in the largest of `units` that keeps the value under `per_unit`,
 /// with four significant digits.
 pub(crate) fn human_size(bytes: u64, per_unit: f64, units: &[&str]) -> String {
+    human_size_digits(bytes, per_unit, units, SIZE_DIGITS)
+}
+
+/// A byte count as Docker prints network and block I/O: `1.2kB`, `3.4MB`.
+fn format_io(bytes: u64) -> String {
+    human_size_digits(bytes, BYTES_PER_IO_UNIT, &IO_UNITS, IO_DIGITS)
+}
+
+/// `in / out`, the way `docker stats` pairs two I/O totals.
+fn io_pair(first: u64, second: u64) -> String {
+    format!("{} / {}", format_io(first), format_io(second))
+}
+
+fn human_size_digits(bytes: u64, per_unit: f64, units: &[&str], digits: usize) -> String {
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= per_unit && unit + 1 < units.len() {
         value /= per_unit;
         unit += 1;
     }
-    let decimals = SIZE_DIGITS.saturating_sub(value.max(1.0).log10() as usize + 1);
+    let decimals = digits.saturating_sub(value.max(1.0).log10() as usize + 1);
     let text = format!("{value:.decimals$}");
     let text = if decimals > 0 {
         text.trim_end_matches('0').trim_end_matches('.')
@@ -149,8 +168,8 @@ impl Row {
                     "{:.2}%",
                     mem_percent(reading.mem_used_bytes, reading.mem_limit_bytes)
                 ),
-                UNAVAILABLE.to_string(),
-                UNAVAILABLE.to_string(),
+                io_pair(reading.net_rx_bytes, reading.net_tx_bytes),
+                io_pair(reading.block_read_bytes, reading.block_write_bytes),
                 reading.pids.to_string(),
             ]),
             None => cells.resize(CELL_COUNT, UNAVAILABLE.to_string()),
@@ -172,6 +191,11 @@ impl Row {
             object["OnlineCPUs"] = json!(reading.online_cpus);
             object["MemUsedBytes"] = json!(reading.mem_used_bytes);
             object["MemLimitBytes"] = json!(reading.mem_limit_bytes);
+            object["MemPeakBytes"] = json!(reading.mem_peak_bytes);
+            object["NetRxBytes"] = json!(reading.net_rx_bytes);
+            object["NetTxBytes"] = json!(reading.net_tx_bytes);
+            object["BlockReadBytes"] = json!(reading.block_read_bytes);
+            object["BlockWriteBytes"] = json!(reading.block_write_bytes);
         }
         object
     }
@@ -397,6 +421,11 @@ mod tests {
             mem_used_bytes: 12 * MIB + MIB / 2,
             mem_limit_bytes: 1024 * MIB,
             pids: 3,
+            mem_peak_bytes: 0,
+            block_read_bytes: 0,
+            block_write_bytes: 0,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
             read_at: Some(prost_types::Timestamp {
                 seconds: secs,
                 nanos: 0,
@@ -434,6 +463,43 @@ mod tests {
         #[case] expected: &str,
     ) {
         assert_eq!(format_bytes(bytes), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0, "0B")]
+    #[case::bytes(999, "999B")]
+    #[case::kilobytes(1200, "1.2kB")]
+    #[case::megabytes(3_400_000, "3.4MB")]
+    #[case::three_digits(15_678, "15.7kB")]
+    #[case::decimal_not_binary(1024, "1.02kB")]
+    fn given_an_io_total_when_formatted_then_decimal_units_with_three_digits(
+        #[case] bytes: u64,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(format_io(bytes), expected);
+    }
+
+    #[test]
+    fn given_a_reading_with_io_when_cells_built_then_net_and_block_columns_are_filled() {
+        // Arrange
+        let mut reading = reading(0, 1, 0);
+        reading.net_rx_bytes = 1200;
+        reading.net_tx_bytes = 3_400_000;
+        reading.block_read_bytes = 0;
+        reading.block_write_bytes = 5_000_000;
+        let row = Row {
+            id: "id".into(),
+            name: "n".into(),
+            reference: "r".into(),
+            metrics: Some((reading, 0.0)),
+        };
+
+        // Act
+        let cells = row.cells();
+
+        // Assert
+        assert_eq!(cells[5], "1.2kB / 3.4MB");
+        assert_eq!(cells[6], "0B / 5MB");
     }
 
     #[rstest::rstest]
