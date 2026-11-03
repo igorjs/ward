@@ -134,6 +134,45 @@ fn given_an_unused_image_when_image_prune_then_only_all_removes_it() {
 }
 
 #[test]
+fn given_a_label_filter_on_a_kind_without_labels_when_pruned_then_it_is_refused() {
+    // Arrange
+    let d = Daemon::spawn();
+    stopped(&d, "old1", &[]);
+
+    // Act
+    let outs = [
+        run(&d, &["image", "prune", "-a", "-f", "--filter", "label!=a"]),
+        run(&d, &["volume", "prune", "-f", "--filter", "label=a"]),
+        run(&d, &["system", "prune", "-f", "--filter", "label=a"]),
+    ];
+
+    // Assert
+    for out in &outs {
+        assert!(!out.status.success());
+        assert!(
+            stderr(out).contains("only supported by container prune"),
+            "{}",
+            stderr(out)
+        );
+    }
+    assert_eq!(names(&d), "old1\n");
+}
+
+#[test]
+fn given_a_recent_sandbox_when_pruned_by_until_then_it_is_kept() {
+    // Arrange
+    let d = Daemon::spawn();
+    stopped(&d, "fresh", &[]);
+
+    // Act
+    let out = ok(&d, &["container", "prune", "-f", "--filter", "until=1h"]);
+
+    // Assert
+    assert!(!out.contains("Deleted Containers"), "{out}");
+    assert_eq!(names(&d), "fresh\n");
+}
+
+#[test]
 fn given_a_stopped_sandbox_when_system_prune_forced_then_it_is_removed_and_reported() {
     // Arrange
     let d = Daemon::spawn();

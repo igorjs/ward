@@ -19,7 +19,7 @@ use ward_core::pb::{
 use crate::client::{self, Resolved};
 use crate::images::size_text;
 use crate::lifecycle::remove_resolved;
-use crate::prune_filter::Filter;
+use crate::prune_filter::{Filter, Kind};
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const PROMPT: &str = "Are you sure you want to continue? [y/N] ";
@@ -94,6 +94,8 @@ struct Report {
     volumes: Vec<String>,
     images: Vec<String>,
     reclaimed: u64,
+    /// Objects that were due for removal and could not be removed.
+    failures: usize,
 }
 
 impl Report {
@@ -128,6 +130,14 @@ impl Report {
             "ImagesDeleted": self.images,
             "SpaceReclaimed": self.reclaimed,
         })
+    }
+
+    /// Fails when anything due for removal stayed, after the report is out.
+    fn finish(&self) -> Result<()> {
+        if self.failures > 0 {
+            bail!("{} objects could not be removed", self.failures);
+        }
+        Ok(())
     }
 
     fn print(&self, json: bool) {
@@ -182,9 +192,15 @@ async fn prune_containers(
     report: &mut Report,
 ) -> Result<()> {
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let mut failed = 0;
     for info in &listed {
-        let target = Resolved::from_info(token_store, info)?;
+        let target = match Resolved::from_info(token_store, info) {
+            Ok(target) => target,
+            Err(e) => {
+                report.failures += 1;
+                eprintln!("error: {}: {e:#}", info.id);
+                continue;
+            }
+        };
         let stopped = matches!(
             target.status,
             SandboxStatus::Stopped | SandboxStatus::Exited
@@ -199,13 +215,10 @@ async fn prune_containers(
         match remove_resolved(c, token_store, &target).await {
             Ok(()) => report.containers.push(target.id),
             Err(e) => {
-                failed += 1;
+                report.failures += 1;
                 eprintln!("error: {}: {e:#}", target.id);
             }
         }
-    }
-    if failed > 0 {
-        bail!("{failed} sandboxes could not be removed");
     }
     Ok(())
 }
@@ -253,6 +266,7 @@ async fn prune_images(
         let reply = match c.remove_image(request).await {
             Ok(reply) => reply.into_inner(),
             Err(status) => {
+                report.failures += 1;
                 eprintln!("error: {}: {}", image.reference, status.message());
                 continue;
             }
@@ -293,7 +307,10 @@ async fn prune_volumes(
                 report.volumes.push(volume.name);
                 report.reclaimed += u64::from(volume.size_mb) * BYTES_PER_MIB;
             }
-            Err(status) => eprintln!("error: {}: {}", volume.name, status.message()),
+            Err(status) => {
+                report.failures += 1;
+                eprintln!("error: {}: {}", volume.name, status.message());
+            }
         }
     }
     Ok(())
@@ -305,7 +322,7 @@ pub async fn container(
     args: ContainerArgs,
     json: bool,
 ) -> Result<()> {
-    let filter = Filter::parse(&args.filter, Utc::now(), false)?;
+    let filter = Filter::parse(&args.filter, Utc::now(), Kind::Containers)?;
     ask(
         args.force,
         &format!("WARNING! This will remove {WARN_CONTAINERS}."),
@@ -314,11 +331,12 @@ pub async fn container(
     let mut report = Report::default();
     prune_containers(&mut c, token_store, &filter, &mut report).await?;
     report.print(json);
+    report.finish()?;
     Ok(())
 }
 
 pub async fn image(socket: &str, args: ImageArgs, json: bool) -> Result<()> {
-    let filter = Filter::parse(&args.filter, Utc::now(), true)?;
+    let filter = Filter::parse(&args.filter, Utc::now(), Kind::Images)?;
     let which = if args.all || filter.wants_all_images() {
         WARN_UNUSED_IMAGES
     } else {
@@ -329,11 +347,12 @@ pub async fn image(socket: &str, args: ImageArgs, json: bool) -> Result<()> {
     let mut report = Report::default();
     prune_images(&mut c, &filter, args.all, &mut report).await?;
     report.print(json);
+    report.finish()?;
     Ok(())
 }
 
 pub async fn volume(socket: &str, args: VolumeArgs, json: bool) -> Result<()> {
-    let filter = Filter::parse(&args.filter, Utc::now(), false)?;
+    let filter = Filter::parse(&args.filter, Utc::now(), Kind::Volumes)?;
     ask(
         args.force,
         &format!("WARNING! This will remove {WARN_VOLUMES}."),
@@ -342,11 +361,12 @@ pub async fn volume(socket: &str, args: VolumeArgs, json: bool) -> Result<()> {
     let mut report = Report::default();
     prune_volumes(&mut c, &filter, &mut report).await?;
     report.print(json);
+    report.finish()?;
     Ok(())
 }
 
 pub async fn system(socket: &str, token_store: &Path, args: SystemArgs, json: bool) -> Result<()> {
-    let filter = Filter::parse(&args.filter, Utc::now(), false)?;
+    let filter = Filter::parse(&args.filter, Utc::now(), Kind::System)?;
     let images = if args.all {
         WARN_UNUSED_IMAGES
     } else {
@@ -366,6 +386,7 @@ pub async fn system(socket: &str, token_store: &Path, args: SystemArgs, json: bo
     }
     prune_images(&mut c, &filter, args.all, &mut report).await?;
     report.print(json);
+    report.finish()?;
     Ok(())
 }
 
@@ -384,12 +405,32 @@ mod tests {
             volumes: lines(&["data"]),
             images: lines(&["untagged: alpine:3", "deleted: sha256:1"]),
             reclaimed: 7_800_000,
+            ..Default::default()
         };
 
         assert_eq!(
             report.text(),
             "Deleted Containers:\nabc\n\nDeleted Volumes:\ndata\n\nDeleted Images:\nuntagged: alpine:3\ndeleted: sha256:1\n\nTotal reclaimed space: 7.8MB\n"
         );
+    }
+
+    #[test]
+    fn given_a_failed_removal_when_finished_then_it_errors_after_the_report_is_built() {
+        let report = Report {
+            containers: lines(&["abc"]),
+            failures: 2,
+            ..Default::default()
+        };
+
+        assert!(report.text().contains("Deleted Containers:\nabc\n"));
+        assert!(
+            report
+                .finish()
+                .expect_err("fails")
+                .to_string()
+                .contains("2 objects")
+        );
+        assert!(Report::default().finish().is_ok());
     }
 
     #[test]
