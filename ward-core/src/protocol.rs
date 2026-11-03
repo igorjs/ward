@@ -64,6 +64,49 @@ pub struct SandboxSpec {
     /// What to do when the main process ends.
     #[serde(default)]
     pub restart: RestartPolicy,
+    /// Guest setup options such as `--read-only` and `--tmpfs`.
+    #[serde(default)]
+    pub guest: GuestOptions,
+    /// Host directories shared into the guest. Filled from the sandbox's
+    /// mounts when the spec is reported; never stored here.
+    #[serde(skip)]
+    pub mounts: Vec<Mount>,
+}
+
+/// Guest setup options of `docker run`, kept on the sandbox record.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuestOptions {
+    /// Mount the root filesystem read-only.
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    #[serde(default)]
+    pub tmpfs: Vec<TmpfsMount>,
+    /// Size of `/dev/shm` in bytes. 0 means [`DEFAULT_SHM_SIZE_BYTES`].
+    #[serde(default)]
+    pub shm_size_bytes: u64,
+}
+
+/// Docker's default size for `/dev/shm`: 64 MiB.
+pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+impl GuestOptions {
+    /// The size `/dev/shm` gets.
+    #[must_use]
+    pub fn shm_size(&self) -> u64 {
+        if self.shm_size_bytes == 0 {
+            DEFAULT_SHM_SIZE_BYTES
+        } else {
+            self.shm_size_bytes
+        }
+    }
+}
+
+/// A tmpfs mounted in the guest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TmpfsMount {
+    pub path: String,
+    /// Mount options as given, such as `size=64m,noexec`.
+    pub options: String,
 }
 
 /// When the daemon starts a sandbox again, as in `docker run --restart`.
@@ -172,7 +215,7 @@ impl PublishedPort {
 }
 
 /// A filesystem bind-mount passed into a sandbox.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Mount {
     pub source: String,
     pub target: String,
