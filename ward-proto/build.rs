@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         // Hand-written in lib.rs so the content never reaches a log line.
-        .skip_debug(["ward.v1.SecretFile"])
+        .skip_debug(["ward.v1.SecretFile", "ward.v1.CheckRegistryLoginRequest"])
         .compile_protos(&[&proto_file], &[&proto_root])?;
 
     // Rerun codegen if the proto changes. Cargo's default heuristic

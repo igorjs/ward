@@ -18,6 +18,7 @@ mod inspect;
 mod lifecycle;
 mod load;
 mod log_output;
+mod login;
 mod output;
 mod ports;
 mod ps_filter;
@@ -664,6 +665,17 @@ enum Commands {
     /// does, and print its id.
     Import(import::Args),
 
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Store registry credentials in Docker's config.json for pulls.
+    ///
+    /// The credentials are checked with the daemon first. The file is
+    /// `$DOCKER_CONFIG/config.json` or `~/.docker/config.json`, mode 0600,
+    /// and the daemon reads it as the user it runs as.
+    Login(login::LoginArgs),
+
+    /// Remove stored registry credentials.
+    Logout(login::LogoutArgs),
+
     /// Add a tag to a local image, as `docker tag` does.
     Tag(tag::Args),
 
@@ -703,7 +715,9 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Manage images: ls and pull. Each is `images` or `pull`.
+    /// Manage images: ls, pull, rm, tag, history, save, load and import. Each
+    /// is the top-level command of the same name (`ls` is `images`, `rm` is
+    /// `rmi`).
     Image {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -972,7 +986,18 @@ const CONTAINER_COMMANDS: [(&str, &str); 22] = [
     ("rename", "rename"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 3] = [("ls", "images"), ("list", "images"), ("pull", "pull")];
+const IMAGE_COMMANDS: [(&str, &str); 10] = [
+    ("ls", "images"),
+    ("list", "images"),
+    ("pull", "pull"),
+    ("rm", "rmi"),
+    ("remove", "rmi"),
+    ("tag", "tag"),
+    ("history", "history"),
+    ("save", "save"),
+    ("load", "load"),
+    ("import", "import"),
+];
 
 /// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
 /// same way, so both spellings share one definition and one help text.
@@ -1586,6 +1611,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Export(args) => export::run(&socket_path, &token_store, args).await?,
 
         Commands::Import(args) => import::run(&socket_path, args).await?,
+
+        Commands::Login(args) => login::login(&socket_path, args).await?,
+
+        Commands::Logout(args) => login::logout(&args)?,
 
         Commands::Tag(args) => tag::run(&socket_path, args).await?,
 

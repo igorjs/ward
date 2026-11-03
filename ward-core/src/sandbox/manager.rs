@@ -1733,6 +1733,18 @@ impl SandboxManager {
             .map_err(image_backend_err)
     }
 
+    /// Check that a registry accepts a login.
+    pub async fn check_registry_login(
+        &self,
+        registry: &str,
+        credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        self.backend
+            .check_registry_login(registry, credentials)
+            .await
+            .map_err(image_backend_err)
+    }
+
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;

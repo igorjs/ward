@@ -7,6 +7,7 @@ pub mod config;
 pub mod egress;
 pub mod grpc;
 pub mod protocol;
+pub mod registry_auth;
 pub mod sandbox;
 pub mod sync;
 pub mod utf8;
