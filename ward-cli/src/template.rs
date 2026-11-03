@@ -326,9 +326,9 @@ fn split(body: &str, format: &str) -> Result<Vec<Piece>> {
     let mut rest = body;
     let mut trim_next = false;
     while let Some((text, tail)) = rest.split_once(ACTION_OPEN) {
-        let (action, after) = tail
-            .split_once(ACTION_CLOSE)
+        let end = action_end(tail)
             .ok_or_else(|| anyhow!("template {format:?} has an unclosed {ACTION_OPEN}"))?;
+        let (action, after) = (&tail[..end], &tail[end + ACTION_CLOSE.len()..]);
         let mut text = if trim_next { text.trim_start() } else { text };
         let mut action = action;
         if let Some(stripped) = trim_marked(action, true) {
@@ -350,6 +350,34 @@ fn split(body: &str, format: &str) -> Result<Vec<Piece>> {
     let rest = if trim_next { rest.trim_start() } else { rest };
     pieces.push(Piece::Text(rest.to_string()));
     Ok(pieces)
+}
+
+/// Where the closing `}}` of the action in `tail` starts. A `}}` inside a
+/// quoted string or a comment does not close it.
+fn action_end(tail: &str) -> Option<usize> {
+    let body = tail.trim_start_matches(TRIM_MARK).trim_start();
+    let mut from = tail.len() - body.len();
+    if body.starts_with(COMMENT_OPEN) {
+        from += body.find(COMMENT_CLOSE)? + COMMENT_CLOSE.len();
+        return tail[from..].find(ACTION_CLOSE).map(|at| from + at);
+    }
+    let mut quote: Option<char> = None;
+    let mut chars = tail[from..].char_indices();
+    while let Some((offset, c)) = chars.next() {
+        match (quote, c) {
+            (Some('"'), '\\') => {
+                chars.next();
+            }
+            (Some(open), _) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '`') => quote = Some(c),
+            (None, _) if tail[from + offset..].starts_with(ACTION_CLOSE) => {
+                return Some(from + offset);
+            }
+            (None, _) => {}
+        }
+    }
+    None
 }
 
 /// The action without its `-` trim mark, if it has one on the given side.
@@ -544,8 +572,8 @@ fn parse_branch(
         Stop::End => Vec::new(),
         Stop::Eof => bail!("unexpected EOF: missing {{{{end}}}} for {keyword}"),
         Stop::Else(rest) => match rest.split_first() {
-            Some((Token::Word(word), tail)) if word == "if" && keyword == "if" => {
-                vec![parse_branch("if", tail, pieces)?]
+            Some((Token::Word(word), tail)) if word == keyword && keyword != "range" => {
+                vec![parse_branch(keyword, tail, pieces)?]
             }
             Some(_) => bail!("unexpected tokens after else"),
             None => {
@@ -580,10 +608,10 @@ fn parse_pipeline_tokens(tokens: &[Token]) -> Result<Pipeline> {
 
 fn parse_pipeline(tokens: &[Token], position: &mut usize) -> Result<Pipeline> {
     let mut pipeline = Pipeline::default();
-    let names = declaration(tokens);
+    let names = declaration(&tokens[*position..]);
     if let Some((names, consumed)) = names {
         pipeline.variables = names;
-        *position = consumed;
+        *position += consumed;
     }
     loop {
         let mut command = Vec::new();
@@ -691,6 +719,8 @@ impl Run {
                     }
                 }
                 Node::If(branch) => {
+                    // Variables of the condition live until the block ends.
+                    let block = self.variables.len();
                     let value = self.pipeline(&branch.pipeline, dot)?;
                     let chosen = if truthy(&value) {
                         &branch.then
@@ -698,14 +728,17 @@ impl Run {
                         &branch.otherwise
                     };
                     self.nodes(chosen, dot)?;
+                    self.variables.truncate(block);
                 }
                 Node::With(branch) => {
+                    let block = self.variables.len();
                     let value = self.pipeline(&branch.pipeline, dot)?;
                     if truthy(&value) {
                         self.nodes(&branch.then, &value)?;
                     } else {
                         self.nodes(&branch.otherwise, dot)?;
                     }
+                    self.variables.truncate(block);
                 }
                 Node::Range(branch) => self.range(branch, dot)?,
             }
@@ -775,8 +808,19 @@ impl Run {
             .split_first()
             .ok_or_else(|| anyhow!("missing value for command"))?;
         let mut args = Vec::with_capacity(rest.len() + 1);
+        // `and` stops at the first false operand and `or` at the first true
+        // one, so the operands after it are never evaluated.
+        let stop_on = match head {
+            Operand::Function(name) if name == "and" => Some(false),
+            Operand::Function(name) if name == "or" => Some(true),
+            _ => None,
+        };
         for operand in rest {
-            args.push(self.operand(operand, dot)?);
+            let value = self.operand(operand, dot)?;
+            if stop_on == Some(truthy(&value)) {
+                return Ok(value);
+            }
+            args.push(value);
         }
         args.extend(piped);
         match head {
@@ -959,6 +1003,14 @@ mod tests {
     #[case::trim_markers("a {{- \"b\" -}} c", "abc")]
     #[case::comment("a{{/* hidden */}}b", "ab")]
     #[case::number_compare("{{if gt .State.Code 2}}big{{end}}", "big")]
+    #[case::declare_group("{{$x := (index .Tags 0)}}{{$x}}", "a")]
+    #[case::declare_in_if("{{if $n := (len .Tags)}}{{$n}}{{end}}", "2")]
+    #[case::range_group("{{range $i, $v := (split \"x:y\" \":\")}}{{$i}}{{end}}", "01")]
+    #[case::quoted_close("{{\"}}\"}}", "}}")]
+    #[case::comment_close("a{{/* x }} y */}}b", "ab")]
+    #[case::else_with("{{with .Empty}}x{{else with .Name}}{{.}}{{end}}", "web")]
+    #[case::and_short_circuits("{{if and .Empty (index .Empty 0)}}x{{end}}", "")]
+    #[case::or_short_circuits("{{if or .Name (index .Empty 0)}}y{{end}}", "y")]
     fn given_go_syntax_when_rendered_then_it_matches_go_templates(
         #[case] format: &str,
         #[case] expected: &str,
@@ -968,6 +1020,15 @@ mod tests {
         let out = template.render(&[deep()]).expect("render");
 
         assert_eq!(out, format!("{expected}\n"));
+    }
+
+    #[test]
+    fn given_a_variable_of_an_if_condition_when_used_after_end_then_it_is_undefined() {
+        let template = Template::parse("{{if $n := .Name}}{{end}}{{$n}}", &ANY).expect("parse");
+
+        let error = template.render(&[deep()]).expect_err("fails");
+
+        assert!(error.to_string().contains("undefined variable"), "{error}");
     }
 
     #[test]
