@@ -77,19 +77,8 @@ impl Args {
 
 /// Parses `--cpus` into billionths of a CPU.
 fn parse_nano_cpus(value: &str) -> Result<u64> {
-    let cpus = value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|cpus| cpus.is_finite() && *cpus >= 0.0)
-        .ok_or_else(|| {
-            anyhow::anyhow!("invalid CPU count '{value}': use a number such as 2 or 0.5")
-        })?;
-    let nanos = (cpus * NANOS_PER_CPU as f64).round();
-    if nanos > u64::MAX as f64 {
-        bail!("CPU count '{value}' is too large");
-    }
-    Ok(nanos as u64)
+    let cpus = resources::parse_cpu_count(value)?;
+    Ok((cpus * NANOS_PER_CPU as f64).round() as u64)
 }
 
 pub async fn run(socket: &str, token_store: &Path, args: Args, json: bool) -> Result<()> {

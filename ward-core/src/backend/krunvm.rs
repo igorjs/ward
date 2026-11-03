@@ -1285,8 +1285,6 @@ impl KrunvmBackend {
         teardown_vm(id, shim, smoltcp).await;
         if let Some(state) = self.sandboxes.write().await.get_mut(id) {
             state.vm_size = None;
-        }
-        if let Some(state) = self.sandboxes.write().await.get_mut(id) {
             state.info.paused = false;
         }
         let _ = std::fs::remove_file(self.agent_socket_path(id));
