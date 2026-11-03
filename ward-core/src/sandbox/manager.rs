@@ -1107,6 +1107,7 @@ impl SandboxManager {
         let meta = &entry.meta;
         let current = meta.status == crate::protocol::SandboxStatus::Exited
             && !meta.manually_stopped
+            && !meta.had_secrets
             && meta.finished_at == request.finished_at;
         if !current
             || !restart::wants_restart(
@@ -1392,6 +1393,10 @@ impl SandboxManager {
         crate::validate::stop_timeout(req.stop_timeout)?;
         let restart =
             crate::validate::restart_policy(req.restart_policy.as_ref(), req.auto_remove)?;
+        // A fresh VM has no secrets, so a restart could not deliver them.
+        if !req.secrets.is_empty() && restart.kind != crate::protocol::RestartKind::No {
+            return Err(ApiError::InvalidRequest(RESTART_WITHOUT_SECRETS.into()));
+        }
         // Held for delivery only: never copied into the stored options.
         let secrets = std::mem::take(&mut req.secrets);
         if let Some(ref r) = req.resources {
@@ -5386,6 +5391,25 @@ pub(crate) mod tests {
         assert_eq!(policy.name, "on-failure");
         assert_eq!(policy.maximum_retry_count, 3);
         assert_eq!(fetched.restart_count, 0);
+    }
+
+    #[tokio::test]
+    async fn given_restart_policy_with_secrets_when_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            secrets: vec![crate::pb::SecretFile {
+                name: "token".into(),
+                content: b"s3cret".to_vec(),
+            }],
+            ..with_restart("always", 0)
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("conflict");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
     }
 
     #[tokio::test]
