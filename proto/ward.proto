@@ -126,6 +126,9 @@ service Ward {
   // Check that a registry accepts a login, for `ward login`. Needs no sandbox
   // token. The daemon keeps nothing; the CLI stores the credentials.
   rpc CheckRegistryLogin(CheckRegistryLoginRequest) returns (google.protobuf.Empty);
+  // Change the memory, CPU, pids limit or restart policy of a running or
+  // stopped sandbox, like `docker update`. The token travels in call metadata.
+  rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxInfo);
   // Freeze every process of a running sandbox, like `docker pause`. The
   // microVM keeps running; only the sandbox's processes stop. The token
   // travels in call metadata.
@@ -421,6 +424,9 @@ message ResourceLimits {
   // Remove the sandbox this long after it ends. 0 uses the daemon default,
   // which is off unless the operator sets one.
   uint64 exited_ttl_seconds = 5;
+  // CPU limit in billionths of a CPU, set by UpdateSandbox. 0 means the whole
+  // `cpus`. Enforced as a CFS quota inside the VM.
+  uint64 nano_cpus = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1041,21 @@ message CheckRegistryLoginRequest {
   string server = 1;
   string username = 2;
   string password = 3;
+}
+
+// `id` is a sandbox name, id or unique id prefix. A field left unset keeps
+// its value.
+message UpdateSandboxRequest {
+  string id = 1;
+  // New memory limit in MiB. 0 removes the limit. On a running sandbox it
+  // cannot exceed the VM's memory, which is fixed until the next start.
+  optional uint32 memory_mb = 2;
+  // New CPU limit in billionths of a CPU. 0 removes the limit. On a running
+  // sandbox it cannot exceed the VM's CPU count.
+  optional uint64 nano_cpus = 3;
+  // New limit on processes. 0 removes the limit.
+  optional uint32 pids_max = 4;
+  optional RestartPolicy restart_policy = 5;
 }
 
 // `id` is a sandbox name, id or unique id prefix.

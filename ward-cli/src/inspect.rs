@@ -342,6 +342,15 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     })
 }
 
+/// The CPU limit: the exact quota from `update`, else the VM's whole CPUs.
+fn nano_cpus(resources: &ward_core::pb::ResourceLimits) -> u64 {
+    if resources.nano_cpus > 0 {
+        resources.nano_cpus
+    } else {
+        u64::from(resources.cpus) * NANOS_PER_CPU
+    }
+}
+
 /// Docker's `HostConfig.MemorySwap`: the value given, else twice the memory
 /// limit, or -1 (unlimited) when memory has no limit.
 fn memory_swap(given: i64, memory: u64) -> i64 {
@@ -403,7 +412,7 @@ fn host_config(info: &SandboxInfo) -> Value {
     let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
         "Memory": memory,
-        "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
+        "NanoCpus": nano_cpus(&resources),
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
             "Name": restart.name,

@@ -143,8 +143,50 @@ const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
 // Per-sandbox state
 // ---------------------------------------------------------------------------
 
+/// What the running VM was booted with. Memory and CPUs cannot grow past it
+/// until the next boot.
+#[derive(Debug, Clone, Copy)]
+struct VmSize {
+    cpus: u32,
+    memory_mb: u32,
+}
+
+impl VmSize {
+    fn of(resources: &crate::protocol::ResourceLimits) -> Self {
+        Self {
+            cpus: resources.cpus,
+            memory_mb: resources.memory_mb,
+        }
+    }
+
+    /// Why `update` does not fit this VM, if it does not. A size of 0 is
+    /// libkrun's default, which is not known here, so it is not checked.
+    fn refuses(&self, update: &crate::protocol::LimitsUpdate) -> Option<String> {
+        let memory = update
+            .memory_mb
+            .filter(|&mb| self.memory_mb > 0 && mb > self.memory_mb)
+            .map(|mb| {
+                format!(
+                    "the memory limit of {mb} MiB is above the VM's {} MiB",
+                    self.memory_mb
+                )
+            });
+        let cpus = update
+            .nano_cpus
+            .filter(|&nanos| {
+                self.cpus > 0 && nanos > u64::from(self.cpus) * crate::protocol::NANOS_PER_CPU
+            })
+            .map(|_| format!("the CPU limit is above the VM's {} CPUs", self.cpus));
+        memory.or(cpus).map(|why| {
+            format!("{why}; a running VM keeps its size, so stop the sandbox, update it and start it again")
+        })
+    }
+}
+
 struct SandboxState {
     info: SandboxInfo,
+    /// Set while a VM is up.
+    vm_size: Option<VmSize>,
     /// Options given at create time. `env` applies to every exec (variables
     /// passed to a single exec win); the rest configures each boot.
     opts: CreateOpts,
@@ -408,6 +450,7 @@ impl Backend for KrunvmBackend {
         };
         let state = SandboxState {
             info: info.clone(),
+            vm_size: Some(VmSize::of(&opts.resources)),
             opts: opts.clone(),
             rootfs,
             blocked,
@@ -578,6 +621,7 @@ impl Backend for KrunvmBackend {
         // No VM outlives the daemon, so a socket file left behind is stale.
         let _ = std::fs::remove_file(self.agent_socket_path(&info.id));
         let state = SandboxState {
+            vm_size: None,
             opts,
             rootfs,
             blocked: Arc::new(BlockedEgress::default()),
@@ -642,6 +686,7 @@ impl Backend for KrunvmBackend {
             state.egress = vm.egress;
         }
         state.info.status = SandboxStatus::Running;
+        state.vm_size = Some(VmSize::of(&state.opts.resources));
         Ok(())
     }
 
@@ -845,6 +890,35 @@ impl Backend for KrunvmBackend {
                 std::io::ErrorKind::Other => BackendError::Exec(e.to_string()),
                 _ => BackendError::Io(e),
             })
+    }
+
+    async fn update_limits(&self, id: &str, update: &crate::protocol::LimitsUpdate) -> Result<()> {
+        let vm_up = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(id)
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+            if let Some(why) = state.vm_size.and_then(|size| size.refuses(update)) {
+                return Err(BackendError::InvalidArgument(why));
+            }
+            state.vm_size.is_some()
+        };
+        #[cfg(feature = "krunvm")]
+        if vm_up && self.boot_vms {
+            let stream = self.agent_stream(id).await?;
+            super::agent::set_limits(stream, update)
+                .await
+                .map_err(|e| BackendError::Exec(format!("update the sandbox limits: {e}")))?;
+        }
+        #[cfg(not(feature = "krunvm"))]
+        let _ = vm_up;
+        let mut sandboxes = self.sandboxes.write().await;
+        let state = sandboxes
+            .get_mut(id)
+            .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        state.opts.resources = state.opts.resources.updated(update);
+        state.info.resources = state.opts.resources.clone();
+        Ok(())
     }
 
     async fn pause_sandbox(&self, id: &str) -> Result<()> {
@@ -1210,6 +1284,7 @@ impl KrunvmBackend {
         #[cfg(feature = "krunvm")]
         teardown_vm(id, shim, smoltcp).await;
         if let Some(state) = self.sandboxes.write().await.get_mut(id) {
+            state.vm_size = None;
             state.info.paused = false;
         }
         let _ = std::fs::remove_file(self.agent_socket_path(id));

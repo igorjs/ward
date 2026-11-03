@@ -45,6 +45,7 @@ mod terminal;
 mod tokens;
 mod top;
 mod unpause;
+mod update;
 mod wait;
 
 use clap::{Args, Parser, Subcommand};
@@ -732,6 +733,9 @@ enum Commands {
     /// Remove every stopped and exited sandbox.
     Prune,
 
+    /// Change the limits or restart policy of one or more sandboxes.
+    Update(update::Args),
+
     /// Freeze the processes of one or more running sandboxes.
     Pause(pause::Args),
 
@@ -752,7 +756,7 @@ enum Commands {
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
     /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
-    /// rename, pause, unpause and attach. Each is the top-level command of the same name.
+    /// rename, pause, unpause, attach and update. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -938,6 +942,7 @@ fn create_request(
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
+        nano_cpus: 0,
     };
     opts.isolation.check()?;
     let mounts = opts
@@ -1008,7 +1013,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 25] = [
+const CONTAINER_COMMANDS: [(&str, &str); 26] = [
     ("ls", "ps"),
     ("ps", "ps"),
     ("create", "create"),
@@ -1031,6 +1036,7 @@ const CONTAINER_COMMANDS: [(&str, &str); 25] = [
     ("prune", "prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("update", "update"),
     ("attach", "attach"),
     ("pause", "pause"),
     ("unpause", "unpause"),
@@ -1710,6 +1716,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
         }
+
+        Commands::Update(args) => update::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
 

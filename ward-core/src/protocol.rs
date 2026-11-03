@@ -318,9 +318,58 @@ pub struct ResourceLimits {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub exited_ttl_seconds: u64,
+    /// CPU limit in billionths of a CPU. 0 means the whole `cpus`.
+    #[serde(default)]
+    pub nano_cpus: u64,
+}
+
+/// Bytes in one MiB.
+pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// Billionths of a CPU in one CPU.
+pub const NANOS_PER_CPU: u64 = 1_000_000_000;
+
+/// Limits `update` changes. A field left `None` is kept, and 0 removes that
+/// limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitsUpdate {
+    pub memory_mb: Option<u32>,
+    pub nano_cpus: Option<u64>,
+    pub pids_max: Option<u32>,
+}
+
+impl LimitsUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The whole CPUs the VM needs to honour `nano_cpus`.
+    pub fn whole_cpus(nano_cpus: u64) -> u32 {
+        u32::try_from(nano_cpus.div_ceil(NANOS_PER_CPU)).unwrap_or(u32::MAX)
+    }
 }
 
 impl ResourceLimits {
+    /// These limits with `update` applied. A CPU limit also sets the VM's CPU
+    /// count for the next boot, rounded up.
+    #[must_use]
+    pub fn updated(&self, update: &LimitsUpdate) -> Self {
+        let mut next = self.clone();
+        if let Some(memory_mb) = update.memory_mb {
+            next.memory_mb = memory_mb;
+        }
+        if let Some(nano_cpus) = update.nano_cpus {
+            next.nano_cpus = nano_cpus;
+            if nano_cpus > 0 {
+                next.cpus = LimitsUpdate::whole_cpus(nano_cpus);
+            }
+        }
+        if let Some(pids_max) = update.pids_max {
+            next.pids_max = pids_max;
+        }
+        next
+    }
+
     /// Fill each CPU, memory and pids field left at 0 from `defaults`.
     /// A field the request set is kept.
     pub fn with_defaults(self, defaults: &crate::config::DefaultLimits) -> Self {
