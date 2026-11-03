@@ -260,6 +260,22 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn count(&self) -> Result<usize>;
 
+    /// Freeze every process of the running sandbox `id` while its VM stays
+    /// up. The sandbox's info reports `paused` until it is thawed, stopped
+    /// or started again.
+    async fn pause_sandbox(&self, _id: &str) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot pause a sandbox".to_string(),
+        ))
+    }
+
+    /// Thaw a sandbox frozen by [`pause_sandbox`](Self::pause_sandbox).
+    async fn unpause_sandbox(&self, _id: &str) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot pause a sandbox".to_string(),
+        ))
+    }
+
     /// Forward connections on host address `bind` to TCP `guest_port` of
     /// the running sandbox `id`. Dropping the listener closes it.
     async fn publish_port(
