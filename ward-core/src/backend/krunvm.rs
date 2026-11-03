@@ -437,6 +437,23 @@ impl Backend for KrunvmBackend {
         Ok(self.image_store.list().await)
     }
 
+    async fn remove_image(
+        &self,
+        name: &str,
+        force: bool,
+        running: &std::collections::HashSet<String>,
+    ) -> Result<super::image::ImageRemoval> {
+        self.image_store.remove_image(name, force, running)
+    }
+
+    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        self.image_store.tag_image(source, target)
+    }
+
+    async fn image_history(&self, name: &str) -> Result<super::image::HistoryView> {
+        self.image_store.image_history(name)
+    }
+
     async fn pull_image(
         &self,
         reference: &str,
