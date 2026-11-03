@@ -173,10 +173,15 @@ pub fn validate(
             options: entry.options.clone(),
         });
     }
+    crate::guest_network::search_domains(&guest.dns_search)?;
+    crate::guest_network::dns_options(&guest.dns_options)?;
     Ok(GuestOptions {
         read_only_rootfs: guest.read_only_rootfs,
         tmpfs,
         shm_size_bytes: guest.shm_size_bytes,
+        extra_hosts: crate::guest_network::extra_hosts(&guest.extra_hosts)?,
+        dns_search: guest.dns_search.clone(),
+        dns_options: guest.dns_options.clone(),
     })
 }
 
@@ -194,6 +199,9 @@ pub fn to_pb(guest: &GuestOptions) -> pb::GuestOptions {
             })
             .collect(),
         shm_size_bytes: guest.shm_size(),
+        extra_hosts: guest.extra_hosts.clone(),
+        dns_search: guest.dns_search.clone(),
+        dns_options: guest.dns_options.clone(),
     }
 }
 
@@ -212,6 +220,11 @@ pub fn agent_args(guest: &GuestOptions) -> Vec<String> {
         ]);
     }
     args.extend([SHM_SIZE_ARG.to_string(), guest.shm_size().to_string()]);
+    args.extend(crate::guest_network::agent_args(
+        &guest.extra_hosts,
+        &guest.dns_search,
+        &guest.dns_options,
+    ));
     args
 }
 
@@ -346,6 +359,7 @@ mod tests {
                 options: "size=1m".into(),
             }],
             shm_size_bytes: SHM_BYTES,
+            ..Default::default()
         };
 
         // Act

@@ -84,6 +84,13 @@ pub struct GuestOptions {
     /// Size of `/dev/shm` in bytes. 0 means [`DEFAULT_SHM_SIZE_BYTES`].
     #[serde(default)]
     pub shm_size_bytes: u64,
+    /// `/etc/hosts` lines as `HOST:IP`, with `host-gateway` already resolved.
+    #[serde(default)]
+    pub extra_hosts: Vec<String>,
+    #[serde(default)]
+    pub dns_search: Vec<String>,
+    #[serde(default)]
+    pub dns_options: Vec<String>,
 }
 
 /// Docker's default size for `/dev/shm`: 64 MiB.
