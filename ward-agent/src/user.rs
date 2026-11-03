@@ -195,6 +195,34 @@ pub fn resolve(spec: &str, passwd: &str, group: &str) -> Result<Identity, UserEr
     })
 }
 
+/// The gids of `--group-add` values: a number as it is, a name looked up in
+/// the group file.
+///
+/// # Errors
+///
+/// [`UserError::GroupNotFound`] for a name the file does not list.
+pub fn resolve_group_add(specs: &[String], group: &str) -> Result<Vec<u32>, UserError> {
+    specs
+        .iter()
+        .map(|spec| match spec.parse::<u32>() {
+            Ok(gid) => Ok(gid),
+            Err(_) => group_entries(group)
+                .find(|entry| entry.name == spec)
+                .map(|entry| entry.gid)
+                .ok_or_else(|| UserError::GroupNotFound(spec.clone())),
+        })
+        .collect()
+}
+
+/// `identity` with `extra` appended to its groups, skipping repeats.
+pub fn add_groups(identity: &mut Identity, extra: &[u32]) {
+    for gid in extra {
+        if !identity.groups.contains(gid) {
+            identity.groups.push(*gid);
+        }
+    }
+}
+
 /// The system calls that change who a process is and where it starts.
 pub trait PrivilegeDropper {
     fn set_groups(&self, groups: &[u32]) -> std::io::Result<()>;
@@ -427,6 +455,35 @@ mod tests {
 
         // Assert
         assert_eq!(resolved, Ok(expected));
+    }
+
+    #[test]
+    fn given_group_add_values_when_resolved_then_names_come_from_the_group_file() {
+        // Arrange
+        let group = "root:x:0:\naudio:x:29:\n";
+        let specs = vec!["audio".to_string(), "1000".to_string()];
+
+        // Act
+        let gids = resolve_group_add(&specs, group);
+
+        // Assert
+        assert_eq!(gids, Ok(vec![29, 1000]));
+        assert_eq!(
+            resolve_group_add(&["nope".to_string()], group),
+            Err(UserError::GroupNotFound("nope".into()))
+        );
+    }
+
+    #[test]
+    fn given_an_identity_when_groups_are_added_then_repeats_are_skipped() {
+        // Arrange
+        let mut who = identity(1000, 1000, &[1000], "/home/u");
+
+        // Act
+        add_groups(&mut who, &[1000, 29]);
+
+        // Assert
+        assert_eq!(who.groups, [1000, 29]);
     }
 
     #[test]
