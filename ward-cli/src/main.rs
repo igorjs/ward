@@ -22,6 +22,7 @@ mod load;
 mod log_output;
 mod login;
 mod output;
+mod pause;
 mod ports;
 mod prune;
 mod prune_filter;
@@ -39,6 +40,7 @@ mod template;
 mod terminal;
 mod tokens;
 mod top;
+mod unpause;
 mod volume;
 mod wait;
 
@@ -709,6 +711,12 @@ enum Commands {
     #[command(name = "image-prune", hide = true)]
     ImagePrune(prune::ImageArgs),
 
+    /// Freeze the processes of one or more running sandboxes.
+    Pause(pause::Args),
+
+    /// Thaw the processes of one or more paused sandboxes.
+    Unpause(unpause::Args),
+
     /// Show the client and daemon versions.
     Version {
         /// Go template over .Client.Version and .Server.Version, .Server.Os,
@@ -722,8 +730,8 @@ enum Commands {
     System(SystemCommands),
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
-    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port
-    /// and rename. Each is the top-level command of the same name.
+    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
+    /// rename, pause and unpause. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -985,7 +993,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 22] = [
+const CONTAINER_COMMANDS: [(&str, &str); 24] = [
     ("ls", "ps"),
     ("ps", "ps"),
     ("create", "create"),
@@ -1008,6 +1016,8 @@ const CONTAINER_COMMANDS: [(&str, &str); 22] = [
     ("prune", "container-prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("pause", "pause"),
+    ("unpause", "unpause"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
 const IMAGE_COMMANDS: [(&str, &str); 11] = [
@@ -1661,6 +1671,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
         }
+
+        Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
+
+        Commands::Unpause(args) => unpause::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
