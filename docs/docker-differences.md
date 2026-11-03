@@ -80,7 +80,7 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 - A VM created without `-m` or `--cpus` has libkrun's default size, which Ward does not know, so the check is skipped and the cgroup limit is set anyway.
 - `--memory 0`, `--cpus 0` and `--pids-limit 0` or `-1` remove the limit. For memory that means the VM's own memory.
 - `--cpus` takes fractions, as in Docker, and is a CPU quota (`cpu.max`). The record also rounds it up to whole CPUs for the next boot. The daemon applies the quota again after each start, and the start fails if the guest cannot take it.
-- The memory and CPU limits need the guest kernel's memory and cpu controllers, and the pids limit its pids controller. A missing one fails the update with the reason, and changes nothing: the guest writes all the limits or none, and a record that cannot be saved puts the old limits back.
+- The memory and CPU limits need the guest kernel's memory and cpu controllers, and the pids limit its pids controller. A missing one fails the update with the reason, and changes nothing: the guest writes all the limits or none, and a record that cannot be saved puts the old limits back. If that fails too, the error says so, and the running sandbox may differ from its record until the next update or restart.
 - `--restart` follows `run --restart`: it is refused with `--rm` and with a sandbox created with `--secret`.
 
 ## Wait

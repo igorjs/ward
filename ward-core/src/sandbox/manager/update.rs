@@ -50,32 +50,38 @@ impl SandboxManager {
                 .map_err(backend_err)?;
         }
         if let Err(e) = self.record_update(&id, &limits, restart).await {
-            self.restore_limits(&id, &limits, &previous).await;
-            return Err(e);
+            return Err(match self.restore_limits(&id, &limits, &previous).await {
+                Ok(()) => e,
+                Err(stuck) => ApiError::Internal(format!(
+                    "{e}; the old limits could not be put back, so the running sandbox may differ from its record: {stuck}"
+                )),
+            });
         }
         tracing::info!(sandbox = %id, "sandbox updated");
         self.info(&id, CommandView::Full).await
     }
 
     /// Put back the values `limits` changed, after the record could not be
-    /// written.
+    /// written. When that fails too, the live VM differs from the record.
     async fn restore_limits(
         &self,
         id: &str,
         limits: &LimitsUpdate,
         previous: &crate::protocol::ResourceLimits,
-    ) {
+    ) -> std::result::Result<(), crate::backend::BackendError> {
         let undo = LimitsUpdate {
             memory_mb: limits.memory_mb.map(|_| previous.memory_mb),
             nano_cpus: limits.nano_cpus.map(|_| previous.nano_cpus),
             pids_max: limits.pids_max.map(|_| previous.pids_max),
         };
         if undo.is_empty() {
-            return;
+            return Ok(());
         }
-        if let Err(e) = self.backend.update_limits(id, &undo).await {
+        let result = self.backend.update_limits(id, &undo).await;
+        if let Err(e) = &result {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot put the old limits back");
         }
+        result
     }
 
     fn update_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -98,7 +104,7 @@ impl SandboxManager {
             ..LimitsUpdate::default()
         };
         self.backend.update_limits(id, &update).await.map_err(|e| {
-            ApiError::InvalidRequest(format!(
+            ApiError::Internal(format!(
                 "cannot apply the CPU limit of {} nano CPUs: {e}",
                 limits.nano_cpus
             ))

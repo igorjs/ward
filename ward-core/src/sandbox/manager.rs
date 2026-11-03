@@ -690,6 +690,7 @@ struct Teardown {
     broker: Arc<Broker>,
     backend: Arc<dyn Backend>,
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
+    update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
     exited_ttl: Option<std::time::Duration>,
@@ -935,6 +936,7 @@ impl SandboxManager {
             broker: Arc::clone(&self.broker),
             backend: Arc::clone(&self.backend),
             processes: Arc::clone(&self.processes),
+            update_locks: Arc::clone(&self.update_locks),
             events: self.events.clone(),
             exited_ttl: self.exited_ttl,
             restarts: self.restart_tx.clone(),
@@ -2896,6 +2898,7 @@ impl SandboxManager {
         from_timeout: bool,
     ) -> std::result::Result<(), BackendError> {
         let removed = Self::detach_entry(teardown.entries.write().await.remove(id), from_timeout);
+        teardown.update_locks.lock_unpoisoned().remove(id);
         let reason = from_timeout.then_some(EndReason::Timeout);
         Self::finish_cleanup(removed, teardown, id, reason).await
     }

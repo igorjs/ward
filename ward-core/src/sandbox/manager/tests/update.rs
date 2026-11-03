@@ -324,7 +324,7 @@ async fn given_a_stored_cpu_quota_the_vm_cannot_take_when_started_then_the_start
 
     // Assert
     assert!(
-        err.to_string().contains("cannot apply the CPU limit"),
+        matches!(&err, ApiError::Internal(m) if m.contains("cannot apply the CPU limit")),
         "{err}"
     );
     assert_eq!(
@@ -364,4 +364,25 @@ async fn given_concurrent_updates_when_they_finish_then_record_and_vm_agree() {
         (recorded.memory_mb, recorded.pids_max),
         (live.memory_mb, live.pids_max)
     );
+}
+
+#[tokio::test]
+async fn given_updated_sandbox_when_removed_then_its_update_lock_is_dropped() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let id = mgr.create(sized(), "").await.unwrap().id;
+    mgr.update(UpdateSandboxRequest {
+        pids_max: Some(PIDS),
+        ..change(&id)
+    })
+    .await
+    .unwrap();
+    assert!(mgr.update_locks.lock_unpoisoned().contains_key(&id));
+
+    // Act
+    mgr.remove(&id).await.unwrap();
+
+    // Assert
+    assert!(!mgr.update_locks.lock_unpoisoned().contains_key(&id));
 }
