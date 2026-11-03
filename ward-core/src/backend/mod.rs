@@ -48,6 +48,10 @@ pub enum BackendError {
 /// Tar chunks buffered between the two ends of a file copy.
 pub const COPY_CHANNEL_CAPACITY: usize = 4;
 
+fn no_image_cache() -> BackendError {
+    BackendError::InvalidArgument("this backend has no image cache".to_string())
+}
+
 /// Convenience result alias for backend operations.
 pub type Result<T> = std::result::Result<T, BackendError>;
 
@@ -166,9 +170,28 @@ pub trait Backend: Send + Sync + 'static {
         _reference: &str,
         _progress: Option<tokio::sync::mpsc::UnboundedSender<image::PullProgress>>,
     ) -> Result<image::CachedImage> {
-        Err(BackendError::InvalidArgument(
-            "this backend has no image cache".to_string(),
-        ))
+        Err(no_image_cache())
+    }
+
+    /// Remove `name` from the image cache. `running` holds the ids of the
+    /// sandboxes that are running.
+    async fn remove_image(
+        &self,
+        _name: &str,
+        _force: bool,
+        _running: &std::collections::HashSet<String>,
+    ) -> Result<image::ImageRemoval> {
+        Err(no_image_cache())
+    }
+
+    /// Give a cached image another tag.
+    async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        Err(no_image_cache())
+    }
+
+    /// The build steps of a cached image.
+    async fn image_history(&self, _name: &str) -> Result<image::HistoryView> {
+        Err(no_image_cache())
     }
 
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;

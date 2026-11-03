@@ -12,17 +12,17 @@ use crate::inspect::{duration_text, seconds_since};
 use crate::stats::human_size;
 use crate::template::Template;
 
-const SHORT_ID_LEN: usize = 12;
-const DIGEST_PREFIX: &str = "sha256:";
+pub(crate) const SHORT_ID_LEN: usize = 12;
+pub(crate) const DIGEST_PREFIX: &str = "sha256:";
 const DEFAULT_TAG: &str = "latest";
 /// Shown for a reference with no tag, as Docker does for a digest reference.
 const NO_TAG: &str = "<none>";
 /// Docker prints image sizes in decimal units.
-const BYTES_PER_UNIT: f64 = 1000.0;
-const SIZE_UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
+pub(crate) const BYTES_PER_UNIT: f64 = 1000.0;
+pub(crate) const SIZE_UNITS: [&str; 6] = ["B", "kB", "MB", "GB", "TB", "PB"];
 const DEFAULT_FORMAT: &str =
     "table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}";
-const CREATED_AT_FORMAT: &str = "%Y-%m-%d %H:%M:%S %z UTC";
+pub(crate) const CREATED_AT_FORMAT: &str = "%Y-%m-%d %H:%M:%S %z UTC";
 const FILTER_REFERENCE: &str = "reference";
 const FILTER_DANGLING: &str = "dangling";
 const WILDCARD: char = '*';

@@ -53,6 +53,12 @@ Each attach session is separate. A client that disconnects only detaches and lea
 - `ward cp` ignores `-a` and `-q`. A copy into a sandbox is checked by the guest while it unpacks, so a tar that fails midway leaves the entries already written, as in Docker. A guest that cannot finish a copy reports an internal error with its own reason.
 - `ward pull` and image storage have gaps: one cache entry per digest, no re-resolve of tags, no eviction on create. See [#252](https://github.com/igorjs/ward/issues/252).
 
+## Image management
+
+- `ward rmi` takes a tag, an image ID or a unique ID prefix, and `--no-prune` is not accepted. An image a running sandbox uses is never deleted, even with `-f`. With `-f` it deletes an image that stopped sandboxes use; the sandbox keeps its own copy of the files. Several tags given by ID need `-f`, as in Docker.
+- `ward tag` moves a tag that another image holds. A name with no tag means `:latest`.
+- `ward history` reads the build steps from the image config, so an image cached by an older Ward shows none. The IMAGE column shows the ID on the top row and `<missing>` on the others. A committed image adds one step whose SIZE is the whole filesystem, not the change, because Ward keeps no layers.
+
 ## Events
 
 `ward events` needs no sandbox token. The daemon keeps only the last 1024 events in memory. Nothing survives a daemon restart.

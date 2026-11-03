@@ -42,6 +42,10 @@ use super::{BackendError, Result};
 use crate::pb::PullPolicy;
 use crate::sync::LockUnpoisoned;
 
+mod manage;
+
+pub use manage::{HistoryView, ImageRemoval};
+
 const GIB: u64 = 1024 * 1024 * 1024;
 /// A pull stops once the layers it downloads add up to this many bytes.
 pub const MAX_PULL_BYTES: u64 = 2 * GIB;
@@ -163,6 +167,52 @@ pub struct ImageConfig {
     /// `KEY=VALUE` entries.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Build steps, oldest first.
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
+}
+
+/// One build step of an image, as `docker history` lists it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistoryEntry {
+    #[serde(default)]
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub comment: String,
+    /// The step changed only the config and added no layer.
+    #[serde(default)]
+    pub empty_layer: bool,
+    /// Size of the layer the step added; zero when it added none.
+    #[serde(default)]
+    pub size_bytes: u64,
+}
+
+/// A `history` entry of an OCI image config. A registry's `created` is
+/// free text, so one that does not parse is dropped, not fatal.
+#[derive(serde::Deserialize, Default)]
+#[serde(default)]
+struct RawHistoryEntry {
+    created: Option<String>,
+    created_by: Option<String>,
+    comment: Option<String>,
+    empty_layer: bool,
+}
+
+impl From<RawHistoryEntry> for HistoryEntry {
+    fn from(raw: RawHistoryEntry) -> Self {
+        Self {
+            created: raw
+                .created
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok())
+                .map(|time| time.with_timezone(&chrono::Utc)),
+            created_by: raw.created_by.unwrap_or_default(),
+            comment: raw.comment.unwrap_or_default(),
+            empty_layer: raw.empty_layer,
+            size_bytes: 0,
+        }
+    }
 }
 
 /// The `config` object of an OCI image config blob. Registries send `null`
@@ -181,6 +231,7 @@ struct RawRuntimeConfig {
 #[serde(default)]
 struct RawImageConfigBlob {
     config: Option<RawRuntimeConfig>,
+    history: Option<Vec<RawHistoryEntry>>,
 }
 
 impl ImageConfig {
@@ -195,7 +246,24 @@ impl ImageConfig {
             working_dir: raw.working_dir.unwrap_or_default(),
             user: raw.user.unwrap_or_default(),
             env: raw.env.unwrap_or_default(),
+            history: parsed
+                .history
+                .unwrap_or_default()
+                .into_iter()
+                .map(HistoryEntry::from)
+                .collect(),
         })
+    }
+
+    /// Give the steps that added a layer the sizes of the manifest's layers,
+    /// oldest first.
+    #[must_use]
+    pub fn with_layer_sizes(mut self, sizes: &[u64]) -> Self {
+        let mut sizes = sizes.iter();
+        for entry in self.history.iter_mut().filter(|entry| !entry.empty_layer) {
+            entry.size_bytes = sizes.next().copied().unwrap_or_default();
+        }
+        self
     }
 }
 
@@ -390,7 +458,12 @@ impl ImagePuller for OciPuller {
             client.pull_manifest_and_config(&image_ref, &auth)
         })
         .await?;
-        let config = ImageConfig::from_blob(config_blob.as_bytes())?;
+        let layer_sizes: Vec<u64> = image_manifest
+            .layers
+            .iter()
+            .map(|layer| u64::try_from(layer.size).unwrap_or_default())
+            .collect();
+        let config = ImageConfig::from_blob(config_blob.as_bytes())?.with_layer_sizes(&layer_sizes);
 
         if let Some(layer) = image_manifest
             .layers
@@ -1617,6 +1690,14 @@ impl ImageStore {
 
         let now = chrono::Utc::now();
         let digest = commit_digest();
+        let mut config = config;
+        config.history.push(HistoryEntry {
+            created: Some(now),
+            created_by: String::new(),
+            comment: spec.message.clone(),
+            empty_layer: false,
+            size_bytes,
+        });
         let meta = CacheMeta {
             image_ref: spec.reference.clone().unwrap_or_else(|| digest.clone()),
             digest,
@@ -1928,6 +2009,7 @@ mod tests {
             working_dir: "/app".to_string(),
             user: "nobody".to_string(),
             env: vec!["PATH=/bin".to_string()],
+            ..ImageConfig::default()
         }
     }
 
@@ -2165,6 +2247,7 @@ mod tests {
                 working_dir: "/w".to_string(),
                 user: "u".to_string(),
                 env: vec!["A=1".to_string()],
+                ..ImageConfig::default()
             }
         );
     }
