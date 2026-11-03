@@ -31,6 +31,8 @@ pub enum EventAction {
     Destroy,
     Update,
     Rename,
+    Pause,
+    Unpause,
     /// The health check turned healthy.
     HealthHealthy,
     /// The health check turned unhealthy.
@@ -47,6 +49,8 @@ impl EventAction {
             Self::Destroy => "destroy",
             Self::Update => "update",
             Self::Rename => "rename",
+            Self::Pause => "pause",
+            Self::Unpause => "unpause",
             Self::HealthHealthy => "health_status: healthy",
             Self::HealthUnhealthy => "health_status: unhealthy",
         }

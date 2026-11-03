@@ -67,6 +67,14 @@ impl SandboxManager {
 
     /// Run one check, record it, and report a change of status.
     async fn run_check(&self, due: Due) {
+        // A frozen guest cannot run a check, and Docker skips it too.
+        if self.is_paused(&due.id).await.unwrap_or(false) {
+            let mut entries = self.entries.write().await;
+            if let Some(tracker) = entries.get_mut(&due.id).and_then(|e| e.health.as_mut()) {
+                tracker.skip(&due.check, Instant::now());
+            }
+            return;
+        }
         let probe = self.probe(&due.id, &due.check).await;
         let mut entries = self.entries.write().await;
         let Some(entry) = entries.get_mut(&due.id) else {

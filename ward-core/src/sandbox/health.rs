@@ -175,6 +175,12 @@ impl Tracker {
         true
     }
 
+    /// Give up the check that was due, to try again after the interval.
+    pub fn skip(&mut self, check: &Check, now: Instant) {
+        self.in_flight = false;
+        self.next_due = now + check.interval;
+    }
+
     /// Add a finished check. Returns the new status when it changed.
     ///
     /// A failure within the start period does not count, but a success
