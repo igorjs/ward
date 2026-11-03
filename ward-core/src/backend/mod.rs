@@ -194,6 +194,19 @@ pub trait Backend: Send + Sync + 'static {
         Err(no_image_cache())
     }
 
+    /// Write cached images to an archive on disk, like `docker save`.
+    async fn save_images(&self, _names: &[String]) -> Result<image::SavedArchive> {
+        Err(no_image_cache())
+    }
+
+    /// Add the images of an archive, received in chunks, to the cache.
+    async fn load_images(
+        &self,
+        _chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<Vec<image::LoadedImage>> {
+        Err(no_image_cache())
+    }
+
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
 
     async fn list_sandboxes(&self) -> Result<Vec<crate::protocol::SandboxInfo>>;

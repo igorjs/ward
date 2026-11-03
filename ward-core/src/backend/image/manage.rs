@@ -32,14 +32,14 @@ pub struct HistoryView {
 }
 
 /// How a name given by the user matched a cache entry.
-enum Matched {
+pub(super) enum Matched {
     /// A reference of the image; the text is the reference as stored.
     Tag(String),
     /// The image id or a prefix of it.
     Id,
 }
 
-type Found = (PathBuf, CacheMeta, Matched);
+pub(super) type Found = (PathBuf, CacheMeta, Matched);
 
 fn short(id: &str) -> &str {
     id.get(..SHORT_ID_LEN).unwrap_or(id)
@@ -104,7 +104,7 @@ impl ImageStore {
         Ok(first.map(|(dir, meta)| (dir, meta, Matched::Id)))
     }
 
-    fn require_named(&self, name: &str) -> Result<Found> {
+    pub(super) fn require_named(&self, name: &str) -> Result<Found> {
         self.find_named(name)?
             .ok_or_else(|| BackendError::ImageNotFound(format!("No such image: {name}")))
     }

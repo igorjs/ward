@@ -1046,6 +1046,58 @@ impl Ward for WardGrpcServer {
         }))
     }
 
+    type SaveImagesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<crate::pb::ArchiveChunk, Status>>;
+
+    #[tracing::instrument(name = "rpc.save_images", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn save_images(
+        &self,
+        request: Request<crate::pb::SaveImagesRequest>,
+    ) -> Result<Response<Self::SaveImagesStream>, Status> {
+        let names = request.into_inner().references;
+        let archive = self
+            .sandbox
+            .save_images(&names)
+            .await
+            .map_err(api_err_to_status)?;
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        tokio::spawn(stream_archive(archive, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
+    }
+
+    #[tracing::instrument(name = "rpc.load_images", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn load_images(
+        &self,
+        request: Request<tonic::Streaming<crate::pb::ArchiveChunk>>,
+    ) -> Result<Response<crate::pb::LoadImagesResponse>, Status> {
+        let mut upload = request.into_inner();
+        let (tx, rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        let pump = async move {
+            while let Some(next) = upload.message().await.transpose() {
+                let chunk = next
+                    .map(|chunk| bytes::Bytes::from(chunk.data))
+                    .map_err(std::io::Error::other);
+                let failed = chunk.is_err();
+                if tx.send(chunk).await.is_err() || failed {
+                    break;
+                }
+            }
+        };
+        let _slot = PULL_SLOTS.acquire().await;
+        let (loaded, ()) = tokio::join!(self.sandbox.load_images(rx), pump);
+        let images = loaded
+            .map_err(api_err_to_status)?
+            .into_iter()
+            .map(|image| crate::pb::LoadedImage {
+                image_id: image.digest,
+                references: image.references,
+            })
+            .collect();
+        Ok(Response::new(crate::pb::LoadImagesResponse { images }))
+    }
+
     #[tracing::instrument(
         name = "rpc.commit",
         skip_all,
@@ -1355,6 +1407,50 @@ async fn stream_pull(
         }
     };
     let _ = out.send(Err(failure)).await;
+}
+
+/// Bytes of a saved archive sent in one message.
+const ARCHIVE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Send the saved archive to `out` in chunks, then drop it from disk.
+async fn stream_archive(
+    archive: crate::backend::image::SavedArchive,
+    out: tokio::sync::mpsc::Sender<Result<crate::pb::ArchiveChunk, Status>>,
+) {
+    use tokio::io::AsyncReadExt;
+    let mut file = match tokio::fs::File::open(&archive.path).await {
+        Ok(file) => file,
+        Err(e) => {
+            error!(error = %e, "saved archive is unreadable");
+            let _ = out
+                .send(Err(internal_status("the archive could not be read")))
+                .await;
+            return;
+        }
+    };
+    loop {
+        let mut data = vec![0; ARCHIVE_CHUNK_BYTES];
+        match file.read(&mut data).await {
+            Ok(0) => return,
+            Ok(read) => {
+                data.truncate(read);
+                if out
+                    .send(Ok(crate::pb::ArchiveChunk { data }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "reading the saved archive failed");
+                let _ = out
+                    .send(Err(internal_status("the archive could not be read")))
+                    .await;
+                return;
+            }
+        }
+    }
 }
 
 /// Send events to `out` until `until` passes or the client hangs up.

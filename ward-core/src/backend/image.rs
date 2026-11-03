@@ -42,8 +42,10 @@ use super::{BackendError, Result};
 use crate::pb::PullPolicy;
 use crate::sync::LockUnpoisoned;
 
+mod archive;
 mod manage;
 
+pub use archive::{LoadedImage, SavedArchive};
 pub use manage::{HistoryView, ImageRemoval};
 
 const GIB: u64 = 1024 * 1024 * 1024;

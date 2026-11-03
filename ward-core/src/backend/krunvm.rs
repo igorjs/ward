@@ -447,6 +447,17 @@ impl Backend for KrunvmBackend {
         self.image_store.tag_image(source, target)
     }
 
+    async fn save_images(&self, names: &[String]) -> Result<super::image::SavedArchive> {
+        self.image_store.save_images(names).await
+    }
+
+    async fn load_images(
+        &self,
+        chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<Vec<super::image::LoadedImage>> {
+        self.image_store.load_images(chunks).await
+    }
+
     async fn image_history(&self, name: &str) -> Result<super::image::HistoryView> {
         self.image_store.image_history(name)
     }
