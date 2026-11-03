@@ -259,13 +259,12 @@ fn given_limit_flags_when_inspected_then_host_config_shows_them() {
 fn given_bad_limit_flags_when_created_then_each_fails_with_a_clear_error() {
     // Arrange
     let d = Daemon::spawn();
-    let cases: [(&[&str], &str); 7] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--ulimit", "files=1"], "invalid ulimit type"),
         (&["--ulimit", "nofile=10:5"], "soft limit"),
         (&["--group-add", "bad group"], "invalid --group-add"),
         (&["-m", "64m", "--memory-swap", "128m"], "no swap"),
         (&["--memory-swap", "-1"], "no swap"),
-        (&["--cpu-shares", "1"], "--cpu-shares"),
         (&["--cpuset-cpus", "x"], "--cpuset-cpus"),
     ];
 

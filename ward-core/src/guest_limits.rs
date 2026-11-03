@@ -26,10 +26,10 @@ pub const ULIMIT_NAMES: [&str; 15] = [
 ];
 /// The value that means no limit.
 pub const UNLIMITED: i64 = -1;
-const MAX_ULIMITS: usize = ULIMIT_NAMES.len();
 const MAX_GROUPS: usize = 64;
 const MAX_GROUP_NAME_LEN: usize = 32;
-/// Docker's bounds for `--cpu-shares`; 0 leaves the default.
+/// The kernel's bounds for `--cpu-shares`, which it clamps to; 0 leaves the
+/// default.
 const MIN_CPU_SHARES: u32 = 2;
 const MAX_CPU_SHARES: u32 = 262_144;
 /// Bounds of the cgroup v2 `cpu.weight` that shares map onto.
@@ -91,9 +91,6 @@ pub fn ulimits(entries: &[pb::Ulimit]) -> Result<Vec<Ulimit>, ApiError> {
             hard,
         });
     }
-    if kept.len() > MAX_ULIMITS {
-        return Err(invalid("too many --ulimit entries".to_string()));
-    }
     Ok(kept)
 }
 
@@ -147,12 +144,6 @@ pub fn cgroup(limits: &CgroupLimits, memory_mb: u32) -> Result<(), ApiError> {
             limits.memory_reservation_bytes
         )));
     }
-    let shares = limits.cpu_shares;
-    if shares != 0 && !(MIN_CPU_SHARES..=MAX_CPU_SHARES).contains(&shares) {
-        return Err(invalid(format!(
-            "--cpu-shares must be 0 or from {MIN_CPU_SHARES} to {MAX_CPU_SHARES}"
-        )));
-    }
     let period = limits.cpu_period;
     if period != 0 && !(MIN_CPU_PERIOD..=MAX_CPU_PERIOD).contains(&period) {
         return Err(invalid(format!(
@@ -189,6 +180,7 @@ fn cpuset(list: &str) -> Result<(), ApiError> {
 /// The cgroup v2 `cpu.weight` for Docker's `--cpu-shares`, on runc's scale.
 #[must_use]
 pub fn cpu_weight(shares: u32) -> u64 {
+    let shares = shares.clamp(MIN_CPU_SHARES, MAX_CPU_SHARES);
     let span = u64::from(MAX_CPU_SHARES - MIN_CPU_SHARES);
     let scaled = u64::from(shares - MIN_CPU_SHARES) * (MAX_CPU_WEIGHT - MIN_CPU_WEIGHT) / span;
     MIN_CPU_WEIGHT + scaled
@@ -221,7 +213,8 @@ pub fn agent_args(ulimits: &[Ulimit], groups: &[String], limits: &CgroupLimits) 
             cpu_weight(limits.cpu_shares).to_string(),
         ]);
     }
-    if limits.cpu_quota != 0 || limits.cpu_period != 0 {
+    // A quota of -1 or 0 alone sets nothing, as in Docker.
+    if limits.cpu_quota > 0 || limits.cpu_period != 0 {
         let quota = if limits.cpu_quota > 0 {
             limits.cpu_quota.to_string()
         } else {
@@ -301,7 +294,8 @@ mod tests {
     #[case::swap_unlimited(CgroupLimits { memory_swap_bytes: -1, ..Default::default() }, false)]
     #[case::swap_more(CgroupLimits { memory_swap_bytes: MEMORY_BYTES * 2, ..Default::default() }, false)]
     #[case::reservation_over_memory(CgroupLimits { memory_reservation_bytes: 128 << 20, ..Default::default() }, false)]
-    #[case::shares_low(CgroupLimits { cpu_shares: 1, ..Default::default() }, false)]
+    #[case::shares_low_is_clamped(CgroupLimits { cpu_shares: 1, ..Default::default() }, true)]
+    #[case::shares_high_is_clamped(CgroupLimits { cpu_shares: u32::MAX, ..Default::default() }, true)]
     #[case::shares_ok(CgroupLimits { cpu_shares: 512, ..Default::default() }, true)]
     #[case::period_low(CgroupLimits { cpu_period: 10, ..Default::default() }, false)]
     #[case::quota_low(CgroupLimits { cpu_quota: 10, ..Default::default() }, false)]
@@ -327,11 +321,52 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case(1, 1)]
     #[case(2, 1)]
     #[case(1024, 39)]
     #[case(262_144, 10_000)]
+    #[case(u32::MAX, 10_000)]
     fn shares_map_onto_cpu_weight_like_runc(#[case] shares: u32, #[case] weight: u64) {
         assert_eq!(cpu_weight(shares), weight);
+    }
+
+    #[test]
+    fn the_agent_argument_names_are_the_ones_the_guest_agent_parses() {
+        use ward_agent::{cgroup_limits, guest_mounts, guest_network, process_limits};
+
+        let pairs = [
+            (ULIMIT_ARG, process_limits::ULIMIT_ARG),
+            (GROUP_ADD_ARG, process_limits::GROUP_ADD_ARG),
+            (MEMORY_LOW_ARG, cgroup_limits::MEMORY_LOW_ARG),
+            (CPU_WEIGHT_ARG, cgroup_limits::CPU_WEIGHT_ARG),
+            (CPU_MAX_ARG, cgroup_limits::CPU_MAX_ARG),
+            (CPUSET_ARG, cgroup_limits::CPUSET_ARG),
+            (
+                crate::guest_options::READ_ONLY_ARG,
+                guest_mounts::READ_ONLY_ARG,
+            ),
+            (crate::guest_options::TMPFS_ARG, guest_mounts::TMPFS_ARG),
+            (
+                crate::guest_options::SHM_SIZE_ARG,
+                guest_mounts::SHM_SIZE_ARG,
+            ),
+            (
+                crate::guest_network::ADD_HOST_ARG,
+                guest_network::ADD_HOST_ARG,
+            ),
+            (
+                crate::guest_network::DNS_SEARCH_ARG,
+                guest_network::DNS_SEARCH_ARG,
+            ),
+            (
+                crate::guest_network::DNS_OPTION_ARG,
+                guest_network::DNS_OPTION_ARG,
+            ),
+        ];
+
+        for (daemon, agent) in pairs {
+            assert_eq!(daemon, agent);
+        }
     }
 
     #[test]
@@ -378,6 +413,29 @@ mod tests {
                 "0"
             ]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::minus_one(-1)]
+    #[case::zero(0)]
+    fn a_quota_that_means_unlimited_sets_nothing_without_a_period(#[case] quota: i64) {
+        let limits = CgroupLimits {
+            cpu_quota: quota,
+            ..Default::default()
+        };
+
+        assert!(agent_args(&[], &[], &limits).is_empty());
+    }
+
+    #[test]
+    fn an_unlimited_quota_with_a_period_keeps_the_period() {
+        let limits = CgroupLimits {
+            cpu_quota: -1,
+            cpu_period: 50_000,
+            ..Default::default()
+        };
+
+        assert_eq!(agent_args(&[], &[], &limits), ["--cpu-max", "max", "50000"]);
     }
 
     #[test]

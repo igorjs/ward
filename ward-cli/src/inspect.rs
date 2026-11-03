@@ -30,6 +30,7 @@ const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const UNLIMITED_SWAP: i64 = -1;
 const STATUS_STARTING: &str = "starting";
 const READ_ONLY_MODE: &str = "ro";
 const BIND_PROPAGATION: &str = "rprivate";
@@ -362,6 +363,16 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     })
 }
 
+/// Docker's `HostConfig.MemorySwap`: the value given, else twice the memory
+/// limit, or -1 (unlimited) when memory has no limit.
+fn memory_swap(given: i64, memory: u64) -> i64 {
+    match (given, memory) {
+        (0, 0) => UNLIMITED_SWAP,
+        (0, memory) => i64::try_from(memory.saturating_mul(2)).unwrap_or(i64::MAX),
+        (given, _) => given,
+    }
+}
+
 /// Docker's `Config.Healthcheck`: only the fields that were set.
 fn healthcheck_value(check: &ward_core::pb::Healthcheck) -> Value {
     let mut value = json!({"Test": check.test});
@@ -447,10 +458,11 @@ fn host_config(info: &SandboxInfo) -> Value {
         },
         ..restart
     };
+    let memory = u64::from(resources.memory_mb) * BYTES_PER_MIB;
     let guest = info.guest.clone().unwrap_or_default();
     let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
-        "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
+        "Memory": memory,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
@@ -470,7 +482,7 @@ fn host_config(info: &SandboxInfo) -> Value {
                 .map(|u| json!({"Name": u.name, "Soft": u.soft, "Hard": u.hard}))
                 .collect::<Vec<_>>()
         }),
-        "MemorySwap": cgroup.memory_swap_bytes,
+        "MemorySwap": memory_swap(cgroup.memory_swap_bytes, memory),
         "MemoryReservation": cgroup.memory_reservation_bytes,
         "CpuShares": cgroup.cpu_shares,
         "CpusetCpus": cgroup.cpuset_cpus,
@@ -868,7 +880,7 @@ mod tests {
                     "DnsSearch": [],
                     "DnsOptions": [],
                     "Ulimits": null,
-                    "MemorySwap": 0,
+                    "MemorySwap": -1,
                     "MemoryReservation": 0,
                     "CpuShares": 0,
                     "CpusetCpus": "",
@@ -962,7 +974,7 @@ mod tests {
                 "DnsSearch": [],
                 "DnsOptions": [],
                 "Ulimits": null,
-                "MemorySwap": 0,
+                "MemorySwap": 1_073_741_824_u64,
                 "MemoryReservation": 0,
                 "CpuShares": 0,
                 "CpusetCpus": "",
@@ -970,6 +982,18 @@ mod tests {
                 "CpuQuota": 0,
             })
         );
+    }
+
+    #[rstest::rstest]
+    #[case::unset_with_memory(0, 512 << 20, 1 << 30)]
+    #[case::unset_without_memory(0, 0, -1)]
+    #[case::given(256 << 20, 256 << 20, 256 << 20)]
+    fn given_memory_swap_when_inspected_then_unset_is_twice_memory_like_docker(
+        #[case] given: i64,
+        #[case] memory: u64,
+        #[case] want: i64,
+    ) {
+        assert_eq!(memory_swap(given, memory), want);
     }
 
     fn health(status: &str) -> Option<ward_core::pb::HealthState> {
