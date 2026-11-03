@@ -14,6 +14,8 @@ use common::Daemon;
 const ENABLE_ENV: &str = "WARD_E2E_VM";
 const IMAGE_ENV: &str = "WARD_E2E_IMAGE";
 const DEFAULT_IMAGE: &str = "alpine:3.20";
+/// Characters of the sandbox ID that make the default host name.
+const SHORT_ID_LEN: usize = 12;
 
 macro_rules! require_vm {
     () => {
@@ -72,4 +74,54 @@ fn given_env_files_and_flag_when_run_then_the_guest_sees_the_merged_environment(
 
     // Assert
     assert_eq!(out.trim(), "first second flag");
+}
+
+#[test]
+fn given_hostname_when_run_then_the_guest_reports_it() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+
+    // Act
+    let named = run_ok(
+        &d,
+        &["run", "--rm", "--hostname", "web1", &image, "hostname"],
+    );
+    let id = run_ok(&d, &["run", "-d", &image, "sleep", "60"]);
+    let id = id.trim();
+    let default = run_ok(&d, &["exec", id, "hostname"]);
+
+    // Assert
+    assert_eq!(named.trim(), "web1");
+    assert_eq!(default.trim(), &id[..SHORT_ID_LEN]);
+}
+
+#[test]
+fn given_stop_signal_when_stopped_then_the_guest_process_gets_it() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+    let id = run_ok(
+        &d,
+        &[
+            "run",
+            "-d",
+            "--stop-signal",
+            "SIGUSR1",
+            &image,
+            "sh",
+            "-c",
+            "trap 'exit 42' USR1; while :; do sleep 1; done",
+        ],
+    );
+    let id = id.trim();
+
+    // Act
+    run_ok(&d, &["stop", id]);
+    let code = run_ok(&d, &["inspect", "--format", "{{.State.ExitCode}}", id]);
+
+    // Assert
+    assert_eq!(code.trim(), "42");
 }

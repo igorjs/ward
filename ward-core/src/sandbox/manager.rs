@@ -25,6 +25,7 @@ use crate::sandbox::copy;
 use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
+use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -418,10 +419,6 @@ const UNKNOWN_EXIT: i32 = 255;
 
 /// Seconds a stopping sandbox's main process gets to end after SIGTERM.
 pub const STOP_GRACE_SECONDS: u64 = 10;
-const SIGTERM: i32 = 15;
-const SIGKILL: i32 = 9;
-/// Highest signal number Linux accepts (the last real-time signal).
-const MAX_SIGNAL: i32 = 64;
 /// The pid `kill_process` accepts for the sandbox's main process.
 pub const MAIN_PROCESS_PID: &str = "0";
 
@@ -1226,6 +1223,9 @@ impl SandboxManager {
         crate::validate::user_spec(&req.user)?;
         crate::validate::secrets(&req.secrets)?;
         crate::validate::labels(&req.labels)?;
+        crate::validate::hostname(&req.hostname)?;
+        crate::validate::stop_signal(&req.stop_signal)?;
+        crate::validate::stop_timeout(req.stop_timeout)?;
         // Held for delivery only: never copied into the stored options.
         let secrets = std::mem::take(&mut req.secrets);
         if let Some(ref r) = req.resources {
@@ -1362,6 +1362,9 @@ impl SandboxManager {
                 published_ports,
                 image_digest,
                 labels: req.labels.clone().into_iter().collect(),
+                hostname: req.hostname.clone(),
+                stop_signal: req.stop_signal.clone(),
+                stop_timeout: req.stop_timeout,
             },
         };
 
@@ -1817,8 +1820,8 @@ impl SandboxManager {
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
-        self.stop_resolved(&id, self.grace_period(grace_seconds))
-            .await?;
+        let grace = self.grace_for(&id, grace_seconds).await;
+        self.stop_resolved(&id, grace).await?;
         let info = self.info(&id, CommandView::Full).await?;
         if self.is_auto_remove(&id).await {
             self.remove(&id).await?;
@@ -1862,8 +1865,8 @@ impl SandboxManager {
         self.refuse_if_had_secrets(&id).await?;
         let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
         if !failed {
-            self.stop_resolved(&id, self.grace_period(grace_seconds))
-                .await?;
+            let grace = self.grace_for(&id, grace_seconds).await;
+            self.stop_resolved(&id, grace).await?;
         }
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
@@ -1901,6 +1904,29 @@ impl SandboxManager {
                 .ok()
                 .map(std::time::Duration::from_secs),
         }
+    }
+
+    /// The wait a stop gets: the request's, else the sandbox's
+    /// `--stop-timeout`, else the daemon default.
+    async fn grace_for(&self, id: &str, requested: Option<i32>) -> Option<std::time::Duration> {
+        let recorded = self
+            .entries
+            .read()
+            .await
+            .get(id)
+            .and_then(|entry| entry.meta.options.spec.stop_timeout);
+        self.grace_period(requested.or(recorded))
+    }
+
+    /// The signal that asks the main process to end: the sandbox's
+    /// `--stop-signal`, else SIGTERM.
+    async fn stop_signal_of(&self, id: &str) -> i32 {
+        self.entries
+            .read()
+            .await
+            .get(id)
+            .and_then(|entry| crate::signal::parse(&entry.meta.options.spec.stop_signal))
+            .unwrap_or(SIGTERM)
     }
 
     async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
@@ -1953,8 +1979,8 @@ impl SandboxManager {
         Ok(())
     }
 
-    /// Ask the main process to end with SIGTERM and force it with SIGKILL
-    /// once the grace period passes. Returns its exit code, or `None` when
+    /// Ask the main process to end with its stop signal (SIGTERM by default)
+    /// and force it with SIGKILL once the grace period passes. Returns its exit code, or `None` when
     /// the sandbox has no main process, and unknown when it never reported an
     /// exit even after SIGKILL.
     async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> MainEnd {
@@ -1970,10 +1996,12 @@ impl SandboxManager {
             )
         };
         if let Some(control) = &control {
-            let _ = control.send(ProcessControl::Signal(SIGTERM)).await;
+            let _ = control
+                .send(ProcessControl::Signal(self.stop_signal_of(id).await))
+                .await;
         }
         if !ended_within(&mut exit, grace).await {
-            tracing::warn!(sandbox_id = %id, "main process ignored SIGTERM, forcing it");
+            tracing::warn!(sandbox_id = %id, "main process ignored the stop signal, forcing it");
             if let Some(control) = &control {
                 let _ = control.send(ProcessControl::Signal(SIGKILL)).await;
             }
@@ -2978,6 +3006,9 @@ fn recorded_state(
         info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
         info.spec.image_digest = entry.meta.options.spec.image_digest.clone();
         info.spec.labels = entry.meta.options.spec.labels.clone();
+        info.spec.hostname = entry.meta.options.spec.hostname.clone();
+        info.spec.stop_signal = entry.meta.options.spec.stop_signal.clone();
+        info.spec.stop_timeout = entry.meta.options.spec.stop_timeout;
         info.spec.name = entry.meta.options.spec.name.clone();
     }
     info
@@ -3030,6 +3061,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
     let created_at = Some(system_time_to_timestamp(info.created_at));
     let expires_at = info.expires_at.map(system_time_to_timestamp);
 
+    let hostname = info.spec.hostname_for(&info.id);
+
     PbSandboxInfo {
         id: info.id,
         status,
@@ -3047,7 +3080,15 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         workdir: info.spec.workdir,
         user: info.spec.user,
         image_digest: info.spec.image_digest,
-        labels: info.spec.labels.into_iter().collect(),
+        labels: info
+            .spec
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        hostname,
+        stop_signal: info.spec.stop_signal.clone(),
+        stop_timeout: info.spec.stop_timeout,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec
@@ -7199,6 +7240,9 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     const SIGKILL_EXIT_CODE: i32 = 137;
     #[cfg(not(feature = "krunvm"))]
+    const STOP_SIGNAL_EXIT_CODE: i32 = 42;
+    const DEFAULT_HOSTNAME_LEN: usize = 12;
+    #[cfg(not(feature = "krunvm"))]
     const SIGTERM_EXIT_CODE: i32 = 143;
     /// Poll until the sandbox reports `want`.
     #[cfg(not(feature = "krunvm"))]
@@ -7534,6 +7578,95 @@ pub(crate) mod tests {
         // Assert
         assert!(started.elapsed() < TEST_STOP_GRACE);
         assert_eq!(exit_code_of(&mgr, &id).await, Some(SIGKILL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stop_timeout_when_stopped_without_a_request_then_it_sets_the_grace() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; echo up; while :; do read x; done".into(),
+            ],
+            stop_timeout: Some(0),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+        let started = std::time::Instant::now();
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert!(started.elapsed() < TEST_STOP_GRACE);
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(SIGKILL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_stop_signal_when_stopped_then_the_main_process_gets_that_signal() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            stop_signal: "SIGHUP".into(),
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        mgr.stop(&id).await.expect("stop");
+
+        // Assert
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[tokio::test]
+    async fn given_hostname_options_when_fetched_then_it_is_the_name_or_the_short_id() {
+        // Arrange
+        let mgr = build_manager(4);
+        let named = CreateSandboxRequest {
+            hostname: "web.example.com".into(),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let custom = mgr.create(named, "").await.unwrap();
+        let default = mgr.create(create_req("alpine"), "").await.unwrap();
+
+        // Assert
+        assert_eq!(custom.hostname, "web.example.com");
+        assert_eq!(default.hostname, default.id[..DEFAULT_HOSTNAME_LEN]);
+        assert_eq!(mgr.get(&custom.id).await.unwrap().hostname, custom.hostname);
+    }
+
+    #[rstest::rstest]
+    #[case::hostname(CreateSandboxRequest { hostname: "-bad".into(), ..create_req("alpine") })]
+    #[case::signal(CreateSandboxRequest { stop_signal: "SIGNOPE".into(), ..create_req("alpine") })]
+    #[case::timeout(CreateSandboxRequest { stop_timeout: Some(-5), ..create_req("alpine") })]
+    #[tokio::test]
+    async fn given_bad_hostname_signal_or_timeout_when_created_then_it_is_refused(
+        #[case] req: CreateSandboxRequest,
+    ) {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("refused");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
     }
 
     #[cfg(not(feature = "krunvm"))]

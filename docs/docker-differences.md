@@ -23,6 +23,8 @@ These flags of `ward run` and `ward create` follow Docker unless noted.
 - `--cidfile FILE` writes the sandbox ID without a newline and fails if FILE exists. The file is removed when creation fails.
 - `--replace` is Podman's: it removes an existing sandbox with the same `--name`, running or not, before creating the new one. Without `--name` it does nothing. Podman stops the old container with its own stop timeout; Ward removes it as `rm -f` does.
 - `--platform linux/ARCH` is accepted only when it names this host's architecture (`linux`, `linux/amd64` or `linux/arm64`, with the `v8` variant for arm64). Ward cannot emulate another architecture, so any other value is an error.
+- `--hostname NAME` sets the guest host name, in the kernel and in `/etc/hostname`. Docker's `-h` short form is not available, because `-h` is help in Ward. Without it the host name is the first 12 characters of the sandbox ID, as in Docker. `inspect` shows it as `Config.Hostname`. Ward does not add the name to `/etc/hosts`, so the guest cannot resolve it through that file. A name takes up to 64 letters, digits, `-`, `.` and `_`, and starts with a letter or digit.
+- `--stop-signal SIGNAL` (a name such as `SIGINT` or a number) replaces SIGTERM as the signal that asks the main process to end. `--stop-timeout SECONDS` replaces the 10 second wait before SIGKILL; `-1` waits forever and `0` kills at once. Both apply to `stop` and `restart`, and `stop -t` or `restart -t` overrides the timeout. `inspect` shows `Config.StopSignal` and `Config.StopTimeout` once they are set, as Docker does. `rm -f` does not send the stop signal: it removes the sandbox at once, as Ward always has.
 - `--init` is accepted and does nothing.
 
 ## Ports

@@ -12,6 +12,8 @@ use common::Daemon;
 
 const ALPINE: &str = "alpine:latest";
 const COMMAND: &str = "true";
+/// Characters of the sandbox ID that make the default host name.
+const SHORT_ID_LEN: usize = 12;
 
 fn run(d: &Daemon, args: &[&str]) -> Output {
     d.cli().args(args).output().expect("run ward")
@@ -348,4 +350,81 @@ fn given_env_file_when_created_then_it_is_accepted() {
 
     // Assert
     assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn given_hostname_when_inspected_then_config_shows_it_or_the_short_id() {
+    // Arrange
+    let d = Daemon::spawn();
+    let named = ok(&d, &["create", "--hostname", "web.example.com", ALPINE])
+        .trim()
+        .to_string();
+    let plain = ok(&d, &["create", ALPINE]).trim().to_string();
+
+    // Act
+    let custom = ok(&d, &["inspect", "--format", "{{.Config.Hostname}}", &named]);
+    let default = ok(&d, &["inspect", "--format", "{{.Config.Hostname}}", &plain]);
+
+    // Assert
+    assert_eq!(custom.trim(), "web.example.com");
+    assert_eq!(default.trim(), &plain[..SHORT_ID_LEN]);
+}
+
+#[test]
+fn given_stop_settings_when_inspected_then_config_shows_them() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "web1",
+            "--stop-signal",
+            "SIGINT",
+            "--stop-timeout",
+            "30",
+            ALPINE,
+        ],
+    );
+    ok(&d, &["create", "--name", "plain1", ALPINE]);
+
+    // Act
+    let set = ok(
+        &d,
+        &[
+            "inspect",
+            "--format",
+            "{{.Config.StopSignal}} {{.Config.StopTimeout}}",
+            "web1",
+        ],
+    );
+    let unset = ok(
+        &d,
+        &["inspect", "--format", "[{{.Config.StopSignal}}]", "plain1"],
+    );
+
+    // Assert
+    assert_eq!(set.trim(), "SIGINT 30");
+    assert_eq!(unset.trim(), "[]");
+}
+
+#[test]
+fn given_bad_hostname_or_stop_signal_when_created_then_it_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let host = run(&d, &["create", "--hostname=-bad", ALPINE]);
+    let signal = run(&d, &["create", "--stop-signal", "SIGNOPE", ALPINE]);
+
+    // Assert
+    assert!(!host.status.success());
+    assert!(stderr(&host).contains("hostname"), "{}", stderr(&host));
+    assert!(!signal.status.success());
+    assert!(
+        stderr(&signal).contains("--stop-signal"),
+        "{}",
+        stderr(&signal)
+    );
 }

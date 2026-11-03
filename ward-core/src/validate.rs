@@ -152,6 +152,47 @@ pub fn labels(labels: &std::collections::HashMap<String, String>) -> Result<(), 
     Ok(())
 }
 
+/// Longest host name Linux accepts (`HOST_NAME_MAX`).
+const MAX_HOSTNAME_LEN: usize = 64;
+
+/// Validate a guest host name. Empty means the default.
+pub fn hostname(name: &str) -> Result<(), ApiError> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_ascii_alphanumeric());
+    let chars_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
+    if name.len() > MAX_HOSTNAME_LEN || !first_ok || !chars_ok {
+        return Err(ApiError::InvalidRequest(format!(
+            "hostname must be at most {MAX_HOSTNAME_LEN} characters of letters, digits, '-', '.' and '_', starting with a letter or digit"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a stop signal. Empty means SIGTERM.
+pub fn stop_signal(signal: &str) -> Result<(), ApiError> {
+    if !signal.is_empty() && crate::signal::parse(signal).is_none() {
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid stop signal: {signal}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a stop timeout: -1 waits forever, 0 kills at once.
+pub fn stop_timeout(seconds: Option<i32>) -> Result<(), ApiError> {
+    let in_range = |s: i32| s == -1 || u64::try_from(s).is_ok_and(|s| s <= MAX_TIMEOUT_SECONDS);
+    if seconds.is_some_and(|s| !in_range(s)) {
+        return Err(ApiError::InvalidRequest(format!(
+            "stop_timeout must be -1 or from 0 to {MAX_TIMEOUT_SECONDS}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a volume name.
 /// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
@@ -1551,5 +1592,58 @@ mod proptests {
         // Act and assert
         assert!(labels(&long).is_err());
         assert!(labels(&many).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::empty("", true)]
+    #[case::short("web1", true)]
+    #[case::fqdn("web.example-1.com", true)]
+    #[case::underscore("a_b", true)]
+    #[case::leading_dash("-web", false)]
+    #[case::leading_dot(".web", false)]
+    #[case::space("my host", false)]
+    #[case::slash("a/b", false)]
+    fn hostname_accepts_plain_names_only(#[case] name: &str, #[case] ok: bool) {
+        // Act
+        let result = hostname(name);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn hostname_rejects_a_name_longer_than_the_kernel_allows() {
+        // Act
+        let result = hostname(&"a".repeat(MAX_HOSTNAME_LEN + 1));
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::none(None, true)]
+    #[case::zero(Some(0), true)]
+    #[case::forever(Some(-1), true)]
+    #[case::too_negative(Some(-2), false)]
+    #[case::too_long(Some(i32::MAX), false)]
+    fn stop_timeout_accepts_minus_one_to_a_month(#[case] seconds: Option<i32>, #[case] ok: bool) {
+        // Act
+        let result = stop_timeout(seconds);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[rstest::rstest]
+    #[case::empty("", true)]
+    #[case::name("SIGINT", true)]
+    #[case::number("2", true)]
+    #[case::unknown("SIGNOPE", false)]
+    fn stop_signal_accepts_known_signals_only(#[case] signal: &str, #[case] ok: bool) {
+        // Act
+        let result = stop_signal(signal);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
     }
 }

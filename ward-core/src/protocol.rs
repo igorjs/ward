@@ -50,6 +50,33 @@ pub struct SandboxSpec {
     /// User metadata from `--label`.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Guest host name from `--hostname`. Empty means the short sandbox id.
+    #[serde(default)]
+    pub hostname: String,
+    /// Signal that stops the main process, as given (`SIGINT`, `2`). Empty
+    /// means SIGTERM.
+    #[serde(default)]
+    pub stop_signal: String,
+    /// Seconds the main process gets after the stop signal. `None` uses the
+    /// daemon default.
+    #[serde(default)]
+    pub stop_timeout: Option<i32>,
+}
+
+/// Characters of the sandbox id that make the default host name, as Docker
+/// uses the first 12 of a container id.
+const DEFAULT_HOSTNAME_LEN: usize = 12;
+
+impl SandboxSpec {
+    /// The host name the guest gets: the requested one, else the short id.
+    #[must_use]
+    pub fn hostname_for(&self, id: &str) -> String {
+        if self.hostname.is_empty() {
+            id.chars().take(DEFAULT_HOSTNAME_LEN).collect()
+        } else {
+            self.hostname.clone()
+        }
+    }
 }
 
 /// A host TCP port forwarded to a guest port.
