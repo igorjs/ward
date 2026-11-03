@@ -30,6 +30,7 @@ use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
 
 mod pause;
+mod wait_condition;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -8967,4 +8968,5 @@ pub(crate) mod tests {
     mod rename;
     #[cfg(not(feature = "krunvm"))]
     mod secrets;
+    mod wait_condition;
 }

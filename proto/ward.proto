@@ -607,6 +607,18 @@ message StatsResponse {
 
 message WaitRequest {
   string sandbox_id = 1;
+  // When to stop waiting. Absent means not running, as before.
+  WaitCondition condition = 2;
+}
+
+// Docker's `wait --condition` values.
+enum WaitCondition {
+  // The sandbox is not running, or stops running.
+  WAIT_CONDITION_NOT_RUNNING = 0;
+  // The sandbox's main process exits next, in this run or the next one.
+  WAIT_CONDITION_NEXT_EXIT = 1;
+  // The sandbox is removed.
+  WAIT_CONDITION_REMOVED = 2;
 }
 
 message WaitResponse {
