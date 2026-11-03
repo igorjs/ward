@@ -26,6 +26,7 @@ mod archive;
 // Only the Linux build calls into it; other hosts compile it for the tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod cgroup;
+mod freezer;
 mod limits;
 mod oom;
 mod pty;
@@ -252,6 +253,8 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 /// `Exec` runs a process and streams its output until it exits, `Ping`
 /// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream,
 /// `PutSecrets` writes secret files, `SetLimits` changes the sandbox's limits, and
+/// `PutSecrets` writes secret files, `Freeze` pauses or resumes the sandbox's
+/// processes, and
 /// `Top` lists the guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
@@ -295,6 +298,10 @@ where
             let mut writer = writer;
             return answer_set_limits(&set, &mut writer).await;
         }
+        Some(request::Kind::Freeze(freeze)) => {
+            let mut writer = writer;
+            return answer_freeze(freeze.frozen, &mut writer).await;
+        }
         Some(request::Kind::Top(top)) => {
             let mut writer = writer;
             return answer_top(&top.ps_args, &mut writer).await;
@@ -311,7 +318,7 @@ where
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, SetLimits, Top or Stats",
+                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, SetLimits, Freeze, Top or Stats",
             ));
         }
     };
@@ -363,6 +370,27 @@ async fn answer_set_limits<W: AsyncWrite + Unpin>(
         None => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "the guest has no sandbox cgroup to limit",
+        )),
+    };
+    let kind = match outcome {
+        Ok(()) => event::Kind::ArchiveDone(proto::ArchiveDone {}),
+        Err(e) => event::Kind::ArchiveError(proto::ArchiveError {
+            message: e.to_string(),
+            ..Default::default()
+        }),
+    };
+    write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await
+}
+
+async fn answer_freeze<W: AsyncWrite + Unpin>(frozen: bool, writer: &mut W) -> std::io::Result<()> {
+    let outcome = match SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir) {
+        Some(dir) => {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || freezer::set_frozen(&dir, frozen)).await?
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the guest has no sandbox cgroup to freeze",
         )),
     };
     let kind = match outcome {
@@ -650,6 +678,7 @@ async fn apply_request(
         | request::Kind::ArchiveEnd(_)
         | request::Kind::PutSecrets(_)
         | request::Kind::SetLimits(_)
+        | request::Kind::Freeze(_)
         | request::Kind::Top(_)
         | request::Kind::Stats(_) => {}
     }

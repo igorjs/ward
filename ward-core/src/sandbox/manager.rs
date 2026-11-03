@@ -31,6 +31,8 @@ use crate::sync::LockUnpoisoned;
 
 mod update;
 
+mod pause;
+
 type Result<T> = std::result::Result<T, ApiError>;
 
 /// Shown when the backend cannot start the sandbox; the cause is only logged.
@@ -1282,6 +1284,7 @@ impl SandboxManager {
             finished_at: meta.finished_at,
             end_reason: meta.end_reason,
             restart_count: meta.restart_count,
+            paused: false,
         };
         if let Err(e) = self
             .backend
@@ -2211,6 +2214,9 @@ impl SandboxManager {
             return Ok(());
         };
         tracing::info!(sandbox_id = %id, "stopping sandbox");
+        if let Err(e) = self.thaw_if_paused(id).await {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot thaw the paused sandbox before stopping it");
+        }
         self.close_listeners(id).await;
         let main_end = self.end_main_process(id, grace).await;
         let died_with = match main_end {
@@ -2688,13 +2694,19 @@ impl SandboxManager {
             return Err(not_running(&id));
         }
         let signal = if signal == 0 { SIGKILL } else { signal };
-        if signal == SIGKILL || signal == self.stop_signal_of(&id).await {
+        let ends_main = signal == SIGKILL || signal == self.stop_signal_of(&id).await;
+        if ends_main {
             self.mark_manually_stopped(&id).await?;
         }
         control
             .send(ProcessControl::Signal(signal))
             .await
-            .map_err(|_| ApiError::ProcessNotFound(MAIN_PROCESS_PID.to_string()))
+            .map_err(|_| ApiError::ProcessNotFound(MAIN_PROCESS_PID.to_string()))?;
+        // Docker thaws after a signal that ends the process, so it can act on it.
+        if ends_main {
+            self.thaw_if_paused(&id).await?;
+        }
+        Ok(())
     }
 
     /// Drop the manager's hold on the main process's stdin, which sends EOF
@@ -2731,6 +2743,7 @@ impl SandboxManager {
         user: &str,
     ) -> Result<ProcessHandle> {
         crate::validate::exec_command(&command)?;
+        self.refuse_if_paused(id).await?;
         let mode = ExecMode {
             tty,
             raw: true,
@@ -2991,6 +3004,7 @@ impl SandboxManager {
     pub async fn exec(&self, req: ExecRequest) -> Result<ProcessInfo> {
         let sandbox_id = self.resolve(&req.sandbox_id).await?;
         crate::validate::exec_command(&req.command)?;
+        self.refuse_if_paused(&sandbox_id).await?;
         let user = self.user_for(&sandbox_id, &req.user).await?;
         self.put_exec_secrets(&sandbox_id, &req.user, &req.secrets)
             .await?;
@@ -3302,6 +3316,7 @@ fn recorded_state(
         info.spec.stop_timeout = entry.meta.options.spec.stop_timeout;
         info.spec.restart = entry.meta.options.spec.restart;
         info.restart_count = entry.meta.restart_count;
+        info.paused &= entry.meta.status == crate::protocol::SandboxStatus::Running;
         info.spec.name = entry.meta.options.spec.name.clone();
     }
     info
@@ -3387,6 +3402,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
             maximum_retry_count: info.spec.restart.max_retries,
         }),
         restart_count: info.restart_count,
+        paused: info.paused,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec
@@ -8951,6 +8967,7 @@ pub(crate) mod tests {
     }
 
     mod egress;
+    mod pause;
     #[cfg(not(feature = "krunvm"))]
     mod ports;
     mod rename;

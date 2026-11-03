@@ -129,6 +129,12 @@ service Ward {
   // Change the memory, CPU, pids limit or restart policy of a running or
   // stopped sandbox, like `docker update`. The token travels in call metadata.
   rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxInfo);
+  // Freeze every process of a running sandbox, like `docker pause`. The
+  // microVM keeps running; only the sandbox's processes stop. The token
+  // travels in call metadata.
+  rpc Pause(PauseRequest) returns (SandboxInfo);
+  // Thaw a paused sandbox, like `docker unpause`.
+  rpc Unpause(UnpauseRequest) returns (SandboxInfo);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +312,9 @@ message SandboxInfo {
   RestartPolicy restart_policy = 25;
   // Times the daemon restarted the sandbox since it was last started by hand.
   uint32 restart_count = 26;
+  // True while the sandbox's processes are frozen by Pause. Its status stays
+  // running, as Docker's State.Running does.
+  bool paused = 27;
 }
 
 enum EndReason {
@@ -973,4 +982,14 @@ message UpdateSandboxRequest {
   // New limit on processes. 0 removes the limit.
   optional uint32 pids_max = 4;
   optional RestartPolicy restart_policy = 5;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message PauseRequest {
+  string id = 1;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message UnpauseRequest {
+  string id = 1;
 }

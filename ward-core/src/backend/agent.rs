@@ -465,6 +465,30 @@ where
     }
 }
 
+/// Ask the agent to freeze (`true`) or thaw (`false`) the sandbox's processes.
+///
+/// # Errors
+///
+/// Returns an error if the guest cannot freeze its cgroup or the connection
+/// fails.
+pub async fn freeze<S>(mut stream: S, frozen: bool) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let open = Request {
+        kind: Some(request::Kind::Freeze(proto::Freeze { frozen })),
+    };
+    write_frame(&mut stream, &encode(&open)).await?;
+    let frame = read_frame(&mut stream)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e)),
+        _ => Err(protocol_error("agent answered a Freeze with another event")),
+    }
+}
+
 /// Ask the agent for a tar of the guest `path` and pass its chunks to `out`.
 /// A failure ends the stream with an `Err` item, since chunks sent before it
 /// are incomplete.
@@ -1173,6 +1197,57 @@ mod tests {
         if let Some(event) = reply {
             write_frame(&mut w, &encode(&event)).await.unwrap();
         }
+    }
+
+    /// Fake guest for `freeze`: reads the opening frame, checks it asks for
+    /// `frozen`, then sends `reply`.
+    async fn freeze_guest<S>(stream: S, frozen: bool, reply: Event)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut r, mut w) = split(stream);
+        let frame = read_frame(&mut r).await.unwrap().expect("freeze frame");
+        let req = Request::decode(&frame[..]).unwrap();
+        let Some(request::Kind::Freeze(freeze)) = req.kind else {
+            panic!("expected a Freeze frame");
+        };
+        assert_eq!(freeze.frozen, frozen);
+        write_frame(&mut w, &encode(&reply)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn given_a_guest_that_froze_when_freeze_then_it_succeeds() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let done = Event {
+            kind: Some(event::Kind::ArchiveDone(proto::ArchiveDone {})),
+        };
+        tokio::spawn(freeze_guest(guest, true, done));
+
+        // Act
+        let result = freeze(daemon, true).await;
+
+        // Assert
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_a_guest_that_cannot_freeze_when_freeze_then_the_reason_is_returned() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let refusal = Event {
+            kind: Some(event::Kind::ArchiveError(proto::ArchiveError {
+                message: "no cgroup".into(),
+                ..Default::default()
+            })),
+        };
+        tokio::spawn(freeze_guest(guest, false, refusal));
+
+        // Act
+        let err = freeze(daemon, false).await.unwrap_err();
+
+        // Assert
+        assert!(err.to_string().contains("no cgroup"), "{err}");
     }
 
     #[tokio::test]
