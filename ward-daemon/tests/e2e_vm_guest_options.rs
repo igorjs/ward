@@ -161,3 +161,30 @@ fn given_mount_flags_when_run_then_bind_is_read_only_and_tmpfs_is_sized() {
     assert!(out.contains("Read-only file system"), "{out}");
     assert!(out.trim().ends_with("2048"), "{out}");
 }
+
+#[test]
+fn given_add_host_and_resolver_flags_when_run_then_the_guest_files_have_them() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let script = "getent hosts db.internal; cat /etc/resolv.conf";
+
+    // Act
+    let out = run_script(
+        &d,
+        &[
+            "--add-host",
+            "db.internal:10.1.2.3",
+            "--dns-search",
+            "corp.example",
+            "--dns-option",
+            "ndots:3",
+        ],
+        script,
+    );
+
+    // Assert
+    assert!(out.contains("10.1.2.3"), "{out}");
+    assert!(out.contains("search corp.example"), "{out}");
+    assert!(out.contains("options ndots:3"), "{out}");
+}

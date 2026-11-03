@@ -203,6 +203,12 @@ message GuestOptions {
   repeated TmpfsMount tmpfs = 2;
   // Size of /dev/shm in bytes, like `docker run --shm-size`. 0 means 64 MiB.
   uint64 shm_size_bytes = 3;
+  // Lines added to /etc/hosts, "HOST:IP", like `docker run --add-host`.
+  repeated string extra_hosts = 4;
+  // Search domains for resolv.conf, like `docker run --dns-search`.
+  repeated string dns_search = 5;
+  // Resolver options for resolv.conf, like `docker run --dns-option`.
+  repeated string dns_options = 6;
 }
 
 // A tmpfs mounted at `path`.
