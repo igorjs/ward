@@ -280,3 +280,85 @@ fn given_bad_limit_flags_when_created_then_each_fails_with_a_clear_error() {
         assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
     }
 }
+
+#[test]
+fn given_health_flags_when_inspected_then_config_and_state_show_the_check() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "chk1",
+            "--health-cmd",
+            "curl -f localhost",
+            "--health-interval",
+            "5s",
+            "--health-retries",
+            "2",
+            ALPINE,
+        ],
+    );
+    ok(&d, &["create", "--name", "plain1", ALPINE]);
+    ok(
+        &d,
+        &["create", "--name", "off1", "--no-healthcheck", ALPINE],
+    );
+
+    // Act
+    let check = inspect(&d, "{{json .Config.Healthcheck}}", "chk1");
+    let off = inspect(&d, "{{json .Config.Healthcheck.Test}}", "off1");
+    let plain = ok(&d, &["inspect", "plain1"]);
+    let none = ok(&d, &["ps", "-a", "-q", "--filter", "health=none"]);
+    let unhealthy = ok(&d, &["ps", "-a", "-q", "--filter", "health=unhealthy"]);
+    let starting = ok(&d, &["ps", "-a", "-q", "--filter", "health=starting"]);
+    let state = inspect(&d, "{{.State.Health.Status}}", "chk1");
+
+    // Assert
+    assert!(
+        check.contains(r#""Test":["CMD-SHELL","curl -f localhost"]"#),
+        "{check}"
+    );
+    assert!(check.contains(r#""Interval":5000000000"#), "{check}");
+    assert!(check.contains(r#""Retries":2"#), "{check}");
+    assert_eq!(off, r#"["NONE"]"#);
+    assert!(!plain.contains("Healthcheck"), "{plain}");
+    assert_eq!(none.lines().count(), 2);
+    assert_eq!(starting.lines().count(), 1);
+    assert_eq!(state, "starting");
+    assert!(unhealthy.trim().is_empty());
+}
+
+#[test]
+fn given_conflicting_health_flags_when_created_then_each_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+    let cases: [(&[&str], &str); 4] = [
+        (&["--health-retries", "2"], "need --health-cmd"),
+        (
+            &["--no-healthcheck", "--health-cmd", "true"],
+            "conflicting options",
+        ),
+        (
+            &["--health-cmd", "true", "--health-interval", "soon"],
+            "invalid duration",
+        ),
+        (
+            &["--health-cmd", "true", "--health-timeout", "1us"],
+            "at least 1ms",
+        ),
+    ];
+
+    for (flags, reason) in cases {
+        // Act
+        let mut args = vec!["create"];
+        args.extend(flags);
+        args.push(ALPINE);
+        let out = run(&d, &args);
+
+        // Assert
+        assert!(!out.status.success(), "{flags:?}");
+        assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
+    }
+}

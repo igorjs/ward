@@ -241,6 +241,7 @@ mod tests {
                     restart: Default::default(),
                     guest: Default::default(),
                     mounts: Default::default(),
+                    health: Default::default(),
                 },
             },
             created_at: SystemTime::now(),

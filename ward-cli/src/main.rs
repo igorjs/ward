@@ -260,8 +260,9 @@ enum Commands {
         /// Show the most recently created sandbox in any state.
         #[arg(short = 'l', long)]
         latest: bool,
-        /// Only sandboxes matching name=, id= (a prefix) or status=
-        /// (created, running, stopping, stopped, exited, failed). Repeatable.
+        /// Only sandboxes matching name=, id= (a prefix), status=
+        /// (created, running, stopping, stopped, exited, failed), label= or
+        /// health= (starting, healthy, unhealthy, none). Repeatable.
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,

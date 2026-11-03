@@ -71,6 +71,9 @@ pub struct SandboxSpec {
     /// mounts when the spec is reported; never stored here.
     #[serde(skip)]
     pub mounts: Vec<Mount>,
+    /// Filled from the health monitor when the spec is reported.
+    #[serde(skip)]
+    pub health: Option<HealthState>,
 }
 
 /// Guest setup options of `docker run`, kept on the sandbox record.
@@ -98,6 +101,38 @@ pub struct GuestOptions {
     pub group_add: Vec<String>,
     #[serde(default)]
     pub cgroup: CgroupLimits,
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+}
+
+/// Docker's `Config.Healthcheck`. A zero value uses the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Healthcheck {
+    pub test: Vec<String>,
+    #[serde(default)]
+    pub interval_ns: u64,
+    #[serde(default)]
+    pub timeout_ns: u64,
+    #[serde(default)]
+    pub start_period_ns: u64,
+    #[serde(default)]
+    pub retries: u32,
+}
+
+/// Health of the current run, as reported. Never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthState {
+    pub status: String,
+    pub failing_streak: u32,
+    pub log: Vec<HealthLogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthLogEntry {
+    pub start: SystemTime,
+    pub end: SystemTime,
+    pub exit_code: i32,
+    pub output: String,
 }
 
 /// A resource limit for every process, `-1` meaning unlimited.

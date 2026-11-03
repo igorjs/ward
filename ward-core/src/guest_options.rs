@@ -4,7 +4,7 @@
 //! request asks for, and the arguments that hand it to the guest agent.
 
 use crate::pb;
-use crate::protocol::{ApiError, CgroupLimits, GuestOptions, TmpfsMount};
+use crate::protocol::{ApiError, CgroupLimits, GuestOptions, Healthcheck, TmpfsMount};
 
 /// Most tmpfs mounts one sandbox takes.
 pub const MAX_TMPFS_MOUNTS: usize = 64;
@@ -187,7 +187,22 @@ pub fn validate(
     };
     crate::guest_limits::cgroup(&cgroup, memory_mb)?;
     crate::guest_limits::group_add(&guest.group_add)?;
+    let healthcheck = guest
+        .healthcheck
+        .as_ref()
+        .map(|h| {
+            let config = Healthcheck {
+                test: h.test.clone(),
+                interval_ns: h.interval_ns,
+                timeout_ns: h.timeout_ns,
+                start_period_ns: h.start_period_ns,
+                retries: h.retries,
+            };
+            crate::sandbox::health::validate(&config).map(|()| config)
+        })
+        .transpose()?;
     Ok(GuestOptions {
+        healthcheck,
         ulimits: crate::guest_limits::ulimits(&guest.ulimits)?,
         group_add: guest.group_add.clone(),
         cgroup,
@@ -227,6 +242,13 @@ pub fn to_pb(guest: &GuestOptions) -> pb::GuestOptions {
             })
             .collect(),
         group_add: guest.group_add.clone(),
+        healthcheck: guest.healthcheck.as_ref().map(|h| pb::Healthcheck {
+            test: h.test.clone(),
+            interval_ns: h.interval_ns,
+            timeout_ns: h.timeout_ns,
+            start_period_ns: h.start_period_ns,
+            retries: h.retries,
+        }),
         cgroup: Some(pb::CgroupLimits {
             memory_swap_bytes: guest.cgroup.memory_swap_bytes,
             memory_reservation_bytes: guest.cgroup.memory_reservation_bytes,
