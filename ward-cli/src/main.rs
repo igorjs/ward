@@ -12,6 +12,7 @@ mod docker;
 mod egress;
 mod events;
 mod export;
+mod guest_opts;
 mod history;
 mod images;
 mod import;
@@ -148,6 +149,8 @@ struct SandboxOpts {
     exited_ttl: Option<u64>,
     #[command(flatten)]
     extras: create_opts::CreateExtras,
+    #[command(flatten)]
+    guest: guest_opts::GuestExtras,
     #[command(flatten)]
     isolation: isolation::IsolationFlags,
 }
@@ -924,6 +927,7 @@ fn create_request(
         ..Default::default()
     };
     opts.extras.apply(&mut request, &opts.env)?;
+    opts.guest.apply(&mut request)?;
     Ok(request)
 }
 
