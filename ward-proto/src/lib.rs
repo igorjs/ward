@@ -41,6 +41,16 @@ pub mod pb {
                 .finish()
         }
     }
+
+    impl std::fmt::Debug for CheckRegistryLoginRequest {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("CheckRegistryLoginRequest")
+                .field("server", &self.server)
+                .field("username", &self.username)
+                .field("password", &"<hidden>")
+                .finish()
+        }
+    }
 }
 
 #[cfg(test)]

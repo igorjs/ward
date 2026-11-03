@@ -123,6 +123,9 @@ service Ward {
   // Make a one-layer image from a tar archive, like `docker import`. Needs
   // no sandbox token. The first message carries the settings and no data.
   rpc ImportImage(stream ImportImageMessage) returns (ImportImageResponse);
+  // Check that a registry accepts a login, for `ward login`. Needs no sandbox
+  // token. The daemon keeps nothing; the CLI stores the credentials.
+  rpc CheckRegistryLogin(CheckRegistryLoginRequest) returns (google.protobuf.Empty);
 }
 
 // ---------------------------------------------------------------------------
@@ -942,4 +945,11 @@ message ImportImageMessage {
 message ImportImageResponse {
   // Id of the new image, e.g. sha256:...
   string image_id = 1;
+}
+
+message CheckRegistryLoginRequest {
+  // Registry host, e.g. ghcr.io or localhost:5000.
+  string server = 1;
+  string username = 2;
+  string password = 3;
 }

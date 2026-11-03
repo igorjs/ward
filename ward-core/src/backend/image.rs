@@ -316,6 +316,25 @@ pub trait ImagePuller: Send + Sync + std::fmt::Debug {
     async fn resolve_digest(&self, _reference: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// Check that `credentials` are accepted by `registry`.
+    async fn check_login(
+        &self,
+        _registry: &str,
+        _credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "this puller cannot check registry logins".to_string(),
+        ))
+    }
+}
+
+/// The login stored for `registry`, or anonymous access when there is none.
+fn registry_auth_for(registry: &str) -> oci_client::secrets::RegistryAuth {
+    match crate::registry_auth::lookup(registry) {
+        Some(found) => oci_client::secrets::RegistryAuth::Basic(found.username, found.password),
+        None => oci_client::secrets::RegistryAuth::Anonymous,
+    }
 }
 
 /// One progress line of a pull, in Docker's wording.
@@ -446,10 +465,9 @@ impl ImagePuller for OciPuller {
         }
 
         use oci_client::manifest;
-        use oci_client::secrets::RegistryAuth;
 
         let (client, image_ref) = self.client_for(reference)?;
-        let auth = RegistryAuth::Anonymous;
+        let auth = registry_auth_for(image_ref.registry());
         let accepted = [
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
@@ -511,6 +529,32 @@ impl ImagePuller for OciPuller {
         Ok(PulledImage { digest, config })
     }
 
+    async fn check_login(
+        &self,
+        registry: &str,
+        credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var(OFFLINE_IMAGES_ENV).as_deref() == Ok("1") {
+            return Ok(());
+        }
+        let probe = format!("{registry}/{LOGIN_PROBE_REPOSITORY}");
+        let (client, image_ref) = self.client_for(&probe)?;
+        let auth = oci_client::secrets::RegistryAuth::Basic(
+            credentials.username.clone(),
+            credentials.password.clone(),
+        );
+        client
+            .auth(&image_ref, &auth, oci_client::RegistryOperation::Pull)
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                BackendError::Image(format!(
+                    "login to {registry} failed: the registry did not accept the credentials"
+                ))
+            })
+    }
+
     async fn resolve_digest(&self, reference: &str) -> Result<Option<String>> {
         #[cfg(debug_assertions)]
         if std::env::var(OFFLINE_IMAGES_ENV).as_deref() == Ok("1") {
@@ -519,10 +563,9 @@ impl ImagePuller for OciPuller {
 
         use oci_client::manifest::OciManifest;
         let (client, image_ref) = self.client_for(reference)?;
-        let (manifest, digest) = with_retry(reference, || {
-            client.pull_manifest(&image_ref, &oci_client::secrets::RegistryAuth::Anonymous)
-        })
-        .await?;
+        let auth = registry_auth_for(image_ref.registry());
+        let (manifest, digest) =
+            with_retry(reference, || client.pull_manifest(&image_ref, &auth)).await?;
         // An index points at one manifest per platform: the pull stores the
         // one for this host, so that is the digest to compare.
         Ok(match manifest {
@@ -635,6 +678,8 @@ fn offline_image_config() -> Result<ImageConfig> {
     }
 }
 
+/// A repository name to ask a registry for a token for, when checking a login.
+const LOGIN_PROBE_REPOSITORY: &str = "ward/login-check:latest";
 /// Attempts for one registry pull. Registries drop or throttle anonymous
 /// requests, and the failure surfaces as an opaque decode error.
 const PULL_ATTEMPTS: u32 = 3;
@@ -1841,6 +1886,15 @@ impl ImageStore {
             )));
         }
         std::fs::remove_dir_all(&entry_dir).map_err(BackendError::Io)
+    }
+
+    /// Check a registry login with the puller.
+    pub async fn check_login(
+        &self,
+        registry: &str,
+        credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        self.puller.check_login(registry, credentials).await
     }
 
     /// List all cached images read from disk, one row per reference.

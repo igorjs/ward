@@ -224,6 +224,15 @@ pub trait Backend: Send + Sync + 'static {
         Err(no_image_cache())
     }
 
+    /// Check that a registry accepts a login.
+    async fn check_registry_login(
+        &self,
+        _registry: &str,
+        _credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        Err(no_image_cache())
+    }
+
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
 
     async fn list_sandboxes(&self) -> Result<Vec<crate::protocol::SandboxInfo>>;
