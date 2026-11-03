@@ -979,7 +979,11 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
-        let exit_code = self.sandbox.wait(&id).await.map_err(api_err_to_status)?;
+        let exit_code = self
+            .sandbox
+            .wait_until(&id, req.condition())
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(WaitResponse { exit_code }))
     }
 
