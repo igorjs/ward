@@ -310,6 +310,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "WorkingDir": info.workdir,
         "User": info.user,
         "Labels": info.labels,
+        "Tty": info.tty,
     });
     // Docker leaves these out of Config until they are set.
     if !info.stop_signal.is_empty() {
@@ -771,6 +772,7 @@ mod tests {
                     "WorkingDir": "",
                     "User": "",
                     "Labels": {},
+                    "Tty": false,
                 },
                 "HostConfig": {
                     "Memory": 0,
