@@ -80,7 +80,7 @@ const DEFAULT_CPUS: &str = "1";
 /// Help for `--time` on `stop` and `restart`.
 fn stop_time_help() -> String {
     format!(
-        "Seconds to wait for the main process after SIGTERM before SIGKILL (default {}, 0 kills at once, -1 waits forever).",
+        "Seconds to wait for the main process after its stop signal before SIGKILL (default {}, or the sandbox's --stop-timeout; 0 kills at once, -1 waits forever).",
         ward_core::sandbox::STOP_GRACE_SECONDS
     )
 }

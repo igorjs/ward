@@ -1611,9 +1611,17 @@ pub const MOUNT_ARG: &str = "--mount";
 /// Argument that caps the sandbox's process count: `--pids-max <n>`.
 pub const PIDS_MAX_ARG: &str = "--pids-max";
 
+/// Argument that names the guest: `--hostname <name>`.
+pub const HOSTNAME_ARG: &str = "--hostname";
+/// File that holds the guest's host name for tools that read it.
+#[cfg(target_os = "linux")]
+const HOSTNAME_FILE: &str = "/etc/hostname";
+
 /// What the agent was launched with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentArgs {
+    /// Host name for the guest; `None` keeps the kernel's.
+    pub hostname: Option<String>,
     pub mounts: Vec<GuestMount>,
     /// Process cap for the sandbox; `None` means unlimited.
     pub pids_max: Option<u32>,
@@ -1629,6 +1637,14 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
     let mut args = args.into_iter();
     let mut parsed = AgentArgs::default();
     while let Some(arg) = args.next() {
+        if arg == HOSTNAME_ARG {
+            let value = args.next().ok_or("--hostname needs <name>")?;
+            if value.is_empty() {
+                return Err("hostname must not be empty".to_string());
+            }
+            parsed.hostname = Some(value);
+            continue;
+        }
         if arg == PIDS_MAX_ARG {
             let value = args.next().ok_or("--pids-max needs <n>")?;
             parsed.pids_max = match value.parse::<u32>() {
@@ -1655,6 +1671,17 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
         });
     }
     Ok(parsed)
+}
+
+/// Give the guest its host name, in the kernel and in `/etc/hostname`.
+///
+/// # Errors
+///
+/// Fails when the kernel refuses the name or the file cannot be written.
+#[cfg(target_os = "linux")]
+pub fn set_hostname(name: &str) -> std::io::Result<()> {
+    rustix::system::sethostname(name.as_bytes())?;
+    std::fs::write(HOSTNAME_FILE, format!("{name}\n"))
 }
 
 /// Mount every share in `mounts`, creating the target directories first.
@@ -1737,6 +1764,21 @@ mod mount_arg_tests {
     #[case::zero(&["--pids-max", "0"])]
     #[case::not_a_number(&["--pids-max", "many"])]
     fn given_bad_pids_max_when_parsed_then_error(#[case] list: &[&str]) {
+        assert!(parse_args(args(list)).is_err());
+    }
+
+    #[test]
+    fn given_hostname_among_other_args_when_parsed_then_it_is_kept() {
+        let parsed = parse_args(args(&["--hostname", "web1", "--pids-max", "20"])).unwrap();
+
+        assert_eq!(parsed.hostname.as_deref(), Some("web1"));
+        assert_eq!(parsed.pids_max, Some(20));
+    }
+
+    #[rstest::rstest]
+    #[case::missing(&["--hostname"])]
+    #[case::empty(&["--hostname", ""])]
+    fn given_bad_hostname_when_parsed_then_error(#[case] list: &[&str]) {
         assert!(parse_args(args(list)).is_err());
     }
 

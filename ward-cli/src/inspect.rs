@@ -48,54 +48,10 @@ const JANUARY_INDEX: i64 = 10;
 const MARCH_NUMBER: i64 = 3;
 const JANUARY_NUMBER_OFFSET: i64 = 9;
 
-/// Signal numbers on Linux, which is what the guest runs.
-const SIGNALS: [(&str, i32); 30] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("STOP", 19),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
-/// Highest signal number Linux accepts (the last real-time signal).
-const MAX_SIGNAL: i32 = 64;
-
 /// Accept `TERM`, `SIGTERM` or a number, like `docker kill -s`.
 pub fn parse_signal(text: &str) -> Result<i32> {
-    if let Ok(number) = text.parse::<i32>() {
-        if (1..=MAX_SIGNAL).contains(&number) {
-            return Ok(number);
-        }
-        bail!("invalid signal: {text}");
-    }
-    let name = text.to_ascii_uppercase();
-    let name = name.strip_prefix("SIG").unwrap_or(&name);
-    match SIGNALS.iter().find(|(known, _)| *known == name) {
-        Some((_, number)) => Ok(*number),
+    match ward_core::signal::parse(text) {
+        Some(number) => Ok(number),
         None => bail!("invalid signal: {text}"),
     }
 }
@@ -327,6 +283,22 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     };
     // Docker reports an unset entrypoint as null.
     let entrypoint = (entrypoint_len > 0).then_some(&info.entrypoint);
+    let mut config = json!({
+        "Hostname": info.hostname,
+        "Image": info.image,
+        "Cmd": cmd,
+        "Entrypoint": entrypoint,
+        "WorkingDir": info.workdir,
+        "User": info.user,
+        "Labels": info.labels,
+    });
+    // Docker leaves these out of Config until they are set.
+    if !info.stop_signal.is_empty() {
+        config["StopSignal"] = json!(info.stop_signal);
+    }
+    if let Some(seconds) = info.stop_timeout {
+        config["StopTimeout"] = json!(seconds);
+    }
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
@@ -340,14 +312,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "StartedAt": state_time(&info.started_at),
             "FinishedAt": state_time(&info.finished_at),
         },
-        "Config": {
-            "Image": info.image,
-            "Cmd": cmd,
-            "Entrypoint": entrypoint,
-            "WorkingDir": info.workdir,
-            "User": info.user,
-            "Labels": info.labels,
-        },
+        "Config": config,
         "HostConfig": host_config(info),
     })
 }
@@ -714,6 +679,7 @@ mod tests {
                     "FinishedAt": "0001-01-01T00:00:00Z",
                 },
                 "Config": {
+                    "Hostname": "",
                     "Image": "alpine",
                     "Cmd": ["sh"],
                     "Entrypoint": null,
@@ -728,6 +694,35 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn given_hostname_and_stop_settings_when_inspected_then_config_shows_them() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            hostname: "web1".into(),
+            stop_signal: "SIGINT".into(),
+            stop_timeout: Some(30),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(value["Config"]["Hostname"], "web1");
+        assert_eq!(value["Config"]["StopSignal"], "SIGINT");
+        assert_eq!(value["Config"]["StopTimeout"], 30);
+    }
+
+    #[test]
+    fn given_no_stop_settings_when_inspected_then_config_leaves_them_out() {
+        // Act
+        let value = inspect_value(&info(SandboxStatus::Running, None));
+
+        // Assert
+        assert!(value["Config"].get("StopSignal").is_none());
+        assert!(value["Config"].get("StopTimeout").is_none());
     }
 
     #[test]

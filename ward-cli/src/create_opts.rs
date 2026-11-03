@@ -46,6 +46,22 @@ pub struct CreateExtras {
     /// Remove an existing sandbox with the same --name first, as Podman does.
     #[arg(long)]
     replace: bool,
+    /// Host name inside the sandbox (no short form: -h is help). Defaults to
+    /// the first 12 characters of the sandbox ID.
+    #[arg(long, value_name = "NAME")]
+    hostname: Option<String>,
+    /// Signal that stops the main process: a name such as SIGINT or a number.
+    /// Default SIGTERM.
+    #[arg(long = "stop-signal", value_name = "SIGNAL")]
+    stop_signal: Option<String>,
+    /// Seconds the main process gets after the stop signal before SIGKILL, for
+    /// stop, restart and the daemon's shutdown. `stop -t` overrides it.
+    #[arg(
+        long = "stop-timeout",
+        value_name = "SECONDS",
+        allow_hyphen_values = true
+    )]
+    stop_timeout: Option<i32>,
     /// Accepted for Docker scripts. It has no effect.
     #[arg(long)]
     init: bool,
@@ -66,6 +82,13 @@ impl CreateExtras {
         check_platform(self.platform.as_deref(), host_arch())?;
         request.env = environment(&self.env_file, env, host_env)?;
         request.labels = labels(&self.label_file, &self.label)?;
+        request.hostname = self.hostname.clone().unwrap_or_default();
+        if let Some(signal) = &self.stop_signal {
+            crate::inspect::parse_signal(signal)
+                .map_err(|_| anyhow::anyhow!("invalid --stop-signal: {signal}"))?;
+            request.stop_signal = signal.clone();
+        }
+        request.stop_timeout = self.stop_timeout;
         Ok(())
     }
 
@@ -462,6 +485,43 @@ mod tests {
         // Assert
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn given_stop_and_host_flags_when_applied_then_the_request_carries_them() {
+        // Arrange
+        let extras = CreateExtras {
+            hostname: Some("web1".into()),
+            stop_signal: Some("SIGINT".into()),
+            stop_timeout: Some(-1),
+            ..Default::default()
+        };
+        let mut request = CreateSandboxRequest::default();
+
+        // Act
+        extras.apply(&mut request, &[]).expect("apply");
+
+        // Assert
+        assert_eq!(request.hostname, "web1");
+        assert_eq!(request.stop_signal, "SIGINT");
+        assert_eq!(request.stop_timeout, Some(-1));
+    }
+
+    #[test]
+    fn given_unknown_stop_signal_when_applied_then_it_is_refused_before_the_wire() {
+        // Arrange
+        let extras = CreateExtras {
+            stop_signal: Some("SIGNOPE".into()),
+            ..Default::default()
+        };
+
+        // Act
+        let error = extras
+            .apply(&mut CreateSandboxRequest::default(), &[])
+            .expect_err("rejected");
+
+        // Assert
+        assert!(error.to_string().contains("--stop-signal"), "{error}");
     }
 
     #[test]

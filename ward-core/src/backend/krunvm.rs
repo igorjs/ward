@@ -52,6 +52,9 @@ const AGENT_MOUNT_ARG: &str = "--mount";
 /// Guest-agent argument that caps the sandbox's process count.
 #[cfg(feature = "krunvm")]
 const AGENT_PIDS_MAX_ARG: &str = "--pids-max";
+/// Guest-agent argument that names the guest.
+#[cfg(feature = "krunvm")]
+const AGENT_HOSTNAME_ARG: &str = "--hostname";
 /// Mode words the guest agent accepts after a mount target.
 #[cfg(feature = "krunvm")]
 const MOUNT_MODE_RO: &str = "ro";
@@ -1272,6 +1275,8 @@ impl KrunvmBackend {
                 opts.resources.pids_max.to_string(),
             ]);
         }
+
+        exec_args.extend([AGENT_HOSTNAME_ARG.to_string(), opts.spec.hostname_for(id)]);
 
         let (net, inherit) = match net_fd {
             Some((raw, owned)) => (
