@@ -53,6 +53,10 @@ A `deny` sandbox without published ports records nothing for `suggest`. The gues
 
 Each attach session is separate. A client that disconnects only detaches and leaves the main process running. In raw terminal mode Ctrl-C goes to the guest as a byte, as in Docker. Outside raw mode the CLI passes SIGINT and SIGTERM to the guest process.
 
+## Wait
+
+`ward wait --condition` takes `not-running` (the default), `next-exit` and `removed`, as Docker does. `next-exit` on a sandbox that is not running waits for it to be started and to exit. `removed` prints the last exit code of the main process, or 0 when it never ran a command. Ward polls the state ten times a second, so a start and exit that both happen between two polls still count as the next exit but the wait may notice them late. `next-exit` and `removed` on a sandbox that does not exist fail at once, as `not-running` does.
+
 ## Commands with a smaller option set
 
 - `ward ps` supports `-a`, `-q`, `-n`, `-l`, `--no-trunc`, `--filter` and a Go `--format` over `.ID .Image .Command .CreatedAt .RunningFor .State .Status .Reason .Names .Labels`, plus `{{.Label "key"}}`. `--filter` takes `name`, `id`, `status` and `label=KEY[=VALUE]` (every label filter must match); `name` is a substring match, not a regular expression, and `label!=` is not supported. `.Ports`, `.Mounts`, `.Networks`, `.Size` and `.LocalVolumes` do not exist yet. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.

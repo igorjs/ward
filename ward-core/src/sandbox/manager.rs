@@ -29,6 +29,8 @@ use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
 
+mod wait_condition;
+
 type Result<T> = std::result::Result<T, ApiError>;
 
 /// Shown when the backend cannot start the sandbox; the cause is only logged.
@@ -8950,4 +8952,5 @@ pub(crate) mod tests {
     mod rename;
     #[cfg(not(feature = "krunvm"))]
     mod secrets;
+    mod wait_condition;
 }

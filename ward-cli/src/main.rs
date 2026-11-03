@@ -524,6 +524,10 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         references: Vec<String>,
+        /// What to wait for: not-running, next-exit (the next time the main
+        /// process exits) or removed.
+        #[arg(long, value_enum, default_value_t)]
+        condition: wait::Condition,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -1545,8 +1549,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stats::run(&socket_path, &token_store, &references, options).await?;
         }
 
-        Commands::Wait { references } => {
-            wait::run(&socket_path, &token_store, &references, json).await?;
+        Commands::Wait {
+            references,
+            condition,
+        } => {
+            wait::run(&socket_path, &token_store, &references, condition, json).await?;
         }
 
         Commands::Events {
