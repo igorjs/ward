@@ -131,3 +131,60 @@ fn given_shm_size_when_df_runs_then_dev_shm_has_that_size_and_the_default_is_64m
     assert_eq!(custom.trim(), CUSTOM_SHM_KIB);
     assert_eq!(default.trim(), DEFAULT_SHM_KIB);
 }
+
+#[test]
+fn given_mount_flags_when_run_then_bind_is_read_only_and_tmpfs_is_sized() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let shared = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let bind = format!(
+        "type=bind,src={},dst=/shared,readonly",
+        shared.path().display()
+    );
+    let script = "touch /shared/s 2>&1; \
+                  df -k /cache | tail -1 | tr -s ' ' | cut -d' ' -f2";
+
+    // Act
+    let out = run_script(
+        &d,
+        &[
+            "--mount",
+            &bind,
+            "--mount",
+            "type=tmpfs,dst=/cache,tmpfs-size=2m",
+        ],
+        script,
+    );
+
+    // Assert
+    assert!(out.contains("Read-only file system"), "{out}");
+    assert!(out.trim().ends_with("2048"), "{out}");
+}
+
+#[test]
+fn given_add_host_and_resolver_flags_when_run_then_the_guest_files_have_them() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let script = "getent hosts db.internal; cat /etc/resolv.conf";
+
+    // Act
+    let out = run_script(
+        &d,
+        &[
+            "--add-host",
+            "db.internal:10.1.2.3",
+            "--dns-search",
+            "corp.example",
+            "--dns-option",
+            "ndots:3",
+        ],
+        script,
+    );
+
+    // Assert
+    assert!(out.contains("10.1.2.3"), "{out}");
+    assert!(out.contains("search corp.example"), "{out}");
+    assert!(out.contains("options ndots:3"), "{out}");
+}

@@ -81,15 +81,109 @@ fn given_read_only_tmpfs_and_shm_size_when_inspected_then_host_config_and_mounts
 fn given_bad_guest_flags_when_created_then_each_fails_with_a_clear_error() {
     // Arrange
     let d = Daemon::spawn();
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--tmpfs", "/x:bogus"], "invalid tmpfs option"),
         (&["--tmpfs", "relative"], "absolute"),
         (&["--tmpfs", "/proc"], "reserved"),
         (
-            &["--tmpfs", "/data", "--tmpfs", "/data/"],
+            &["--tmpfs", "/data", "--mount", "type=tmpfs,dst=/data"],
             "Duplicate mount point: /data",
         ),
+        (&["--mount", "type=volume,src=v,dst=/v"], "named volumes"),
         (&["--shm-size", "lots"], "invalid size"),
+    ];
+
+    for (flags, reason) in cases {
+        // Act
+        let mut args = vec!["create"];
+        args.extend(flags);
+        args.push(ALPINE);
+        let out = run(&d, &args);
+
+        // Assert
+        assert!(!out.status.success(), "{flags:?}");
+        assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
+    }
+}
+
+#[test]
+fn given_mount_flag_when_inspected_then_bind_and_tmpfs_map_onto_the_existing_mounts() {
+    // Arrange
+    let d = Daemon::spawn();
+    // The stub daemon only shares paths under its default allowlist.
+    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let source = dir.path().to_str().unwrap().to_string();
+    let bind = format!("type=bind,src={source},dst=/data,readonly");
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "m1",
+            "--mount",
+            &bind,
+            "--mount",
+            "type=tmpfs,dst=/cache,tmpfs-size=1m",
+            "-v",
+            &format!("{source}:/other"),
+            ALPINE,
+        ],
+    );
+
+    // Act
+    let tmpfs = inspect(&d, "{{json .HostConfig.Tmpfs}}", "m1");
+    let mounts = inspect(&d, "{{json .Mounts}}", "m1");
+
+    // Assert
+    assert!(mounts.contains(r#""Mode":"ro""#), "{mounts}");
+    assert!(mounts.contains(r#""Destination":"/other""#), "{mounts}");
+    assert_eq!(tmpfs, r#"{"/cache":"rw,size=1048576"}"#);
+}
+
+#[test]
+fn given_hosts_and_resolver_flags_when_inspected_then_host_config_shows_them() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "net1",
+            "--add-host",
+            "db:10.1.2.3",
+            "--add-host",
+            "v6:[::1]",
+            "--add-host",
+            "gw:host-gateway",
+            "--dns-search",
+            "example.com",
+            "--dns-option",
+            "ndots:2",
+            ALPINE,
+        ],
+    );
+
+    // Act
+    let hosts = inspect(&d, "{{json .HostConfig.ExtraHosts}}", "net1");
+    let search = inspect(&d, "{{json .HostConfig.DnsSearch}}", "net1");
+    let options = inspect(&d, "{{json .HostConfig.DnsOptions}}", "net1");
+
+    // Assert
+    assert_eq!(hosts, r#"["db:10.1.2.3","v6:::1","gw:10.0.2.2"]"#);
+    assert_eq!(search, r#"["example.com"]"#);
+    assert_eq!(options, r#"["ndots:2"]"#);
+}
+
+#[test]
+fn given_bad_hosts_or_dns_flags_when_created_then_each_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+    let cases: [(&[&str], &str); 4] = [
+        (&["--add-host", "db"], "use HOST:IP"),
+        (&["--add-host", "db:nope"], "not an IP"),
+        (&["--dns-option", "ndots 2"], "invalid --dns-option"),
+        (&["--dns", "1.1.1.1"], "--egress"),
     ];
 
     for (flags, reason) in cases {

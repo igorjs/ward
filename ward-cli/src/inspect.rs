@@ -310,6 +310,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "WorkingDir": info.workdir,
         "User": info.user,
         "Labels": info.labels,
+        "Tty": info.tty,
     });
     // Docker leaves these out of Config until they are set.
     if !info.stop_signal.is_empty() {
@@ -397,6 +398,10 @@ fn host_config(info: &SandboxInfo) -> Value {
         },
         "ReadonlyRootfs": guest.read_only_rootfs,
         "ShmSize": guest.shm_size_bytes,
+        "ExtraHosts": (!guest.extra_hosts.is_empty()).then_some(guest.extra_hosts),
+        "Dns": [],
+        "DnsSearch": guest.dns_search,
+        "DnsOptions": guest.dns_options,
     });
     // Docker leaves Tmpfs out until a tmpfs is mounted.
     if !guest.tmpfs.is_empty() {
@@ -771,6 +776,7 @@ mod tests {
                     "WorkingDir": "",
                     "User": "",
                     "Labels": {},
+                    "Tty": false,
                 },
                 "HostConfig": {
                     "Memory": 0,
@@ -779,6 +785,10 @@ mod tests {
                     "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                     "ReadonlyRootfs": false,
                     "ShmSize": 0,
+                    "ExtraHosts": null,
+                    "Dns": [],
+                    "DnsSearch": [],
+                    "DnsOptions": [],
                 },
                 "Mounts": [],
                 "RestartCount": 0,
@@ -862,6 +872,10 @@ mod tests {
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 "ReadonlyRootfs": false,
                 "ShmSize": 0,
+                "ExtraHosts": null,
+                "Dns": [],
+                "DnsSearch": [],
+                "DnsOptions": [],
             })
         );
     }
@@ -873,6 +887,9 @@ mod tests {
             guest: Some(ward_core::pb::GuestOptions {
                 read_only_rootfs: true,
                 shm_size_bytes: 134_217_728,
+                extra_hosts: vec!["db:10.1.2.3".into()],
+                dns_search: vec!["example.com".into()],
+                dns_options: vec![],
                 tmpfs: vec![
                     ward_core::pb::TmpfsMount {
                         path: "/run".into(),
@@ -898,6 +915,8 @@ mod tests {
         // Assert
         assert_eq!(value["HostConfig"]["ReadonlyRootfs"], true);
         assert_eq!(value["HostConfig"]["ShmSize"], 134_217_728);
+        assert_eq!(value["HostConfig"]["ExtraHosts"], json!(["db:10.1.2.3"]));
+        assert_eq!(value["HostConfig"]["DnsSearch"], json!(["example.com"]));
         assert_eq!(
             value["HostConfig"]["Tmpfs"],
             json!({"/run": "size=64m", "/frozen": "rw,ro"})

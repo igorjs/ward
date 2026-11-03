@@ -3403,6 +3403,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
             maximum_retry_count: info.spec.restart.max_retries,
         }),
         restart_count: info.restart_count,
+        tty: info.spec.tty,
         guest: Some(crate::guest_options::to_pb(&info.spec.guest)),
         mounts: info
             .spec
@@ -8231,6 +8232,8 @@ pub(crate) mod tests {
                     options: "size=1m".into(),
                 }],
                 shm_size_bytes: 0,
+                extra_hosts: vec!["db:host-gateway".into()],
+                ..Default::default()
             }),
             ..create_req("alpine")
         };
@@ -8242,6 +8245,7 @@ pub(crate) mod tests {
         // Assert
         assert!(guest.read_only_rootfs);
         assert_eq!(guest.tmpfs[0].path, "/scratch");
+        assert_eq!(guest.extra_hosts, ["db:10.0.2.2"]);
         assert_eq!(
             guest.shm_size_bytes,
             crate::protocol::DEFAULT_SHM_SIZE_BYTES
