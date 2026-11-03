@@ -221,7 +221,8 @@ pub fn agent_args(ulimits: &[Ulimit], groups: &[String], limits: &CgroupLimits) 
             cpu_weight(limits.cpu_shares).to_string(),
         ]);
     }
-    if limits.cpu_quota != 0 || limits.cpu_period != 0 {
+    // A quota of -1 or 0 alone sets nothing, as in Docker.
+    if limits.cpu_quota > 0 || limits.cpu_period != 0 {
         let quota = if limits.cpu_quota > 0 {
             limits.cpu_quota.to_string()
         } else {
@@ -378,6 +379,29 @@ mod tests {
                 "0"
             ]
         );
+    }
+
+    #[rstest::rstest]
+    #[case::minus_one(-1)]
+    #[case::zero(0)]
+    fn a_quota_that_means_unlimited_sets_nothing_without_a_period(#[case] quota: i64) {
+        let limits = CgroupLimits {
+            cpu_quota: quota,
+            ..Default::default()
+        };
+
+        assert!(agent_args(&[], &[], &limits).is_empty());
+    }
+
+    #[test]
+    fn an_unlimited_quota_with_a_period_keeps_the_period() {
+        let limits = CgroupLimits {
+            cpu_quota: -1,
+            cpu_period: 50_000,
+            ..Default::default()
+        };
+
+        assert_eq!(agent_args(&[], &[], &limits), ["--cpu-max", "max", "50000"]);
     }
 
     #[test]
