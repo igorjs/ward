@@ -17,12 +17,14 @@ mod lifecycle;
 mod log_output;
 mod output;
 mod ports;
+mod ps_filter;
 mod pull;
 mod resources;
 mod rmi;
 mod secrets;
 mod socket;
 mod stats;
+mod system;
 mod tag;
 mod template;
 mod terminal;
@@ -217,9 +219,30 @@ enum Commands {
         /// Print only the sandbox IDs.
         #[arg(short, long)]
         quiet: bool,
-        /// Output format. Only `json` is supported.
-        #[arg(long, value_parser = ["json"])]
+        /// Go template for each sandbox, or `json`. Fields: .ID .Image
+        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names.
+        #[arg(long)]
         format: Option<String>,
+        /// Print the full sandbox ID.
+        #[arg(long)]
+        no_trunc: bool,
+        /// Show the N most recently created sandboxes in any state, -1 for all.
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = ps_filter::NO_LIMIT,
+            allow_negative_numbers = true,
+            value_name = "N"
+        )]
+        last: i64,
+        /// Show the most recently created sandbox in any state.
+        #[arg(short = 'l', long)]
+        latest: bool,
+        /// Only sandboxes matching name=, id= (a prefix) or status=
+        /// (created, running, stopping, stopped, exited, failed). Repeatable.
+        /// A status filter looks at every state.
+        #[arg(short, long)]
+        filter: Vec<String>,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -238,7 +261,16 @@ enum Commands {
 
     #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print low level details of one or more sandboxes as a JSON array.
+    ///
+    /// --format takes a Go template over the JSON, such as
+    /// `{{.State.Status}}` or `{{json .Config}}`.
     Inspect {
+        /// Go template for each sandbox.
+        #[arg(short, long)]
+        format: Option<String>,
+        /// Kind of object to inspect: container. Ward cannot inspect images yet.
+        #[arg(long = "type", value_name = "TYPE")]
+        kind: Option<String>,
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         references: Vec<String>,
@@ -609,8 +641,44 @@ enum Commands {
     /// Show the layers of an image, newest first, as `docker history` does.
     History(history::Args),
 
+    /// Give a sandbox a new name.
+    Rename {
+        /// Sandbox name, ID or ID prefix.
+        reference: String,
+        /// The new name.
+        new_name: String,
+    },
+
     /// Remove every stopped and exited sandbox.
     Prune,
+
+    /// Show the client and daemon versions.
+    Version {
+        /// Go template over .Client.Version and .Server.Version, .Server.Os,
+        /// .Server.Arch and .Server.Backend.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
+
+    /// Daemon-wide commands.
+    #[command(subcommand)]
+    System(SystemCommands),
+
+    /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
+    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port
+    /// and rename. Each is the top-level command of the same name.
+    Container {
+        /// Subcommand and its arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Manage images: ls and pull. Each is `images` or `pull`.
+    Image {
+        /// Subcommand and its arguments.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Volume management subcommands.
     #[command(subcommand)]
@@ -646,6 +714,16 @@ enum Commands {
 
     /// Show daemon information.
     Info,
+}
+
+#[derive(Debug, Subcommand)]
+enum SystemCommands {
+    /// Show daemon information.
+    Info,
+    /// Count sandboxes and cached images.
+    Df,
+    /// Remove every stopped and exited sandbox.
+    Prune,
 }
 
 #[derive(Debug, Subcommand)]
@@ -821,15 +899,70 @@ const GENERIC_FAILURE_EXIT_CODE: i32 = 1;
 /// The first positional argument, which names the subcommand. Skips flags and
 /// the value of `--socket`, the one global flag that takes a separate value.
 fn subcommand_name(args: impl IntoIterator<Item = String>) -> Option<String> {
-    let mut args = args.into_iter().skip(1);
-    while let Some(arg) = args.next() {
+    let args: Vec<String> = args.into_iter().collect();
+    subcommand_index(&args).map(|index| args[index].clone())
+}
+
+fn subcommand_index(args: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(arg) = args.get(index) {
         if arg == "--socket" {
-            args.next();
+            index += 1;
         } else if !arg.starts_with('-') {
-            return Some(arg);
+            return Some(index);
         }
+        index += 1;
     }
     None
+}
+
+/// Docker's `container` subcommands and the top-level command each stands for.
+const CONTAINER_COMMANDS: [(&str, &str); 22] = [
+    ("ls", "ps"),
+    ("ps", "ps"),
+    ("create", "create"),
+    ("run", "run"),
+    ("start", "start"),
+    ("stop", "stop"),
+    ("restart", "restart"),
+    ("rm", "rm"),
+    ("remove", "rm"),
+    ("kill", "kill"),
+    ("logs", "logs"),
+    ("inspect", "inspect"),
+    ("exec", "exec"),
+    ("cp", "cp"),
+    ("top", "top"),
+    ("stats", "stats"),
+    ("wait", "wait"),
+    ("diff", "diff"),
+    ("commit", "commit"),
+    ("prune", "prune"),
+    ("port", "port"),
+    ("rename", "rename"),
+];
+/// Docker's `image` subcommands that Ward has, and what they stand for.
+const IMAGE_COMMANDS: [(&str, &str); 3] = [("ls", "images"), ("list", "images"), ("pull", "pull")];
+
+/// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
+/// same way, so both spellings share one definition and one help text.
+fn expand_groups(mut args: Vec<String>) -> Vec<String> {
+    let Some(group) = subcommand_index(&args) else {
+        return args;
+    };
+    let table: &[(&str, &str)] = match args[group].as_str() {
+        "container" => &CONTAINER_COMMANDS,
+        "image" => &IMAGE_COMMANDS,
+        _ => return args,
+    };
+    let target = args
+        .get(group + 1)
+        .and_then(|sub| table.iter().find(|(name, _)| name == sub))
+        .map(|(_, command)| (*command).to_string());
+    if let Some(command) = target {
+        args.splice(group..=group + 1, [command]);
+    }
+    args
 }
 
 /// `run` and `exec` report their own failures as 125, so that scripts can tell
@@ -840,11 +973,12 @@ fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let cli = match Cli::try_parse() {
+    let args = expand_groups(std::env::args().collect());
+    let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
             let code = if e.use_stderr()
-                && reports_cli_failure_as_125(subcommand_name(std::env::args()).as_deref())
+                && reports_cli_failure_as_125(subcommand_name(args.clone()).as_deref())
             {
                 CLI_FAILURE_EXIT_CODE
             } else {
@@ -958,14 +1092,25 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             output::emit_rows(json, no_pretty, &["id", "status", "image"], &rows)?;
         }
 
-        Commands::Ps { all, quiet, format } => {
+        Commands::Ps {
+            all,
+            quiet,
+            format,
+            no_trunc,
+            last,
+            latest,
+            filter,
+        } => {
             let mut c = client::connect(&socket_path).await?;
             let options = inspect::PsOptions {
                 all,
                 quiet,
                 json,
-                format_json: format.is_some(),
+                format,
                 no_pretty,
+                no_trunc,
+                filters: ps_filter::Filters::parse(&filter)?,
+                limit: ps_filter::limit(last, latest),
             };
             inspect::ps(&mut c, options).await?;
         }
@@ -981,9 +1126,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Inspect { references } => {
+        Commands::Inspect {
+            format,
+            kind,
+            references,
+        } => {
+            inspect::check_type(kind.as_deref())?;
             let mut c = client::connect(&socket_path).await?;
-            inspect::inspect(&mut c, &token_store, &references).await?;
+            inspect::inspect(&mut c, &token_store, &references, format.as_deref()).await?;
         }
 
         Commands::Exec {
@@ -1398,9 +1548,31 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::History(args) => history::run(&socket_path, args, json).await?,
 
-        Commands::Prune => {
+        Commands::Rename {
+            reference,
+            new_name,
+        } => {
+            let mut c = client::connect(&socket_path).await?;
+            lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
+        }
+
+        Commands::Prune | Commands::System(SystemCommands::Prune) => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
+        }
+
+        Commands::Version { format } => {
+            system::version(&socket_path, format.as_deref(), json).await?;
+        }
+
+        Commands::System(SystemCommands::Df) => {
+            system::df(&socket_path, json, no_pretty).await?;
+        }
+
+        Commands::Container { .. } | Commands::Image { .. } => {
+            anyhow::bail!(
+                "missing or unknown subcommand; see 'ward container --help' or 'ward image --help'"
+            );
         }
 
         Commands::Volume(vol_cmd) => match vol_cmd {
@@ -1536,25 +1708,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Info => {
-            let mut c = client::connect(&socket_path).await?;
-            let resp = c.get_info(()).await?.into_inner();
-            if json {
-                println!(
-                    "{}",
-                    json!({
-                        "version": resp.version,
-                        "platform": resp.platform,
-                        "arch": resp.arch,
-                        "backend": resp.backend,
-                    })
-                );
-            } else {
-                println!("version: {}", resp.version);
-                println!("platform: {}", resp.platform);
-                println!("arch: {}", resp.arch);
-                println!("backend: {}", resp.backend);
-            }
+        Commands::Info | Commands::System(SystemCommands::Info) => {
+            system::info(&socket_path, json).await?;
         }
     }
 
@@ -1612,6 +1767,36 @@ mod tests {
         assert_eq!(env.get("SET").map(String::as_str), Some("from-host"));
         assert!(!env.contains_key("UNSET"));
         assert_eq!(env.get("A").map(String::as_str), Some("b=c"));
+    }
+
+    #[rstest::rstest]
+    #[case::container_ls(&["ward", "container", "ls", "-a"], &["ward", "ps", "-a"])]
+    #[case::global_flags(&["ward", "--socket", "s", "--json", "container", "rm", "-f", "x"], &["ward", "--socket", "s", "--json", "rm", "-f", "x"])]
+    #[case::container_remove(&["ward", "container", "remove", "x"], &["ward", "rm", "x"])]
+    #[case::image_ls(&["ward", "image", "ls"], &["ward", "images"])]
+    #[case::image_pull(&["ward", "image", "pull", "alpine"], &["ward", "pull", "alpine"])]
+    #[case::unknown_sub_is_left_alone(&["ward", "container", "nope"], &["ward", "container", "nope"])]
+    #[case::other_command(&["ward", "ps", "container"], &["ward", "ps", "container"])]
+    fn given_group_command_when_expanded_then_it_names_the_top_level_command(
+        #[case] args: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let args = args.iter().map(ToString::to_string).collect();
+
+        assert_eq!(expand_groups(args), expected);
+    }
+
+    #[test]
+    fn given_every_group_target_when_parsed_then_the_command_exists() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+
+        for (_, target) in CONTAINER_COMMANDS.iter().chain(&IMAGE_COMMANDS) {
+            assert!(
+                cli.find_subcommand(target).is_some(),
+                "no top-level {target}"
+            );
+        }
     }
 
     #[test]

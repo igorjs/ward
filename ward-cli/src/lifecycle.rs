@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! `ward stop / start / restart / rm / prune`.
+//! `ward stop / start / restart / rm / rename / prune`.
 //!
 //! Each command takes sandbox references (name, id or id prefix), works
 //! through them in order and keeps going after a failure, like Docker: a
@@ -14,7 +14,8 @@ use serde_json::json;
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{
-    RemoveSandboxRequest, RestartRequest, SandboxStatus, StartRequest, StopRequest,
+    RemoveSandboxRequest, RenameSandboxRequest, RestartRequest, SandboxStatus, StartRequest,
+    StopRequest,
 };
 
 use crate::client::{self, Resolved};
@@ -141,6 +142,26 @@ pub async fn remove(
         }
     }
     failures.finish(refs.len(), "removed")
+}
+
+/// Give a sandbox a new name. Like `docker rename`, success prints nothing.
+pub async fn rename(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+    new_name: &str,
+    json: bool,
+) -> Result<()> {
+    let target = client::resolve(c, token_store, reference).await?;
+    let request = RenameSandboxRequest {
+        id: target.id.clone(),
+        new_name: new_name.to_string(),
+    };
+    c.rename_sandbox(target.request(request)?).await?;
+    if json {
+        println!("{}", json!({"renamed": reference, "name": new_name}));
+    }
+    Ok(())
 }
 
 /// Remove every stopped and exited sandbox, skipping those the CLI holds no

@@ -11,6 +11,8 @@ use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
 
 use crate::lifecycle::Failures;
+use crate::ps_filter::{self, Filters};
+use crate::template::{ANY_FIELD, Template};
 use crate::{client, output, status_name};
 
 pub const PS_HEADERS: [&str; 6] = [
@@ -203,53 +205,98 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Command": info.command_name,
         "CreatedAt": created.map(created_at_text),
         "RunningFor": format!("{} ago", duration_text(elapsed)),
+        "State": status_name(info.status),
         "Status": status_text(info, now_seconds),
         "Reason": reason_name(info),
         "Names": info.name,
     })
 }
 
+/// Each `ps --format` field with the header a `table` template gives it.
+const PS_FIELDS: [(&str, &str); 9] = [
+    ("ID", "CONTAINER ID"),
+    ("Image", "IMAGE"),
+    ("Command", "COMMAND"),
+    ("CreatedAt", "CREATED AT"),
+    ("RunningFor", "CREATED"),
+    ("State", "STATE"),
+    ("Status", "STATUS"),
+    ("Reason", "REASON"),
+    ("Names", "NAMES"),
+];
+
 pub struct PsOptions {
     pub all: bool,
     pub quiet: bool,
     /// Global `--json`: one array.
     pub json: bool,
-    /// `--format json`: one object per line, like Docker.
-    pub format_json: bool,
+    /// Go template per sandbox; `json` prints one object per line, like Docker.
+    pub format: Option<String>,
     pub no_pretty: bool,
+    pub no_trunc: bool,
+    pub filters: Filters,
+    pub limit: Option<usize>,
 }
 
 pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
+    let template = options
+        .format
+        .as_deref()
+        .map(|format| Template::parse(format, &PS_FIELDS))
+        .transpose()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let shown: Vec<&SandboxInfo> = listed
-        .iter()
-        .filter(|s| options.all || s.status == SandboxStatus::Running as i32)
-        .collect();
+    let shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
     if options.quiet {
         for info in shown {
-            println!("{}", info.id);
+            println!("{}", id_text(info, options.no_trunc));
         }
         return Ok(());
     }
-    if options.format_json {
-        for info in shown {
-            println!("{}", ps_json_object(info, now));
-        }
+    let object = |info: &SandboxInfo| {
+        let mut object = ps_json_object(info, now);
+        object["ID"] = Value::String(id_text(info, options.no_trunc));
+        object
+    };
+    if let Some(template) = template {
+        let records: Vec<_> = shown
+            .into_iter()
+            .filter_map(|info| match object(info) {
+                Value::Object(map) => Some(map),
+                _ => None,
+            })
+            .collect();
+        print!("{}", template.render(&records));
         return Ok(());
     }
     if options.json {
-        let objects: Vec<Value> = shown.into_iter().map(|s| ps_json_object(s, now)).collect();
+        let objects: Vec<Value> = shown.into_iter().map(object).collect();
         println!("{}", serde_json::to_string(&objects)?);
         return Ok(());
     }
-    let rows: Vec<Vec<Value>> = shown.into_iter().map(|s| ps_row(s, now)).collect();
+    let rows: Vec<Vec<Value>> = shown
+        .into_iter()
+        .map(|s| {
+            let mut row = ps_row(s, now);
+            row[0] = Value::String(id_text(s, options.no_trunc));
+            row
+        })
+        .collect();
     if let Some(header) = output::tsv_header(options.no_pretty, &PS_HEADERS) {
         println!("{header}");
     }
     output::emit_rows(false, options.no_pretty, &PS_HEADERS, &rows)
+}
+
+/// The id Docker shows: 12 characters unless `--no-trunc`.
+fn id_text(info: &SandboxInfo, no_trunc: bool) -> String {
+    if no_trunc {
+        info.id.clone()
+    } else {
+        info.id.chars().take(SHORT_ID_LEN).collect()
+    }
 }
 
 /// Docker shaped `inspect` entry for one sandbox.
@@ -381,13 +428,32 @@ fn created_at_text(seconds: i64) -> String {
     )
 }
 
-/// Print one array element per found reference. Missing ones go to stderr
-/// and make the command fail, like Docker.
+/// `--type` values. Ward has no image inspection yet.
+const TYPE_CONTAINER: &str = "container";
+const TYPE_IMAGE: &str = "image";
+
+/// Accept `--type container`, and say why `image` or anything else is refused.
+pub fn check_type(kind: Option<&str>) -> Result<()> {
+    match kind {
+        None | Some(TYPE_CONTAINER) => Ok(()),
+        Some(TYPE_IMAGE) => bail!("inspecting images is not supported yet; only --type container"),
+        Some(other) => {
+            bail!("invalid --type \"{other}\", expected {TYPE_CONTAINER} or {TYPE_IMAGE}")
+        }
+    }
+}
+
+/// Print one array element per found reference, or one rendering of `format`
+/// each. Missing ones go to stderr and make the command fail, like Docker.
 pub async fn inspect(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     references: &[String],
+    format: Option<&str>,
 ) -> Result<()> {
+    let template = format
+        .map(|format| Template::parse(format, &[(ANY_FIELD, "")]))
+        .transpose()?;
     let mut found = Vec::new();
     let mut failures = Failures::new();
     for reference in references {
@@ -404,7 +470,19 @@ pub async fn inspect(
             Err(e) => failures.record(reference, &e),
         }
     }
-    println!("{}", serde_json::to_string_pretty(&found)?);
+    match template {
+        Some(template) => {
+            let records: Vec<_> = found
+                .into_iter()
+                .filter_map(|value| match value {
+                    Value::Object(map) => Some(map),
+                    _ => None,
+                })
+                .collect();
+            print!("{}", template.render(&records));
+        }
+        None => println!("{}", serde_json::to_string_pretty(&found)?),
+    }
     failures.finish(references.len(), "inspected")
 }
 
@@ -442,6 +520,18 @@ pub async fn kill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::unset(None, true)]
+    #[case::container(Some("container"), true)]
+    #[case::image(Some("image"), false)]
+    #[case::unknown(Some("volume"), false)]
+    fn given_type_when_checked_then_only_container_passes(
+        #[case] kind: Option<&str>,
+        #[case] accepted: bool,
+    ) {
+        assert_eq!(check_type(kind).is_ok(), accepted);
+    }
 
     const NOW: i64 = 1_000_000;
 
@@ -538,6 +628,7 @@ mod tests {
                 "Command": "sh",
                 "CreatedAt": "1970-01-12 13:44:40 +0000 UTC",
                 "RunningFor": "2 minutes ago",
+                "State": "running",
                 "Status": "Up 2 minutes",
                 "Reason": "",
                 "Names": "web1",
