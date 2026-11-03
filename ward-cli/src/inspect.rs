@@ -12,18 +12,23 @@ use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInf
 use ward_core::protocol::RestartKind;
 
 use crate::lifecycle::Failures;
+use crate::ps_columns::{image_sizes, ports_text, size_column};
 use crate::ps_filter::{self, Filters};
 use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
 
-pub const PS_HEADERS: [&str; 6] = [
+pub const PS_HEADERS: [&str; 7] = [
     "CONTAINER ID",
     "IMAGE",
     "COMMAND",
     "CREATED",
     "STATUS",
+    "PORTS",
     "NAMES",
 ];
+
+/// The column `ps -s` adds.
+const PS_SIZE_HEADER: &str = "SIZE";
 
 /// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
@@ -180,6 +185,7 @@ pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
         Value::String(info.command_name.clone()),
         Value::String(created),
         Value::String(status_text(info, now_seconds)),
+        Value::String(ports_text(info)),
         Value::String(info.name.clone()),
     ]
 }
@@ -200,6 +206,10 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Reason": reason_name(info),
         "Names": info.name,
         "Labels": labels_text(&info.labels),
+        "Ports": ports_text(info),
+        "Mounts": "",
+        "Networks": "",
+        "Size": "",
     })
 }
 
@@ -211,7 +221,7 @@ fn labels_text(labels: &std::collections::HashMap<String, String>) -> String {
 }
 
 /// Each `ps --format` field with the header a `table` template gives it.
-const PS_FIELDS: [(&str, &str); 10] = [
+const PS_FIELDS: [(&str, &str); 14] = [
     ("ID", "CONTAINER ID"),
     ("Image", "IMAGE"),
     ("Command", "COMMAND"),
@@ -222,6 +232,10 @@ const PS_FIELDS: [(&str, &str); 10] = [
     ("Reason", "REASON"),
     ("Names", "NAMES"),
     (LABELS_FIELD, "LABELS"),
+    ("Ports", "PORTS"),
+    ("Mounts", "MOUNTS"),
+    ("Networks", "NETWORKS"),
+    ("Size", "SIZE"),
 ];
 
 pub struct PsOptions {
@@ -236,6 +250,8 @@ pub struct PsOptions {
     pub filters: Filters,
     pub limit: Option<usize>,
     pub sort: Option<ps_filter::SortField>,
+    /// `-s`: add the SIZE column.
+    pub size: bool,
 }
 
 pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
@@ -258,9 +274,17 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         }
         return Ok(());
     }
+    let sizes = if options.size {
+        image_sizes(&c.list_images(()).await?.into_inner().images)
+    } else {
+        Default::default()
+    };
     let object = |info: &SandboxInfo| {
         let mut object = ps_json_object(info, now);
         object["ID"] = Value::String(id_text(info, options.no_trunc));
+        if options.size {
+            object["Size"] = Value::String(size_column(info, &sizes));
+        }
         object
     };
     let template_record = |info: &SandboxInfo| match object(info) {
@@ -285,13 +309,20 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .map(|s| {
             let mut row = ps_row(s, now);
             row[0] = Value::String(id_text(s, options.no_trunc));
+            if options.size {
+                row.push(Value::String(size_column(s, &sizes)));
+            }
             row
         })
         .collect();
-    if let Some(header) = output::tsv_header(options.no_pretty, &PS_HEADERS) {
+    let mut headers = PS_HEADERS.to_vec();
+    if options.size {
+        headers.push(PS_SIZE_HEADER);
+    }
+    if let Some(header) = output::tsv_header(options.no_pretty, &headers) {
         println!("{header}");
     }
-    output::emit_rows(false, options.no_pretty, &PS_HEADERS, &rows)
+    output::emit_rows(false, options.no_pretty, &headers, &rows)
 }
 
 /// The id Docker shows: 12 characters unless `--no-trunc`.
@@ -750,6 +781,7 @@ mod tests {
                 "COMMAND",
                 "CREATED",
                 "STATUS",
+                "PORTS",
                 "NAMES"
             ]
         );
@@ -773,6 +805,7 @@ mod tests {
                 "sh",
                 "2 minutes ago",
                 "Exited (7)",
+                "",
                 "web1"
             ]
         );
@@ -800,6 +833,10 @@ mod tests {
                 "Reason": "",
                 "Names": "web1",
                 "Labels": "",
+                "Ports": "",
+                "Mounts": "",
+                "Networks": "",
+                "Size": "",
             })
         );
     }

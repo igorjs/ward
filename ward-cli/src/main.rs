@@ -30,6 +30,9 @@ mod login;
 mod output;
 mod pause;
 mod ports;
+mod prune;
+mod prune_filter;
+mod ps_columns;
 mod ps_filter;
 mod pull;
 mod resources;
@@ -244,7 +247,8 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
         /// Go template for each sandbox, or `json`. Fields: .ID .Image
-        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names.
+        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names
+        /// .Labels .Ports .Mounts .Networks .Size.
         #[arg(long)]
         format: Option<String>,
         /// Print the full sandbox ID.
@@ -272,6 +276,10 @@ enum Commands {
         /// oldest first, runningfor newest first. Podman's size is not offered.
         #[arg(long, value_enum, ignore_case = true, value_name = "FIELD")]
         sort: Option<ps_filter::SortField>,
+        /// Add a SIZE column: the writable layer is not measured, so it shows
+        /// `--` next to the image's size.
+        #[arg(short, long)]
+        size: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -750,6 +758,14 @@ enum Commands {
     /// Remove every stopped and exited sandbox.
     Prune,
 
+    /// Remove stopped sandboxes, asking first unless -f is given.
+    #[command(name = "container-prune", hide = true)]
+    ContainerPrune(prune::ContainerArgs),
+
+    /// Remove images no sandbox uses, asking first unless -f is given.
+    #[command(name = "image-prune", hide = true)]
+    ImagePrune(prune::ImageArgs),
+
     /// Change the limits or restart policy of one or more sandboxes.
     Update(update::Args),
 
@@ -822,17 +838,28 @@ enum Commands {
     Health,
 
     /// Show daemon information.
-    Info,
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SystemCommands {
     /// Show daemon information.
-    Info,
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
     /// Count sandboxes and cached images.
     Df,
-    /// Remove every stopped and exited sandbox.
-    Prune,
+    /// Remove stopped sandboxes, and with -a unused images and with
+    /// --volumes volumes, asking first unless -f is given.
+    Prune(prune::SystemArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -869,6 +896,8 @@ enum VolumeCommands {
         /// Volume ID.
         id: String,
     },
+    /// Remove unused volumes, asking first.
+    Prune(prune::VolumeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1051,7 +1080,7 @@ const CONTAINER_COMMANDS: [(&str, &str); 27] = [
     ("wait", "wait"),
     ("diff", "diff"),
     ("commit", "commit"),
-    ("prune", "prune"),
+    ("prune", "container-prune"),
     ("port", "port"),
     ("rename", "rename"),
     ("update", "update"),
@@ -1060,8 +1089,9 @@ const CONTAINER_COMMANDS: [(&str, &str); 27] = [
     ("unpause", "unpause"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 11] = [
+const IMAGE_COMMANDS: [(&str, &str); 12] = [
     ("exists", "image-exists"),
+    ("prune", "image-prune"),
     ("ls", "images"),
     ("list", "images"),
     ("pull", "pull"),
@@ -1253,6 +1283,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             latest,
             filter,
             sort,
+            size,
         } => {
             let mut c = client::connect(&socket_path).await?;
             let options = inspect::PsOptions {
@@ -1265,6 +1296,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 filters: ps_filter::Filters::parse(&filter)?,
                 limit: ps_filter::limit(last, latest),
                 sort,
+                size,
             };
             inspect::ps(&mut c, options).await?;
         }
@@ -1768,9 +1800,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Unpause(args) => unpause::run(&socket_path, &token_store, args, json).await?,
 
-        Commands::Prune | Commands::System(SystemCommands::Prune) => {
+        Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
+        }
+
+        Commands::ContainerPrune(args) => {
+            prune::container(&socket_path, &token_store, args, json).await?;
+        }
+
+        Commands::ImagePrune(args) => prune::image(&socket_path, args, json).await?,
+
+        Commands::System(SystemCommands::Prune(args)) => {
+            prune::system(&socket_path, &token_store, args, json).await?;
         }
 
         Commands::Version { format } => {
@@ -1830,6 +1872,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .collect();
                 output::emit_rows(json, no_pretty, &["id", "name", "size_mb"], &rows)?;
             }
+            VolumeCommands::Prune(args) => prune::volume(&socket_path, args, json).await?,
             VolumeCommands::Remove { id } => {
                 let mut c = client::connect(&socket_path).await?;
                 c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
@@ -1920,8 +1963,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Info | Commands::System(SystemCommands::Info) => {
-            system::info(&socket_path, json).await?;
+        Commands::Info { format } | Commands::System(SystemCommands::Info { format }) => {
+            system::info(&socket_path, format.as_deref(), json).await?;
         }
     }
 
