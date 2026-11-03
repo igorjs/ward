@@ -190,7 +190,7 @@ pub async fn list(socket: &str, args: ListArgs, json: bool, no_pretty: bool) -> 
         volumes.iter().for_each(|v| println!("{}", v.name));
     } else if let Some(template) = parsed {
         let records: Vec<_> = volumes.iter().map(list_record).collect();
-        print!("{}", template.render(&records));
+        print!("{}", template.render(&records)?);
     } else {
         let rows: Vec<Vec<Value>> = volumes
             .iter()
@@ -221,7 +221,7 @@ pub async fn inspect(socket: &str, args: InspectArgs) -> Result<()> {
         }
     }
     match parsed {
-        Some(template) => print!("{}", template.render(&found)),
+        Some(template) => print!("{}", template.render(&found)?),
         None => println!("{}", serde_json::to_string_pretty(&found)?),
     }
     if missing > 0 {
@@ -354,7 +354,9 @@ mod tests {
         let template =
             template::Template::parse("{{.Name}} {{.Size}} {{.Driver}}", &FIELDS).expect("parse");
 
-        let out = template.render(&[list_record(&volume("aaa111", "cache"))]);
+        let out = template
+            .render(&[list_record(&volume("aaa111", "cache"))])
+            .expect("render");
 
         assert_eq!(out, "cache 104.9MB local\n");
     }
