@@ -28,6 +28,7 @@ mod login;
 mod output;
 mod pause;
 mod ports;
+mod ps_columns;
 mod ps_filter;
 mod pull;
 mod resources;
@@ -242,7 +243,8 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
         /// Go template for each sandbox, or `json`. Fields: .ID .Image
-        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names.
+        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names
+        /// .Labels .Ports .Mounts .Networks .Size.
         #[arg(long)]
         format: Option<String>,
         /// Print the full sandbox ID.
@@ -266,6 +268,10 @@ enum Commands {
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
+        /// Add a SIZE column: the writable layer is not measured, so it shows
+        /// `--` next to the image's size.
+        #[arg(short, long)]
+        size: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -806,13 +812,23 @@ enum Commands {
     Health,
 
     /// Show daemon information.
-    Info,
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SystemCommands {
     /// Show daemon information.
-    Info,
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
     /// Count sandboxes and cached images.
     Df,
     /// Remove every stopped and exited sandbox.
@@ -1218,6 +1234,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             last,
             latest,
             filter,
+            size,
         } => {
             let mut c = client::connect(&socket_path).await?;
             let options = inspect::PsOptions {
@@ -1229,6 +1246,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_trunc,
                 filters: ps_filter::Filters::parse(&filter)?,
                 limit: ps_filter::limit(last, latest),
+                size,
             };
             inspect::ps(&mut c, options).await?;
         }
@@ -1876,8 +1894,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Info | Commands::System(SystemCommands::Info) => {
-            system::info(&socket_path, json).await?;
+        Commands::Info { format } | Commands::System(SystemCommands::Info { format }) => {
+            system::info(&socket_path, format.as_deref(), json).await?;
         }
     }
 
