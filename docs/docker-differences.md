@@ -64,11 +64,28 @@ A `deny` sandbox without published ports records nothing for `suggest`. The gues
 
 Each attach session is separate. A client that disconnects only detaches and leaves the main process running. In raw terminal mode Ctrl-C goes to the guest as a byte, as in Docker. Outside raw mode the CLI passes SIGINT and SIGTERM to the guest process.
 
+## Wait
+
+`ward wait --condition` takes `not-running` (the default), `next-exit` and `removed`, as Docker does. `next-exit` on a sandbox that is not running waits for it to be started and to exit. `removed` prints the last exit code of the main process, or 0 when it never ran a command. Ward polls the state ten times a second, so a start and exit that both happen between two polls still count as the next exit but the wait may notice them late. `next-exit` and `removed` on a sandbox that does not exist fail at once, as `not-running` does.
+
+
+## Pause
+
+`ward pause` and `ward unpause` freeze and thaw the sandbox's processes with the guest's cgroup v2 freezer. libkrun has no way to pause the virtual CPUs, so the microVM itself keeps running: its kernel and the Ward agent stay up, and only the main process and every exec process stop. Differences from Docker:
+
+- `cp`, `top`, `stats` and `logs` work on a paused sandbox, as they do in Docker, because the agent answers outside the frozen group.
+- The guest clock and the sandbox timeout (`--timeout`) keep running while paused.
+- `exec` fails with `Container ID is paused, unpause the container before exec`.
+- `stop`, `restart` and `kill` with SIGKILL or the stop signal thaw the sandbox first, so the signal is delivered, as Docker does. `rm -f` removes it without thawing. Any other `kill` signal stays pending until `unpause`.
+- A paused sandbox shows `Up X (Paused)` in `ps`, `paused` as its state (so `--filter status=paused` works and `status=running` leaves it out), and `State.Paused` and `State.Status` in `inspect`. `ward events` reports `pause` and `unpause`.
+- The paused state is not kept across a daemon restart, because the VM does not survive one either.
+- It needs a guest kernel with cgroup v2. Without it the command fails with the guest's reason.
+
 ## Commands with a smaller option set
 
 - `ward ps` supports `-a`, `-q`, `-n`, `-l`, `--no-trunc`, `--filter` and a Go `--format` over `.ID .Image .Command .CreatedAt .RunningFor .State .Status .Reason .Names .Labels`, plus `{{.Label "key"}}`. `--filter` takes `name`, `id`, `status` and `label=KEY[=VALUE]` (every label filter must match); `name` is a substring match, not a regular expression, and `label!=` is not supported. `.Ports`, `.Mounts`, `.Networks`, `.Size` and `.LocalVolumes` do not exist yet. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.
 - `ward inspect` takes `--format` as a Go template over the JSON it prints. Only `{{.Path}}` and `{{json .Path}}` work: no `range`, `if`, `index` or functions. An array field prints as JSON, not as Go's `[a b]`. `--type container` is accepted and `--type image` is refused, because Ward cannot inspect images yet.
-- `ward container` and `ward image` are spellings of the top-level commands. `container` has `ls`, `ps`, `create`, `run`, `start`, `stop`, `restart`, `rm`, `kill`, `logs`, `inspect`, `exec`, `cp`, `top`, `stats`, `wait`, `diff`, `commit`, `prune`, `port` and `rename`; `image` has `ls` and `pull`. The other Docker subcommands are not there yet.
+- `ward container` and `ward image` are spellings of the top-level commands. `container` has `ls`, `ps`, `create`, `run`, `start`, `stop`, `restart`, `rm`, `kill`, `logs`, `inspect`, `exec`, `cp`, `top`, `stats`, `wait`, `diff`, `commit`, `prune`, `port`, `rename`, `pause` and `unpause`; `image` has `ls` and `pull`. The other Docker subcommands are not there yet.
 - `ward version` prints the client and daemon versions. Unlike Docker it has no API version, Go version, git commit or build time. Without a daemon it prints the client half and exits 1. `--format` fields are `.Client.Version` and `.Server.Version`, `.Server.Os`, `.Server.Arch` and `.Server.Backend`.
 - `ward system info` is `ward info`, and `ward system prune` is `ward prune`: both remove only stopped and exited sandboxes, never images, volumes or networks, and take no `-a`, `-f` or `--filter`. `ward system df` lists the sandbox count (with how many run) and the image cache size; it has no per-image breakdown and no `-v`.
 - `ward rename` prints nothing on success, as Docker does. It works on a running sandbox. Docker's `rename` event carries the old name; Ward's does not.

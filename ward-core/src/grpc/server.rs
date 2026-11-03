@@ -21,12 +21,13 @@ use crate::pb::{
     DiffResponse, EgressLogEntry, EgressLogResponse, EventsRequest, ExecRequest, FileChange,
     GetCommunicationLogRequest, GetEgressLogRequest, GetSandboxRequest, GetVolumeRequest,
     HealthStatus, KillProcessRequest, ListImagesResponse, ListSandboxesResponse,
-    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
-    PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest, RemoveVolumeRequest,
-    RenameSandboxRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
+    ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, PauseRequest,
+    ProcessInfo, PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest,
+    RemoveVolumeRequest, RenameSandboxRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
     SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
     StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
-    TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
+    TopRequest, TopResponse, UnpauseRequest, VolumeInfo, WaitRequest, WaitResponse,
+    WriteStdinRequest,
 };
 use crate::protocol::{ApiError, ISSUES_URL};
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -291,6 +292,35 @@ impl Ward for WardGrpcServer {
             .map_err(api_err_to_status)?;
         self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.pause",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn pause(&self, request: Request<PauseRequest>) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.pause(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.unpause",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn unpause(
+        &self,
+        request: Request<UnpauseRequest>,
+    ) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.unpause(&id).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
     }
 
     #[tracing::instrument(
@@ -949,7 +979,11 @@ impl Ward for WardGrpcServer {
         let token = token_from_metadata(&request).to_string();
         let req = request.into_inner();
         let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
-        let exit_code = self.sandbox.wait(&id).await.map_err(api_err_to_status)?;
+        let exit_code = self
+            .sandbox
+            .wait_until(&id, req.condition())
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(WaitResponse { exit_code }))
     }
 

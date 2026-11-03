@@ -398,6 +398,7 @@ impl Backend for KrunvmBackend {
             finished_at: None,
             end_reason: None,
             restart_count: 0,
+            paused: false,
         };
 
         #[cfg(feature = "krunvm")]
@@ -846,6 +847,14 @@ impl Backend for KrunvmBackend {
             })
     }
 
+    async fn pause_sandbox(&self, id: &str) -> Result<()> {
+        self.set_frozen(id, true).await
+    }
+
+    async fn unpause_sandbox(&self, id: &str) -> Result<()> {
+        self.set_frozen(id, false).await
+    }
+
     async fn put_secrets(
         &self,
         sandbox_id: &str,
@@ -1200,11 +1209,35 @@ impl KrunvmBackend {
 
         #[cfg(feature = "krunvm")]
         teardown_vm(id, shim, smoltcp).await;
+        if let Some(state) = self.sandboxes.write().await.get_mut(id) {
+            state.info.paused = false;
+        }
         let _ = std::fs::remove_file(self.agent_socket_path(id));
         self.processes
             .write()
             .await
             .retain(|_, record| record.sandbox_id != id);
+        Ok(())
+    }
+
+    /// Freeze or thaw the sandbox's processes through its agent. Stub builds
+    /// have no guest and only record the state.
+    async fn set_frozen(&self, id: &str, frozen: bool) -> Result<()> {
+        if !self.sandboxes.read().await.contains_key(id) {
+            return Err(BackendError::NotFound(id.to_string()));
+        }
+        #[cfg(feature = "krunvm")]
+        if self.boot_vms {
+            let stream = self.agent_stream(id).await?;
+            super::agent::freeze(stream, frozen)
+                .await
+                .map_err(|e| BackendError::Exec(format!("freeze the sandbox: {e}")))?;
+        }
+        let mut sandboxes = self.sandboxes.write().await;
+        let state = sandboxes
+            .get_mut(id)
+            .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        state.info.paused = frozen;
         Ok(())
     }
 

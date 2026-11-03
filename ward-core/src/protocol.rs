@@ -328,6 +328,8 @@ pub struct SandboxInfo {
     pub end_reason: Option<EndReason>,
     /// Restarts the daemon made since the sandbox was last started by hand.
     pub restart_count: u32,
+    /// True while the sandbox's processes are frozen.
+    pub paused: bool,
 }
 
 /// Why a sandbox ended.
