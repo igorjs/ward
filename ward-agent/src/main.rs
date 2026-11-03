@@ -48,6 +48,9 @@ async fn main() -> std::io::Result<()> {
             "sandbox cgroup NOT set up: no pids limit and OOM kills counted guest-wide"
         ),
     }
+    ward_agent::apply_cgroup_limits(&args.cgroup_settings)
+        .map_err(|e| std::io::Error::other(format!("cannot apply the cgroup limits: {e}")))?;
+    ward_agent::set_process_limits(&args.ulimits, &args.group_add);
     if ward_agent::net::interface_present() {
         match ward_agent::net::configure() {
             Ok(()) => tracing::info!("guest network configured"),
