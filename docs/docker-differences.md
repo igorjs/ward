@@ -64,6 +64,12 @@ A `deny` sandbox without published ports records nothing for `suggest`. The gues
 
 Each attach session is separate. A client that disconnects only detaches and leaves the main process running. In raw terminal mode Ctrl-C goes to the guest as a byte, as in Docker. Outside raw mode the CLI passes SIGINT and SIGTERM to the guest process.
 
+- `ward attach SANDBOX` follows `docker attach`: it shows only the output the process writes after the attach, sends this terminal's input unless `--no-stdin`, and exits with the process's exit code. A sandbox that is not running fails with `You cannot attach to a stopped container, start it first`.
+- `--detach-keys` takes Docker's syntax and defaults to `ctrl-p,ctrl-q`. Typing it prints `read escape sequence` on stderr, ends the attach with exit code 0 and leaves the process running. Docker's `detachKeys` setting in `config.json` is not read, and `--detach-keys` is not on `run` or `exec`.
+- `--sig-proxy` (default true) passes SIGINT and SIGTERM to the process when the CLI does not own the terminal. With `--sig-proxy=false` they end the CLI (exit 130 or 143) and leave the process alone. With a terminal, Ctrl-C is a key and the flag has no effect, as in Docker.
+- `ward start -a` and `-i` start one sandbox, then attach as above and exit with the process's exit code. They show all the output of that run, and `-i` also sends input. Several references with either flag are refused, as in Docker. Docker attaches before it starts; Ward attaches right after the start call returns and replays the output of the new run, so nothing is lost.
+- `ward run -a STREAM` (STDIN, STDOUT or STDERR, repeatable) shows only those streams, and sends input only for STDIN with `-i`. Without `-a` all are attached. `-a` with `-d` fails.
+
 ## Update
 
 `ward update` takes `--memory`, `--cpus`, `--pids-limit` and `--restart`, on a running or stopped sandbox. With none of them it fails, as Docker does. It reports `update` in `ward events`, and `inspect` shows the new values in `HostConfig`.
@@ -73,15 +79,9 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 - `--memory` above the memory the VM started with, and `--cpus` above its CPU count, are refused with a message that says so. Lowering them works. To raise them, stop the sandbox, update it and start it again: a stopped sandbox accepts any value, and the next boot is sized to it.
 - A VM created without `-m` or `--cpus` has libkrun's default size, which Ward does not know, so the check is skipped and the cgroup limit is set anyway.
 - `--memory 0`, `--cpus 0` and `--pids-limit 0` or `-1` remove the limit. For memory that means the VM's own memory.
-- `--cpus` takes fractions, as in Docker, and is a CPU quota (`cpu.max`). The record also rounds it up to whole CPUs for the next boot. The daemon applies the quota again after each start.
-- The memory and CPU limits need the guest kernel's memory and cpu controllers, and the pids limit its pids controller. A missing one fails the update with the reason, and changes nothing.
+- `--cpus` takes fractions, as in Docker, and is a CPU quota (`cpu.max`). The record also rounds it up to whole CPUs for the next boot. The daemon applies the quota again after each start, and the start fails if the guest cannot take it.
+- The memory and CPU limits need the guest kernel's memory and cpu controllers, and the pids limit its pids controller. A missing one fails the update with the reason, and changes nothing: the guest writes all the limits or none, and a record that cannot be saved puts the old limits back.
 - `--restart` follows `run --restart`: it is refused with `--rm` and with a sandbox created with `--secret`.
-
-- `ward attach SANDBOX` follows `docker attach`: it shows only the output the process writes after the attach, sends this terminal's input unless `--no-stdin`, and exits with the process's exit code. A sandbox that is not running fails with `You cannot attach to a stopped container, start it first`.
-- `--detach-keys` takes Docker's syntax and defaults to `ctrl-p,ctrl-q`. Typing it prints `read escape sequence` on stderr, ends the attach with exit code 0 and leaves the process running. Docker's `detachKeys` setting in `config.json` is not read, and `--detach-keys` is not on `run` or `exec`.
-- `--sig-proxy` (default true) passes SIGINT and SIGTERM to the process when the CLI does not own the terminal. With `--sig-proxy=false` they end the CLI (exit 130 or 143) and leave the process alone. With a terminal, Ctrl-C is a key and the flag has no effect, as in Docker.
-- `ward start -a` and `-i` start one sandbox, then attach as above and exit with the process's exit code. They show all the output of that run, and `-i` also sends input. Several references with either flag are refused, as in Docker. Docker attaches before it starts; Ward attaches right after the start call returns and replays the output of the new run, so nothing is lost.
-- `ward run -a STREAM` (STDIN, STDOUT or STDERR, repeatable) shows only those streams, and sends input only for STDIN with `-i`. Without `-a` all are attached. `-a` with `-d` fails.
 
 ## Wait
 
