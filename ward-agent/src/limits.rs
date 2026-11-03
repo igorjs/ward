@@ -72,24 +72,38 @@ pub fn apply(dir: &Path, limits: Limits) -> io::Result<()> {
     if let Some(pids) = limits.pids_max {
         writes.push((dir.join(PIDS_MAX_FILE), limit_text(u64::from(pids))));
     }
-    write_all_or_none(&writes)
+    write_all_or_none(&writes, |path, text| std::fs::write(path, text))
 }
 
 /// Write every file, or put back the ones already written when a later write
-/// fails. The old contents are read before the first write.
-fn write_all_or_none(writes: &[(std::path::PathBuf, String)]) -> io::Result<()> {
+/// fails. The old contents are read before the first write. A value that
+/// cannot be put back is named in the returned error.
+fn write_all_or_none(
+    writes: &[(std::path::PathBuf, String)],
+    mut write: impl FnMut(&Path, &str) -> io::Result<()>,
+) -> io::Result<()> {
     let old = writes
         .iter()
         .map(|(path, _)| std::fs::read_to_string(path))
         .collect::<io::Result<Vec<_>>>()?;
     for (done, (path, text)) in writes.iter().enumerate() {
-        if let Err(e) = std::fs::write(path, text) {
-            for ((path, _), before) in writes.iter().zip(&old).take(done) {
-                // Best effort: the kernel already accepted these values once.
-                let _ = std::fs::write(path, before.trim());
+        let Err(e) = write(path, text) else {
+            continue;
+        };
+        let mut stuck = Vec::new();
+        for ((path, _), before) in writes.iter().zip(&old).take(done) {
+            if let Err(restore) = write(path, before.trim()) {
+                tracing::warn!(path = %path.display(), error = %restore, "cannot put a limit back");
+                stuck.push(format!("{}: {restore}", path.display()));
             }
+        }
+        if stuck.is_empty() {
             return Err(e);
         }
+        return Err(io::Error::new(
+            e.kind(),
+            format!("{e}; could not put back {}", stuck.join(", ")),
+        ));
     }
     Ok(())
 }
@@ -255,32 +269,65 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
     }
 
+    fn pairs(dir: &Path) -> Vec<(std::path::PathBuf, String)> {
+        ["a", "b", "c"]
+            .iter()
+            .map(|name| (dir.join(name), format!("new-{name}")))
+            .collect()
+    }
+
+    fn seeded() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(dir.path().join(name), format!("old-{name}")).unwrap();
+        }
+        dir
+    }
+
     #[test]
     fn given_a_later_write_that_fails_when_applied_then_earlier_files_are_restored() {
         // Arrange
-        let root = fake_root("cpu memory pids", true);
-        let group = root.path().join(GROUP);
-        std::fs::write(group.join(MEMORY_MAX_FILE), "1000").unwrap();
-        // A read-only file reads fine but cannot be written, so the pids
-        // write fails last.
-        let mut mode = std::fs::metadata(group.join(PIDS_MAX_FILE))
-            .unwrap()
-            .permissions();
-        mode.set_readonly(true);
-        std::fs::set_permissions(group.join(PIDS_MAX_FILE), mode).unwrap();
-        let limits = Limits {
-            memory_bytes: Some(2000),
-            nano_cpus: Some(500_000_000),
-            pids_max: Some(5),
-        };
+        let dir = seeded();
+        let mut calls = 0;
 
         // Act
-        let result = apply(&group, limits);
+        let result = write_all_or_none(&pairs(dir.path()), |path, text| {
+            calls += 1;
+            if calls == 3 {
+                return Err(io::Error::other("refused"));
+            }
+            std::fs::write(path, text)
+        });
 
         // Assert
-        assert!(result.is_err());
-        assert_eq!(read(&root, MEMORY_MAX_FILE), "1000");
-        assert_eq!(read(&root, CPU_MAX_FILE), "max");
+        assert_eq!(result.unwrap_err().to_string(), "refused");
+        let read = |name: &str| std::fs::read_to_string(dir.path().join(name)).unwrap();
+        assert_eq!(
+            (read("a"), read("b"), read("c")),
+            ("old-a".into(), "old-b".into(), "old-c".into())
+        );
+    }
+
+    #[test]
+    fn given_a_restore_that_fails_when_applied_then_the_error_names_the_file() {
+        // Arrange
+        let dir = seeded();
+        let stuck = dir.path().join("a");
+        let mut calls = 0;
+
+        // Act
+        let result = write_all_or_none(&pairs(dir.path()), |path, text| {
+            calls += 1;
+            if calls == 3 || path == stuck && text.starts_with("old") {
+                return Err(io::Error::other("refused"));
+            }
+            std::fs::write(path, text)
+        });
+
+        // Assert
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("could not put back"), "{message}");
+        assert!(message.contains(&stuck.display().to_string()), "{message}");
     }
 
     #[test]
