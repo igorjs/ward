@@ -9,6 +9,7 @@ pub mod grpc;
 pub mod protocol;
 pub mod registry_auth;
 pub mod sandbox;
+pub mod signal;
 pub mod sync;
 pub mod utf8;
 pub mod validate;

@@ -6,7 +6,7 @@
 //! its oldest events, and a reader that fell behind is told how many it
 //! missed. A bounded history of recent events serves `since` replays.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -58,6 +58,8 @@ pub struct SandboxEvent {
     pub exit_code: Option<i32>,
     /// Set on `die` when the cause is known.
     pub reason: Option<EndReason>,
+    /// The sandbox's labels, reported as event attributes like Docker.
+    pub labels: BTreeMap<String, String>,
 }
 
 impl SandboxEvent {
@@ -70,6 +72,7 @@ impl SandboxEvent {
             at: SystemTime::now(),
             exit_code: None,
             reason: None,
+            labels: meta.options.spec.labels.clone(),
         }
     }
 
@@ -188,6 +191,7 @@ mod tests {
             at: at(sandbox),
             exit_code: None,
             reason: None,
+            labels: BTreeMap::new(),
         }
     }
 

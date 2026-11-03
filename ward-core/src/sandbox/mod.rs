@@ -5,6 +5,7 @@ pub mod events;
 mod launch;
 mod manager;
 pub mod resource_metrics;
+pub mod restart;
 pub mod store;
 #[cfg(all(test, not(feature = "krunvm")))]
 pub(crate) use manager::tests::{create_with_command, host_manager};
