@@ -118,7 +118,11 @@ Each attach session is separate. A client that disconnects only detaches and lea
 
 ## Events
 
-`ward events` needs no sandbox token. The daemon keeps only the last 1024 events in memory. Nothing survives a daemon restart.
+`ward events` needs no sandbox token. The daemon keeps only the last 1024 events in memory. Nothing survives a daemon restart, so `--since` cannot reach further back than that ring. `--until` ends the stream at that time. `--filter` takes `type`, `event`, `container` (also `name`), `image`, `label` and Ward's `reason` (the `reason` attribute of a `die` event). Events carry no labels of their own, so `label` matches an event attribute. Values of one key are alternatives and different keys all must match; `key!=value` negation is not supported.
+
+## Logs
+
+`ward logs` takes `-f`, `--tail`, `--since`, `--until`, `-t` and `--details`. `--until` hides output from that time on and, with `-f`, stops following then. `--details` does nothing: Docker uses it to print the labels and environment named by `--log-opt`, and Ward has no log options.
 
 ## Ward additions
 
