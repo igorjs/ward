@@ -247,13 +247,13 @@ fn given_running_sandbox_when_ps_then_header_and_a_row_are_printed() {
     let mut lines = printed.lines();
     assert_eq!(
         lines.next(),
-        Some("CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tNAMES")
+        Some("CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES")
     );
     let row: Vec<&str> = lines.next().expect("row").split('\t').collect();
     assert_eq!(row[0], &id[..12]);
     assert_eq!(row[1], "alpine:latest");
     assert!(row[4].starts_with("Up"), "{row:?}");
-    assert_eq!(row[5], "web1");
+    assert_eq!(row[6], "web1");
     assert_eq!(lines.next(), None);
 }
 

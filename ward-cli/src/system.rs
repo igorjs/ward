@@ -68,10 +68,18 @@ pub async fn version(socket: &str, format: Option<&str>, json: bool) -> Result<(
 }
 
 /// Prints daemon information.
-pub async fn info(socket: &str, json: bool) -> Result<()> {
+pub async fn info(socket: &str, format: Option<&str>, json: bool) -> Result<()> {
+    let template = format
+        .map(|format| Template::parse(format, &[(ANY_FIELD, "")]))
+        .transpose()?;
     let mut c = client::connect(socket).await?;
     let resp = c.get_info(()).await?.into_inner();
-    if json {
+    if let Some(template) = template {
+        let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
+        let images = c.list_images(()).await?.into_inner().images;
+        let record = info_record(&resp, &sandboxes, images.len());
+        print!("{}", template.render(&[record])?);
+    } else if json {
         println!(
             "{}",
             json!({
@@ -88,6 +96,31 @@ pub async fn info(socket: &str, json: bool) -> Result<()> {
         println!("backend: {}", resp.backend);
     }
     Ok(())
+}
+
+/// The `docker info` record with the fields Ward has, under Docker's names.
+fn info_record(
+    info: &ward_core::pb::DaemonInfo,
+    sandboxes: &[ward_core::pb::SandboxInfo],
+    images: usize,
+) -> serde_json::Map<String, Value> {
+    let running = sandboxes
+        .iter()
+        .filter(|s| s.status == SandboxStatus::Running as i32)
+        .count();
+    let Value::Object(map) = json!({
+        "ServerVersion": info.version,
+        "OSType": info.platform,
+        "Architecture": info.arch,
+        "Driver": info.backend,
+        "Containers": sandboxes.len(),
+        "ContainersRunning": running,
+        "ContainersStopped": sandboxes.len() - running,
+        "Images": images,
+    }) else {
+        unreachable!("json! of an object")
+    };
+    map
 }
 
 /// Counts sandboxes and cached images, like `docker system df`.

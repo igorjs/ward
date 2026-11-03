@@ -79,15 +79,19 @@ fn parse_decimal(digits: &str) -> Option<f64> {
 /// Parses `--cpus`, which may be fractional, onto the whole CPU count the
 /// daemon takes: rounded up. `0` means "daemon default" and is passed through.
 pub fn parse_cpus(value: &str) -> Result<u32> {
-    let cpus = value
+    Ok(parse_cpu_count(value)?.ceil() as u32)
+}
+
+/// Parses a CPU count that may be fractional, such as `2` or `0.5`.
+pub fn parse_cpu_count(value: &str) -> Result<f64> {
+    value
         .trim()
         .parse::<f64>()
         .ok()
         .filter(|cpus| cpus.is_finite() && *cpus >= 0.0 && *cpus <= f64::from(u32::MAX))
         .ok_or_else(|| {
             anyhow::anyhow!("invalid CPU count '{value}': use a number such as 2 or 0.5")
-        })?;
-    Ok(cpus.ceil() as u32)
+        })
 }
 
 /// Maps Docker's `--pids-limit` onto the daemon's count: `0` and `-1` both

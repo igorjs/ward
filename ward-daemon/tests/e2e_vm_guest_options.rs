@@ -258,3 +258,61 @@ fn given_an_unknown_group_name_when_run_then_the_process_does_not_start() {
         String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("unable to find group nosuchgroup"), "{text}");
 }
+
+const HEALTH_POLL_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+const HEALTH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Poll `inspect` until the health status is `want`.
+fn wait_for_health(d: &Daemon, id: &str, want: &str) {
+    let deadline = std::time::Instant::now() + HEALTH_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        let status = run_ok(d, &["inspect", "--format", "{{.State.Health.Status}}", id]);
+        if status.trim() == want {
+            return;
+        }
+        std::thread::sleep(HEALTH_POLL_STEP);
+    }
+    panic!("{id} never became {want}");
+}
+
+#[test]
+fn given_a_health_check_when_the_probe_file_comes_and_goes_then_status_follows() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+    let id = run_ok(
+        &d,
+        &[
+            "run",
+            "-d",
+            "--health-cmd",
+            "test -f /tmp/ok",
+            "--health-interval",
+            "1s",
+            "--health-retries",
+            "2",
+            &image,
+            "sleep",
+            "120",
+        ],
+    );
+    let id = id.trim();
+
+    // Act
+    let first = run_ok(&d, &["inspect", "--format", "{{.State.Health.Status}}", id]);
+    run_ok(&d, &["exec", id, "touch", "/tmp/ok"]);
+    wait_for_health(&d, id, "healthy");
+    let listed = run_ok(&d, &["ps", "--filter", "health=healthy"]);
+    run_ok(&d, &["exec", id, "rm", "/tmp/ok"]);
+    wait_for_health(&d, id, "unhealthy");
+    let streak = run_ok(
+        &d,
+        &["inspect", "--format", "{{.State.Health.FailingStreak}}", id],
+    );
+
+    // Assert
+    assert_eq!(first.trim(), "starting");
+    assert!(listed.contains("(healthy)"), "{listed}");
+    assert!(streak.trim().parse::<u32>().unwrap() >= 2, "{streak}");
+}
