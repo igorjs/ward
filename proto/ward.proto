@@ -190,6 +190,27 @@ message CreateSandboxRequest {
   // What to do when the main process ends, like `docker run --restart`.
   // Absent means "no".
   RestartPolicy restart_policy = 25;
+  // Guest setup options, like Docker's HostConfig.
+  GuestOptions guest = 26;
+}
+
+// Guest setup options of `docker run`. Every field is optional; new ones are
+// appended as the options they stand for are added.
+message GuestOptions {
+  // Mount the root filesystem read-only, like `docker run --read-only`.
+  bool read_only_rootfs = 1;
+  // Tmpfs mounts, like `docker run --tmpfs PATH[:OPTIONS]`.
+  repeated TmpfsMount tmpfs = 2;
+  // Size of /dev/shm in bytes, like `docker run --shm-size`. 0 means 64 MiB.
+  uint64 shm_size_bytes = 3;
+}
+
+// A tmpfs mounted at `path`.
+message TmpfsMount {
+  string path = 1;
+  // Comma separated mount options as `docker run --tmpfs` takes them, such as
+  // "size=64m,noexec". Empty means the defaults.
+  string options = 2;
 }
 
 // Mirrors Docker's restart policy.
@@ -309,9 +330,14 @@ message SandboxInfo {
   RestartPolicy restart_policy = 25;
   // Times the daemon restarted the sandbox since it was last started by hand.
   uint32 restart_count = 26;
+  // Whether the main process runs on a pseudo-terminal.
+  bool tty = 30;
   // True while the sandbox's processes are frozen by Pause. Its status stays
   // running, as Docker's State.Running does.
   bool paused = 27;
+  GuestOptions guest = 28;
+  // Host directories shared into the guest, from `-v` and `--mount`.
+  repeated Mount mounts = 29;
 }
 
 enum EndReason {
@@ -607,6 +633,18 @@ message StatsResponse {
 
 message WaitRequest {
   string sandbox_id = 1;
+  // When to stop waiting. Absent means not running, as before.
+  WaitCondition condition = 2;
+}
+
+// Docker's `wait --condition` values.
+enum WaitCondition {
+  // The sandbox is not running, or stops running.
+  WAIT_CONDITION_NOT_RUNNING = 0;
+  // The sandbox's main process exits next, in this run or the next one.
+  WAIT_CONDITION_NEXT_EXIT = 1;
+  // The sandbox is removed.
+  WAIT_CONDITION_REMOVED = 2;
 }
 
 message WaitResponse {

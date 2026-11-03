@@ -3,16 +3,20 @@
 //! ward – command-line interface to the Ward daemon.
 
 mod attach;
+mod attach_cmd;
+mod attach_streams;
 mod client;
 mod commit;
 mod cp;
 mod create_opts;
+mod detach_keys;
 mod diff;
 mod docker;
 mod egress;
 mod events;
 mod exists;
 mod export;
+mod guest_opts;
 mod history;
 mod images;
 mod import;
@@ -33,6 +37,7 @@ mod rmi;
 mod save;
 mod secrets;
 mod socket;
+mod start_attach;
 mod stats;
 mod system;
 mod tag;
@@ -152,6 +157,8 @@ struct SandboxOpts {
     exited_ttl: Option<u64>,
     #[command(flatten)]
     extras: create_opts::CreateExtras,
+    #[command(flatten)]
+    guest: guest_opts::GuestExtras,
     #[command(flatten)]
     isolation: isolation::IsolationFlags,
 }
@@ -359,6 +366,9 @@ enum Commands {
         /// Print the sandbox ID and leave the command running.
         #[arg(short, long)]
         detach: bool,
+        /// Attach only this stream: STDIN, STDOUT or STDERR. Repeatable.
+        #[arg(short = 'a', long = "attach", value_name = "STREAM")]
+        attach: Vec<String>,
         /// Give the command a secret file at /run/secrets/NAME, read from
         /// FILE on this host. NAME defaults to the base name of FILE.
         #[arg(long, value_name = "[NAME=]FILE")]
@@ -442,7 +452,12 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         refs: Vec<String>,
+        #[command(flatten)]
+        attach: start_attach::StartFlags,
     },
+
+    /// Attach to the main process of a running sandbox.
+    Attach(attach_cmd::Args),
 
     /// Restart one or more sandboxes.
     Restart {
@@ -535,6 +550,10 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         references: Vec<String>,
+        /// What to wait for: not-running, next-exit (the next time the main
+        /// process exits) or removed.
+        #[arg(long, value_enum, default_value_t)]
+        condition: wait::Condition,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -738,7 +757,7 @@ enum Commands {
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
     /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
-    /// rename, pause and unpause. Each is the top-level command of the same name.
+    /// rename, pause, unpause and attach. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -948,6 +967,7 @@ fn create_request(
         ..Default::default()
     };
     opts.extras.apply(&mut request, &opts.env)?;
+    opts.guest.apply(&mut request)?;
     Ok(request)
 }
 
@@ -993,7 +1013,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 25] = [
+const CONTAINER_COMMANDS: [(&str, &str); 26] = [
     ("exists", "container-exists"),
     ("ls", "ps"),
     ("ps", "ps"),
@@ -1017,6 +1037,7 @@ const CONTAINER_COMMANDS: [(&str, &str); 25] = [
     ("prune", "prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("attach", "attach"),
     ("pause", "pause"),
     ("unpause", "unpause"),
 ];
@@ -1296,8 +1317,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tty,
             rm,
             detach,
+            attach,
             secret,
         } => {
+            let streams = attach_streams::Streams::parse(&attach)?;
+            if detach && !attach.is_empty() {
+                anyhow::bail!("conflicting options: -a and -d");
+            }
             opts.extras.check_rm(rm)?;
             let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
@@ -1315,6 +1341,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 tty,
                 rm,
                 detach,
+                streams,
                 hooks,
             };
             let code = docker::run(&socket_path, &token_store, request, flags).await?;
@@ -1520,7 +1547,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
         }
 
-        Commands::Start { refs } => {
+        Commands::Start { refs, attach } if attach.wanted() => {
+            let code = start_attach::run(&socket_path, &token_store, &refs, &attach).await?;
+            std::process::exit(code);
+        }
+
+        Commands::Attach(args) => {
+            let code = attach_cmd::run(&socket_path, &token_store, args).await?;
+            std::process::exit(code);
+        }
+
+        Commands::Start { refs, .. } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
@@ -1585,8 +1622,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stats::run(&socket_path, &token_store, &references, options).await?;
         }
 
-        Commands::Wait { references } => {
-            wait::run(&socket_path, &token_store, &references, json).await?;
+        Commands::Wait {
+            references,
+            condition,
+        } => {
+            wait::run(&socket_path, &token_store, &references, condition, json).await?;
         }
 
         Commands::Events {
@@ -1921,6 +1961,13 @@ mod tests {
         let args = args.iter().map(ToString::to_string).collect();
 
         assert_eq!(expand_groups(args), expected);
+    }
+
+    #[test]
+    fn given_the_whole_command_tree_when_built_then_clap_finds_no_conflicts() {
+        use clap::CommandFactory;
+
+        Cli::command().debug_assert();
     }
 
     #[test]
