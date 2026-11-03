@@ -126,6 +126,8 @@ pub struct Resolved {
     pub status: SandboxStatus,
     /// The sandbox's working directory; empty when it has none.
     pub workdir: String,
+    /// Whether the main process runs on a pseudo-terminal.
+    pub tty: bool,
     token: Option<String>,
 }
 
@@ -137,6 +139,7 @@ impl Resolved {
             id: info.id.clone(),
             status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
             workdir: info.workdir.clone(),
+            tty: info.tty,
         })
     }
 
@@ -147,6 +150,7 @@ impl Resolved {
             id: info.id.clone(),
             status: SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified),
             workdir: info.workdir.clone(),
+            tty: info.tty,
         }
     }
 
