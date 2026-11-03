@@ -124,12 +124,12 @@ fn given_system_group_when_info_df_prune_then_each_runs() {
     // Act
     let info = ok(&d, &["system", "info"]);
     let df = ok(&d, &["--no-pretty", "system", "df"]);
-    let pruned = ok(&d, &["system", "prune"]);
+    let pruned = ok(&d, &["system", "prune", "-f"]);
 
     // Assert
     assert!(info.contains("backend:"), "{info}");
     assert!(df.contains("Containers\t1\t0"), "{df}");
-    assert_eq!(pruned.trim(), id);
+    assert!(pruned.contains(&id), "{pruned}");
 }
 
 #[test]

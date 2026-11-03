@@ -22,6 +22,8 @@ mod log_output;
 mod login;
 mod output;
 mod ports;
+mod prune;
+mod prune_filter;
 mod ps_filter;
 mod pull;
 mod resources;
@@ -697,6 +699,14 @@ enum Commands {
     /// Remove every stopped and exited sandbox.
     Prune,
 
+    /// Remove stopped sandboxes, asking first unless -f is given.
+    #[command(name = "container-prune", hide = true)]
+    ContainerPrune(prune::ContainerArgs),
+
+    /// Remove images no sandbox uses, asking first unless -f is given.
+    #[command(name = "image-prune", hide = true)]
+    ImagePrune(prune::ImageArgs),
+
     /// Show the client and daemon versions.
     Version {
         /// Go template over .Client.Version and .Server.Version, .Server.Os,
@@ -769,8 +779,9 @@ enum SystemCommands {
     Info,
     /// Count sandboxes and cached images.
     Df,
-    /// Remove every stopped and exited sandbox.
-    Prune,
+    /// Remove stopped sandboxes, and with -a unused images and with
+    /// --volumes volumes, asking first unless -f is given.
+    Prune(prune::SystemArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -807,6 +818,8 @@ enum VolumeCommands {
         /// Volume ID.
         id: String,
     },
+    /// Remove unused volumes, asking first.
+    Prune(prune::VolumeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -985,12 +998,13 @@ const CONTAINER_COMMANDS: [(&str, &str); 22] = [
     ("wait", "wait"),
     ("diff", "diff"),
     ("commit", "commit"),
-    ("prune", "prune"),
+    ("prune", "container-prune"),
     ("port", "port"),
     ("rename", "rename"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 10] = [
+const IMAGE_COMMANDS: [(&str, &str); 11] = [
+    ("prune", "image-prune"),
     ("ls", "images"),
     ("list", "images"),
     ("pull", "pull"),
@@ -1641,9 +1655,19 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
         }
 
-        Commands::Prune | Commands::System(SystemCommands::Prune) => {
+        Commands::Prune => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::prune(&mut c, &token_store, json).await?;
+        }
+
+        Commands::ContainerPrune(args) => {
+            prune::container(&socket_path, &token_store, args, json).await?;
+        }
+
+        Commands::ImagePrune(args) => prune::image(&socket_path, args, json).await?,
+
+        Commands::System(SystemCommands::Prune(args)) => {
+            prune::system(&socket_path, &token_store, args, json).await?;
         }
 
         Commands::Version { format } => {
@@ -1703,6 +1727,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .collect();
                 output::emit_rows(json, no_pretty, &["id", "name", "size_mb"], &rows)?;
             }
+            VolumeCommands::Prune(args) => prune::volume(&socket_path, args, json).await?,
             VolumeCommands::Remove { id } => {
                 let mut c = client::connect(&socket_path).await?;
                 c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
