@@ -1814,6 +1814,41 @@ impl SandboxManager {
         Ok(added)
     }
 
+    /// Give sandbox `reference` the name `new_name`. Fails when another
+    /// sandbox or an in-flight create holds the name, or it is the current one.
+    pub async fn rename(&self, reference: &str, new_name: &str) -> Result<PbSandboxInfo> {
+        crate::validate::sandbox_name(new_name)?;
+        let id = self.resolve(reference).await?;
+        let _reservation = NameReservation::claim(&self.pending_names, new_name)
+            .ok_or_else(|| name_in_use(new_name, None))?;
+        {
+            let mut entries = self.entries.write().await;
+            let holder = entries
+                .iter()
+                .find(|(_, entry)| entry.meta.options.spec.name == new_name)
+                .map(|(holder, _)| holder.clone());
+            match holder {
+                Some(holder) if holder == id => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "sandbox {id} is already named {new_name}"
+                    )));
+                }
+                Some(holder) => return Err(name_in_use(new_name, Some(&holder))),
+                None => {}
+            }
+            let entry = entries
+                .get_mut(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+            let mut next = entry.meta.clone();
+            next.options.spec.name = new_name.to_string();
+            self.persist(next.clone()).await?;
+            entry.meta = next;
+            self.events
+                .emit(SandboxEvent::new(EventAction::Rename, &entry.meta));
+        }
+        self.info(&id, CommandView::Argv0Only).await
+    }
+
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
         let id = self.resolve(id).await?;
@@ -3002,6 +3037,7 @@ fn recorded_state(
         info.end_reason = entry.meta.end_reason;
         info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
         info.spec.image_digest = entry.meta.options.spec.image_digest.clone();
+        info.spec.name = entry.meta.options.spec.name.clone();
     }
     info
 }
@@ -8265,6 +8301,7 @@ pub(crate) mod tests {
     mod egress;
     #[cfg(not(feature = "krunvm"))]
     mod ports;
+    mod rename;
     #[cfg(not(feature = "krunvm"))]
     mod secrets;
 }
