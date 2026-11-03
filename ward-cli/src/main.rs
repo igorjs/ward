@@ -17,12 +17,14 @@ mod history;
 mod images;
 mod import;
 mod inspect;
+mod isolation;
 mod latest;
 mod lifecycle;
 mod load;
 mod log_output;
 mod login;
 mod output;
+mod pause;
 mod ports;
 mod ps_filter;
 mod pull;
@@ -38,6 +40,7 @@ mod template;
 mod terminal;
 mod tokens;
 mod top;
+mod unpause;
 mod wait;
 
 use clap::{Args, Parser, Subcommand};
@@ -149,6 +152,8 @@ struct SandboxOpts {
     exited_ttl: Option<u64>,
     #[command(flatten)]
     extras: create_opts::CreateExtras,
+    #[command(flatten)]
+    isolation: isolation::IsolationFlags,
 }
 
 /// Parse `--exited-ttl` into whole seconds, rounding a fraction up.
@@ -713,6 +718,12 @@ enum Commands {
     /// Remove every stopped and exited sandbox.
     Prune,
 
+    /// Freeze the processes of one or more running sandboxes.
+    Pause(pause::Args),
+
+    /// Thaw the processes of one or more paused sandboxes.
+    Unpause(unpause::Args),
+
     /// Show the client and daemon versions.
     Version {
         /// Go template over .Client.Version and .Server.Version, .Server.Os,
@@ -726,8 +737,8 @@ enum Commands {
     System(SystemCommands),
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
-    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port
-    /// and rename. Each is the top-level command of the same name.
+    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
+    /// rename, pause and unpause. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -914,6 +925,7 @@ fn create_request(
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
     };
+    opts.isolation.check()?;
     let mounts = opts
         .volume
         .iter()
@@ -981,7 +993,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 23] = [
+const CONTAINER_COMMANDS: [(&str, &str); 25] = [
     ("exists", "container-exists"),
     ("ls", "ps"),
     ("ps", "ps"),
@@ -1005,6 +1017,8 @@ const CONTAINER_COMMANDS: [(&str, &str); 23] = [
     ("prune", "prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("pause", "pause"),
+    ("unpause", "unpause"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
 const IMAGE_COMMANDS: [(&str, &str); 11] = [
@@ -1674,6 +1688,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::ImageExists(args) => {
             std::process::exit(exists::image(&socket_path, &args.name).await)
         }
+
+        Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
+
+        Commands::Unpause(args) => unpause::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Prune | Commands::System(SystemCommands::Prune) => {
             let mut c = client::connect(&socket_path).await?;
