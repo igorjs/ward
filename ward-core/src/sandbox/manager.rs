@@ -3403,6 +3403,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
             maximum_retry_count: info.spec.restart.max_retries,
         }),
         restart_count: info.restart_count,
+        tty: info.spec.tty,
         guest: Some(crate::guest_options::to_pb(&info.spec.guest)),
         mounts: info
             .spec
