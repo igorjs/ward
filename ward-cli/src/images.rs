@@ -160,7 +160,7 @@ fn split_reference(reference: &str) -> (&str, &str) {
     }
 }
 
-fn record(image: &ImageInfo, no_trunc: bool, now: DateTime<Utc>) -> Map<String, Value> {
+pub(crate) fn record(image: &ImageInfo, no_trunc: bool, now: DateTime<Utc>) -> Map<String, Value> {
     let (repository, tag) = split_reference(&image.reference);
     let id = if no_trunc {
         image.digest.clone()
