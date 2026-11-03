@@ -38,7 +38,24 @@ pub struct GuestExtras {
     /// tmpfs-mode=. Named volumes cannot be attached yet. Repeatable.
     #[arg(long, value_name = "type=TYPE,src=SRC,dst=DST[,ro]")]
     mount: Vec<String>,
+    /// Add a line to /etc/hosts: HOST:IP. HOST:host-gateway is the host
+    /// stack's address, reachable only while the sandbox has a network
+    /// device. Repeatable.
+    #[arg(long = "add-host", value_name = "HOST:IP")]
+    add_host: Vec<String>,
+    /// Not supported: the sandbox's resolver is the host relay that enforces
+    /// --egress, and no other server is reachable.
+    #[arg(long, hide = true, value_name = "IP")]
+    dns: Vec<String>,
+    /// Add a search domain to /etc/resolv.conf. Repeatable.
+    #[arg(long = "dns-search", value_name = "DOMAIN")]
+    dns_search: Vec<String>,
+    /// Add a resolver option such as ndots:2 to /etc/resolv.conf. Repeatable.
+    #[arg(long = "dns-option", value_name = "OPTION")]
+    dns_option: Vec<String>,
 }
+
+const DNS_REFUSAL: &str = "--dns is not supported: the sandbox resolves names through the host relay that enforces --egress, and no other name server is reachable. See docs/docker-differences.md";
 
 impl GuestExtras {
     /// Put the guest options and the `--mount` binds on `request`.
@@ -47,8 +64,14 @@ impl GuestExtras {
     ///
     /// Fails on a malformed or unsupported value.
     pub fn apply(&self, request: &mut CreateSandboxRequest) -> Result<()> {
+        if !self.dns.is_empty() {
+            bail!(DNS_REFUSAL);
+        }
         let mut guest = GuestOptions {
             read_only_rootfs: self.read_only,
+            extra_hosts: self.add_host.clone(),
+            dns_search: self.dns_search.clone(),
+            dns_options: self.dns_option.clone(),
             ..GuestOptions::default()
         };
         for spec in &self.tmpfs {
@@ -262,10 +285,13 @@ mod tests {
             read_only: true,
             tmpfs: vec!["/run:size=1m".into()],
             shm_size: Some("128m".into()),
+            add_host: vec!["db:10.1.2.3".into()],
+            dns_search: vec!["example.com".into()],
             mount: vec![
                 "type=bind,src=/tmp/a,dst=/data".into(),
                 "type=tmpfs,dst=/cache".into(),
             ],
+            ..Default::default()
         };
         let mut request = CreateSandboxRequest::default();
 
@@ -276,6 +302,8 @@ mod tests {
         let guest = request.guest.unwrap();
         assert!(guest.read_only_rootfs);
         assert_eq!(guest.shm_size_bytes, 128 << 20);
+        assert_eq!(guest.extra_hosts, ["db:10.1.2.3"]);
+        assert_eq!(guest.dns_search, ["example.com"]);
         assert_eq!(
             guest
                 .tmpfs
@@ -285,5 +313,22 @@ mod tests {
             ["/run", "/cache"]
         );
         assert_eq!(request.mounts.len(), 1);
+    }
+
+    #[test]
+    fn given_dns_when_applied_then_it_is_refused_with_the_reason() {
+        // Arrange
+        let extras = GuestExtras {
+            dns: vec!["1.1.1.1".into()],
+            ..Default::default()
+        };
+
+        // Act
+        let error = extras
+            .apply(&mut CreateSandboxRequest::default())
+            .unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains("--egress"), "{error}");
     }
 }
