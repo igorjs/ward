@@ -387,6 +387,15 @@ enum Commands {
         /// Prefix every line with its RFC3339 arrival time.
         #[arg(short = 't', long, conflicts_with = "pid")]
         timestamps: bool,
+        /// Only output before this time, in the forms --since takes. With
+        /// --follow, stops at that time.
+        #[arg(long, conflicts_with = "pid")]
+        until: Option<String>,
+        /// Accepted for Docker compatibility. Docker adds the --log-opt
+        /// labels and env to each line; Ward has no such options, so there
+        /// is nothing to add.
+        #[arg(long, conflicts_with = "pid")]
+        details: bool,
     },
 
     /// Write bytes to a process's stdin.
@@ -532,7 +541,8 @@ enum Commands {
     /// The daemon answers without a sandbox token, like `ward ps`, and keeps
     /// only the last 1024 events in memory, destroyed sandboxes included and
     /// none across a restart. --since replays from that history. --filter
-    /// takes type, event, container or name (a name or ID prefix), image and
+    /// takes type, event, reason (why a die event ended), container or name
+    /// (a name or ID prefix), image and
     /// label (an attribute, as key or key=value). --format takes a Go
     /// template over .Type .Action .Status .ID .From .Scope .Time .TimeNano
     /// .Actor.ID .Actor.Attributes.<key>, or json.
@@ -1306,11 +1316,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tail,
             since,
             timestamps,
+            until,
+            details: _,
         } => {
             let options = log_output::LogOptions {
                 tail: docker::parse_tail(&tail)?,
                 since: since
                     .map(|value| log_output::parse_since(&value, chrono::Utc::now()))
+                    .transpose()?,
+                until: until
+                    .map(|value| log_output::parse_until(&value, chrono::Utc::now()))
                     .transpose()?,
                 timestamps,
             };

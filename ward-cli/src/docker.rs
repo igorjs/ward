@@ -167,13 +167,22 @@ pub async fn logs(
         follow,
         ..Default::default()
     };
+    let until = options.until.filter(|_| follow);
     let mut printer = LogPrinter::new(options);
-    // No exit status means the output simply ended.
-    let code = attach::attach_with(&mut c, &target, start, false, |output| {
+    let attached = attach::attach_with(&mut c, &target, start, false, |output| {
         print_all(printer.accept(output))
-    })
-    .await?
-    .unwrap_or(0);
+    });
+    // No exit status means the output simply ended, or --until passed.
+    let status = match until {
+        Some(until) => {
+            let left = (until - chrono::Utc::now()).to_std().unwrap_or_default();
+            tokio::time::timeout(left, attached)
+                .await
+                .unwrap_or(Ok(None))?
+        }
+        None => attached.await?,
+    };
+    let code = status.unwrap_or(0);
     print_all(printer.finish())?;
     Ok(code)
 }
