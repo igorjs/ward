@@ -1692,6 +1692,28 @@ impl SandboxManager {
             .map_err(image_backend_err)
     }
 
+    /// Write cached images to an archive on disk.
+    pub async fn save_images(
+        &self,
+        names: &[String],
+    ) -> Result<crate::backend::image::SavedArchive> {
+        self.backend
+            .save_images(names)
+            .await
+            .map_err(image_backend_err)
+    }
+
+    /// Add the images of an archive to the cache.
+    pub async fn load_images(
+        &self,
+        chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<Vec<crate::backend::image::LoadedImage>> {
+        self.backend
+            .load_images(chunks)
+            .await
+            .map_err(image_backend_err)
+    }
+
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;

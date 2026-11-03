@@ -111,6 +111,12 @@ service Ward {
   // The layers of a cached image, newest first, like `docker history`.
   // Needs no sandbox token.
   rpc ImageHistory(ImageHistoryRequest) returns (ImageHistoryResponse);
+  // Write cached images as an OCI image layout archive, like `docker save`.
+  // Needs no sandbox token.
+  rpc SaveImages(SaveImagesRequest) returns (stream ArchiveChunk);
+  // Add the images of an archive to the cache, like `docker load`. Needs no
+  // sandbox token. Docker and OCI layout archives are accepted.
+  rpc LoadImages(stream ArchiveChunk) returns (LoadImagesResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -875,4 +881,24 @@ message ImageHistoryResponse {
   string image_id = 1;
   // Newest first.
   repeated HistoryLayer layers = 2;
+}
+
+message SaveImagesRequest {
+  // Tags, image ids or unique id prefixes.
+  repeated string references = 1;
+}
+
+message ArchiveChunk {
+  bytes data = 1;
+}
+
+message LoadedImage {
+  // Id of the image, e.g. sha256:...
+  string image_id = 1;
+  // Names the archive gave the image. Empty when it gave none.
+  repeated string references = 2;
+}
+
+message LoadImagesResponse {
+  repeated LoadedImage images = 1;
 }

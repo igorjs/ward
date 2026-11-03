@@ -15,6 +15,7 @@ mod history;
 mod images;
 mod inspect;
 mod lifecycle;
+mod load;
 mod log_output;
 mod output;
 mod ports;
@@ -22,6 +23,7 @@ mod ps_filter;
 mod pull;
 mod resources;
 mod rmi;
+mod save;
 mod secrets;
 mod socket;
 mod stats;
@@ -636,6 +638,19 @@ enum Commands {
     /// running sandbox uses is never deleted. -f deletes one that stopped
     /// sandboxes use, or one with several tags given by ID.
     Rmi(rmi::Args),
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Write images to a tar archive, as `docker save` does.
+    ///
+    /// The archive is an OCI image layout that `docker load` and `podman
+    /// load` also read. Each image is saved as one flattened layer.
+    Save(save::Args),
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Load images from a tar archive, as `docker load` does.
+    ///
+    /// Reads archives from `ward save`, `docker save` and `podman save`.
+    Load(load::Args),
 
     /// Add a tag to a local image, as `docker tag` does.
     Tag(tag::Args),
@@ -1555,6 +1570,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Rmi(args) => rmi::run(&socket_path, args).await?,
+
+        Commands::Save(args) => save::run(&socket_path, args).await?,
+
+        Commands::Load(args) => load::run(&socket_path, args).await?,
 
         Commands::Tag(args) => tag::run(&socket_path, args).await?,
 
