@@ -41,6 +41,13 @@ pub struct SandboxMeta {
     /// content: it lets a later start refuse a VM that would lack them.
     #[serde(default)]
     pub had_secrets: bool,
+    /// Restarts the daemon made since the sandbox was last started by hand.
+    #[serde(default)]
+    pub restart_count: u32,
+    /// Whether the last stop or kill came from a user, which ends restarts
+    /// until the sandbox is started again.
+    #[serde(default)]
+    pub manually_stopped: bool,
 }
 
 /// Hex SHA-256 of a capability token.
@@ -231,6 +238,7 @@ mod tests {
                     hostname: String::new(),
                     stop_signal: String::new(),
                     stop_timeout: None,
+                    restart: Default::default(),
                 },
             },
             created_at: SystemTime::now(),
@@ -241,6 +249,8 @@ mod tests {
             end_reason: None,
             token_hash: hash_token(TOKEN),
             had_secrets: false,
+            restart_count: 0,
+            manually_stopped: false,
         }
     }
 

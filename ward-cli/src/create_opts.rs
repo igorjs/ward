@@ -13,6 +13,7 @@ use clap::Args;
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{CreateSandboxRequest, SandboxInfo};
+use ward_core::protocol::{RestartKind, RestartPolicy};
 
 use crate::{client, lifecycle};
 
@@ -62,6 +63,10 @@ pub struct CreateExtras {
         allow_hyphen_values = true
     )]
     stop_timeout: Option<i32>,
+    /// What to do when the main process ends: no (default), on-failure[:N],
+    /// always or unless-stopped. Not with --rm.
+    #[arg(long, value_name = "POLICY", value_parser = parse_restart)]
+    restart: Option<RestartPolicy>,
     /// Accepted for Docker scripts. It has no effect.
     #[arg(long)]
     init: bool,
@@ -89,6 +94,23 @@ impl CreateExtras {
             request.stop_signal = signal.clone();
         }
         request.stop_timeout = self.stop_timeout;
+        request.restart_policy = self.restart.map(|policy| ward_core::pb::RestartPolicy {
+            name: policy.kind.as_str().to_string(),
+            maximum_retry_count: policy.max_retries,
+        });
+        Ok(())
+    }
+
+    /// Refuse `--rm` with a restart policy, as Docker does.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `rm` is set and a policy other than `no` is given.
+    pub fn check_rm(&self, rm: bool) -> Result<()> {
+        let restarts = self.restart.is_some_and(|p| p.kind != RestartKind::No);
+        if rm && restarts {
+            bail!("conflicting options: --restart and --rm");
+        }
         Ok(())
     }
 
@@ -99,6 +121,10 @@ impl CreateExtras {
             replace: self.replace.then(|| name.map(str::to_string)).flatten(),
         }
     }
+}
+
+fn parse_restart(text: &str) -> Result<RestartPolicy, String> {
+    RestartPolicy::parse(text)
 }
 
 fn host_env(key: &str) -> Option<String> {
@@ -522,6 +548,48 @@ mod tests {
 
         // Assert
         assert!(error.to_string().contains("--stop-signal"), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case::none(None, true, true)]
+    #[case::no(Some("no"), true, true)]
+    #[case::always_without_rm(Some("always"), false, true)]
+    #[case::always_with_rm(Some("always"), true, false)]
+    #[case::on_failure_with_rm(Some("on-failure:3"), true, false)]
+    fn given_restart_and_rm_when_checked_then_only_a_real_policy_conflicts(
+        #[case] restart: Option<&str>,
+        #[case] rm: bool,
+        #[case] ok: bool,
+    ) {
+        // Arrange
+        let extras = CreateExtras {
+            restart: restart.map(|text| RestartPolicy::parse(text).expect("policy")),
+            ..Default::default()
+        };
+
+        // Act
+        let result = extras.check_rm(rm);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn given_restart_flag_when_applied_then_the_request_carries_the_policy() {
+        // Arrange
+        let extras = CreateExtras {
+            restart: Some(RestartPolicy::parse("on-failure:3").expect("policy")),
+            ..Default::default()
+        };
+        let mut request = CreateSandboxRequest::default();
+
+        // Act
+        extras.apply(&mut request, &[]).expect("apply");
+
+        // Assert
+        let policy = request.restart_policy.expect("policy");
+        assert_eq!(policy.name, "on-failure");
+        assert_eq!(policy.maximum_retry_count, 3);
     }
 
     #[test]

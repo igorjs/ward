@@ -30,6 +30,23 @@ fn image() -> String {
     std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
 }
 
+const POLL_STEP: std::time::Duration = std::time::Duration::from_millis(200);
+const WAIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Time to show the restarts have stopped at the cap.
+const RESTART_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn wait_for_restart_count(d: &Daemon, id: &str, want: u32) {
+    let deadline = std::time::Instant::now() + WAIT_DEADLINE;
+    while std::time::Instant::now() < deadline {
+        let count = run_ok(d, &["inspect", "--format", "{{.RestartCount}}", id]);
+        if count.trim().parse::<u32>().is_ok_and(|n| n >= want) {
+            return;
+        }
+        std::thread::sleep(POLL_STEP);
+    }
+    panic!("{id} never restarted {want} times");
+}
+
 fn run_ok(d: &Daemon, args: &[&str]) -> String {
     let out = d.cli().args(args).output().expect("run ward");
     assert!(
@@ -124,4 +141,34 @@ fn given_stop_signal_when_stopped_then_the_guest_process_gets_it() {
 
     // Assert
     assert_eq!(code.trim(), "42");
+}
+
+#[test]
+fn given_on_failure_cap_when_the_guest_command_fails_then_it_is_restarted_that_many_times() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+    let id = run_ok(
+        &d,
+        &[
+            "run",
+            "-d",
+            "--restart",
+            "on-failure:2",
+            &image,
+            "sh",
+            "-c",
+            "exit 1",
+        ],
+    );
+    let id = id.trim();
+
+    // Act
+    wait_for_restart_count(&d, id, 2);
+    std::thread::sleep(RESTART_SETTLE);
+    let count = run_ok(&d, &["inspect", "--format", "{{.RestartCount}}", id]);
+
+    // Assert
+    assert_eq!(count.trim(), "2");
 }

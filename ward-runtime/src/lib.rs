@@ -110,6 +110,7 @@ impl Runtime {
             .with_default_limits(cfg.default_limits)
             .with_data_dir(data_dir.clone()),
         );
+        sandbox_manager.spawn_restart_supervisor();
         sandbox_manager.restore().await;
         let volume_manager = Arc::new(VolumeManager::new(data_dir, cfg.max_volumes));
         Self {
