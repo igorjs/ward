@@ -12,6 +12,7 @@ mod docker;
 mod egress;
 mod events;
 mod export;
+mod guest_opts;
 mod history;
 mod images;
 mod import;
@@ -150,6 +151,8 @@ struct SandboxOpts {
     exited_ttl: Option<u64>,
     #[command(flatten)]
     extras: create_opts::CreateExtras,
+    #[command(flatten)]
+    guest: guest_opts::GuestExtras,
     #[command(flatten)]
     isolation: isolation::IsolationFlags,
 }
@@ -538,6 +541,10 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         references: Vec<String>,
+        /// What to wait for: not-running, next-exit (the next time the main
+        /// process exits) or removed.
+        #[arg(long, value_enum, default_value_t)]
+        condition: wait::Condition,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -942,6 +949,7 @@ fn create_request(
         ..Default::default()
     };
     opts.extras.apply(&mut request, &opts.env)?;
+    opts.guest.apply(&mut request)?;
     Ok(request)
 }
 
@@ -1574,8 +1582,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             stats::run(&socket_path, &token_store, &references, options).await?;
         }
 
-        Commands::Wait { references } => {
-            wait::run(&socket_path, &token_store, &references, json).await?;
+        Commands::Wait {
+            references,
+            condition,
+        } => {
+            wait::run(&socket_path, &token_store, &references, condition, json).await?;
         }
 
         Commands::Events {

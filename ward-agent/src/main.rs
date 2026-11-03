@@ -33,6 +33,13 @@ async fn main() -> std::io::Result<()> {
         }
     }
     ward_agent::mount_all(&args.mounts)?;
+    let bind_targets: Vec<&str> = args.mounts.iter().map(|m| m.target.as_str()).collect();
+    ward_agent::guest_mounts::mount_tmpfs_all(
+        &args.tmpfs,
+        args.shm_size,
+        args.read_only,
+        &bind_targets,
+    )?;
     match ward_agent::setup_cgroup(args.pids_max) {
         Ok(()) => tracing::info!(pids_max = ?args.pids_max, "sandbox cgroup ready"),
         Err(e) => tracing::warn!(
@@ -46,6 +53,11 @@ async fn main() -> std::io::Result<()> {
             Ok(()) => tracing::info!("guest network configured"),
             Err(e) => tracing::warn!(error = %e, "guest network setup failed"),
         }
+    }
+
+    if args.read_only {
+        ward_agent::guest_mounts::remount_root_read_only()?;
+        tracing::info!("root filesystem is read-only");
     }
 
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, AGENT_VSOCK_PORT))?;
