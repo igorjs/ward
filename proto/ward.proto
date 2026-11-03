@@ -209,6 +209,35 @@ message GuestOptions {
   repeated string group_add = 8;
   // Limits the guest's cgroup enforces.
   CgroupLimits cgroup = 9;
+  // The health check the daemon runs in the guest, like `docker run --health-cmd`.
+  Healthcheck healthcheck = 10;
+}
+
+// Mirrors Docker's Config.Healthcheck. A zero duration or count uses the
+// default (30s interval, 30s timeout, 0s start period, 3 retries).
+message Healthcheck {
+  // ["CMD-SHELL", command], ["CMD", program, args...] or ["NONE"].
+  repeated string test = 1;
+  uint64 interval_ns = 2;
+  uint64 timeout_ns = 3;
+  uint64 start_period_ns = 4;
+  uint32 retries = 5;
+}
+
+// Mirrors Docker's State.Health.
+message HealthState {
+  // "starting", "healthy" or "unhealthy".
+  string status = 1;
+  uint32 failing_streak = 2;
+  // The last five checks, oldest first.
+  repeated HealthLogEntry log = 3;
+}
+
+message HealthLogEntry {
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  int32 exit_code = 3;
+  string output = 4;
 }
 
 // One `--ulimit NAME=SOFT:HARD`. -1 means unlimited.
@@ -363,6 +392,8 @@ message SandboxInfo {
   GuestOptions guest = 27;
   // Host directories shared into the guest, from `-v` and `--mount`.
   repeated Mount mounts = 28;
+  // Absent unless the sandbox has a health check.
+  HealthState health = 29;
 }
 
 enum EndReason {

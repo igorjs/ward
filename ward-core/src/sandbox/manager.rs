@@ -23,11 +23,14 @@ use crate::protocol::{
 };
 use crate::sandbox::copy;
 use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
+use crate::sandbox::health;
 use crate::sandbox::launch::{self, Launch, Overrides};
 use crate::sandbox::restart::{self, RestartRequest};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
+
+mod health_monitor;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -105,6 +108,8 @@ struct SandboxEntry {
     meta: SandboxMeta,
     /// Open while the sandbox runs; dropping them closes the host ports.
     listeners: Vec<PortListener>,
+    /// The checks of the current run, once the sandbox has a health check.
+    health: Option<health::Tracker>,
 }
 
 /// What leaves the `entries` map when a sandbox is removed.
@@ -1300,6 +1305,7 @@ impl SandboxManager {
             _creation_permit: permit,
             meta,
             listeners: Vec::new(),
+            health: None,
         };
         rearm_exited_ttl(&self.teardown(), &mut entry, ended_at);
         self.entries.write().await.insert(id.clone(), entry);
@@ -1544,6 +1550,7 @@ impl SandboxManager {
                 restart,
                 guest,
                 mounts: Vec::new(),
+                health: None,
             },
         };
 
@@ -1622,6 +1629,7 @@ impl SandboxManager {
                 _creation_permit: permit,
                 meta,
                 listeners,
+                health: None,
             },
         );
 
@@ -3305,6 +3313,17 @@ fn recorded_state(
         info.spec.restart = entry.meta.options.spec.restart;
         info.spec.guest = entry.meta.options.spec.guest.clone();
         info.spec.mounts = entry.meta.options.mounts.clone();
+        info.spec.health = entry
+            .health
+            .as_ref()
+            .map(health::Tracker::state)
+            .or_else(|| {
+                // The first check is not due yet, but the status is already known.
+                let config = entry.meta.options.spec.guest.healthcheck.as_ref();
+                let checked = config.and_then(health::Check::from_config).is_some();
+                (checked && entry.meta.status == crate::protocol::SandboxStatus::Running)
+                    .then(health::Tracker::starting_state)
+            });
         info.restart_count = entry.meta.restart_count;
         info.spec.name = entry.meta.options.spec.name.clone();
     }
@@ -3392,6 +3411,24 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         }),
         restart_count: info.restart_count,
         guest: Some(crate::guest_options::to_pb(&info.spec.guest)),
+        health: info
+            .spec
+            .health
+            .as_ref()
+            .map(|state| crate::pb::HealthState {
+                status: state.status.clone(),
+                failing_streak: state.failing_streak,
+                log: state
+                    .log
+                    .iter()
+                    .map(|entry| crate::pb::HealthLogEntry {
+                        start: Some(system_time_to_timestamp(entry.start)),
+                        end: Some(system_time_to_timestamp(entry.end)),
+                        exit_code: entry.exit_code,
+                        output: entry.output.clone(),
+                    })
+                    .collect(),
+            }),
         mounts: info
             .spec
             .mounts
@@ -7490,6 +7527,92 @@ pub(crate) mod tests {
             );
             tokio::time::sleep(TEST_POLL_STEP).await;
         }
+    }
+
+    /// Create a running sandbox whose health check runs `script`.
+    #[cfg(not(feature = "krunvm"))]
+    async fn create_checked(mgr: &SandboxManager, script: &str, retries: u32) -> String {
+        const CHECK_INTERVAL_NS: u64 = 50_000_000;
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec!["sleep".into(), "30".into()],
+            guest: Some(crate::pb::GuestOptions {
+                healthcheck: Some(crate::pb::Healthcheck {
+                    test: vec!["CMD-SHELL".into(), script.into()],
+                    interval_ns: CHECK_INTERVAL_NS,
+                    retries,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        mgr.create(req, "").await.expect("create").id
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn wait_for_health(mgr: &SandboxManager, id: &str, want: &str) -> crate::pb::HealthState {
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        loop {
+            let state = mgr.get(id).await.expect("get").health;
+            if let Some(state) = state.filter(|s| s.status == want) {
+                return state;
+            }
+            assert!(std::time::Instant::now() < deadline, "never became {want}");
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_check_that_passes_then_fails_when_it_runs_then_status_follows_with_events() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_health_supervisor();
+        let marker = std::env::temp_dir().join(format!("ward-health-{}", uuid::Uuid::new_v4()));
+        let script = format!("echo probing; test ! -e {}", marker.display());
+        let id = create_checked(&mgr, &script, 2).await;
+
+        // Act
+        let healthy = wait_for_health(&mgr, &id, "healthy").await;
+        std::fs::write(&marker, "").expect("mark");
+        let unhealthy = wait_for_health(&mgr, &id, "unhealthy").await;
+
+        // Assert
+        assert_eq!(healthy.failing_streak, 0);
+        assert!(unhealthy.failing_streak >= 2);
+        let last = unhealthy.log.last().expect("log");
+        assert_eq!(last.exit_code, 1);
+        assert!(unhealthy.log.len() <= crate::sandbox::health::MAX_LOG_ENTRIES);
+        assert!(healthy.log[0].output.contains("probing"));
+        let _ = std::fs::remove_file(&marker);
+        let mut reader = mgr
+            .events()
+            .subscribe(Some(std::time::SystemTime::UNIX_EPOCH));
+        let mut seen = Vec::new();
+        while let Ok(Some(next)) = tokio::time::timeout(TEST_POLL_STEP, reader.next()).await {
+            seen.push(next.event.action);
+        }
+        let want = [EventAction::HealthHealthy, EventAction::HealthUnhealthy];
+        assert!(seen.windows(2).any(|w| w == want), "{seen:?}");
+    }
+
+    #[test]
+    fn given_a_bad_healthcheck_when_created_then_it_is_refused() {
+        // Arrange
+        let guest = Some(crate::pb::GuestOptions {
+            healthcheck: Some(crate::pb::Healthcheck {
+                test: vec!["RUN".into(), "true".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        // Act
+        let result = crate::guest_options::validate(guest.as_ref(), &[], 0);
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[cfg(not(feature = "krunvm"))]

@@ -2,6 +2,7 @@
 
 mod copy;
 pub mod events;
+pub mod health;
 mod launch;
 mod manager;
 pub mod resource_metrics;
