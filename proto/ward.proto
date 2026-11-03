@@ -330,6 +330,8 @@ message SandboxInfo {
   RestartPolicy restart_policy = 25;
   // Times the daemon restarted the sandbox since it was last started by hand.
   uint32 restart_count = 26;
+  // Whether the main process runs on a pseudo-terminal.
+  bool tty = 30;
   // True while the sandbox's processes are frozen by Pause. Its status stays
   // running, as Docker's State.Running does.
   bool paused = 27;

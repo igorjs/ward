@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use rustix::termios::isatty;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::Channel;
@@ -21,12 +21,35 @@ use ward_core::pb::{
 };
 
 use crate::client::Resolved;
+use crate::detach_keys::{DetachFilter, DetachKeys, Filtered};
 use crate::terminal::{self, ExitSignals, RawModeGuard};
 
 /// Docker's wording, so scripts that match on it keep working.
 const NOT_A_TTY: &str = "the input device is not a TTY";
 const STDIN_CHUNK_BYTES: usize = 8192;
 const OUTBOUND_CAPACITY: usize = 16;
+
+/// What Docker prints after the detach keys are typed.
+const DETACHED_MESSAGE: &str = "read escape sequence";
+/// Docker exits 0 after a detach.
+const DETACHED_EXIT_CODE: i32 = 0;
+
+/// Settings of `docker attach` that the other attach commands leave alone.
+pub struct Options {
+    /// Typing this ends the attach and leaves the process running.
+    pub detach_keys: Option<DetachKeys>,
+    /// Hand SIGINT and SIGTERM to the process. Docker's `--sig-proxy`.
+    pub sig_proxy: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            detach_keys: None,
+            sig_proxy: true,
+        }
+    }
+}
 
 /// A piece of output with the stream it came from and, when the daemon sent
 /// one, the time it arrived.
@@ -112,38 +135,53 @@ pub async fn attach_with(
     forward_stdin: bool,
     sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
-    // Registered first so a signal during setup cannot leave raw mode on.
-    let mut exits = ExitSignals::register(!relays_signals(&start, forward_stdin))?;
-    attach_with_exits(client, target, start, forward_stdin, &mut exits, sink).await
+    attach_opts(
+        client,
+        target,
+        start,
+        forward_stdin,
+        &Options::default(),
+        sink,
+    )
+    .await
 }
 
-/// Like [`attach`], using handlers the caller registered with SIGINT and
-/// SIGTERM included, so the caller keeps hearing them once the attach ends.
-pub async fn attach_registered(
+/// Like [`attach_with`], with the settings of `docker attach`.
+pub async fn attach_opts(
     client: &mut WardClient<Channel>,
     target: &Resolved,
     start: AttachStart,
     forward_stdin: bool,
-    exits: &mut ExitSignals,
+    options: &Options,
+    sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
-    let sink = |output: Output| match output {
-        Output::Data(chunk) => write_to_terminal(chunk.stream, chunk.bytes),
-        Output::ReplayEnd => Ok(()),
-    };
-    attach_with_exits(client, target, start, forward_stdin, exits, sink).await
+    // Registered first so a signal during setup cannot leave raw mode on.
+    let relays = relays_signals(&start, forward_stdin, options.sig_proxy);
+    let mut exits = ExitSignals::register(!relays)?;
+    attach_with_exits(
+        client,
+        target,
+        start,
+        forward_stdin,
+        options,
+        &mut exits,
+        sink,
+    )
+    .await
 }
 
 /// SIGINT and SIGTERM go to the guest, unless the CLI owns the terminal
-/// (raw mode) or only watches (replay).
-fn relays_signals(start: &AttachStart, forward_stdin: bool) -> bool {
-    !(start.tty && forward_stdin) && !start.replay
+/// (raw mode), only watches (replay) or `--sig-proxy=false` is set.
+fn relays_signals(start: &AttachStart, forward_stdin: bool, sig_proxy: bool) -> bool {
+    sig_proxy && !(start.tty && forward_stdin) && !start.replay
 }
 
-async fn attach_with_exits(
+pub async fn attach_with_exits(
     client: &mut WardClient<Channel>,
     target: &Resolved,
     start: AttachStart,
     forward_stdin: bool,
+    options: &Options,
     exits: &mut ExitSignals,
     mut sink: impl FnMut(Output) -> std::io::Result<()>,
 ) -> Result<Option<i32>> {
@@ -152,8 +190,8 @@ async fn attach_with_exits(
     // Raw mode turns Ctrl-C into a byte, so it is only worth it when
     // stdin is forwarded. Dropped on every exit path, which restores it.
     let raw_input = tty && forward_stdin;
-    let relay_signals = relays_signals(&start, forward_stdin);
-    let _raw = if raw_input {
+    let relay_signals = relays_signals(&start, forward_stdin, options.sig_proxy);
+    let raw = if raw_input {
         Some(enter_raw_mode()?)
     } else {
         None
@@ -167,8 +205,10 @@ async fn attach_with_exits(
     if relay_signals {
         forward_signals(tx.clone())?;
     }
+    let (detach_tx, mut detach_rx) = oneshot::channel();
     if forward_stdin {
-        forward_stdin_bytes(tx.clone());
+        let filter = options.detach_keys.as_ref().map(DetachKeys::filter);
+        forward_stdin_bytes(tx.clone(), filter, detach_tx);
     } else if !replay {
         // Nothing will be typed, so tell the process its stdin is closed.
         send(&tx, Kind::Stdin(AttachStdin { data: Vec::new() })).await?;
@@ -180,11 +220,27 @@ async fn attach_with_exits(
         relay_replies(replies, replay, &mut sink).await
     };
     // `tx` lives to here, so the client half stays open until the end.
+    let detached = async {
+        // A closed stdin drops the sender without a detach.
+        match (&mut detach_rx).await {
+            Ok(()) => (),
+            Err(_) => std::future::pending().await,
+        }
+    };
+    let mut was_detached = false;
     let outcome = tokio::select! {
         outcome = streaming => outcome,
         code = recv_exit(exits, relay_signals) => Ok(Some(code)),
+        () = detached => {
+            was_detached = true;
+            Ok(Some(DETACHED_EXIT_CODE))
+        }
     };
     drop(tx);
+    drop(raw);
+    if was_detached {
+        eprintln!("{DETACHED_MESSAGE}");
+    }
     if relay_signals {
         // Already relayed to the guest, not meant for the caller's next wait.
         exits.discard_pending_interrupts();
@@ -285,10 +341,15 @@ fn forward_signals(tx: mpsc::Sender<AttachMessage>) -> Result<()> {
 }
 
 /// Copies stdin to the stream, then sends the empty message that means EOF.
+/// With a `filter`, typing its sequence signals `detach` and stops the copy.
 ///
 /// Runs on its own thread: a blocking read on the runtime would stall its
 /// shutdown on the error path.
-fn forward_stdin_bytes(tx: mpsc::Sender<AttachMessage>) {
+fn forward_stdin_bytes(
+    tx: mpsc::Sender<AttachMessage>,
+    mut filter: Option<DetachFilter>,
+    detach: oneshot::Sender<()>,
+) {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin().lock();
         let mut buf = vec![0u8; STDIN_CHUNK_BYTES];
@@ -297,7 +358,19 @@ fn forward_stdin_bytes(tx: mpsc::Sender<AttachMessage>) {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 other => other.unwrap_or(0),
             };
-            let data = buf[..read].to_vec();
+            let mut data = buf[..read].to_vec();
+            if let Some(filter) = filter.as_mut().filter(|_| read > 0) {
+                match filter.feed(&data) {
+                    Filtered::Pass(passed) => data = passed,
+                    Filtered::Detach => {
+                        let _ = detach.send(());
+                        return;
+                    }
+                }
+                if data.is_empty() {
+                    continue;
+                }
+            }
             let message = AttachMessage {
                 kind: Some(Kind::Stdin(AttachStdin { data })),
             };
