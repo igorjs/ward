@@ -20,6 +20,9 @@ const COMMENT_OPEN: &str = "/*";
 const COMMENT_CLOSE: &str = "*/";
 /// `{{- ` and ` -}}` trim the white space around an action.
 const TRIM_MARK: char = '-';
+/// Deep enough for any real template, shallow enough for the default stack.
+const MAX_NESTING_DEPTH: usize = 200;
+const MAX_RANGE_VARIABLES: usize = 2;
 /// A column that accepts any field path, for records without a fixed shape.
 pub const ANY_FIELD: &str = "*";
 const PATH_SEPARATOR: char = '.';
@@ -125,7 +128,7 @@ impl Template {
         let body = body.replace("\\t", "\t").replace("\\n", "\n");
         let pieces = split(&body, format)?;
         let mut pieces = pieces.into_iter();
-        let (nodes, stop) = parse_block(&mut pieces)?;
+        let (nodes, stop) = parse_block(&mut pieces, 0)?;
         if !matches!(stop, Stop::Eof) {
             bail!("template {format:?} has an unexpected else or end");
         }
@@ -326,9 +329,9 @@ fn split(body: &str, format: &str) -> Result<Vec<Piece>> {
     let mut rest = body;
     let mut trim_next = false;
     while let Some((text, tail)) = rest.split_once(ACTION_OPEN) {
-        let (action, after) = tail
-            .split_once(ACTION_CLOSE)
+        let end = action_end(tail)
             .ok_or_else(|| anyhow!("template {format:?} has an unclosed {ACTION_OPEN}"))?;
+        let (action, after) = (&tail[..end], &tail[end + ACTION_CLOSE.len()..]);
         let mut text = if trim_next { text.trim_start() } else { text };
         let mut action = action;
         if let Some(stripped) = trim_marked(action, true) {
@@ -350,6 +353,54 @@ fn split(body: &str, format: &str) -> Result<Vec<Piece>> {
     let rest = if trim_next { rest.trim_start() } else { rest };
     pieces.push(Piece::Text(rest.to_string()));
     Ok(pieces)
+}
+
+fn char_literal(chars: &[char], start: usize) -> Result<(char, usize)> {
+    let (character, end) = match (chars.get(start + 1), chars.get(start + 2)) {
+        (Some('\\'), Some(escaped)) => (
+            match escaped {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => *other,
+            },
+            start + 3,
+        ),
+        (Some(&c), _) if c != '\'' => (c, start + 2),
+        _ => bail!("malformed character constant"),
+    };
+    if chars.get(end) != Some(&'\'') {
+        bail!("unterminated character constant");
+    }
+    Ok((character, end + 1))
+}
+
+/// Where the closing `}}` of the action in `tail` starts. A `}}` inside a
+/// quoted string or a comment does not close it.
+fn action_end(tail: &str) -> Option<usize> {
+    let body = tail.trim_start_matches(TRIM_MARK).trim_start();
+    let mut from = tail.len() - body.len();
+    if body.starts_with(COMMENT_OPEN) {
+        from += body.find(COMMENT_CLOSE)? + COMMENT_CLOSE.len();
+        return tail[from..].find(ACTION_CLOSE).map(|at| from + at);
+    }
+    let mut quote: Option<char> = None;
+    let mut chars = tail[from..].char_indices();
+    while let Some((offset, c)) = chars.next() {
+        match (quote, c) {
+            (Some('"' | '\''), '\\') => {
+                chars.next();
+            }
+            (Some(open), _) if c == open => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '`' | '\'') => quote = Some(c),
+            (None, _) if tail[from + offset..].starts_with(ACTION_CLOSE) => {
+                return Some(from + offset);
+            }
+            (None, _) => {}
+        }
+    }
+    None
 }
 
 /// The action without its `-` trim mark, if it has one on the given side.
@@ -391,6 +442,19 @@ fn lex(action: &str) -> Result<Vec<Token>> {
             '"' => {
                 let (text, next) = quoted(&chars, i)?;
                 tokens.push(Token::Literal(Value::String(text)));
+                i = next;
+            }
+            '`' => {
+                let Some(length) = chars[i + 1..].iter().position(|&c| c == '`') else {
+                    bail!("unterminated raw quoted string");
+                };
+                let text: String = chars[i + 1..i + 1 + length].iter().collect();
+                tokens.push(Token::Literal(Value::String(text)));
+                i += length + 2;
+            }
+            '\'' => {
+                let (character, next) = char_literal(&chars, i)?;
+                tokens.push(Token::Literal(Value::from(u32::from(character))));
                 i = next;
             }
             '$' => {
@@ -497,7 +561,15 @@ fn quoted(chars: &[char], start: usize) -> Result<(String, usize)> {
 
 // ---- parsing ----
 
-fn parse_block(pieces: &mut std::vec::IntoIter<Piece>) -> Result<(Vec<Node>, Stop)> {
+fn check_depth(depth: usize) -> Result<()> {
+    if depth > MAX_NESTING_DEPTH {
+        bail!("template nests deeper than {MAX_NESTING_DEPTH} levels");
+    }
+    Ok(())
+}
+
+fn parse_block(pieces: &mut std::vec::IntoIter<Piece>, depth: usize) -> Result<(Vec<Node>, Stop)> {
+    check_depth(depth)?;
     let mut nodes = Vec::new();
     while let Some(piece) = pieces.next() {
         let tokens = match piece {
@@ -516,7 +588,7 @@ fn parse_block(pieces: &mut std::vec::IntoIter<Piece>) -> Result<(Vec<Node>, Sto
             }
             Some(Token::Word(word)) if matches!(word.as_str(), "if" | "with" | "range") => {
                 let word = word.clone();
-                nodes.push(parse_branch(&word, &tokens[1..], pieces)?);
+                nodes.push(parse_branch(&word, &tokens[1..], pieces, depth + 1)?);
             }
             Some(Token::Word(word))
                 if matches!(
@@ -526,7 +598,7 @@ fn parse_block(pieces: &mut std::vec::IntoIter<Piece>) -> Result<(Vec<Node>, Sto
             {
                 bail!("unsupported action {word:?} in --format")
             }
-            Some(_) => nodes.push(Node::Action(parse_pipeline_tokens(&tokens)?)),
+            Some(_) => nodes.push(Node::Action(parse_pipeline_tokens(&tokens, depth)?)),
             None => bail!("missing value for command"),
         }
     }
@@ -537,23 +609,29 @@ fn parse_branch(
     keyword: &str,
     tokens: &[Token],
     pieces: &mut std::vec::IntoIter<Piece>,
+    depth: usize,
 ) -> Result<Node> {
-    let pipeline = parse_pipeline_tokens(tokens)?;
-    let (then, stop) = parse_block(pieces)?;
+    check_depth(depth)?;
+    let pipeline = parse_pipeline_tokens(tokens, depth)?;
+    if keyword == "range" && pipeline.variables.len() > MAX_RANGE_VARIABLES {
+        bail!("range can only initialize {MAX_RANGE_VARIABLES} variables");
+    }
+    let (then, stop) = parse_block(pieces, depth)?;
     let otherwise = match stop {
         Stop::End => Vec::new(),
         Stop::Eof => bail!("unexpected EOF: missing {{{{end}}}} for {keyword}"),
         Stop::Else(rest) => match rest.split_first() {
-            Some((Token::Word(word), tail)) if word == "if" && keyword == "if" => {
-                vec![parse_branch("if", tail, pieces)?]
+            Some((Token::Word(word), tail)) if word == keyword && keyword != "range" => {
+                vec![parse_branch(keyword, tail, pieces, depth + 1)?]
             }
             Some(_) => bail!("unexpected tokens after else"),
             None => {
-                let (otherwise, stop) = parse_block(pieces)?;
-                if !matches!(stop, Stop::End) {
-                    bail!("unexpected EOF: missing {{{{end}}}} for {keyword}");
+                let (otherwise, stop) = parse_block(pieces, depth)?;
+                match stop {
+                    Stop::End => otherwise,
+                    Stop::Else(_) => bail!("unexpected {{{{else}}}} in {keyword}"),
+                    Stop::Eof => bail!("unexpected EOF: missing {{{{end}}}} for {keyword}"),
                 }
-                otherwise
             }
         },
     };
@@ -569,28 +647,29 @@ fn parse_branch(
     })
 }
 
-fn parse_pipeline_tokens(tokens: &[Token]) -> Result<Pipeline> {
+fn parse_pipeline_tokens(tokens: &[Token], depth: usize) -> Result<Pipeline> {
     let mut position = 0;
-    let pipeline = parse_pipeline(tokens, &mut position)?;
+    let pipeline = parse_pipeline(tokens, &mut position, depth)?;
     if position < tokens.len() {
         bail!("unexpected {:?} in --format", tokens[position]);
     }
     Ok(pipeline)
 }
 
-fn parse_pipeline(tokens: &[Token], position: &mut usize) -> Result<Pipeline> {
+fn parse_pipeline(tokens: &[Token], position: &mut usize, depth: usize) -> Result<Pipeline> {
+    check_depth(depth)?;
     let mut pipeline = Pipeline::default();
-    let names = declaration(tokens);
+    let names = declaration(&tokens[*position..]);
     if let Some((names, consumed)) = names {
         pipeline.variables = names;
-        *position = consumed;
+        *position += consumed;
     }
     loop {
         let mut command = Vec::new();
         while let Some(token) = tokens.get(*position) {
             match token {
                 Token::Pipe | Token::Close => break,
-                _ => command.push(parse_operand(tokens, position)?),
+                _ => command.push(parse_operand(tokens, position, depth)?),
             }
         }
         if command.is_empty() {
@@ -629,7 +708,7 @@ fn declaration(tokens: &[Token]) -> Option<(Vec<String>, usize)> {
     }
 }
 
-fn parse_operand(tokens: &[Token], position: &mut usize) -> Result<Operand> {
+fn parse_operand(tokens: &[Token], position: &mut usize, depth: usize) -> Result<Operand> {
     let token = tokens[*position].clone();
     *position += 1;
     Ok(match token {
@@ -644,7 +723,7 @@ fn parse_operand(tokens: &[Token], position: &mut usize) -> Result<Operand> {
             Operand::Function(name)
         }
         Token::Open => {
-            let inner = parse_pipeline(tokens, position)?;
+            let inner = parse_pipeline(tokens, position, depth + 1)?;
             if tokens.get(*position) != Some(&Token::Close) {
                 bail!("unclosed left paren");
             }
@@ -691,6 +770,8 @@ impl Run {
                     }
                 }
                 Node::If(branch) => {
+                    // Variables of the condition live until the block ends.
+                    let block = self.variables.len();
                     let value = self.pipeline(&branch.pipeline, dot)?;
                     let chosen = if truthy(&value) {
                         &branch.then
@@ -698,14 +779,17 @@ impl Run {
                         &branch.otherwise
                     };
                     self.nodes(chosen, dot)?;
+                    self.variables.truncate(block);
                 }
                 Node::With(branch) => {
+                    let block = self.variables.len();
                     let value = self.pipeline(&branch.pipeline, dot)?;
                     if truthy(&value) {
                         self.nodes(&branch.then, &value)?;
                     } else {
                         self.nodes(&branch.otherwise, dot)?;
                     }
+                    self.variables.truncate(block);
                 }
                 Node::Range(branch) => self.range(branch, dot)?,
             }
@@ -775,8 +859,19 @@ impl Run {
             .split_first()
             .ok_or_else(|| anyhow!("missing value for command"))?;
         let mut args = Vec::with_capacity(rest.len() + 1);
+        // `and` stops at the first false operand and `or` at the first true
+        // one, so the operands after it are never evaluated.
+        let stop_on = match head {
+            Operand::Function(name) if name == "and" => Some(false),
+            Operand::Function(name) if name == "or" => Some(true),
+            _ => None,
+        };
         for operand in rest {
-            args.push(self.operand(operand, dot)?);
+            let value = self.operand(operand, dot)?;
+            if stop_on == Some(truthy(&value)) {
+                return Ok(value);
+            }
+            args.push(value);
         }
         args.extend(piped);
         match head {
@@ -959,6 +1054,14 @@ mod tests {
     #[case::trim_markers("a {{- \"b\" -}} c", "abc")]
     #[case::comment("a{{/* hidden */}}b", "ab")]
     #[case::number_compare("{{if gt .State.Code 2}}big{{end}}", "big")]
+    #[case::declare_group("{{$x := (index .Tags 0)}}{{$x}}", "a")]
+    #[case::declare_in_if("{{if $n := (len .Tags)}}{{$n}}{{end}}", "2")]
+    #[case::range_group("{{range $i, $v := (split \"x:y\" \":\")}}{{$i}}{{end}}", "01")]
+    #[case::quoted_close("{{\"}}\"}}", "}}")]
+    #[case::comment_close("a{{/* x }} y */}}b", "ab")]
+    #[case::else_with("{{with .Empty}}x{{else with .Name}}{{.}}{{end}}", "web")]
+    #[case::and_short_circuits("{{if and .Empty (index .Empty 0)}}x{{end}}", "")]
+    #[case::or_short_circuits("{{if or .Name (index .Empty 0)}}y{{end}}", "y")]
     fn given_go_syntax_when_rendered_then_it_matches_go_templates(
         #[case] format: &str,
         #[case] expected: &str,
@@ -968,6 +1071,15 @@ mod tests {
         let out = template.render(&[deep()]).expect("render");
 
         assert_eq!(out, format!("{expected}\n"));
+    }
+
+    #[test]
+    fn given_a_variable_of_an_if_condition_when_used_after_end_then_it_is_undefined() {
+        let template = Template::parse("{{if $n := .Name}}{{end}}{{$n}}", &ANY).expect("parse");
+
+        let error = template.render(&[deep()]).expect_err("fails");
+
+        assert!(error.to_string().contains("undefined variable"), "{error}");
     }
 
     #[test]
@@ -986,5 +1098,67 @@ mod tests {
         let out = template.render(&[deep()]).expect("render");
 
         assert_eq!(out, "NAME   STATUS\nweb    running\n");
+    }
+
+    #[test]
+    fn given_deeply_nested_blocks_when_parsed_then_it_fails_without_overflowing() {
+        let depth = 20_000;
+        let source = format!("{}x{}", "{{if 1}}".repeat(depth), "{{end}}".repeat(depth));
+
+        let error = Template::parse(&source, &ANY).err().expect("fails");
+
+        assert!(error.to_string().contains("nests deeper"), "{error}");
+    }
+
+    #[test]
+    fn given_deeply_nested_parentheses_when_parsed_then_it_fails_without_overflowing() {
+        let depth = 20_000;
+        let source = format!("{{{{{}1{}}}}}", "(".repeat(depth), ")".repeat(depth));
+
+        let error = Template::parse(&source, &ANY).err().expect("fails");
+
+        assert!(error.to_string().contains("nests deeper"), "{error}");
+    }
+
+    #[test]
+    fn given_a_long_else_if_chain_when_parsed_then_it_fails_without_overflowing() {
+        let source = format!("{{{{if 0}}}}{}{{{{end}}}}", "{{else if 0}}".repeat(20_000));
+
+        let error = Template::parse(&source, &ANY).err().expect("fails");
+
+        assert!(error.to_string().contains("nests deeper"), "{error}");
+    }
+
+    #[test]
+    fn given_two_else_actions_when_parsed_then_it_fails() {
+        let error = Template::parse("{{if 1}}a{{else}}b{{else}}c{{end}}", &ANY)
+            .err()
+            .expect("fails");
+
+        assert!(error.to_string().contains("unexpected {{else}}"), "{error}");
+    }
+
+    #[test]
+    fn given_a_range_with_three_variables_when_parsed_then_it_fails() {
+        let error = Template::parse("{{range $a, $b, $c := .Tags}}{{end}}", &ANY)
+            .err()
+            .expect("fails");
+
+        assert!(error.to_string().contains("range can only"), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case::raw_string("{{`a}}b`}}", "a}}b")]
+    #[case::char_literal("{{'a'}}", "97")]
+    #[case::escaped_char_literal("{{'\\n'}}", "10")]
+    fn given_go_literals_when_rendered_then_they_match_go(
+        #[case] format: &str,
+        #[case] expected: &str,
+    ) {
+        let template = Template::parse(format, &ANY).expect("parse");
+
+        let out = template.render(&[deep()]).expect("render");
+
+        assert_eq!(out, format!("{expected}\n"));
     }
 }

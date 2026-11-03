@@ -6,7 +6,7 @@
 use anyhow::{Result, bail};
 use clap::Args;
 use ward_core::guest_options::check_tmpfs_options;
-use ward_core::pb::{CreateSandboxRequest, GuestOptions, Mount, TmpfsMount};
+use ward_core::pb::{CgroupLimits, CreateSandboxRequest, GuestOptions, Mount, TmpfsMount, Ulimit};
 
 use crate::resources::parse_size_bytes;
 
@@ -53,7 +53,43 @@ pub struct GuestExtras {
     /// Add a resolver option such as ndots:2 to /etc/resolv.conf. Repeatable.
     #[arg(long = "dns-option", value_name = "OPTION")]
     dns_option: Vec<String>,
+    /// Set a resource limit on every process: NAME=SOFT[:HARD], where -1 is
+    /// unlimited. Names: core, cpu, data, fsize, locks, memlock, msgqueue,
+    /// nice, nofile, nproc, rss, rtprio, rttime, sigpending, stack. Repeatable.
+    #[arg(long, value_name = "NAME=SOFT[:HARD]")]
+    ulimit: Vec<String>,
+    /// Add a supplementary group, by name or id, to every process. Repeatable.
+    #[arg(long = "group-add", value_name = "GROUP|GID")]
+    group_add: Vec<String>,
+    /// Only a value equal to --memory is accepted: the guest has no swap.
+    #[arg(long = "memory-swap", value_name = "SIZE", allow_hyphen_values = true)]
+    memory_swap: Option<String>,
+    /// Memory the guest cgroup protects from reclaim (memory.low). Must not
+    /// exceed --memory.
+    #[arg(long = "memory-reservation", value_name = "SIZE")]
+    memory_reservation: Option<String>,
+    /// Relative CPU weight, 2 to 262144 (default 1024), as cgroup v2 cpu.weight.
+    #[arg(long = "cpu-shares", value_name = "N")]
+    cpu_shares: Option<u32>,
+    /// CPUs the processes may use, such as 0-1,3 (cpuset.cpus).
+    #[arg(long = "cpuset-cpus", value_name = "LIST")]
+    cpuset_cpus: Option<String>,
+    /// Length of a CPU scheduling period in microseconds, 1000 to 1000000.
+    #[arg(long = "cpu-period", value_name = "MICROSECONDS")]
+    cpu_period: Option<u64>,
+    /// CPU time per period in microseconds, at least 1000; -1 or 0 for none.
+    #[arg(
+        long = "cpu-quota",
+        value_name = "MICROSECONDS",
+        allow_negative_numbers = true
+    )]
+    cpu_quota: Option<i64>,
 }
+
+const ULIMIT_SEPARATOR: char = '=';
+const ULIMIT_HARD_SEPARATOR: char = ':';
+/// The value that means unlimited, for sizes and ulimits.
+const UNLIMITED: i64 = -1;
 
 const DNS_REFUSAL: &str = "--dns is not supported: the sandbox resolves names through the host relay that enforces --egress, and no other name server is reachable. See docs/docker-differences.md";
 
@@ -72,6 +108,13 @@ impl GuestExtras {
             extra_hosts: self.add_host.clone(),
             dns_search: self.dns_search.clone(),
             dns_options: self.dns_option.clone(),
+            ulimits: self
+                .ulimit
+                .iter()
+                .map(|spec| parse_ulimit(spec))
+                .collect::<Result<_>>()?,
+            group_add: self.group_add.clone(),
+            cgroup: Some(self.cgroup_limits()?),
             ..GuestOptions::default()
         };
         for spec in &self.tmpfs {
@@ -89,6 +132,43 @@ impl GuestExtras {
         request.guest = Some(guest);
         Ok(())
     }
+}
+
+impl GuestExtras {
+    fn cgroup_limits(&self) -> Result<CgroupLimits> {
+        let swap = match self.memory_swap.as_deref() {
+            None => 0,
+            Some(text) if text.trim() == "-1" => UNLIMITED,
+            Some(text) => i64::try_from(parse_size_bytes(text)?)?,
+        };
+        Ok(CgroupLimits {
+            memory_swap_bytes: swap,
+            memory_reservation_bytes: self
+                .memory_reservation
+                .as_deref()
+                .map(parse_size_bytes)
+                .transpose()?
+                .unwrap_or_default(),
+            cpu_shares: self.cpu_shares.unwrap_or_default(),
+            cpuset_cpus: self.cpuset_cpus.clone().unwrap_or_default(),
+            cpu_period: self.cpu_period.unwrap_or_default(),
+            cpu_quota: self.cpu_quota.unwrap_or_default(),
+        })
+    }
+}
+
+/// Parse `NAME=SOFT[:HARD]` of `--ulimit`. HARD defaults to SOFT.
+fn parse_ulimit(spec: &str) -> Result<Ulimit> {
+    let bad = || anyhow::anyhow!("invalid --ulimit '{spec}': use NAME=SOFT[:HARD]");
+    let (name, values) = spec.split_once(ULIMIT_SEPARATOR).ok_or_else(bad)?;
+    let (soft, hard) = values
+        .split_once(ULIMIT_HARD_SEPARATOR)
+        .unwrap_or((values, values));
+    Ok(Ulimit {
+        name: name.to_string(),
+        soft: soft.parse().map_err(|_| bad())?,
+        hard: hard.parse().map_err(|_| bad())?,
+    })
 }
 
 /// Parse `PATH[:OPTIONS]` of `--tmpfs`.
@@ -313,6 +393,56 @@ mod tests {
             ["/run", "/cache"]
         );
         assert_eq!(request.mounts.len(), 1);
+    }
+
+    #[rstest::rstest]
+    #[case::soft_only("nofile=1024", "nofile", 1024, 1024)]
+    #[case::both("nproc=100:200", "nproc", 100, 200)]
+    #[case::unlimited("memlock=-1", "memlock", -1, -1)]
+    fn given_ulimit_flag_when_parsed_then_hard_defaults_to_soft(
+        #[case] spec: &str,
+        #[case] name: &str,
+        #[case] soft: i64,
+        #[case] hard: i64,
+    ) {
+        // Act
+        let parsed = parse_ulimit(spec).unwrap();
+
+        // Assert
+        assert_eq!(
+            (parsed.name.as_str(), parsed.soft, parsed.hard),
+            (name, soft, hard)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::no_value("nofile")]
+    #[case::not_a_number("nofile=many")]
+    #[case::bad_hard("nofile=1:x")]
+    fn given_a_bad_ulimit_flag_when_parsed_then_it_shows_the_format(#[case] spec: &str) {
+        let error = parse_ulimit(spec).unwrap_err();
+
+        assert!(error.to_string().contains("NAME=SOFT[:HARD]"), "{error}");
+    }
+
+    #[test]
+    fn given_cgroup_flags_when_applied_then_sizes_are_bytes_and_swap_may_be_unlimited() {
+        // Arrange
+        let extras = GuestExtras {
+            memory_swap: Some("-1".into()),
+            memory_reservation: Some("64m".into()),
+            cpu_shares: Some(512),
+            cpu_quota: Some(-1),
+            ..Default::default()
+        };
+
+        // Act
+        let limits = extras.cgroup_limits().unwrap();
+
+        // Assert
+        assert_eq!(limits.memory_swap_bytes, -1);
+        assert_eq!(limits.memory_reservation_bytes, 64 << 20);
+        assert_eq!((limits.cpu_shares, limits.cpu_quota), (512, -1));
     }
 
     #[test]
