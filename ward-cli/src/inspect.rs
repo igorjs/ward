@@ -258,7 +258,7 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
     };
     if let Some(template) = template {
         let records: Vec<_> = shown.into_iter().filter_map(template_record).collect();
-        print!("{}", template.render(&records));
+        print!("{}", template.render(&records)?);
         return Ok(());
     }
     if options.json {
@@ -577,7 +577,7 @@ pub async fn inspect(
                     _ => None,
                 })
                 .collect();
-            print!("{}", template.render(&records));
+            print!("{}", template.render(&records)?);
         }
         None => println!("{}", serde_json::to_string_pretty(&found)?),
     }

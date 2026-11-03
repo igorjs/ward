@@ -78,7 +78,7 @@ pub async fn run(socket: &str, args: Args, json: bool) -> Result<()> {
             Value::Array(records.into_iter().map(Value::Object).collect())
         );
     } else {
-        print!("{}", template.render(&records));
+        print!("{}", template.render(&records)?);
     }
     Ok(())
 }
@@ -171,7 +171,7 @@ mod tests {
         let template = Template::parse(DEFAULT_FORMAT, &FIELDS).expect("parse");
 
         // Act
-        let out = template.render(&records);
+        let out = template.render(&records).unwrap();
 
         // Assert
         let rows: Vec<&str> = out.lines().skip(1).collect();

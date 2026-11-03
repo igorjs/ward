@@ -42,6 +42,7 @@ mod stats;
 mod system;
 mod tag;
 mod template;
+mod template_funcs;
 mod terminal;
 mod tokens;
 mod top;
