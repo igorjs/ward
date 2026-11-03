@@ -114,6 +114,12 @@ service Ward {
   // Add the images of an archive to the cache, like `docker load`. Needs no
   // sandbox token. Docker and OCI layout archives are accepted.
   rpc LoadImages(stream ArchiveChunk) returns (LoadImagesResponse);
+  // Write a sandbox's filesystem as a tar archive, like `docker export`. The
+  // token travels in call metadata. Works in any sandbox state.
+  rpc ExportSandbox(ExportSandboxRequest) returns (stream ArchiveChunk);
+  // Make a one-layer image from a tar archive, like `docker import`. Needs
+  // no sandbox token. The first message carries the settings and no data.
+  rpc ImportImage(stream ImportImageMessage) returns (ImportImageResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -875,4 +881,25 @@ message LoadedImage {
 
 message LoadImagesResponse {
   repeated LoadedImage images = 1;
+}
+
+message ExportSandboxRequest {
+  string sandbox_id = 1;
+}
+
+message ImportImageMessage {
+  // Settings; read from the first message only.
+  // Local tag for the new image. Empty leaves it untagged.
+  string reference = 1;
+  string message = 2;
+  // Dockerfile instructions applied to the image config: CMD, ENTRYPOINT,
+  // ENV, WORKDIR and USER.
+  repeated string changes = 3;
+  // A piece of the tar archive, plain or gzip.
+  bytes data = 4;
+}
+
+message ImportImageResponse {
+  // Id of the new image, e.g. sha256:...
+  string image_id = 1;
 }

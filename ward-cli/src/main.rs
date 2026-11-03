@@ -10,8 +10,10 @@ mod diff;
 mod docker;
 mod egress;
 mod events;
+mod export;
 mod history;
 mod images;
+mod import;
 mod inspect;
 mod lifecycle;
 mod load;
@@ -551,6 +553,8 @@ enum Commands {
         /// Print only the image reference once the pull is done.
         #[arg(short, long)]
         quiet: bool,
+        #[command(flatten)]
+        flags: pull::Flags,
         /// Image to pull: IMAGE[:TAG|@DIGEST].
         image: String,
     },
@@ -616,6 +620,17 @@ enum Commands {
     ///
     /// Reads archives from `ward save`, `docker save` and `podman save`.
     Load(load::Args),
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Write a sandbox's filesystem to a tar archive, as `docker export` does.
+    ///
+    /// Works in any state. Owners are written as root.
+    Export(export::Args),
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Make a one-layer local image from a tar archive, as `docker import`
+    /// does, and print its id.
+    Import(import::Args),
 
     /// Add a tag to a local image, as `docker tag` does.
     Tag(tag::Args),
@@ -1381,7 +1396,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             images::run(&socket_path, options).await?;
         }
 
-        Commands::Pull { quiet, image } => {
+        Commands::Pull {
+            quiet,
+            flags,
+            image,
+        } => {
+            flags.check()?;
             pull::run(&socket_path, &image, quiet).await?;
         }
 
@@ -1412,6 +1432,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Save(args) => save::run(&socket_path, args).await?,
 
         Commands::Load(args) => load::run(&socket_path, args).await?,
+
+        Commands::Export(args) => export::run(&socket_path, &token_store, args).await?,
+
+        Commands::Import(args) => import::run(&socket_path, args).await?,
 
         Commands::Tag(args) => tag::run(&socket_path, args).await?,
 

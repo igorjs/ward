@@ -458,6 +458,28 @@ impl Backend for KrunvmBackend {
         self.image_store.load_images(chunks).await
     }
 
+    async fn export_sandbox(&self, sandbox_id: &str) -> Result<super::image::SavedArchive> {
+        let rootfs = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes
+                .get(sandbox_id)
+                .ok_or_else(|| BackendError::NotFound(sandbox_id.to_string()))?
+                .rootfs
+                .clone()
+        };
+        self.image_store
+            .export_rootfs(&rootfs, BOOT_WRITTEN_PATHS)
+            .await
+    }
+
+    async fn import_image(
+        &self,
+        spec: super::image::ImportSpec,
+        chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<super::image::LoadedImage> {
+        self.image_store.import_image(spec, chunks).await
+    }
+
     async fn image_history(&self, name: &str) -> Result<super::image::HistoryView> {
         self.image_store.image_history(name)
     }
