@@ -36,6 +36,7 @@ const SHORT_ID_LEN: usize = 12;
 const UNKNOWN_EXIT_CODE: i32 = 255;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const UNLIMITED_SWAP: i64 = -1;
+const STATUS_STARTING: &str = "starting";
 const READ_ONLY_MODE: &str = "ro";
 const BIND_PROPAGATION: &str = "rprivate";
 const NANOS_PER_CPU: u64 = 1_000_000_000;
@@ -142,7 +143,10 @@ fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
         SandboxStatus::Running => {
             let uptime = seconds_since(&info.started_at, now_seconds).unwrap_or(since_created);
             let paused = if info.paused { PAUSED_SUFFIX } else { "" };
-            format!("Up {}{paused}", duration_text(uptime))
+            match health_suffix(info).filter(|_| !info.paused) {
+                Some(suffix) => format!("Up {} ({suffix})", duration_text(uptime)),
+                None => format!("Up {}{paused}", duration_text(uptime)),
+            }
         }
         SandboxStatus::Exited => {
             let code = info.exit_code.unwrap_or_default();
@@ -157,6 +161,16 @@ fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
         SandboxStatus::Stopping => "Stopping".to_string(),
         SandboxStatus::Unspecified => "Unknown".to_string(),
     }
+}
+
+/// Docker's note after a running sandbox's uptime: `healthy`, `unhealthy` or
+/// `health: starting`. `None` without a health check.
+fn health_suffix(info: &SandboxInfo) -> Option<String> {
+    let status = info.health.as_ref()?.status.as_str();
+    Some(match status {
+        STATUS_STARTING => format!("health: {STATUS_STARTING}"),
+        other => other.to_string(),
+    })
 }
 
 /// One `ps` row. Only argv[0] of the command is shown, since arguments can
@@ -351,26 +365,42 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     if let Some(seconds) = info.stop_timeout {
         config["StopTimeout"] = json!(seconds);
     }
+    if let Some(check) = info.guest.as_ref().and_then(|g| g.healthcheck.as_ref()) {
+        config["Healthcheck"] = healthcheck_value(check);
+    }
+    let mut state = json!({
+        "Status": state_name(info),
+        "Running": info.status == SandboxStatus::Running as i32,
+        "Paused": info.paused,
+        "ExitCode": state_exit_code(info),
+        "OOMKilled": info.end_reason == EndReason::Oom as i32,
+        "Reason": reason_name(info),
+        "StartedAt": state_time(&info.started_at),
+        "FinishedAt": state_time(&info.finished_at),
+    });
+    if let Some(health) = &info.health {
+        state["Health"] = health_value(health);
+    }
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
         "Image": info.image_digest,
         "Created": info.created_at.as_ref().map(|t| rfc3339(t.seconds)),
-        "State": {
-            "Status": state_name(info),
-            "Running": info.status == SandboxStatus::Running as i32,
-            "Paused": info.paused,
-            "ExitCode": state_exit_code(info),
-            "OOMKilled": info.end_reason == EndReason::Oom as i32,
-            "Reason": reason_name(info),
-            "StartedAt": state_time(&info.started_at),
-            "FinishedAt": state_time(&info.finished_at),
-        },
+        "State": state,
         "Config": config,
         "RestartCount": info.restart_count,
         "HostConfig": host_config(info),
         "Mounts": mounts(info),
     })
+}
+
+/// The CPU limit: the exact quota from `update`, else the VM's whole CPUs.
+fn nano_cpus(resources: &ward_core::pb::ResourceLimits) -> u64 {
+    if resources.nano_cpus > 0 {
+        resources.nano_cpus
+    } else {
+        u64::from(resources.cpus) * NANOS_PER_CPU
+    }
 }
 
 /// Docker's `HostConfig.MemorySwap`: the value given, else twice the memory
@@ -381,6 +411,45 @@ fn memory_swap(given: i64, memory: u64) -> i64 {
         (0, memory) => i64::try_from(memory.saturating_mul(2)).unwrap_or(i64::MAX),
         (given, _) => given,
     }
+}
+
+/// Docker's `Config.Healthcheck`: only the fields that were set.
+fn healthcheck_value(check: &ward_core::pb::Healthcheck) -> Value {
+    let mut value = json!({"Test": check.test});
+    for (key, nanos) in [
+        ("Interval", check.interval_ns),
+        ("Timeout", check.timeout_ns),
+        ("StartPeriod", check.start_period_ns),
+    ] {
+        if nanos != 0 {
+            value[key] = json!(nanos);
+        }
+    }
+    if check.retries != 0 {
+        value["Retries"] = json!(check.retries);
+    }
+    value
+}
+
+/// Docker's `State.Health`.
+fn health_value(health: &ward_core::pb::HealthState) -> Value {
+    let log: Vec<Value> = health
+        .log
+        .iter()
+        .map(|entry| {
+            json!({
+                "Start": state_time(&entry.start),
+                "End": state_time(&entry.end),
+                "ExitCode": entry.exit_code,
+                "Output": entry.output,
+            })
+        })
+        .collect();
+    json!({
+        "Status": health.status,
+        "FailingStreak": health.failing_streak,
+        "Log": log,
+    })
 }
 
 /// Docker's top-level `Mounts`: the bind mounts, then the tmpfs mounts.
@@ -434,7 +503,7 @@ fn host_config(info: &SandboxInfo) -> Value {
     let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
         "Memory": memory,
-        "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
+        "NanoCpus": nano_cpus(&resources),
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
             "Name": restart.name,
@@ -973,6 +1042,63 @@ mod tests {
         assert_eq!(memory_swap(given, memory), want);
     }
 
+    fn health(status: &str) -> Option<ward_core::pb::HealthState> {
+        Some(ward_core::pb::HealthState {
+            status: status.into(),
+            failing_streak: 1,
+            log: vec![ward_core::pb::HealthLogEntry {
+                exit_code: 1,
+                output: "down".into(),
+                ..Default::default()
+            }],
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::starting("starting", "Up 5 seconds (health: starting)")]
+    #[case::healthy("healthy", "Up 5 seconds (healthy)")]
+    #[case::unhealthy("unhealthy", "Up 5 seconds (unhealthy)")]
+    fn given_a_health_check_when_status_built_then_docker_adds_it_after_the_uptime(
+        #[case] status: &str,
+        #[case] want: &str,
+    ) {
+        // Arrange
+        let sandbox = SandboxInfo {
+            health: health(status),
+            started_at: Some(prost_types::Timestamp {
+                seconds: 100,
+                nanos: 0,
+            }),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let text = status_text(&sandbox, 105);
+
+        // Assert
+        assert_eq!(text, want);
+    }
+
+    #[test]
+    fn given_health_state_when_inspected_then_state_health_follows_docker() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            health: health("unhealthy"),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        let shown = &value["State"]["Health"];
+        assert_eq!(shown["Status"], "unhealthy");
+        assert_eq!(shown["FailingStreak"], 1);
+        assert_eq!(shown["Log"][0]["ExitCode"], 1);
+        assert_eq!(shown["Log"][0]["Output"], "down");
+        assert!(value["Config"].get("Healthcheck").is_none());
+    }
+
     #[test]
     fn given_guest_mounts_when_inspected_then_docker_places_them() {
         // Arrange
@@ -983,6 +1109,12 @@ mod tests {
                 extra_hosts: vec!["db:10.1.2.3".into()],
                 dns_search: vec!["example.com".into()],
                 dns_options: vec![],
+                healthcheck: Some(ward_core::pb::Healthcheck {
+                    test: vec!["CMD-SHELL".into(), "true".into()],
+                    interval_ns: 5_000_000_000,
+                    retries: 2,
+                    ..Default::default()
+                }),
                 ulimits: vec![ward_core::pb::Ulimit {
                     name: "nofile".into(),
                     soft: 1024,
@@ -1025,6 +1157,10 @@ mod tests {
         assert_eq!(
             value["HostConfig"]["Ulimits"],
             json!([{"Name": "nofile", "Soft": 1024, "Hard": 2048}])
+        );
+        assert_eq!(
+            value["Config"]["Healthcheck"],
+            json!({"Test": ["CMD-SHELL", "true"], "Interval": 5_000_000_000_u64, "Retries": 2})
         );
         assert_eq!(value["HostConfig"]["CpuShares"], 512);
         assert_eq!(value["HostConfig"]["CpusetCpus"], "0-1");

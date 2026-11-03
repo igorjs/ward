@@ -75,7 +75,7 @@ impl SandboxManager {
         Ok(())
     }
 
-    async fn is_paused(&self, id: &str) -> Result<bool> {
+    pub(super) async fn is_paused(&self, id: &str) -> Result<bool> {
         if self.recorded_status(id).await? != SandboxStatus::Running {
             return Ok(false);
         }
