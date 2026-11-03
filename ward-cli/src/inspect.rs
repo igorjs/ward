@@ -202,6 +202,7 @@ pub struct PsOptions {
     pub no_trunc: bool,
     pub filters: Filters,
     pub limit: Option<usize>,
+    pub sort: Option<ps_filter::SortField>,
 }
 
 pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
@@ -214,7 +215,10 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    let mut shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    if let Some(field) = options.sort {
+        ps_filter::sort(&mut shown, field);
+    }
     if options.quiet {
         for info in shown {
             println!("{}", id_text(info, options.no_trunc));

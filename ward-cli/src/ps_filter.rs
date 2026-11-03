@@ -105,12 +105,45 @@ pub fn select<'a>(
         .filter(|s| every_state || s.status == SandboxStatus::Running as i32)
         .filter(|s| filters.allows(s))
         .collect();
-    let created = |s: &SandboxInfo| s.created_at.map(|t| (t.seconds, t.nanos));
     shown.sort_by(|a, b| created(b).cmp(&created(a)).then_with(|| a.id.cmp(&b.id)));
     if let Some(limit) = limit {
         shown.truncate(limit);
     }
     shown
+}
+
+fn created(info: &SandboxInfo) -> Option<(i64, i32)> {
+    info.created_at.map(|t| (t.seconds, t.nanos))
+}
+
+/// A column `ps --sort` orders by, as Podman names them. Podman's `size` is
+/// left out because Ward does not measure it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SortField {
+    Command,
+    Created,
+    Id,
+    Image,
+    Names,
+    Runningfor,
+    Status,
+}
+
+/// Orders `shown` by `field`, ascending: oldest first for `created`, newest
+/// first for `runningfor`. Ties fall back to the ID.
+pub fn sort(shown: &mut [&SandboxInfo], field: SortField) {
+    shown.sort_by(|a, b| {
+        let order = match field {
+            SortField::Command => a.command_name.cmp(&b.command_name),
+            SortField::Created => created(a).cmp(&created(b)),
+            SortField::Id => a.id.cmp(&b.id),
+            SortField::Image => a.image.cmp(&b.image),
+            SortField::Names => a.name.cmp(&b.name),
+            SortField::Runningfor => created(b).cmp(&created(a)),
+            SortField::Status => status_word(a.status).cmp(status_word(b.status)),
+        };
+        order.then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 #[cfg(test)]
@@ -163,6 +196,24 @@ mod tests {
         let shown = select(&listed, true, &Filters::default(), None);
 
         assert_eq!(names(&shown), ["web2", "db", "web1"]);
+    }
+
+    #[rstest::rstest]
+    #[case::created(SortField::Created, &["web1", "db", "web2"])]
+    #[case::runningfor(SortField::Runningfor, &["web2", "db", "web1"])]
+    #[case::names(SortField::Names, &["db", "web1", "web2"])]
+    #[case::id(SortField::Id, &["web1", "web2", "db"])]
+    #[case::status(SortField::Status, &["db", "web2", "web1"])]
+    fn given_a_sort_field_when_sorted_then_the_order_is_ascending(
+        #[case] field: SortField,
+        #[case] expected: &[&str],
+    ) {
+        let listed = fleet();
+        let mut shown = select(&listed, true, &Filters::default(), None);
+
+        sort(&mut shown, field);
+
+        assert_eq!(names(&shown), expected);
     }
 
     #[rstest::rstest]

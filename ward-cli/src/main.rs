@@ -11,11 +11,13 @@ mod diff;
 mod docker;
 mod egress;
 mod events;
+mod exists;
 mod export;
 mod history;
 mod images;
 mod import;
 mod inspect;
+mod latest;
 mod lifecycle;
 mod load;
 mod log_output;
@@ -251,6 +253,10 @@ enum Commands {
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
+        /// Order the list by this column, ascending (Podman): created is
+        /// oldest first, runningfor newest first. Podman's size is not offered.
+        #[arg(long, value_enum, ignore_case = true, value_name = "FIELD")]
+        sort: Option<ps_filter::SortField>,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -694,6 +700,16 @@ enum Commands {
         new_name: String,
     },
 
+    /// Exit 0 if the sandbox exists, 1 if not, 125 on an error. Prints
+    /// nothing, as `podman container exists` does.
+    #[command(name = "container-exists", hide = true)]
+    ContainerExists(exists::Args),
+
+    /// Exit 0 if the image is cached, 1 if not, 125 on an error. Prints
+    /// nothing, as `podman image exists` does.
+    #[command(name = "image-exists", hide = true)]
+    ImageExists(exists::Args),
+
     /// Remove every stopped and exited sandbox.
     Prune,
 
@@ -965,7 +981,8 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 22] = [
+const CONTAINER_COMMANDS: [(&str, &str); 23] = [
+    ("exists", "container-exists"),
     ("ls", "ps"),
     ("ps", "ps"),
     ("create", "create"),
@@ -990,7 +1007,8 @@ const CONTAINER_COMMANDS: [(&str, &str); 22] = [
     ("rename", "rename"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 10] = [
+const IMAGE_COMMANDS: [(&str, &str); 11] = [
+    ("exists", "image-exists"),
     ("ls", "images"),
     ("list", "images"),
     ("pull", "pull"),
@@ -1032,7 +1050,13 @@ fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let args = expand_groups(std::env::args().collect());
+    let args = match latest::expand(expand_groups(std::env::args().collect())).await {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(GENERIC_FAILURE_EXIT_CODE);
+        }
+    };
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -1165,6 +1189,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             last,
             latest,
             filter,
+            sort,
         } => {
             let mut c = client::connect(&socket_path).await?;
             let options = inspect::PsOptions {
@@ -1176,6 +1201,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_trunc,
                 filters: ps_filter::Filters::parse(&filter)?,
                 limit: ps_filter::limit(last, latest),
+                sort,
             };
             inspect::ps(&mut c, options).await?;
         }
@@ -1639,6 +1665,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
+        }
+
+        Commands::ContainerExists(args) => {
+            std::process::exit(exists::container(&socket_path, &args.name).await)
+        }
+
+        Commands::ImageExists(args) => {
+            std::process::exit(exists::image(&socket_path, &args.name).await)
         }
 
         Commands::Prune | Commands::System(SystemCommands::Prune) => {
