@@ -260,6 +260,19 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn count(&self) -> Result<usize>;
 
+    /// Change the limits of sandbox `id`. A running VM keeps its size, so a
+    /// memory or CPU limit above it is refused; the guest applies the new
+    /// limits at once. The backend keeps them for the next boot.
+    async fn update_limits(
+        &self,
+        _id: &str,
+        _update: &crate::protocol::LimitsUpdate,
+    ) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot update a sandbox".to_string(),
+        ))
+    }
+
     /// Forward connections on host address `bind` to TCP `guest_port` of
     /// the running sandbox `id`. Dropping the listener closes it.
     async fn publish_port(

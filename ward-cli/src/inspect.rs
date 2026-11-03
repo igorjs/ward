@@ -319,6 +319,15 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     })
 }
 
+/// The CPU limit: the exact quota from `update`, else the VM's whole CPUs.
+fn nano_cpus(resources: &ward_core::pb::ResourceLimits) -> u64 {
+    if resources.nano_cpus > 0 {
+        resources.nano_cpus
+    } else {
+        u64::from(resources.cpus) * NANOS_PER_CPU
+    }
+}
+
 /// Docker `HostConfig` limits. Unlimited is 0, and null for pids.
 fn host_config(info: &SandboxInfo) -> Value {
     let resources = info.resources.unwrap_or_default();
@@ -333,7 +342,7 @@ fn host_config(info: &SandboxInfo) -> Value {
     };
     json!({
         "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
-        "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
+        "NanoCpus": nano_cpus(&resources),
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
             "Name": restart.name,

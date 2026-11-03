@@ -29,6 +29,8 @@ use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
 
+mod update;
+
 type Result<T> = std::result::Result<T, ApiError>;
 
 /// Shown when the backend cannot start the sandbox; the cause is only logged.
@@ -2308,6 +2310,7 @@ impl SandboxManager {
             self.mark_failed(id).await;
             return Err(e);
         }
+        self.reapply_cpu_quota(id).await;
         self.commit_running_and_register(id, comms).await?;
         self.emit_event(id, EventAction::Start, None).await;
         if let Err(e) = self.spawn_main(id).await {
@@ -3256,6 +3259,7 @@ fn pb_resources_to_protocol(pb: crate::pb::ResourceLimits) -> ResourceLimits {
         pids_max: pb.pids_max,
         timeout_seconds: pb.timeout_seconds,
         exited_ttl_seconds: pb.exited_ttl_seconds,
+        nano_cpus: pb.nano_cpus,
     }
 }
 
@@ -3266,6 +3270,7 @@ fn protocol_resources_to_pb(resources: &ResourceLimits) -> crate::pb::ResourceLi
         pids_max: resources.pids_max,
         timeout_seconds: resources.timeout_seconds,
         exited_ttl_seconds: resources.exited_ttl_seconds,
+        nano_cpus: resources.nano_cpus,
     }
 }
 
@@ -4416,6 +4421,7 @@ pub(crate) mod tests {
             pids_max: 256,
             timeout_seconds: 3600,
             exited_ttl_seconds: 120,
+            nano_cpus: 1_500_000_000,
         };
 
         // Act
@@ -8950,4 +8956,5 @@ pub(crate) mod tests {
     mod rename;
     #[cfg(not(feature = "krunvm"))]
     mod secrets;
+    mod update;
 }

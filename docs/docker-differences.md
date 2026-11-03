@@ -53,11 +53,24 @@ A `deny` sandbox without published ports records nothing for `suggest`. The gues
 
 Each attach session is separate. A client that disconnects only detaches and leaves the main process running. In raw terminal mode Ctrl-C goes to the guest as a byte, as in Docker. Outside raw mode the CLI passes SIGINT and SIGTERM to the guest process.
 
+## Update
+
+`ward update` takes `--memory`, `--cpus`, `--pids-limit` and `--restart`, on a running or stopped sandbox. With none of them it fails, as Docker does. It reports `update` in `ward events`, and `inspect` shows the new values in `HostConfig`.
+
+On a running sandbox the limits apply at once, inside the VM: the guest agent writes `memory.max`, `cpu.max` and `pids.max` of the sandbox cgroup. The VM itself cannot change size while it runs, because libkrun fixes its memory and virtual CPUs at boot and has no ballooning or hot-plug. So:
+
+- `--memory` above the memory the VM started with, and `--cpus` above its CPU count, are refused with a message that says so. Lowering them works. To raise them, stop the sandbox, update it and start it again: a stopped sandbox accepts any value, and the next boot is sized to it.
+- A VM created without `-m` or `--cpus` has libkrun's default size, which Ward does not know, so the check is skipped and the cgroup limit is set anyway.
+- `--memory 0`, `--cpus 0` and `--pids-limit 0` or `-1` remove the limit. For memory that means the VM's own memory.
+- `--cpus` takes fractions, as in Docker, and is a CPU quota (`cpu.max`). The record also rounds it up to whole CPUs for the next boot. The daemon applies the quota again after each start.
+- The memory and CPU limits need the guest kernel's memory and cpu controllers, and the pids limit its pids controller. A missing one fails the update with the reason, and changes nothing.
+- `--restart` follows `run --restart`: it is refused with `--rm` and with a sandbox created with `--secret`.
+
 ## Commands with a smaller option set
 
 - `ward ps` supports `-a`, `-q`, `-n`, `-l`, `--no-trunc`, `--filter` and a Go `--format` over `.ID .Image .Command .CreatedAt .RunningFor .State .Status .Reason .Names .Labels`, plus `{{.Label "key"}}`. `--filter` takes `name`, `id`, `status` and `label=KEY[=VALUE]` (every label filter must match); `name` is a substring match, not a regular expression, and `label!=` is not supported. `.Ports`, `.Mounts`, `.Networks`, `.Size` and `.LocalVolumes` do not exist yet. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.
 - `ward inspect` takes `--format` as a Go template over the JSON it prints. Only `{{.Path}}` and `{{json .Path}}` work: no `range`, `if`, `index` or functions. An array field prints as JSON, not as Go's `[a b]`. `--type container` is accepted and `--type image` is refused, because Ward cannot inspect images yet.
-- `ward container` and `ward image` are spellings of the top-level commands. `container` has `ls`, `ps`, `create`, `run`, `start`, `stop`, `restart`, `rm`, `kill`, `logs`, `inspect`, `exec`, `cp`, `top`, `stats`, `wait`, `diff`, `commit`, `prune`, `port` and `rename`; `image` has `ls` and `pull`. The other Docker subcommands are not there yet.
+- `ward container` and `ward image` are spellings of the top-level commands. `container` has `ls`, `ps`, `create`, `run`, `start`, `stop`, `restart`, `rm`, `kill`, `logs`, `inspect`, `exec`, `cp`, `top`, `stats`, `wait`, `diff`, `commit`, `prune`, `port`, `rename` and `update`; `image` has `ls` and `pull`. The other Docker subcommands are not there yet.
 - `ward version` prints the client and daemon versions. Unlike Docker it has no API version, Go version, git commit or build time. Without a daemon it prints the client half and exits 1. `--format` fields are `.Client.Version` and `.Server.Version`, `.Server.Os`, `.Server.Arch` and `.Server.Backend`.
 - `ward system info` is `ward info`, and `ward system prune` is `ward prune`: both remove only stopped and exited sandboxes, never images, volumes or networks, and take no `-a`, `-f` or `--filter`. `ward system df` lists the sandbox count (with how many run) and the image cache size; it has no per-image breakdown and no `-v`.
 - `ward rename` prints nothing on success, as Docker does. It works on a running sandbox. Docker's `rename` event carries the old name; Ward's does not.

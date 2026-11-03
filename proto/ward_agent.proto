@@ -32,6 +32,7 @@ message Request {
     Top top = 11;
     Stats stats = 12;
     PutSecrets put_secrets = 13;
+    SetLimits set_limits = 15;
   }
 }
 
@@ -185,6 +186,18 @@ message StatsSample {
   // devices.
   uint64 block_read_bytes = 7;
   uint64 block_write_bytes = 8;
+}
+
+// Must be the first and only frame on a connection. The agent writes each
+// limit that is set into the sandbox cgroup and answers with one ArchiveDone
+// or ArchiveError. A field left unset keeps the cgroup as it is.
+message SetLimits {
+  // memory.max in bytes. 0 removes the limit.
+  optional uint64 memory_bytes = 1;
+  // cpu.max, in billionths of a CPU. 0 removes the limit.
+  optional uint64 nano_cpus = 2;
+  // pids.max. 0 removes the limit.
+  optional uint32 pids_max = 3;
 }
 
 // Answer to Ping.

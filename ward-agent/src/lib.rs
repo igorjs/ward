@@ -26,6 +26,7 @@ mod archive;
 // Only the Linux build calls into it; other hosts compile it for the tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod cgroup;
+mod limits;
 mod oom;
 mod pty;
 mod secrets;
@@ -250,7 +251,7 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
 /// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream,
-/// `PutSecrets` writes secret files, and
+/// `PutSecrets` writes secret files, `SetLimits` changes the sandbox's limits, and
 /// `Top` lists the guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
@@ -290,6 +291,10 @@ where
             let mut writer = writer;
             return answer_secrets(put, &mut writer).await;
         }
+        Some(request::Kind::SetLimits(set)) => {
+            let mut writer = writer;
+            return answer_set_limits(&set, &mut writer).await;
+        }
         Some(request::Kind::Top(top)) => {
             let mut writer = writer;
             return answer_top(&top.ps_args, &mut writer).await;
@@ -306,7 +311,7 @@ where
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, Top or Stats",
+                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, SetLimits, Top or Stats",
             ));
         }
     };
@@ -329,6 +334,35 @@ async fn answer_secrets<W: AsyncWrite + Unpin>(
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             e.to_string(),
+        )),
+    };
+    let kind = match outcome {
+        Ok(()) => event::Kind::ArchiveDone(proto::ArchiveDone {}),
+        Err(e) => event::Kind::ArchiveError(proto::ArchiveError {
+            message: e.to_string(),
+            ..Default::default()
+        }),
+    };
+    write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await
+}
+
+async fn answer_set_limits<W: AsyncWrite + Unpin>(
+    set: &proto::SetLimits,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let limits = limits::Limits {
+        memory_bytes: set.memory_bytes,
+        nano_cpus: set.nano_cpus,
+        pids_max: set.pids_max,
+    };
+    let outcome = match SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir) {
+        Some(dir) => {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || limits::apply(&dir, limits)).await?
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the guest has no sandbox cgroup to limit",
         )),
     };
     let kind = match outcome {
@@ -615,6 +649,7 @@ async fn apply_request(
         | request::Kind::ArchiveChunk(_)
         | request::Kind::ArchiveEnd(_)
         | request::Kind::PutSecrets(_)
+        | request::Kind::SetLimits(_)
         | request::Kind::Top(_)
         | request::Kind::Stats(_) => {}
     }
