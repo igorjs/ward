@@ -78,7 +78,8 @@ Each attach session is separate. A client that disconnects only detaches and lea
 - `ward export` reads the sandbox's files from the host, so it works in any state without a running guest. Owners are written as root, directory and symlink times are zero, hard links become copies, and sockets, pipes and device nodes are left out. Files Ward wrote at boot are left out.
 - `ward import` takes a file or `-`, plain or gzip. A URL is not supported, and `--platform` is not accepted. `-c` takes CMD, ENTRYPOINT, ENV, WORKDIR and USER. The image is kept like a committed one: it is never evicted.
 - `ward pull --platform` accepts only `linux/` plus this machine's architecture, because a microVM runs the host's architecture. `--all-tags` is refused. `ward search` is not available; Docker Hub's search API has no OCI equivalent.
-- `ward login` and `ward logout` are not available yet. Pulls are anonymous, so private registries cannot be reached.
+- `ward login` checks the credentials with the daemon, then stores them in `$DOCKER_CONFIG/config.json` or `~/.docker/config.json` (mode 0600), merged with what is there. The daemon reads the file of the user it runs as for every pull, so run `ward login` as that user. There is no interactive prompt: give `--username` and `--password-stdin`. Credential helpers (`credsStore`, `credHelpers`) are not supported and make login fail. Passwords are never printed or logged. `ward logout` removes the entry.
+- `ward image` supports `ls`, `pull`, `rm`, `tag`, `history`, `save`, `load` and `import`.
 
 ## Events
 

@@ -484,6 +484,14 @@ impl Backend for KrunvmBackend {
         self.image_store.import_image(spec, chunks).await
     }
 
+    async fn check_registry_login(
+        &self,
+        registry: &str,
+        credentials: &crate::registry_auth::Credentials,
+    ) -> Result<()> {
+        self.image_store.check_login(registry, credentials).await
+    }
+
     async fn image_history(&self, name: &str) -> Result<super::image::HistoryView> {
         self.image_store.image_history(name)
     }

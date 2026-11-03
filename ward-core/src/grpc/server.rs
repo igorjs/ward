@@ -1185,6 +1185,26 @@ impl Ward for WardGrpcServer {
         }))
     }
 
+    #[tracing::instrument(name = "rpc.check_registry_login", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn check_registry_login(
+        &self,
+        request: Request<crate::pb::CheckRegistryLoginRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let credentials = crate::registry_auth::Credentials {
+            username: req.username,
+            password: req.password,
+        };
+        self.sandbox
+            .check_registry_login(
+                &crate::registry_auth::registry_host(&req.server),
+                &credentials,
+            )
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
+    }
+
     #[tracing::instrument(
         name = "rpc.commit",
         skip_all,
