@@ -987,6 +987,65 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(ListImagesResponse { images }))
     }
 
+    #[tracing::instrument(name = "rpc.remove_image", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn remove_image(
+        &self,
+        request: Request<crate::pb::RemoveImageRequest>,
+    ) -> Result<Response<crate::pb::RemoveImageResponse>, Status> {
+        let req = request.into_inner();
+        let removal = self
+            .sandbox
+            .remove_image(&req.reference, req.force)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(crate::pb::RemoveImageResponse {
+            untagged: removal.untagged,
+            deleted: removal.deleted,
+        }))
+    }
+
+    #[tracing::instrument(name = "rpc.tag_image", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn tag_image(
+        &self,
+        request: Request<crate::pb::TagImageRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        self.sandbox
+            .tag_image(&req.source, &req.target)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(name = "rpc.image_history", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn image_history(
+        &self,
+        request: Request<crate::pb::ImageHistoryRequest>,
+    ) -> Result<Response<crate::pb::ImageHistoryResponse>, Status> {
+        let view = self
+            .sandbox
+            .image_history(&request.into_inner().reference)
+            .await
+            .map_err(api_err_to_status)?;
+        let layers = view
+            .entries
+            .into_iter()
+            .rev()
+            .map(|entry| crate::pb::HistoryLayer {
+                created: entry
+                    .created
+                    .map(|time| std::time::SystemTime::from(time).into()),
+                created_by: entry.created_by,
+                size_bytes: entry.size_bytes,
+                comment: entry.comment,
+            })
+            .collect();
+        Ok(Response::new(crate::pb::ImageHistoryResponse {
+            image_id: view.image_id,
+            layers,
+        }))
+    }
+
     #[tracing::instrument(
         name = "rpc.commit",
         skip_all,

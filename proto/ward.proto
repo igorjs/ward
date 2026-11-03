@@ -99,6 +99,15 @@ service Ward {
   // Health
   rpc GetHealth(google.protobuf.Empty) returns (HealthStatus);
   rpc GetInfo(google.protobuf.Empty) returns (DaemonInfo);
+
+  // Remove a tag or an image from the local cache, like `docker rmi`. Needs
+  // no sandbox token. An image a running sandbox uses is never deleted.
+  rpc RemoveImage(RemoveImageRequest) returns (RemoveImageResponse);
+  // Add a tag to a cached image, like `docker tag`. Needs no sandbox token.
+  rpc TagImage(TagImageRequest) returns (google.protobuf.Empty);
+  // The layers of a cached image, newest first, like `docker history`.
+  // Needs no sandbox token.
+  rpc ImageHistory(ImageHistoryRequest) returns (ImageHistoryResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -795,4 +804,49 @@ message CommunicationLogEntry {
   bool allowed = 3;
   uint32 subscriber_count = 4;
   google.protobuf.Timestamp timestamp = 5;
+}
+
+// ---------------------------------------------------------------------------
+// Image management messages
+// ---------------------------------------------------------------------------
+
+message RemoveImageRequest {
+  // A tag, an image id or a unique prefix of one.
+  string reference = 1;
+  // Delete an image that stopped sandboxes use, or that has several tags.
+  bool force = 2;
+}
+
+message RemoveImageResponse {
+  // References that no longer name the image, in `docker rmi` order.
+  repeated string untagged = 1;
+  // Ids of the images deleted from the cache.
+  repeated string deleted = 2;
+}
+
+message TagImageRequest {
+  // A tag, an image id or a unique prefix of one.
+  string source = 1;
+  // The new tag. It moves off any other image that holds it.
+  string target = 2;
+}
+
+message ImageHistoryRequest {
+  string reference = 1;
+}
+
+message HistoryLayer {
+  // Unset when the image config gave no time.
+  google.protobuf.Timestamp created = 1;
+  string created_by = 2;
+  // Zero for a step that adds no layer.
+  uint64 size_bytes = 3;
+  string comment = 4;
+}
+
+message ImageHistoryResponse {
+  // Id of the image, e.g. sha256:...
+  string image_id = 1;
+  // Newest first.
+  repeated HistoryLayer layers = 2;
 }
