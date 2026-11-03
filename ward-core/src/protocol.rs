@@ -91,6 +91,38 @@ pub struct GuestOptions {
     pub dns_search: Vec<String>,
     #[serde(default)]
     pub dns_options: Vec<String>,
+    #[serde(default)]
+    pub ulimits: Vec<Ulimit>,
+    /// Supplementary groups by name or id.
+    #[serde(default)]
+    pub group_add: Vec<String>,
+    #[serde(default)]
+    pub cgroup: CgroupLimits,
+}
+
+/// A resource limit for every process, `-1` meaning unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Ulimit {
+    pub name: String,
+    pub soft: i64,
+    pub hard: i64,
+}
+
+/// Docker's cgroup options as given. 0 means not set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CgroupLimits {
+    #[serde(default)]
+    pub memory_swap_bytes: i64,
+    #[serde(default)]
+    pub memory_reservation_bytes: u64,
+    #[serde(default)]
+    pub cpu_shares: u32,
+    #[serde(default)]
+    pub cpuset_cpus: String,
+    #[serde(default)]
+    pub cpu_period: u64,
+    #[serde(default)]
+    pub cpu_quota: i64,
 }
 
 /// Docker's default size for `/dev/shm`: 64 MiB.

@@ -21,6 +21,8 @@ const FILTER_CONTAINER: &str = "container";
 const FILTER_NAME: &str = "name";
 const FILTER_IMAGE: &str = "image";
 const FILTER_LABEL: &str = "label";
+const FILTER_REASON: &str = "reason";
+const REASON_ATTRIBUTE: &str = "reason";
 const IMAGE_ATTRIBUTE: &str = "image";
 const NAME_ATTRIBUTE: &str = "name";
 const JSON_FORMAT: &str = "{{json .}}";
@@ -76,7 +78,7 @@ pub async fn run(socket: &str, options: Options) -> Result<()> {
             );
         }
         if filters.allows(&event) {
-            print!("{}", format.render(&event));
+            print!("{}", format.render(&event)?);
         }
     }
     Ok(())
@@ -101,6 +103,8 @@ struct Filters {
     events: Vec<String>,
     containers: Vec<String>,
     images: Vec<String>,
+    /// Why a sandbox ended, as `die` events carry it.
+    reasons: Vec<String>,
     /// Attribute filters: `key` or `key=value`. Events carry no labels, so
     /// an attribute is the closest match.
     labels: Vec<String>,
@@ -113,6 +117,7 @@ impl Filters {
             events: Vec::new(),
             containers: Vec::new(),
             images: Vec::new(),
+            reasons: Vec::new(),
             labels: Vec::new(),
         };
         for filter in filters {
@@ -128,6 +133,7 @@ impl Filters {
                 FILTER_EVENT => parsed.events.push(value.to_string()),
                 FILTER_CONTAINER | FILTER_NAME => parsed.containers.push(value.to_string()),
                 FILTER_IMAGE => parsed.images.push(value.to_string()),
+                FILTER_REASON => parsed.reasons.push(value.to_string()),
                 FILTER_LABEL => parsed.labels.push(value.to_string()),
                 other => bail!("Invalid filter '{other}'"),
             }
@@ -146,6 +152,7 @@ impl Filters {
                 c == attribute(NAME_ATTRIBUTE) || event.sandbox_id.starts_with(c)
             })
             && any(&self.images, &|i| i == attribute(IMAGE_ATTRIBUTE))
+            && any(&self.reasons, &|r| r == attribute(REASON_ATTRIBUTE))
             && any(&self.labels, &|label| match label.split_once('=') {
                 Some((key, value)) => event.attributes.get(key).is_some_and(|v| v == value),
                 None => event.attributes.contains_key(label),
@@ -169,10 +176,10 @@ impl Format {
         })
     }
 
-    fn render(&self, event: &SandboxEvent) -> String {
+    fn render(&self, event: &SandboxEvent) -> Result<String> {
         match self {
-            Self::Default => default_line(event),
-            Self::Json => format!("{}\n", docker_json(event)),
+            Self::Default => Ok(default_line(event)),
+            Self::Json => Ok(format!("{}\n", docker_json(event))),
             Self::Template(template) => template.render(&[record(event)]),
         }
     }
@@ -299,7 +306,7 @@ mod tests {
         .unwrap();
 
         // Act
-        let line = format.render(&event("die", "web1"));
+        let line = format.render(&event("die", "web1")).unwrap();
 
         // Assert
         assert_eq!(line, format!("container die {ID} web1\n"));
@@ -311,7 +318,7 @@ mod tests {
         let format = Format::choose(None, true).unwrap();
 
         // Act
-        let line = format.render(&event("die", "web1"));
+        let line = format.render(&event("die", "web1")).unwrap();
 
         // Assert
         let parsed: Value = serde_json::from_str(&line).unwrap();
@@ -346,6 +353,25 @@ mod tests {
 
         // Act
         let got = filters.allows(&event(action, name));
+
+        // Assert
+        assert_eq!(got, allowed);
+    }
+
+    #[rstest::rstest]
+    #[case::reason_match(&["reason=oom"], true)]
+    #[case::reason_miss(&["reason=timeout"], false)]
+    #[case::either_reason(&["reason=timeout", "reason=oom"], true)]
+    fn given_a_reason_filter_when_checked_then_the_die_attribute_decides(
+        #[case] given: &[&str],
+        #[case] allowed: bool,
+    ) {
+        // Arrange
+        let mut died = event("die", "web1");
+        died.attributes.insert("reason".into(), "oom".into());
+
+        // Act
+        let got = filters(given).allows(&died);
 
         // Assert
         assert_eq!(got, allowed);

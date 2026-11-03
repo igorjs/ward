@@ -19,8 +19,8 @@ pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Child cgroup that holds every spawned process.
 const SANDBOX_GROUP: &str = "ward";
-const CONTROLLERS_FILE: &str = "cgroup.controllers";
-const SUBTREE_CONTROL_FILE: &str = "cgroup.subtree_control";
+pub(crate) const CONTROLLERS_FILE: &str = "cgroup.controllers";
+pub(crate) const SUBTREE_CONTROL_FILE: &str = "cgroup.subtree_control";
 const PROCS_FILE: &str = "cgroup.procs";
 const PIDS_MAX_FILE: &str = "pids.max";
 const PIDS_CONTROLLER: &str = "pids";
@@ -192,7 +192,7 @@ fn enable_controllers(root: &Path, pids: bool, memory: bool, io: bool) -> io::Re
     }
 }
 
-fn write_file(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn write_file(path: &Path, text: &str) -> io::Result<()> {
     let mut file: File = OpenOptions::new().write(true).truncate(true).open(path)?;
     file.write_all(text.as_bytes())
 }

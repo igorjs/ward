@@ -188,3 +188,73 @@ fn given_add_host_and_resolver_flags_when_run_then_the_guest_files_have_them() {
     assert!(out.contains("search corp.example"), "{out}");
     assert!(out.contains("options ndots:3"), "{out}");
 }
+
+#[test]
+fn given_ulimit_and_group_add_when_run_and_exec_then_both_see_them() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+    let id = run_ok(
+        &d,
+        &[
+            "run",
+            "-d",
+            "--ulimit",
+            "nofile=512:1024",
+            "--ulimit",
+            "core=0",
+            "--group-add",
+            "1234",
+            "--group-add",
+            "audio",
+            &image,
+            "sleep",
+            "60",
+        ],
+    );
+    let id = id.trim();
+
+    // Act
+    let main = run_script(
+        &d,
+        &["--ulimit", "nofile=256:256", "--group-add", "1234"],
+        "ulimit -n; ulimit -Hn; id -G",
+    );
+    let exec_soft = run_ok(&d, &["exec", id, "sh", "-c", "ulimit -n"]);
+    let exec_hard = run_ok(&d, &["exec", id, "sh", "-c", "ulimit -Hn"]);
+    let exec_core = run_ok(&d, &["exec", id, "sh", "-c", "ulimit -c"]);
+    let exec_groups = run_ok(&d, &["exec", id, "id", "-G"]);
+
+    // Assert
+    let lines: Vec<&str> = main.lines().collect();
+    assert_eq!(&lines[..2], ["256", "256"], "{main}");
+    assert!(lines[2].split_whitespace().any(|g| g == "1234"), "{main}");
+    assert_eq!(exec_soft.trim(), "512");
+    assert_eq!(exec_hard.trim(), "1024");
+    assert_eq!(exec_core.trim(), "0");
+    let groups: Vec<&str> = exec_groups.split_whitespace().collect();
+    assert!(groups.contains(&"1234"), "{exec_groups}");
+    assert!(groups.contains(&"18"), "{exec_groups}");
+}
+
+#[test]
+fn given_an_unknown_group_name_when_run_then_the_process_does_not_start() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+
+    // Act
+    let out = d
+        .cli()
+        .args(["run", "--rm", "--group-add", "nosuchgroup", &image, "true"])
+        .output()
+        .expect("run ward");
+
+    // Assert
+    assert!(!out.status.success());
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("unable to find group nosuchgroup"), "{text}");
+}
