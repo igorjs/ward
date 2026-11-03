@@ -3,10 +3,13 @@
 //! ward – command-line interface to the Ward daemon.
 
 mod attach;
+mod attach_cmd;
+mod attach_streams;
 mod client;
 mod commit;
 mod cp;
 mod create_opts;
+mod detach_keys;
 mod diff;
 mod docker;
 mod egress;
@@ -29,6 +32,7 @@ mod rmi;
 mod save;
 mod secrets;
 mod socket;
+mod start_attach;
 mod stats;
 mod system;
 mod tag;
@@ -348,6 +352,9 @@ enum Commands {
         /// Print the sandbox ID and leave the command running.
         #[arg(short, long)]
         detach: bool,
+        /// Attach only this stream: STDIN, STDOUT or STDERR. Repeatable.
+        #[arg(short = 'a', long = "attach", value_name = "STREAM")]
+        attach: Vec<String>,
         /// Give the command a secret file at /run/secrets/NAME, read from
         /// FILE on this host. NAME defaults to the base name of FILE.
         #[arg(long, value_name = "[NAME=]FILE")]
@@ -431,7 +438,12 @@ enum Commands {
         /// Sandbox names, IDs or ID prefixes.
         #[arg(required = true)]
         refs: Vec<String>,
+        #[command(flatten)]
+        attach: start_attach::StartFlags,
     },
+
+    /// Attach to the main process of a running sandbox.
+    Attach(attach_cmd::Args),
 
     /// Restart one or more sandboxes.
     Restart {
@@ -710,8 +722,8 @@ enum Commands {
     System(SystemCommands),
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
-    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port
-    /// and rename. Each is the top-level command of the same name.
+    /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
+    /// rename and attach. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -965,7 +977,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 22] = [
+const CONTAINER_COMMANDS: [(&str, &str); 23] = [
     ("ls", "ps"),
     ("ps", "ps"),
     ("create", "create"),
@@ -988,6 +1000,7 @@ const CONTAINER_COMMANDS: [(&str, &str); 22] = [
     ("prune", "prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("attach", "attach"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
 const IMAGE_COMMANDS: [(&str, &str); 10] = [
@@ -1256,8 +1269,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tty,
             rm,
             detach,
+            attach,
             secret,
         } => {
+            let streams = attach_streams::Streams::parse(&attach)?;
+            if detach && !attach.is_empty() {
+                anyhow::bail!("conflicting options: -a and -d");
+            }
             opts.extras.check_rm(rm)?;
             let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
@@ -1275,6 +1293,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 tty,
                 rm,
                 detach,
+                streams,
                 hooks,
             };
             let code = docker::run(&socket_path, &token_store, request, flags).await?;
@@ -1480,7 +1499,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
         }
 
-        Commands::Start { refs } => {
+        Commands::Start { refs, attach } if attach.wanted() => {
+            let code = start_attach::run(&socket_path, &token_store, &refs, &attach).await?;
+            std::process::exit(code);
+        }
+
+        Commands::Attach(args) => {
+            let code = attach_cmd::run(&socket_path, &token_store, args).await?;
+            std::process::exit(code);
+        }
+
+        Commands::Start { refs, .. } => {
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
@@ -1869,6 +1898,13 @@ mod tests {
         let args = args.iter().map(ToString::to_string).collect();
 
         assert_eq!(expand_groups(args), expected);
+    }
+
+    #[test]
+    fn given_the_whole_command_tree_when_built_then_clap_finds_no_conflicts() {
+        use clap::CommandFactory;
+
+        Cli::command().debug_assert();
     }
 
     #[test]

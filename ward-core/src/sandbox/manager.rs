@@ -3382,6 +3382,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
             maximum_retry_count: info.spec.restart.max_retries,
         }),
         restart_count: info.restart_count,
+        tty: info.spec.tty,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec

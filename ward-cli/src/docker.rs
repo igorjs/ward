@@ -11,7 +11,8 @@ use std::time::Duration;
 use anyhow::Result;
 use ward_core::pb::{AttachMode, AttachStart, CreateSandboxRequest, SecretFile};
 
-use crate::attach::{self, require_exit, require_terminal};
+use crate::attach::{self, Options, Output, require_exit, require_terminal};
+use crate::attach_streams::Streams;
 use crate::client::{self, Resolved};
 use crate::log_output::{LogOptions, LogPrinter, Printable};
 use crate::terminal::ExitSignals;
@@ -27,6 +28,8 @@ pub struct RunFlags {
     pub tty: bool,
     pub rm: bool,
     pub detach: bool,
+    /// The streams `-a` asked for; all of them without it.
+    pub streams: Streams,
     pub hooks: crate::create_opts::Hooks,
 }
 
@@ -68,11 +71,21 @@ pub async fn run(
     } else {
         None
     };
+    let forward_stdin = flags.interactive && flags.streams.stdin;
+    let streams = flags.streams;
+    let sink = |output: Output| match output {
+        Output::Data(chunk) if streams.shows(chunk.stream) => {
+            attach::write_to_terminal(chunk.stream, chunk.bytes)
+        }
+        Output::Data(_) | Output::ReplayEnd => Ok(()),
+    };
     let outcome = match exits.as_mut() {
         Some(exits) => {
-            attach::attach_registered(&mut c, &target, start, flags.interactive, exits).await
+            let options = Options::default();
+            attach::attach_with_exits(&mut c, &target, start, forward_stdin, &options, exits, sink)
+                .await
         }
-        None => attach::attach(&mut c, &target, start, flags.interactive).await,
+        None => attach::attach_with(&mut c, &target, start, forward_stdin, sink).await,
     };
     if flags.rm {
         let removal = lifecycle::remove_resolved(&mut c, token_store, &target);
