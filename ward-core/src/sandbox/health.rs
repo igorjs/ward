@@ -127,14 +127,24 @@ pub struct Probe {
 /// Cut `output` to Docker's limit on a character boundary.
 #[must_use]
 pub fn truncate_output(output: &str) -> String {
-    if output.len() <= MAX_OUTPUT_BYTES {
-        return output.to_string();
+    cut_at(output, MAX_OUTPUT_BYTES).to_string()
+}
+
+/// Add `chunk` to `output` without letting it pass Docker's limit.
+pub fn append_capped(output: &mut String, chunk: &str) {
+    let room = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+    output.push_str(cut_at(chunk, room));
+}
+
+fn cut_at(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
     }
-    let mut end = MAX_OUTPUT_BYTES;
-    while !output.is_char_boundary(end) {
+    let mut end = max;
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    output[..end].to_string()
+    &text[..end]
 }
 
 /// The checks of one run of a sandbox.
@@ -151,17 +161,17 @@ pub struct Tracker {
 }
 
 impl Tracker {
-    /// Begin tracking a run that started at `now`; the first check is one
-    /// interval away.
+    /// Begin tracking a run that started at `started_at`; the first check is
+    /// one interval after it.
     #[must_use]
-    pub fn new(run_started: Option<SystemTime>, now: Instant, interval: Duration) -> Self {
+    pub fn new(run_started: Option<SystemTime>, started_at: Instant, interval: Duration) -> Self {
         Self {
             run_started,
-            started_at: now,
+            started_at,
             status: STATUS_STARTING,
             failing_streak: 0,
             log: VecDeque::new(),
-            next_due: now + interval,
+            next_due: started_at + interval,
             in_flight: false,
         }
     }
@@ -184,15 +194,22 @@ impl Tracker {
     /// Add a finished check. Returns the new status when it changed.
     ///
     /// A failure within the start period does not count, but a success
-    /// ends it, as in Docker.
-    pub fn record(&mut self, probe: Probe, check: &Check, now: Instant) -> Option<&'static str> {
+    /// ends it, as in Docker. The period is measured to when the check
+    /// began, not when it ended.
+    pub fn record(
+        &mut self,
+        probe: Probe,
+        check: &Check,
+        began: Instant,
+        now: Instant,
+    ) -> Option<&'static str> {
         self.in_flight = false;
         self.next_due = now + check.interval;
         let before = self.status;
         if probe.exit_code == 0 {
             self.status = STATUS_HEALTHY;
             self.failing_streak = 0;
-        } else if now.duration_since(self.started_at) >= check.start_period {
+        } else if began.saturating_duration_since(self.started_at) >= check.start_period {
             self.failing_streak += 1;
             if self.failing_streak >= check.retries {
                 self.status = STATUS_UNHEALTHY;
@@ -316,9 +333,9 @@ mod tests {
         let mut tracker = Tracker::new(None, start, INTERVAL);
 
         // Act
-        let first = tracker.record(probe(1), &check, start + INTERVAL);
-        let second = tracker.record(probe(1), &check, start + INTERVAL * 2);
-        let third = tracker.record(probe(0), &check, start + INTERVAL * 3);
+        let first = tracker.record(probe(1), &check, start + INTERVAL, start + INTERVAL);
+        let second = tracker.record(probe(1), &check, start + INTERVAL * 2, start + INTERVAL * 2);
+        let third = tracker.record(probe(0), &check, start + INTERVAL * 3, start + INTERVAL * 3);
 
         // Assert
         assert_eq!(first, None);
@@ -335,10 +352,15 @@ mod tests {
         let mut tracker = Tracker::new(None, start, INTERVAL);
 
         // Act
-        let early = tracker.record(probe(1), &check, start + INTERVAL);
+        let early = tracker.record(probe(1), &check, start + INTERVAL, start + INTERVAL);
         let state = tracker.state();
-        let healthy = tracker.record(probe(0), &check, start + INTERVAL * 2);
-        let late = tracker.record(probe(1), &check, start + Duration::from_secs(120));
+        let healthy = tracker.record(probe(0), &check, start + INTERVAL * 2, start + INTERVAL * 2);
+        let late = tracker.record(
+            probe(1),
+            &check,
+            start + Duration::from_secs(120),
+            start + Duration::from_secs(120),
+        );
 
         // Assert
         assert_eq!(early, None);
@@ -359,7 +381,7 @@ mod tests {
 
         // Act
         for code in 0..7 {
-            tracker.record(probe(code), &check, start + INTERVAL);
+            tracker.record(probe(code), &check, start + INTERVAL, start + INTERVAL);
         }
 
         // Assert
@@ -378,7 +400,7 @@ mod tests {
         assert!(!tracker.take_due(start + INTERVAL / 2));
         assert!(tracker.take_due(start + INTERVAL));
         assert!(!tracker.take_due(start + INTERVAL * 2));
-        tracker.record(probe(0), &check, start + INTERVAL * 2);
+        tracker.record(probe(0), &check, start + INTERVAL * 2, start + INTERVAL * 2);
         assert!(!tracker.take_due(start + INTERVAL * 2));
         assert!(tracker.take_due(start + INTERVAL * 3));
     }
@@ -395,5 +417,37 @@ mod tests {
         assert!(cut.len() <= MAX_OUTPUT_BYTES);
         assert!(cut.chars().all(|c| c == 'é'));
         assert_eq!(truncate_output("ok"), "ok");
+    }
+
+    #[test]
+    fn the_start_period_is_measured_to_when_the_check_began() {
+        // Arrange
+        let check = check(1, Duration::from_secs(60));
+        let start = Instant::now();
+        let mut tracker = Tracker::new(None, start, INTERVAL);
+        let began = start + Duration::from_secs(50);
+        let ended = start + Duration::from_secs(70);
+
+        // Act
+        let status = tracker.record(probe(1), &check, began, ended);
+
+        // Assert
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn appended_output_stops_at_the_limit_and_never_splits_a_character() {
+        // Arrange
+        let mut output = String::new();
+
+        // Act
+        for _ in 0..MAX_OUTPUT_BYTES {
+            append_capped(&mut output, "é");
+        }
+        append_capped(&mut output, "more");
+
+        // Assert
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+        assert!(output.len() >= MAX_OUTPUT_BYTES - 1);
     }
 }

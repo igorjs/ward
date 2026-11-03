@@ -3331,6 +3331,7 @@ fn recorded_state(
         info.spec.health = entry
             .health
             .as_ref()
+            .filter(|t| t.run_started == entry.meta.started_at)
             .map(health::Tracker::state)
             .or_else(|| {
                 // The first check is not due yet, but the status is already known.
@@ -7613,6 +7614,48 @@ pub(crate) mod tests {
         }
         let want = [EventAction::HealthHealthy, EventAction::HealthUnhealthy];
         assert!(seen.windows(2).any(|w| w == want), "{seen:?}");
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_check_that_floods_output_when_it_runs_then_the_log_keeps_only_the_limit() {
+        // Arrange
+        const FLOOD_BYTES: usize = 2_000_000;
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_health_supervisor();
+        let script = format!("head -c {FLOOD_BYTES} /dev/zero | tr '\\0' a; exit 1");
+        let id = create_checked(&mgr, &script, 1).await;
+
+        // Act
+        let state = wait_for_health(&mgr, &id, "unhealthy").await;
+
+        // Assert
+        let output = &state.log[0].output;
+        assert_eq!(output.len(), crate::sandbox::health::MAX_OUTPUT_BYTES);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_probe_from_an_earlier_run_when_it_finishes_then_the_new_run_is_untouched() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let id = create_checked(&mgr, "exit 1", 1).await;
+        tokio::time::sleep(TEST_POLL_STEP).await;
+        let stale = mgr.take_due_checks().await.pop().expect("due");
+        {
+            let mut entries = mgr.entries.write().await;
+            let entry = entries.get_mut(&id).expect("entry");
+            entry.meta.started_at = Some(std::time::SystemTime::now());
+        }
+        mgr.take_due_checks().await;
+
+        // Act
+        mgr.run_check(stale).await;
+
+        // Assert
+        let state = mgr.get(&id).await.expect("get").health.expect("health");
+        assert_eq!(state.status, "starting");
+        assert!(state.log.is_empty());
     }
 
     #[test]
