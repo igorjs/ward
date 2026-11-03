@@ -47,6 +47,7 @@ mod terminal;
 mod tokens;
 mod top;
 mod unpause;
+mod update;
 mod wait;
 
 use clap::{Args, Parser, Subcommand};
@@ -261,8 +262,9 @@ enum Commands {
         /// Show the most recently created sandbox in any state.
         #[arg(short = 'l', long)]
         latest: bool,
-        /// Only sandboxes matching name=, id= (a prefix) or status=
-        /// (created, running, stopping, stopped, exited, failed). Repeatable.
+        /// Only sandboxes matching name=, id= (a prefix), status=
+        /// (created, running, stopping, stopped, exited, failed), label= or
+        /// health= (starting, healthy, unhealthy, none). Repeatable.
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
@@ -748,6 +750,9 @@ enum Commands {
     /// Remove every stopped and exited sandbox.
     Prune,
 
+    /// Change the limits or restart policy of one or more sandboxes.
+    Update(update::Args),
+
     /// Freeze the processes of one or more running sandboxes.
     Pause(pause::Args),
 
@@ -768,7 +773,7 @@ enum Commands {
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
     /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
-    /// rename, pause, unpause and attach. Each is the top-level command of the same name.
+    /// rename, pause, unpause, attach and update. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -954,6 +959,7 @@ fn create_request(
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
+        nano_cpus: 0,
     };
     opts.isolation.check()?;
     let mounts = opts
@@ -1024,7 +1030,7 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 26] = [
+const CONTAINER_COMMANDS: [(&str, &str); 27] = [
     ("exists", "container-exists"),
     ("ls", "ps"),
     ("ps", "ps"),
@@ -1048,6 +1054,7 @@ const CONTAINER_COMMANDS: [(&str, &str); 26] = [
     ("prune", "prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("update", "update"),
     ("attach", "attach"),
     ("pause", "pause"),
     ("unpause", "unpause"),
@@ -1754,6 +1761,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::ImageExists(args) => {
             std::process::exit(exists::image(&socket_path, &args.name).await)
         }
+
+        Commands::Update(args) => update::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
 

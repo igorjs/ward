@@ -260,6 +260,19 @@ pub trait Backend: Send + Sync + 'static {
 
     async fn count(&self) -> Result<usize>;
 
+    /// Change the limits of sandbox `id`. A running VM keeps its size, so a
+    /// memory or CPU limit above it is refused; the guest applies the new
+    /// limits at once. The backend keeps them for the next boot.
+    async fn update_limits(
+        &self,
+        _id: &str,
+        _update: &crate::protocol::LimitsUpdate,
+    ) -> Result<()> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot update a sandbox".to_string(),
+        ))
+    }
+
     /// Freeze every process of the running sandbox `id` while its VM stays
     /// up. The sandbox's info reports `paused` until it is thawed, stopped
     /// or started again.

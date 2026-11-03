@@ -6,7 +6,9 @@
 use anyhow::{Result, bail};
 use clap::Args;
 use ward_core::guest_options::check_tmpfs_options;
-use ward_core::pb::{CgroupLimits, CreateSandboxRequest, GuestOptions, Mount, TmpfsMount, Ulimit};
+use ward_core::pb::{
+    CgroupLimits, CreateSandboxRequest, GuestOptions, Healthcheck, Mount, TmpfsMount, Ulimit,
+};
 
 use crate::resources::parse_size_bytes;
 
@@ -84,6 +86,33 @@ pub struct GuestExtras {
         allow_negative_numbers = true
     )]
     cpu_quota: Option<i64>,
+    /// Command the daemon runs in the sandbox to check its health, under
+    /// /bin/sh -c. Exit 0 is healthy.
+    #[arg(long = "health-cmd", value_name = "COMMAND")]
+    health_cmd: Option<String>,
+    /// Time between checks, such as 30s or 1m (default 30s).
+    #[arg(long = "health-interval", value_name = "DURATION", value_parser = parse_health_duration)]
+    health_interval: Option<std::time::Duration>,
+    /// Time one check may take before it counts as failed (default 30s).
+    #[arg(long = "health-timeout", value_name = "DURATION", value_parser = parse_health_duration)]
+    health_timeout: Option<std::time::Duration>,
+    /// Failed checks in a row that make the sandbox unhealthy (default 3).
+    #[arg(long = "health-retries", value_name = "N")]
+    health_retries: Option<u32>,
+    /// Time after start in which failed checks do not count (default 0s).
+    #[arg(long = "health-start-period", value_name = "DURATION", value_parser = parse_health_duration)]
+    health_start_period: Option<std::time::Duration>,
+    /// Run no health check.
+    #[arg(long = "no-healthcheck")]
+    no_healthcheck: bool,
+}
+
+const HEALTH_SHELL: &str = "CMD-SHELL";
+const HEALTH_NONE: &str = "NONE";
+
+fn parse_health_duration(value: &str) -> Result<std::time::Duration, String> {
+    crate::log_output::parse_duration(value)
+        .ok_or_else(|| format!("invalid duration '{value}': use a value like 30s, 1m or 1h30m"))
 }
 
 const ULIMIT_SEPARATOR: char = '=';
@@ -115,6 +144,7 @@ impl GuestExtras {
                 .collect::<Result<_>>()?,
             group_add: self.group_add.clone(),
             cgroup: Some(self.cgroup_limits()?),
+            healthcheck: self.healthcheck()?,
             ..GuestOptions::default()
         };
         for spec in &self.tmpfs {
@@ -135,6 +165,35 @@ impl GuestExtras {
 }
 
 impl GuestExtras {
+    fn healthcheck(&self) -> Result<Option<Healthcheck>> {
+        let tuned = self.health_interval.is_some()
+            || self.health_timeout.is_some()
+            || self.health_start_period.is_some()
+            || self.health_retries.is_some();
+        match (&self.health_cmd, self.no_healthcheck) {
+            (Some(_), true) => bail!("conflicting options: --no-healthcheck and --health-cmd"),
+            (None, true) if tuned => bail!("conflicting options: --no-healthcheck and --health-*"),
+            (None, true) => Ok(Some(Healthcheck {
+                test: vec![HEALTH_NONE.to_string()],
+                ..Default::default()
+            })),
+            (None, false) if tuned => bail!("--health-* options need --health-cmd"),
+            (None, false) => Ok(None),
+            (Some(command), false) => {
+                let nanos = |d: Option<std::time::Duration>| {
+                    d.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+                };
+                Ok(Some(Healthcheck {
+                    test: vec![HEALTH_SHELL.to_string(), command.clone()],
+                    interval_ns: nanos(self.health_interval),
+                    timeout_ns: nanos(self.health_timeout),
+                    start_period_ns: nanos(self.health_start_period),
+                    retries: self.health_retries.unwrap_or_default(),
+                }))
+            }
+        }
+    }
+
     fn cgroup_limits(&self) -> Result<CgroupLimits> {
         let swap = match self.memory_swap.as_deref() {
             None => 0,
@@ -443,6 +502,51 @@ mod tests {
         assert_eq!(limits.memory_swap_bytes, -1);
         assert_eq!(limits.memory_reservation_bytes, 64 << 20);
         assert_eq!((limits.cpu_shares, limits.cpu_quota), (512, -1));
+    }
+
+    #[test]
+    fn given_health_flags_when_applied_then_the_test_is_cmd_shell_with_nanosecond_durations() {
+        // Arrange
+        let extras = GuestExtras {
+            health_cmd: Some("curl -f localhost".into()),
+            health_interval: Some(std::time::Duration::from_secs(5)),
+            health_retries: Some(2),
+            ..Default::default()
+        };
+
+        // Act
+        let check = extras.healthcheck().unwrap().unwrap();
+
+        // Assert
+        assert_eq!(check.test, ["CMD-SHELL", "curl -f localhost"]);
+        assert_eq!(
+            (check.interval_ns, check.timeout_ns, check.retries),
+            (5_000_000_000, 0, 2)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::none_with_cmd(GuestExtras { health_cmd: Some("x".into()), no_healthcheck: true, ..Default::default() }, "conflicting options")]
+    #[case::none_with_tuning(GuestExtras { health_retries: Some(1), no_healthcheck: true, ..Default::default() }, "conflicting options")]
+    #[case::tuning_without_cmd(GuestExtras { health_retries: Some(1), ..Default::default() }, "need --health-cmd")]
+    fn given_conflicting_health_flags_when_applied_then_the_error_says_why(
+        #[case] extras: GuestExtras,
+        #[case] reason: &str,
+    ) {
+        let error = extras.healthcheck().unwrap_err();
+
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+
+    #[test]
+    fn given_no_healthcheck_when_applied_then_the_test_is_none_and_no_flags_means_no_check() {
+        let none = GuestExtras {
+            no_healthcheck: true,
+            ..Default::default()
+        };
+
+        assert_eq!(none.healthcheck().unwrap().unwrap().test, ["NONE"]);
+        assert!(GuestExtras::default().healthcheck().unwrap().is_none());
     }
 
     #[test]

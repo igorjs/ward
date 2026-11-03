@@ -432,6 +432,41 @@ where
     }
 }
 
+/// Ask the agent to write `update` into the sandbox cgroup.
+///
+/// # Errors
+///
+/// Returns an error if the guest cannot apply a limit or the connection
+/// fails.
+pub async fn set_limits<S>(
+    mut stream: S,
+    update: &crate::protocol::LimitsUpdate,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let open = Request {
+        kind: Some(request::Kind::SetLimits(proto::SetLimits {
+            memory_bytes: update
+                .memory_mb
+                .map(|mb| u64::from(mb) * crate::protocol::BYTES_PER_MIB),
+            nano_cpus: update.nano_cpus,
+            pids_max: update.pids_max,
+        })),
+    };
+    write_frame(&mut stream, &encode(&open)).await?;
+    let frame = read_frame(&mut stream)
+        .await?
+        .ok_or_else(|| protocol_error("agent closed the connection before answering"))?;
+    match Event::decode(&frame[..]).map(|e| e.kind) {
+        Ok(Some(event::Kind::ArchiveDone(_))) => Ok(()),
+        Ok(Some(event::Kind::ArchiveError(e))) => Err(agent_failure(e)),
+        _ => Err(protocol_error(
+            "agent answered a SetLimits with another event",
+        )),
+    }
+}
+
 /// Ask the agent to freeze (`true`) or thaw (`false`) the sandbox's processes.
 ///
 /// # Errors
@@ -1213,6 +1248,38 @@ mod tests {
 
         // Assert
         assert!(err.to_string().contains("no cgroup"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn given_limits_when_set_then_the_agent_gets_bytes_nanos_and_pids() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let update = crate::protocol::LimitsUpdate {
+            memory_mb: Some(2),
+            nano_cpus: None,
+            pids_max: Some(9),
+        };
+        let guest = tokio::spawn(async move {
+            let (mut r, mut w) = split(guest);
+            let frame = read_frame(&mut r).await.unwrap().expect("limits frame");
+            let req = Request::decode(&frame[..]).unwrap();
+            let done = Event {
+                kind: Some(event::Kind::ArchiveDone(proto::ArchiveDone {})),
+            };
+            write_frame(&mut w, &encode(&done)).await.unwrap();
+            req
+        });
+
+        // Act
+        set_limits(daemon, &update).await.unwrap();
+
+        // Assert
+        let Some(request::Kind::SetLimits(sent)) = guest.await.unwrap().kind else {
+            panic!("expected a SetLimits frame");
+        };
+        assert_eq!(sent.memory_bytes, Some(2 * 1024 * 1024));
+        assert_eq!(sent.nano_cpus, None);
+        assert_eq!(sent.pids_max, Some(9));
     }
 
     #[tokio::test]
