@@ -1393,7 +1393,11 @@ impl SandboxManager {
         crate::validate::stop_timeout(req.stop_timeout)?;
         let restart =
             crate::validate::restart_policy(req.restart_policy.as_ref(), req.auto_remove)?;
-        let guest = crate::guest_options::validate(req.guest.as_ref(), &req.mounts)?;
+        let guest = crate::guest_options::validate(
+            req.guest.as_ref(),
+            &req.mounts,
+            req.resources.as_ref().map_or(0, |r| r.memory_mb),
+        )?;
         // A fresh VM has no secrets, so a restart could not deliver them.
         if !req.secrets.is_empty() && restart.kind != crate::protocol::RestartKind::No {
             return Err(ApiError::InvalidRequest(RESTART_WITHOUT_SECRETS.into()));

@@ -369,6 +369,7 @@ fn host_config(info: &SandboxInfo) -> Value {
         ..restart
     };
     let guest = info.guest.clone().unwrap_or_default();
+    let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
         "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
@@ -383,7 +384,24 @@ fn host_config(info: &SandboxInfo) -> Value {
         "Dns": [],
         "DnsSearch": guest.dns_search,
         "DnsOptions": guest.dns_options,
+        "Ulimits": (!guest.ulimits.is_empty()).then(|| {
+            guest
+                .ulimits
+                .iter()
+                .map(|u| json!({"Name": u.name, "Soft": u.soft, "Hard": u.hard}))
+                .collect::<Vec<_>>()
+        }),
+        "MemorySwap": cgroup.memory_swap_bytes,
+        "MemoryReservation": cgroup.memory_reservation_bytes,
+        "CpuShares": cgroup.cpu_shares,
+        "CpusetCpus": cgroup.cpuset_cpus,
+        "CpuPeriod": cgroup.cpu_period,
+        "CpuQuota": cgroup.cpu_quota,
     });
+    // Docker leaves GroupAdd out until a group is added.
+    if !guest.group_add.is_empty() {
+        config["GroupAdd"] = json!(guest.group_add);
+    }
     // Docker leaves Tmpfs out until a tmpfs is mounted.
     if !guest.tmpfs.is_empty() {
         let tmpfs: serde_json::Map<String, Value> = guest
@@ -767,6 +785,20 @@ mod tests {
                     "Dns": [],
                     "DnsSearch": [],
                     "DnsOptions": [],
+                "Ulimits": null,
+                "MemorySwap": 0,
+                "MemoryReservation": 0,
+                "CpuShares": 0,
+                "CpusetCpus": "",
+                "CpuPeriod": 0,
+                "CpuQuota": 0,
+                    "Ulimits": null,
+                    "MemorySwap": 0,
+                    "MemoryReservation": 0,
+                    "CpuShares": 0,
+                    "CpusetCpus": "",
+                    "CpuPeriod": 0,
+                    "CpuQuota": 0,
                 },
                 "Mounts": [],
                 "RestartCount": 0,
@@ -854,6 +886,13 @@ mod tests {
                 "Dns": [],
                 "DnsSearch": [],
                 "DnsOptions": [],
+                "Ulimits": null,
+                "MemorySwap": 0,
+                "MemoryReservation": 0,
+                "CpuShares": 0,
+                "CpusetCpus": "",
+                "CpuPeriod": 0,
+                "CpuQuota": 0,
             })
         );
     }
@@ -868,6 +907,17 @@ mod tests {
                 extra_hosts: vec!["db:10.1.2.3".into()],
                 dns_search: vec!["example.com".into()],
                 dns_options: vec![],
+                ulimits: vec![ward_core::pb::Ulimit {
+                    name: "nofile".into(),
+                    soft: 1024,
+                    hard: 2048,
+                }],
+                group_add: vec!["audio".into()],
+                cgroup: Some(ward_core::pb::CgroupLimits {
+                    cpu_shares: 512,
+                    cpuset_cpus: "0-1".into(),
+                    ..Default::default()
+                }),
                 tmpfs: vec![
                     ward_core::pb::TmpfsMount {
                         path: "/run".into(),
@@ -895,6 +945,13 @@ mod tests {
         assert_eq!(value["HostConfig"]["ShmSize"], 134_217_728);
         assert_eq!(value["HostConfig"]["ExtraHosts"], json!(["db:10.1.2.3"]));
         assert_eq!(value["HostConfig"]["DnsSearch"], json!(["example.com"]));
+        assert_eq!(value["HostConfig"]["GroupAdd"], json!(["audio"]));
+        assert_eq!(
+            value["HostConfig"]["Ulimits"],
+            json!([{"Name": "nofile", "Soft": 1024, "Hard": 2048}])
+        );
+        assert_eq!(value["HostConfig"]["CpuShares"], 512);
+        assert_eq!(value["HostConfig"]["CpusetCpus"], "0-1");
         assert_eq!(
             value["HostConfig"]["Tmpfs"],
             json!({"/run": "size=64m", "/frozen": "rw,ro"})

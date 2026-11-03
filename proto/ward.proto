@@ -203,6 +203,36 @@ message GuestOptions {
   repeated string dns_search = 5;
   // Resolver options for resolv.conf, like `docker run --dns-option`.
   repeated string dns_options = 6;
+  // Resource limits set on every process, like `docker run --ulimit`.
+  repeated Ulimit ulimits = 7;
+  // Supplementary groups, names or ids, like `docker run --group-add`.
+  repeated string group_add = 8;
+  // Limits the guest's cgroup enforces.
+  CgroupLimits cgroup = 9;
+}
+
+// One `--ulimit NAME=SOFT:HARD`. -1 means unlimited.
+message Ulimit {
+  string name = 1;
+  int64 soft = 2;
+  int64 hard = 3;
+}
+
+// Docker's cgroup options. 0 means not set, except `cpu_quota`, where 0 and
+// -1 both mean unlimited.
+message CgroupLimits {
+  // `--memory-swap`. The guest has no swap, so only the memory limit is valid.
+  int64 memory_swap_bytes = 1;
+  // `--memory-reservation`, enforced as memory.low.
+  uint64 memory_reservation_bytes = 2;
+  // `--cpu-shares`, enforced as cpu.weight.
+  uint32 cpu_shares = 3;
+  // `--cpuset-cpus`, such as "0-1,3".
+  string cpuset_cpus = 4;
+  // `--cpu-period` in microseconds.
+  uint64 cpu_period = 5;
+  // `--cpu-quota` in microseconds per period.
+  int64 cpu_quota = 6;
 }
 
 // A tmpfs mounted at `path`.
