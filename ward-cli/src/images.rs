@@ -37,6 +37,11 @@ const FIELDS: [(&str, &str); 7] = [
     ("Size", "SIZE"),
 ];
 
+/// A byte count in Docker's decimal units.
+pub fn size_text(bytes: u64) -> String {
+    human_size(bytes, BYTES_PER_UNIT, &SIZE_UNITS)
+}
+
 pub struct Options {
     pub quiet: bool,
     pub no_trunc: bool,
@@ -183,7 +188,7 @@ fn record(image: &ImageInfo, no_trunc: bool, now: DateTime<Utc>) -> Map<String, 
         "Digest": image.digest,
         "CreatedAt": created_at,
         "CreatedSince": since,
-        "Size": human_size(image.size_bytes, BYTES_PER_UNIT, &SIZE_UNITS),
+        "Size": size_text(image.size_bytes),
     }) {
         Value::Object(map) => map,
         _ => unreachable!("json! of an object literal"),
