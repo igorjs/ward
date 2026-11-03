@@ -1352,6 +1352,7 @@ impl KrunvmBackend {
         }
 
         exec_args.extend([AGENT_HOSTNAME_ARG.to_string(), opts.spec.hostname_for(id)]);
+        exec_args.extend(crate::guest_options::agent_args(&opts.spec.guest));
 
         let (net, inherit) = match net_fd {
             Some((raw, owned)) => (
