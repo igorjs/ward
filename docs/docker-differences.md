@@ -14,6 +14,17 @@ There is no `ward build` and no Dockerfile support yet. Ward runs images from a 
 
 `--memory` without a suffix means bytes, as in Docker. Older Ward read a bare number as MiB. The value is rounded down to whole MiB, and anything under 1 MiB fails. `0` uses the daemon default.
 
+## Create options
+
+These flags of `ward run` and `ward create` follow Docker unless noted.
+
+- `--env-file FILE` reads `KEY=VALUE` lines. Blank lines and lines starting with `#` are skipped, and a bare `KEY` takes the host value or is dropped when the host has none. `-e` overrides the files, and a later file overrides an earlier one. Values are not unquoted or expanded.
+- `-l/--label KEY[=VALUE]` and `--label-file FILE` set labels, shown in `inspect` as `Config.Labels`. `-l` overrides the file. A sandbox takes at most 128 labels, with keys up to 256 bytes and values up to 4096. Labels also appear as attributes of its `ward events`, so `events --filter label=KEY[=VALUE]` works.
+- `--cidfile FILE` writes the sandbox ID without a newline and fails if FILE exists. The file is removed when creation fails.
+- `--replace` is Podman's: it removes an existing sandbox with the same `--name`, running or not, before creating the new one. Without `--name` it does nothing. Podman stops the old container with its own stop timeout; Ward removes it as `rm -f` does.
+- `--platform linux/ARCH` is accepted only when it names this host's architecture (`linux`, `linux/amd64` or `linux/arm64`, with the `v8` variant for arm64). Ward cannot emulate another architecture, so any other value is an error.
+- `--init` is accepted and does nothing.
+
 ## Ports
 
 - `-p` binds `127.0.0.1` when you give no `HOST_IP`. Docker binds `0.0.0.0`. Ward keeps ports private unless you ask.
@@ -41,7 +52,7 @@ Each attach session is separate. A client that disconnects only detaches and lea
 
 ## Commands with a smaller option set
 
-- `ward ps` supports `-a`, `-q`, `-n`, `-l`, `--no-trunc`, `--filter` and a Go `--format` over `.ID .Image .Command .CreatedAt .RunningFor .State .Status .Reason .Names`. `--filter` takes `name`, `id` and `status`; `name` is a substring match, not a regular expression, and `label` is not supported yet. `.Ports`, `.Labels`, `.Mounts`, `.Networks`, `.Size` and `.LocalVolumes` do not exist yet. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.
+- `ward ps` supports `-a`, `-q`, `-n`, `-l`, `--no-trunc`, `--filter` and a Go `--format` over `.ID .Image .Command .CreatedAt .RunningFor .State .Status .Reason .Names .Labels`, plus `{{.Label "key"}}`. `--filter` takes `name`, `id`, `status` and `label=KEY[=VALUE]` (every label filter must match); `name` is a substring match, not a regular expression, and `label!=` is not supported. `.Ports`, `.Mounts`, `.Networks`, `.Size` and `.LocalVolumes` do not exist yet. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.
 - `ward inspect` takes `--format` as a Go template over the JSON it prints. Only `{{.Path}}` and `{{json .Path}}` work: no `range`, `if`, `index` or functions. An array field prints as JSON, not as Go's `[a b]`. `--type container` is accepted and `--type image` is refused, because Ward cannot inspect images yet.
 - `ward container` and `ward image` are spellings of the top-level commands. `container` has `ls`, `ps`, `create`, `run`, `start`, `stop`, `restart`, `rm`, `kill`, `logs`, `inspect`, `exec`, `cp`, `top`, `stats`, `wait`, `diff`, `commit`, `prune`, `port` and `rename`; `image` has `ls` and `pull`. The other Docker subcommands are not there yet.
 - `ward version` prints the client and daemon versions. Unlike Docker it has no API version, Go version, git commit or build time. Without a daemon it prints the client half and exits 1. `--format` fields are `.Client.Version` and `.Server.Version`, `.Server.Os`, `.Server.Arch` and `.Server.Backend`.

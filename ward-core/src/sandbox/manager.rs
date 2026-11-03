@@ -1225,6 +1225,7 @@ impl SandboxManager {
         crate::validate::image_ref(&req.image)?;
         crate::validate::user_spec(&req.user)?;
         crate::validate::secrets(&req.secrets)?;
+        crate::validate::labels(&req.labels)?;
         // Held for delivery only: never copied into the stored options.
         let secrets = std::mem::take(&mut req.secrets);
         if let Some(ref r) = req.resources {
@@ -1360,6 +1361,7 @@ impl SandboxManager {
                 auto_remove: req.auto_remove,
                 published_ports,
                 image_digest,
+                labels: req.labels.clone().into_iter().collect(),
             },
         };
 
@@ -3015,6 +3017,7 @@ fn recorded_state(
         info.end_reason = entry.meta.end_reason;
         info.spec.published_ports = entry.meta.options.spec.published_ports.clone();
         info.spec.image_digest = entry.meta.options.spec.image_digest.clone();
+        info.spec.labels = entry.meta.options.spec.labels.clone();
         info.spec.name = entry.meta.options.spec.name.clone();
     }
     info
@@ -3084,6 +3087,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         workdir: info.spec.workdir,
         user: info.spec.user,
         image_digest: info.spec.image_digest,
+        labels: info.spec.labels.into_iter().collect(),
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec
@@ -3646,6 +3650,42 @@ pub(crate) mod tests {
         // Assert
         assert!(matches!(err, ApiError::InvalidRequest(_)));
         assert_eq!(puller.pulled(), vec!["alpine".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn given_labels_when_created_then_get_returns_them() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            labels: [("team".to_string(), "infra".to_string())].into(),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let created = mgr.create(req, "").await.unwrap();
+        let fetched = mgr.get(&created.id).await.unwrap();
+
+        // Assert
+        assert_eq!(
+            fetched.labels.get("team").map(String::as_str),
+            Some("infra")
+        );
+    }
+
+    #[tokio::test]
+    async fn given_empty_label_key_when_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            labels: [(String::new(), "x".to_string())].into(),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("empty key");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)));
     }
 
     // ----- pull policy and image digest -----------------------------------

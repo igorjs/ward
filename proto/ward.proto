@@ -154,6 +154,8 @@ message CreateSandboxRequest {
   // Files written to /run/secrets before the main process starts. The daemon
   // keeps them in memory only and never stores or reports them.
   repeated SecretFile secrets = 20;
+  // Key/value metadata kept on the sandbox, like `docker run --label`.
+  map<string, string> labels = 21;
 }
 
 // A secret delivered to the guest as the read-only file /run/secrets/<name>
@@ -257,6 +259,7 @@ message SandboxInfo {
   // Manifest digest the image resolved to when the sandbox was created,
   // e.g. sha256:... Empty for a sandbox created before it was recorded.
   string image_digest = 20;
+  map<string, string> labels = 21;
 }
 
 enum EndReason {

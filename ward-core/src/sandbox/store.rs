@@ -196,6 +196,8 @@ mod tests {
 
     const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
     const IMAGE_DIGEST: &str = "sha256:abc123";
+    const LABEL_KEY: &str = "team";
+    const LABEL_VALUE: &str = "infra";
     const ID_A: &str = "aaaaaaaa-0000-0000-0000-000000000001";
     const ID_B: &str = "bbbbbbbb-0000-0000-0000-000000000002";
 
@@ -225,6 +227,7 @@ mod tests {
                         container_port: 80,
                     }],
                     image_digest: IMAGE_DIGEST.into(),
+                    labels: [(LABEL_KEY.to_string(), LABEL_VALUE.to_string())].into(),
                 },
             },
             created_at: SystemTime::now(),
@@ -321,6 +324,27 @@ mod tests {
 
         // Assert
         assert_eq!(loaded[0].options.spec.image_digest, IMAGE_DIGEST);
+    }
+
+    #[test]
+    fn given_labels_when_loaded_then_they_are_kept() {
+        // Arrange
+        let (_tmp, store) = store();
+        store.save(&meta(ID_A, SandboxStatus::Stopped)).unwrap();
+
+        // Act
+        let loaded = store.load_all();
+
+        // Assert
+        assert_eq!(
+            loaded[0]
+                .options
+                .spec
+                .labels
+                .get(LABEL_KEY)
+                .map(String::as_str),
+            Some(LABEL_VALUE)
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,9 @@ pub struct SandboxSpec {
     /// Manifest digest the image resolved to at creation. Empty when unknown.
     #[serde(default)]
     pub image_digest: String,
+    /// User metadata from `--label`.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
 }
 
 /// A host TCP port forwarded to a guest port.
