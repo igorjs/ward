@@ -4,7 +4,7 @@ Ward copies Docker's command line where it can. This page lists the places it do
 
 ## Isolation
 
-Ward runs each sandbox in a microVM, not in Linux namespaces. The guest has its own kernel. Docker flags that change host privileges have no meaning there. `ward run` and `ward create` reject any flag not listed in their `--help`, including `--privileged`, `--cap-add`, `--device` and `--network`. Network access is set with `--egress` instead.
+Ward runs each sandbox in a microVM, not in Linux namespaces. The guest has its own kernel. Docker flags that change host privileges have no meaning there. `ward run` and `ward create` refuse `--privileged`, `--cap-add`, `--cap-drop`, `--security-opt`, `--device`, `--network` (and `--net`), `--ipc`, `--pid`, `--uts`, `--userns` and `--cgroupns` with a one line reason, and reject any other flag not listed in their `--help`. `--privileged=false` is accepted, as it changes nothing. Network access is set with `--egress` instead.
 
 ## Build
 
