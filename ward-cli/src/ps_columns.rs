@@ -133,6 +133,27 @@ fn image_size(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> Option<u64> {
         .or_else(by_prefix)
 }
 
+/// Whether a sandbox was made from the cached image, resolving its image the
+/// way `image_size` does.
+pub fn uses_image(info: &SandboxInfo, image: &ImageInfo) -> bool {
+    if !info.image_digest.is_empty() && info.image_digest == image.digest {
+        return true;
+    }
+    if info.image == image.reference || format!("{}:{DEFAULT_TAG}", info.image) == image.reference {
+        return true;
+    }
+    let wanted = info
+        .image
+        .strip_prefix(DIGEST_PREFIX)
+        .unwrap_or(&info.image);
+    wanted.len() >= MIN_ID_PREFIX
+        && wanted.chars().all(|c| c.is_ascii_hexdigit())
+        && image
+            .digest
+            .strip_prefix(DIGEST_PREFIX)
+            .is_some_and(|hex| hex.starts_with(wanted))
+}
+
 /// Docker's `0B (virtual 7.8MB)`. Ward cannot tell how much a sandbox wrote
 /// on top of its image, so the first figure is unmeasured.
 pub fn size_column(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> String {

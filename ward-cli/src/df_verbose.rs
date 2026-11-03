@@ -2,16 +2,19 @@
 
 //! `ward system df -v`: the per-object usage tables of `docker system df -v`.
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use ward_core::pb::{ImageInfo, SandboxInfo, VolumeInfo};
 
 use crate::client;
-use crate::images::{record as image_record, size_text};
+use crate::images::{BYTES_PER_MIB, record as image_record, size_text};
 use crate::inspect::ps_json_object;
+use crate::ps_columns::uses_image;
 
-const BYTES_PER_MIB: u64 = 1024 * 1024;
 const COLUMN_PADDING: usize = 3;
+/// A sandbox cannot mount a volume yet, and no volume has a sandbox using it.
+const NO_VOLUMES: &str = "0";
+const NO_LINKS: &str = "0";
 /// Shown for a figure Ward does not measure.
 const UNMEASURED: &str = "--";
 /// What `docker system df -v` prints for the build cache; Ward has none.
@@ -44,17 +47,21 @@ type Row = Vec<String>;
 /// column is not padded.
 fn table(headers: &[&str], rows: &[Row]) -> String {
     let header: Row = headers.iter().map(ToString::to_string).collect();
+    let widths: Vec<usize> = (0..headers.len())
+        .map(|column| {
+            std::iter::once(&header)
+                .chain(rows)
+                .map(|line| line[column].chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
     let mut out = String::new();
     for line in std::iter::once(&header).chain(rows) {
         for (column, cell) in line.iter().enumerate() {
             out.push_str(cell);
             if column + 1 < line.len() {
-                let widest = std::iter::once(&header)
-                    .chain(rows)
-                    .map(|l| l[column].chars().count())
-                    .max()
-                    .unwrap_or(0);
-                let pad = widest + COLUMN_PADDING - cell.chars().count();
+                let pad = widths[column] + COLUMN_PADDING - cell.chars().count();
                 out.push_str(&" ".repeat(pad));
             }
         }
@@ -63,15 +70,9 @@ fn table(headers: &[&str], rows: &[Row]) -> String {
     out
 }
 
-/// How many sandboxes were made from the image, by tag or by resolved digest.
+/// How many sandboxes were made from the image, by any name that reaches it.
 fn users_of(image: &ImageInfo, sandboxes: &[SandboxInfo]) -> usize {
-    sandboxes
-        .iter()
-        .filter(|s| {
-            s.image == image.reference
-                || (!s.image_digest.is_empty() && s.image_digest == image.digest)
-        })
-        .count()
+    sandboxes.iter().filter(|s| uses_image(s, image)).count()
 }
 
 fn image_rows(images: &[ImageInfo], sandboxes: &[SandboxInfo]) -> Vec<Row> {
@@ -107,7 +108,7 @@ fn container_rows(sandboxes: &[SandboxInfo]) -> Vec<Row> {
                 field("ID"),
                 field("Image"),
                 field("Command"),
-                "0".to_string(),
+                NO_VOLUMES.to_string(),
                 UNMEASURED.to_string(),
                 field("RunningFor"),
                 field("Status"),
@@ -123,7 +124,7 @@ fn volume_rows(volumes: &[VolumeInfo]) -> Vec<Row> {
         .map(|volume| {
             vec![
                 volume.name.clone(),
-                "0".to_string(),
+                NO_LINKS.to_string(),
                 size_text(u64::from(volume.size_mb) * BYTES_PER_MIB),
             ]
         })
@@ -140,7 +141,14 @@ fn report(images: &[ImageInfo], sandboxes: &[SandboxInfo], volumes: &[VolumeInfo
     )
 }
 
-pub async fn run(socket: &str) -> Result<()> {
+/// # Errors
+///
+/// Fails with `--json`, which has no verbose form, or when the daemon cannot
+/// be reached.
+pub async fn run(socket: &str, json: bool) -> Result<()> {
+    if json {
+        bail!("--json is not supported with system df -v");
+    }
     let mut c = client::connect(socket).await?;
     let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
     let images = c.list_images(()).await?.into_inner().images;
@@ -205,6 +213,27 @@ mod tests {
         assert!(text.contains("0123456789ab   alpine:3"), "{text}");
         assert!(text.contains("data          0       104.9MB"), "{text}");
         assert!(text.ends_with("Build cache usage: 0B\n"), "{text}");
+    }
+
+    #[test]
+    fn given_an_untagged_sandbox_image_when_users_counted_then_the_default_tag_matches() {
+        let cached = image("alpine:latest", "sha256:abcdef0123", 1);
+        let sandboxes = [
+            SandboxInfo {
+                image: "alpine".into(),
+                ..Default::default()
+            },
+            SandboxInfo {
+                image: "abcdef".into(),
+                ..Default::default()
+            },
+            SandboxInfo {
+                image: "alpine:3".into(),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(users_of(&cached, &sandboxes), 2);
     }
 
     #[test]

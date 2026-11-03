@@ -1827,7 +1827,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::System(SystemCommands::Df { verbose: true }) => {
-            df_verbose::run(&socket_path).await?;
+            df_verbose::run(&socket_path, json).await?;
         }
 
         Commands::System(SystemCommands::Df { verbose: false }) => {
@@ -1868,9 +1868,17 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             VolumeCommands::List(args) => volume::list(&socket_path, args, json, no_pretty).await?,
-            VolumeCommands::Inspect(args) => volume::inspect(&socket_path, args).await?,
+            VolumeCommands::Inspect(args) => {
+                if !volume::inspect(&socket_path, args).await? {
+                    std::process::exit(GENERIC_FAILURE_EXIT_CODE);
+                }
+            }
             VolumeCommands::Prune(args) => prune::volume(&socket_path, args, json).await?,
-            VolumeCommands::Remove(args) => volume::remove(&socket_path, args, json).await?,
+            VolumeCommands::Remove(args) => {
+                if !volume::remove(&socket_path, args, json).await? {
+                    std::process::exit(GENERIC_FAILURE_EXIT_CODE);
+                }
+            }
         },
 
         Commands::Publish {

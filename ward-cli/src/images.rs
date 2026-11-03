@@ -37,6 +37,8 @@ const FIELDS: [(&str, &str); 7] = [
     ("Size", "SIZE"),
 ];
 
+pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 /// A byte count in Docker's decimal units.
 pub fn size_text(bytes: u64) -> String {
     human_size(bytes, BYTES_PER_UNIT, &SIZE_UNITS)

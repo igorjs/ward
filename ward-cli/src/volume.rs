@@ -9,15 +9,21 @@ use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{RemoveVolumeRequest, VolumeInfo};
 
-use crate::client::{self, PlainError};
-use crate::images::size_text;
+use crate::client;
+use crate::images::{BYTES_PER_MIB, size_text};
 use crate::inspect::rfc3339;
 use crate::{output, template};
 
-const BYTES_PER_MIB: u64 = 1024 * 1024;
 /// The only volume driver, and the only scope.
 const DRIVER: &str = "local";
 const SCOPE: &str = "local";
+/// Volumes carry no labels, and nothing links to them.
+const NO_LABELS: &str = "";
+const NO_LINKS: &str = "N/A";
+/// The words `dangling=` accepts, as Docker does.
+const TRUE_WORDS: [&str; 2] = ["true", "1"];
+const FALSE_WORDS: [&str; 2] = ["false", "0"];
+const ERROR_PREFIX: &str = "Error response from daemon: ";
 const FILTER_NAME: &str = "name";
 const FILTER_DANGLING: &str = "dangling";
 const FILTER_DRIVER: &str = "driver";
@@ -75,9 +81,25 @@ pub struct RemoveArgs {
 struct Filters {
     names: Vec<String>,
     /// Ward volumes cannot be attached to a sandbox, so all are dangling.
-    dangling: Option<bool>,
-    driver: Option<String>,
+    dangling: Vec<bool>,
+    drivers: Vec<String>,
     labels: Vec<String>,
+}
+
+/// Why a reference names no single volume.
+#[derive(Debug, PartialEq)]
+enum FindError {
+    NotFound(String),
+    Ambiguous(String),
+}
+
+impl std::fmt::Display for FindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(reference) => write!(f, "get {reference}: no such volume"),
+            Self::Ambiguous(reference) => write!(f, "multiple volumes match '{reference}'"),
+        }
+    }
 }
 
 impl Filters {
@@ -90,13 +112,15 @@ impl Filters {
             match key {
                 FILTER_NAME => filters.names.push(value.to_string()),
                 FILTER_DANGLING => {
-                    filters.dangling = Some(match value {
-                        "true" | "1" => true,
-                        "false" | "0" => false,
-                        _ => bail!("invalid filter 'dangling={value}'"),
+                    filters.dangling.push(if TRUE_WORDS.contains(&value) {
+                        true
+                    } else if FALSE_WORDS.contains(&value) {
+                        false
+                    } else {
+                        bail!("invalid filter 'dangling={value}'")
                     });
                 }
-                FILTER_DRIVER => filters.driver = Some(value.to_string()),
+                FILTER_DRIVER => filters.drivers.push(value.to_string()),
                 FILTER_LABEL => filters.labels.push(value.to_string()),
                 other => bail!("invalid filter '{other}'"),
             }
@@ -104,17 +128,18 @@ impl Filters {
         Ok(filters)
     }
 
-    /// Volumes carry no labels, so any `label=` filter matches none.
+    /// Volumes carry no labels, so any `label=` filter matches none. Values
+    /// of one key are alternatives, as in Docker.
     fn allows(&self, volume: &VolumeInfo) -> bool {
         self.labels.is_empty()
-            && self.dangling != Some(false)
-            && self.driver.as_deref().is_none_or(|d| d == DRIVER)
+            && (self.dangling.is_empty() || self.dangling.contains(&true))
+            && (self.drivers.is_empty() || self.drivers.iter().any(|d| d == DRIVER))
             && (self.names.is_empty() || self.names.iter().any(|n| volume.name.contains(n)))
     }
 }
 
 /// The volume `reference` names: a name, an ID or a unique ID prefix.
-fn find<'a>(volumes: &'a [VolumeInfo], reference: &str) -> Result<&'a VolumeInfo> {
+fn find<'a>(volumes: &'a [VolumeInfo], reference: &str) -> Result<&'a VolumeInfo, FindError> {
     if let Some(volume) = volumes
         .iter()
         .find(|v| v.name == reference || v.id == reference)
@@ -124,8 +149,10 @@ fn find<'a>(volumes: &'a [VolumeInfo], reference: &str) -> Result<&'a VolumeInfo
     let mut prefixed = volumes.iter().filter(|v| v.id.starts_with(reference));
     match (prefixed.next(), prefixed.next()) {
         (Some(volume), None) if !reference.is_empty() => Ok(volume),
-        (Some(_), Some(_)) => bail!("multiple volumes match '{reference}'"),
-        _ => bail!("get {reference}: no such volume"),
+        (Some(_), Some(_)) if !reference.is_empty() => {
+            Err(FindError::Ambiguous(reference.to_string()))
+        }
+        _ => Err(FindError::NotFound(reference.to_string())),
     }
 }
 
@@ -135,38 +162,35 @@ fn created_seconds(volume: &VolumeInfo) -> Option<i64> {
 
 /// The `volume inspect` object, in Docker's shape plus Ward's `Id` and `SizeMB`.
 fn inspect_object(volume: &VolumeInfo) -> Map<String, Value> {
-    let Value::Object(map) = json!({
-        "CreatedAt": created_seconds(volume).map(rfc3339),
-        "Driver": DRIVER,
-        "Labels": {},
-        "Mountpoint": volume.mount_path,
-        "Name": volume.name,
-        "Options": null,
-        "Scope": SCOPE,
-        "Id": volume.id,
-        "SizeMB": volume.size_mb,
-    }) else {
-        unreachable!("json! of an object")
-    };
-    map
+    Map::from_iter([
+        (
+            "CreatedAt".to_string(),
+            json!(created_seconds(volume).map(rfc3339)),
+        ),
+        ("Driver".to_string(), json!(DRIVER)),
+        ("Labels".to_string(), json!({})),
+        ("Mountpoint".to_string(), json!(volume.mount_path)),
+        ("Name".to_string(), json!(volume.name)),
+        ("Options".to_string(), Value::Null),
+        ("Scope".to_string(), json!(SCOPE)),
+        ("Id".to_string(), json!(volume.id)),
+        ("SizeMB".to_string(), json!(volume.size_mb)),
+    ])
 }
 
 /// The `ls --format` record.
 fn list_record(volume: &VolumeInfo) -> Map<String, Value> {
     let size = u64::from(volume.size_mb) * BYTES_PER_MIB;
-    let Value::Object(map) = json!({
-        "Driver": DRIVER,
-        "Name": volume.name,
-        "ID": volume.id,
-        "Mountpoint": volume.mount_path,
-        "Scope": SCOPE,
-        "Size": size_text(size),
-        "Labels": "",
-        "Links": "N/A",
-    }) else {
-        unreachable!("json! of an object")
-    };
-    map
+    Map::from_iter([
+        ("Driver".to_string(), json!(DRIVER)),
+        ("Name".to_string(), json!(volume.name)),
+        ("ID".to_string(), json!(volume.id)),
+        ("Mountpoint".to_string(), json!(volume.mount_path)),
+        ("Scope".to_string(), json!(SCOPE)),
+        ("Size".to_string(), json!(size_text(size))),
+        ("Labels".to_string(), json!(NO_LABELS)),
+        ("Links".to_string(), json!(NO_LINKS)),
+    ])
 }
 
 async fn all_volumes(c: &mut WardClient<Channel>) -> Result<Vec<VolumeInfo>> {
@@ -201,7 +225,13 @@ pub async fn list(socket: &str, args: ListArgs, json: bool, no_pretty: bool) -> 
     Ok(())
 }
 
-pub async fn inspect(socket: &str, args: InspectArgs) -> Result<()> {
+/// Prints the volumes found. Returns false when any reference named none, after
+/// printing each such error, so the caller can exit non-zero.
+///
+/// # Errors
+///
+/// Fails on a bad template or when the daemon cannot be reached.
+pub async fn inspect(socket: &str, args: InspectArgs) -> Result<bool> {
     let parsed = args
         .format
         .as_deref()
@@ -210,13 +240,13 @@ pub async fn inspect(socket: &str, args: InspectArgs) -> Result<()> {
     let mut c = client::connect(socket).await?;
     let volumes = all_volumes(&mut c).await?;
     let mut found = Vec::new();
-    let mut missing = 0;
+    let mut all_found = true;
     for reference in &args.volumes {
         match find(&volumes, reference) {
             Ok(volume) => found.push(inspect_object(volume)),
             Err(e) => {
-                missing += 1;
-                eprintln!("Error: {e}");
+                all_found = false;
+                eprintln!("{ERROR_PREFIX}{e}");
             }
         }
     }
@@ -224,47 +254,48 @@ pub async fn inspect(socket: &str, args: InspectArgs) -> Result<()> {
         Some(template) => print!("{}", template.render(&found)?),
         None => println!("{}", serde_json::to_string_pretty(&found)?),
     }
-    if missing > 0 {
-        return Err(anyhow::Error::new(PlainError(format!(
-            "Error: no such volume ({missing} of {})",
-            args.volumes.len()
-        ))));
-    }
-    Ok(())
+    Ok(all_found)
 }
 
-pub async fn remove(socket: &str, args: RemoveArgs, json: bool) -> Result<()> {
+/// Removes each volume in turn and keeps going after a failure. Returns false
+/// when any removal failed, after printing each error. With `-f` a volume that
+/// does not exist is skipped.
+///
+/// # Errors
+///
+/// Fails when the daemon cannot be reached.
+pub async fn remove(socket: &str, args: RemoveArgs, json: bool) -> Result<bool> {
     let mut c = client::connect(socket).await?;
-    let volumes = all_volumes(&mut c).await?;
-    let mut failed = 0;
+    let mut volumes = all_volumes(&mut c).await?;
+    let mut all_removed = true;
     for reference in &args.volumes {
-        let result = match find(&volumes, reference) {
-            Ok(volume) => c
-                .remove_volume(RemoveVolumeRequest {
-                    id: volume.id.clone(),
-                })
-                .await
-                .map(|_| ())
-                .map_err(anyhow::Error::from),
-            Err(e) if args.force && e.to_string().contains("no such volume") => continue,
-            Err(e) => Err(e),
-        };
-        match result {
-            Ok(()) if json => println!("{}", json!({"removed": reference})),
-            Ok(()) => println!("{reference}"),
+        let id = match find(&volumes, reference) {
+            Ok(volume) => volume.id.clone(),
+            Err(FindError::NotFound(_)) if args.force => continue,
             Err(e) => {
-                failed += 1;
-                eprintln!("Error response from daemon: {e}");
+                all_removed = false;
+                eprintln!("{ERROR_PREFIX}{e}");
+                continue;
+            }
+        };
+        let request = RemoveVolumeRequest { id: id.clone() };
+        match c.remove_volume(request).await {
+            Ok(_) => {
+                // A repeat of the same volume must now count as missing.
+                volumes.retain(|v| v.id != id);
+                if json {
+                    println!("{}", json!({"removed": reference}));
+                } else {
+                    println!("{reference}");
+                }
+            }
+            Err(status) => {
+                all_removed = false;
+                eprintln!("{ERROR_PREFIX}{}", status.message());
             }
         }
     }
-    if failed > 0 {
-        return Err(anyhow::Error::new(PlainError(format!(
-            "Error: failed to remove {failed} of {} volumes",
-            args.volumes.len()
-        ))));
-    }
-    Ok(())
+    Ok(all_removed)
 }
 
 #[cfg(test)]
@@ -307,12 +338,34 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::unknown("nope", FindError::NotFound("nope".into()), "get nope: no such volume")]
+    #[case::empty("", FindError::NotFound(String::new()), "get : no such volume")]
+    #[case::ambiguous("aa", FindError::Ambiguous("aa".into()), "multiple volumes match 'aa'")]
+    fn given_a_bad_reference_when_found_then_the_error_is_typed_and_worded_like_docker(
+        #[case] reference: &str,
+        #[case] expected: FindError,
+        #[case] text: &str,
+    ) {
+        let volumes = fleet();
+
+        let error = find(&volumes, reference).expect_err("no single volume");
+
+        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), text);
+    }
+
+    #[rstest::rstest]
     #[case::by_name(&["name=ca"], &["cache"])]
     #[case::dangling(&["dangling=true"], &["cache", "data"])]
     #[case::not_dangling(&["dangling=false"], &[])]
     #[case::driver(&["driver=local"], &["cache", "data"])]
     #[case::other_driver(&["driver=nfs"], &[])]
     #[case::label_matches_none(&["label=env"], &[])]
+    #[case::repeated_driver_is_an_alternative(&["driver=nfs", "driver=local"], &["cache", "data"])]
+    #[case::repeated_dangling_is_an_alternative(&["dangling=false", "dangling=true"], &["cache", "data"])]
+    #[case::one_of_two_names(&["name=ca", "name=zzz"], &["cache"])]
+    #[case::numeric_dangling(&["dangling=1"], &["cache", "data"])]
+    #[case::numeric_not_dangling(&["dangling=0"], &[])]
     fn given_filters_when_applied_then_the_matching_volumes_remain(
         #[case] specs: &[&str],
         #[case] expected: &[&str],
