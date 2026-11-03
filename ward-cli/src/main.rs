@@ -11,6 +11,7 @@ mod diff;
 mod docker;
 mod egress;
 mod events;
+mod history;
 mod images;
 mod inspect;
 mod lifecycle;
@@ -20,10 +21,12 @@ mod ports;
 mod ps_filter;
 mod pull;
 mod resources;
+mod rmi;
 mod secrets;
 mod socket;
 mod stats;
 mod system;
+mod tag;
 mod template;
 mod terminal;
 mod tokens;
@@ -625,6 +628,21 @@ enum Commands {
         /// Local tag for the new image, REPOSITORY[:TAG].
         repository: Option<String>,
     },
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Remove tags and images from the local cache, as `docker rmi` does.
+    ///
+    /// A tag that is not the image's last is only untagged. An image a
+    /// running sandbox uses is never deleted. -f deletes one that stopped
+    /// sandboxes use, or one with several tags given by ID.
+    Rmi(rmi::Args),
+
+    /// Add a tag to a local image, as `docker tag` does.
+    Tag(tag::Args),
+
+    #[command(after_help = DOCKER_DIFFERENCES)]
+    /// Show the layers of an image, newest first, as `docker history` does.
+    History(history::Args),
 
     /// Give a sandbox a new name.
     Rename {
@@ -1536,6 +1554,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             };
             commit::run(&socket_path, &token_store, &container, options).await?;
         }
+
+        Commands::Rmi(args) => rmi::run(&socket_path, args).await?,
+
+        Commands::Tag(args) => tag::run(&socket_path, args).await?,
+
+        Commands::History(args) => history::run(&socket_path, args, json).await?,
 
         Commands::Rename {
             reference,

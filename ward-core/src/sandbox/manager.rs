@@ -1826,6 +1826,46 @@ impl SandboxManager {
         Ok(image_to_pb(&image))
     }
 
+    /// Remove an image or a tag from the cache, like `docker rmi`.
+    pub async fn remove_image(
+        &self,
+        name: &str,
+        force: bool,
+    ) -> Result<crate::backend::image::ImageRemoval> {
+        let running: std::collections::HashSet<String> = self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|info| {
+                matches!(
+                    SandboxStatus::try_from(info.status),
+                    Ok(SandboxStatus::Running | SandboxStatus::Creating | SandboxStatus::Stopping)
+                )
+            })
+            .map(|info| info.id)
+            .collect();
+        self.backend
+            .remove_image(name, force, &running)
+            .await
+            .map_err(image_backend_err)
+    }
+
+    /// Add a tag to a cached image.
+    pub async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        self.backend
+            .tag_image(source, target)
+            .await
+            .map_err(image_backend_err)
+    }
+
+    /// The build steps of a cached image.
+    pub async fn image_history(&self, name: &str) -> Result<crate::backend::image::HistoryView> {
+        self.backend
+            .image_history(name)
+            .await
+            .map_err(image_backend_err)
+    }
+
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;
