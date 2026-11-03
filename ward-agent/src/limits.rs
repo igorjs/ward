@@ -55,16 +55,41 @@ pub fn apply(dir: &Path, limits: Limits) -> io::Result<()> {
         return Err(unsupported("the guest kernel has no pids controller"));
     }
 
+    if limits.nano_cpus.is_some() {
+        enable(root, CPU_CONTROLLER)?;
+    }
+    if limits.pids_max.is_some() {
+        enable(root, PIDS_CONTROLLER)?;
+    }
+
+    let mut writes = Vec::new();
     if let Some(bytes) = limits.memory_bytes {
-        std::fs::write(dir.join(MEMORY_MAX_FILE), limit_text(bytes))?;
+        writes.push((dir.join(MEMORY_MAX_FILE), limit_text(bytes)));
     }
     if let Some(nanos) = limits.nano_cpus {
-        enable(root, CPU_CONTROLLER)?;
-        std::fs::write(dir.join(CPU_MAX_FILE), cpu_max_text(nanos))?;
+        writes.push((dir.join(CPU_MAX_FILE), cpu_max_text(nanos)));
     }
     if let Some(pids) = limits.pids_max {
-        enable(root, PIDS_CONTROLLER)?;
-        std::fs::write(dir.join(PIDS_MAX_FILE), limit_text(u64::from(pids)))?;
+        writes.push((dir.join(PIDS_MAX_FILE), limit_text(u64::from(pids))));
+    }
+    write_all_or_none(&writes)
+}
+
+/// Write every file, or put back the ones already written when a later write
+/// fails. The old contents are read before the first write.
+fn write_all_or_none(writes: &[(std::path::PathBuf, String)]) -> io::Result<()> {
+    let old = writes
+        .iter()
+        .map(|(path, _)| std::fs::read_to_string(path))
+        .collect::<io::Result<Vec<_>>>()?;
+    for (done, (path, text)) in writes.iter().enumerate() {
+        if let Err(e) = std::fs::write(path, text) {
+            for ((path, _), before) in writes.iter().zip(&old).take(done) {
+                // Best effort: the kernel already accepted these values once.
+                let _ = std::fs::write(path, before.trim());
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -228,6 +253,34 @@ mod tests {
 
         // Assert
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn given_a_later_write_that_fails_when_applied_then_earlier_files_are_restored() {
+        // Arrange
+        let root = fake_root("cpu memory pids", true);
+        let group = root.path().join(GROUP);
+        std::fs::write(group.join(MEMORY_MAX_FILE), "1000").unwrap();
+        // A read-only file reads fine but cannot be written, so the pids
+        // write fails last.
+        let mut mode = std::fs::metadata(group.join(PIDS_MAX_FILE))
+            .unwrap()
+            .permissions();
+        mode.set_readonly(true);
+        std::fs::set_permissions(group.join(PIDS_MAX_FILE), mode).unwrap();
+        let limits = Limits {
+            memory_bytes: Some(2000),
+            nano_cpus: Some(500_000_000),
+            pids_max: Some(5),
+        };
+
+        // Act
+        let result = apply(&group, limits);
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(read(&root, MEMORY_MAX_FILE), "1000");
+        assert_eq!(read(&root, CPU_MAX_FILE), "max");
     }
 
     #[test]
