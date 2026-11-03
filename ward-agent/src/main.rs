@@ -55,6 +55,14 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    if let Err(e) =
+        ward_agent::guest_network::apply(&args.hosts, &args.dns_search, &args.dns_options)
+    {
+        return Err(std::io::Error::other(format!(
+            "cannot write /etc/hosts or /etc/resolv.conf: {e}"
+        )));
+    }
+
     if args.read_only {
         ward_agent::guest_mounts::remount_root_read_only()?;
         tracing::info!("root filesystem is read-only");
