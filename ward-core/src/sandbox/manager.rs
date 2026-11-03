@@ -30,6 +30,7 @@ use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
 
 mod pause;
+mod wait_condition;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
@@ -1396,6 +1397,7 @@ impl SandboxManager {
         crate::validate::stop_timeout(req.stop_timeout)?;
         let restart =
             crate::validate::restart_policy(req.restart_policy.as_ref(), req.auto_remove)?;
+        let guest = crate::guest_options::validate(req.guest.as_ref(), &req.mounts)?;
         // A fresh VM has no secrets, so a restart could not deliver them.
         if !req.secrets.is_empty() && restart.kind != crate::protocol::RestartKind::No {
             return Err(ApiError::InvalidRequest(RESTART_WITHOUT_SECRETS.into()));
@@ -1540,6 +1542,8 @@ impl SandboxManager {
                 stop_signal: req.stop_signal.clone(),
                 stop_timeout: req.stop_timeout,
                 restart,
+                guest,
+                mounts: Vec::new(),
             },
         };
 
@@ -3310,6 +3314,8 @@ fn recorded_state(
         info.spec.stop_signal = entry.meta.options.spec.stop_signal.clone();
         info.spec.stop_timeout = entry.meta.options.spec.stop_timeout;
         info.spec.restart = entry.meta.options.spec.restart;
+        info.spec.guest = entry.meta.options.spec.guest.clone();
+        info.spec.mounts = entry.meta.options.mounts.clone();
         info.restart_count = entry.meta.restart_count;
         info.paused &= entry.meta.status == crate::protocol::SandboxStatus::Running;
         info.spec.name = entry.meta.options.spec.name.clone();
@@ -3398,6 +3404,17 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         }),
         restart_count: info.restart_count,
         tty: info.spec.tty,
+        guest: Some(crate::guest_options::to_pb(&info.spec.guest)),
+        mounts: info
+            .spec
+            .mounts
+            .iter()
+            .map(|m| crate::pb::Mount {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                readonly: m.readonly,
+            })
+            .collect(),
         paused: info.paused,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
@@ -8203,6 +8220,57 @@ pub(crate) mod tests {
         assert_eq!(mgr.get(&custom.id).await.unwrap().hostname, custom.hostname);
     }
 
+    #[tokio::test]
+    async fn given_guest_options_when_created_then_info_reports_them_with_the_default_shm() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            guest: Some(crate::pb::GuestOptions {
+                read_only_rootfs: true,
+                tmpfs: vec![crate::pb::TmpfsMount {
+                    path: "/scratch/".into(),
+                    options: "size=1m".into(),
+                }],
+                shm_size_bytes: 0,
+            }),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let id = mgr.create(req, "").await.unwrap().id;
+        let guest = mgr.get(&id).await.unwrap().guest.unwrap();
+
+        // Assert
+        assert!(guest.read_only_rootfs);
+        assert_eq!(guest.tmpfs[0].path, "/scratch");
+        assert_eq!(
+            guest.shm_size_bytes,
+            crate::protocol::DEFAULT_SHM_SIZE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_tmpfs_on_a_reserved_path_when_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            guest: Some(crate::pb::GuestOptions {
+                tmpfs: vec![crate::pb::TmpfsMount {
+                    path: "/proc".into(),
+                    options: String::new(),
+                }],
+                ..Default::default()
+            }),
+            ..create_req("alpine")
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("refused");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
+    }
+
     #[rstest::rstest]
     #[case::hostname(CreateSandboxRequest { hostname: "-bad".into(), ..create_req("alpine") })]
     #[case::signal(CreateSandboxRequest { stop_signal: "SIGNOPE".into(), ..create_req("alpine") })]
@@ -8968,4 +9036,5 @@ pub(crate) mod tests {
     mod rename;
     #[cfg(not(feature = "krunvm"))]
     mod secrets;
+    mod wait_condition;
 }

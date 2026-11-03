@@ -4,7 +4,7 @@ Ward copies Docker's command line where it can. This page lists the places it do
 
 ## Isolation
 
-Ward runs each sandbox in a microVM, not in Linux namespaces. The guest has its own kernel. Docker flags that change host privileges have no meaning there. `ward run` and `ward create` reject any flag not listed in their `--help`, including `--privileged`, `--cap-add`, `--device` and `--network`. Network access is set with `--egress` instead.
+Ward runs each sandbox in a microVM, not in Linux namespaces. The guest has its own kernel. Docker flags that change host privileges have no meaning there. `ward run` and `ward create` refuse `--privileged`, `--cap-add`, `--cap-drop`, `--security-opt`, `--device`, `--network` (and `--net`), `--ipc`, `--pid`, `--uts`, `--userns` and `--cgroupns` with a one line reason, and reject any other flag not listed in their `--help`. `--privileged=false` is accepted, as it changes nothing. Network access is set with `--egress` instead.
 
 ## Build
 
@@ -27,6 +27,14 @@ These flags of `ward run` and `ward create` follow Docker unless noted.
 - `--stop-signal SIGNAL` (a name such as `SIGINT` or a number) replaces SIGTERM as the signal that asks the main process to end. `--stop-timeout SECONDS` replaces the 10 second wait before SIGKILL; `-1` waits forever and `0` kills at once. Both apply to `stop` and `restart`, and `stop -t` or `restart -t` overrides the timeout. `inspect` shows `Config.StopSignal` and `Config.StopTimeout` once they are set, as Docker does. `rm -f` does not send the stop signal: it removes the sandbox at once, as Ward always has.
 - `--restart no|on-failure[:N]|always|unless-stopped` follows Docker. The daemon starts the sandbox again when its main process ends: `always` and `unless-stopped` after any exit, `on-failure` only after a non-zero exit and at most N times (0 or no N means no limit). The wait between restarts starts at 100 ms, doubles each time up to 1 minute, and starts over after a run of 10 seconds or more. `stop` and `rm` end the restarts, and so does `kill` with SIGKILL or the stop signal; any other kill signal does not. A start or `restart` by hand clears that and resets `RestartCount`, which `inspect` shows at its top level, with the policy in `HostConfig.RestartPolicy`. Differences: a sandbox waiting for its next restart shows `exited`, not `restarting`; the daemon restarts `always` and `unless-stopped` sandboxes when it starts (and `unless-stopped` only if not stopped by hand) but a clean `wardd` shutdown removes every sandbox first, so this applies after a crash; `--restart` other than `no` cannot be combined with `--secret`, because a fresh VM has no secrets to deliver; `--rm` with `--restart` other than `no` is refused, as in Docker.
 - `--init` is accepted and does nothing.
+
+## Guest setup options
+
+These flags of `ward run` and `ward create` are enforced by the guest agent when the VM boots, and `inspect` shows them where Docker does.
+
+- `--read-only` remounts the root filesystem read-only after the guest is set up, so a write fails with EROFS. `/dev` and `/dev/shm` are separate mounts and stay writable. Docker leaves `/tmp` and `/run` read-only; Ward, like Podman's `--read-only-tmpfs`, gives `/tmp` and `/run` a writable tmpfs (not `noexec`, mode 1777) unless you mount something there yourself. `--tmpfs` mounts and `-v` mounts stay writable. `ward cp` into the root of a read-only sandbox fails, as in Docker. `inspect` shows `HostConfig.ReadonlyRootfs`.
+- `--tmpfs PATH[:OPTIONS]` mounts a tmpfs, repeatable, with Docker's defaults `rw,noexec,nosuid,nodev`. Options are `ro`, `rw`, `exec`, `noexec`, `suid`, `nosuid`, `dev`, `nodev`, `sync`, `async`, `dirsync`, `atime`, `noatime`, `diratime`, `nodiratime`, `relatime`, `norelatime`, `strictatime`, `nostrictatime` and the kernel's `size=`, `mode=`, `nr_inodes=`, `uid=` and `gid=` (sizes take a `k`, `m` or `g` suffix; `%` is not accepted). A later option wins over an earlier one. `/`, `/proc`, `/sys`, `/dev` and `/dev/shm` cannot be mounted over, and a destination used twice fails with `Duplicate mount point`. At most 64 tmpfs mounts. `inspect` shows `HostConfig.Tmpfs` (only when set) and `Mounts`, which also lists `-v` binds.
+- `--shm-size SIZE` sizes `/dev/shm`, a tmpfs mounted `noexec,nosuid,nodev` with mode 1777. The default and `0` mean 64 MiB, as in Docker. `inspect` shows `HostConfig.ShmSize`, which is 64 MiB even when the flag is not given.
 
 ## Ports
 
@@ -58,6 +66,11 @@ Each attach session is separate. A client that disconnects only detaches and lea
 - `--sig-proxy` (default true) passes SIGINT and SIGTERM to the process when the CLI does not own the terminal. With `--sig-proxy=false` they end the CLI (exit 130 or 143) and leave the process alone. With a terminal, Ctrl-C is a key and the flag has no effect, as in Docker.
 - `ward start -a` and `-i` start one sandbox, then attach as above and exit with the process's exit code. They show all the output of that run, and `-i` also sends input. Several references with either flag are refused, as in Docker. Docker attaches before it starts; Ward attaches right after the start call returns and replays the output of the new run, so nothing is lost.
 - `ward run -a STREAM` (STDIN, STDOUT or STDERR, repeatable) shows only those streams, and sends input only for STDIN with `-i`. Without `-a` all are attached. `-a` with `-d` fails.
+
+## Wait
+
+`ward wait --condition` takes `not-running` (the default), `next-exit` and `removed`, as Docker does. `next-exit` on a sandbox that is not running waits for it to be started and to exit. `removed` prints the last exit code of the main process, or 0 when it never ran a command. Ward polls the state ten times a second, so a start and exit that both happen between two polls still count as the next exit but the wait may notice them late. `next-exit` and `removed` on a sandbox that does not exist fail at once, as `not-running` does.
+
 
 ## Pause
 

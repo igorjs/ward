@@ -484,6 +484,7 @@ async fn given_wrong_missing_or_empty_token_when_wait_then_permission_denied() {
     for token in [Some("wrong"), None, Some("")] {
         let wait = WaitRequest {
             sandbox_id: sandbox_id.clone(),
+            ..Default::default()
         };
         let wait = match token {
             Some(token) => common::with_token(wait, token),

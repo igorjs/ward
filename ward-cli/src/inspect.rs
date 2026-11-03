@@ -30,6 +30,8 @@ const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const READ_ONLY_MODE: &str = "ro";
+const BIND_PROPAGATION: &str = "rprivate";
 const NANOS_PER_CPU: u64 = 1_000_000_000;
 const SECONDS_PER_MINUTE: i64 = 60;
 const SECONDS_PER_HOUR: i64 = 3600;
@@ -335,7 +337,42 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "Config": config,
         "RestartCount": info.restart_count,
         "HostConfig": host_config(info),
+        "Mounts": mounts(info),
     })
+}
+
+/// Docker's top-level `Mounts`: the bind mounts, then the tmpfs mounts.
+fn mounts(info: &SandboxInfo) -> Vec<Value> {
+    let binds = info.mounts.iter().map(|m| {
+        json!({
+            "Type": "bind",
+            "Source": m.source,
+            "Destination": m.target,
+            "Mode": if m.readonly { READ_ONLY_MODE } else { "" },
+            "RW": !m.readonly,
+            "Propagation": BIND_PROPAGATION,
+        })
+    });
+    let tmpfs = info.guest.iter().flat_map(|guest| &guest.tmpfs).map(|t| {
+        let read_only = last_access_mode(&t.options) == READ_ONLY_MODE;
+        json!({
+            "Type": "tmpfs",
+            "Source": "",
+            "Destination": t.path,
+            "Mode": "",
+            "RW": !read_only,
+            "Propagation": "",
+        })
+    });
+    binds.chain(tmpfs).collect()
+}
+
+/// The last of `ro` and `rw` in a tmpfs option list, as the kernel applies it.
+fn last_access_mode(options: &str) -> &str {
+    options
+        .split(',')
+        .rfind(|o| matches!(*o, "ro" | "rw"))
+        .unwrap_or("rw")
 }
 
 /// Docker `HostConfig` limits. Unlimited is 0, and null for pids.
@@ -350,7 +387,8 @@ fn host_config(info: &SandboxInfo) -> Value {
         },
         ..restart
     };
-    json!({
+    let guest = info.guest.clone().unwrap_or_default();
+    let mut config = json!({
         "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
@@ -358,7 +396,19 @@ fn host_config(info: &SandboxInfo) -> Value {
             "Name": restart.name,
             "MaximumRetryCount": restart.maximum_retry_count,
         },
-    })
+        "ReadonlyRootfs": guest.read_only_rootfs,
+        "ShmSize": guest.shm_size_bytes,
+    });
+    // Docker leaves Tmpfs out until a tmpfs is mounted.
+    if !guest.tmpfs.is_empty() {
+        let tmpfs: serde_json::Map<String, Value> = guest
+            .tmpfs
+            .iter()
+            .map(|t| (t.path.clone(), json!(t.options)))
+            .collect();
+        config["Tmpfs"] = Value::Object(tmpfs);
+    }
+    config
 }
 
 /// Calendar fields of a UTC instant.
@@ -729,7 +779,10 @@ mod tests {
                     "NanoCpus": 0,
                     "PidsLimit": null,
                     "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                    "ReadonlyRootfs": false,
+                    "ShmSize": 0,
                 },
+                "Mounts": [],
                 "RestartCount": 0,
             })
         );
@@ -809,7 +862,58 @@ mod tests {
                 "NanoCpus": 2_000_000_000_u64,
                 "PidsLimit": 100,
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+                "ReadonlyRootfs": false,
+                "ShmSize": 0,
             })
+        );
+    }
+
+    #[test]
+    fn given_guest_mounts_when_inspected_then_docker_places_them() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            guest: Some(ward_core::pb::GuestOptions {
+                read_only_rootfs: true,
+                shm_size_bytes: 134_217_728,
+                tmpfs: vec![
+                    ward_core::pb::TmpfsMount {
+                        path: "/run".into(),
+                        options: "size=64m".into(),
+                    },
+                    ward_core::pb::TmpfsMount {
+                        path: "/frozen".into(),
+                        options: "rw,ro".into(),
+                    },
+                ],
+            }),
+            mounts: vec![ward_core::pb::Mount {
+                source: "/tmp/data".into(),
+                target: "/data".into(),
+                readonly: true,
+            }],
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(value["HostConfig"]["ReadonlyRootfs"], true);
+        assert_eq!(value["HostConfig"]["ShmSize"], 134_217_728);
+        assert_eq!(
+            value["HostConfig"]["Tmpfs"],
+            json!({"/run": "size=64m", "/frozen": "rw,ro"})
+        );
+        assert_eq!(
+            value["Mounts"],
+            json!([
+                {"Type": "bind", "Source": "/tmp/data", "Destination": "/data",
+                 "Mode": "ro", "RW": false, "Propagation": "rprivate"},
+                {"Type": "tmpfs", "Source": "", "Destination": "/run",
+                 "Mode": "", "RW": true, "Propagation": ""},
+                {"Type": "tmpfs", "Source": "", "Destination": "/frozen",
+                 "Mode": "", "RW": false, "Propagation": ""},
+            ])
         );
     }
 
