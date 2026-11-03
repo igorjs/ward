@@ -28,6 +28,7 @@ mod archive;
 mod cgroup;
 mod freezer;
 pub mod guest_mounts;
+pub mod guest_network;
 mod limits;
 mod oom;
 mod pty;
@@ -253,10 +254,9 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
 /// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream,
-/// `PutSecrets` writes secret files, `SetLimits` changes the sandbox's limits, and
-/// `PutSecrets` writes secret files, `Freeze` pauses or resumes the sandbox's
-/// processes, and
-/// `Top` lists the guest's processes and `Stats` reports its resource use.
+/// `PutSecrets` writes secret files, `SetLimits` changes the sandbox's limits,
+/// `Freeze` pauses or resumes the sandbox's processes, `Top` lists the
+/// guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -1690,6 +1690,9 @@ pub struct AgentArgs {
     pub tmpfs: Vec<guest_mounts::GuestTmpfs>,
     /// Size of `/dev/shm` in bytes; `None` leaves it alone.
     pub shm_size: Option<u64>,
+    pub hosts: Vec<guest_network::GuestHost>,
+    pub dns_search: Vec<String>,
+    pub dns_options: Vec<String>,
     /// Host name for the guest; `None` keeps the kernel's.
     pub hostname: Option<String>,
     pub mounts: Vec<GuestMount>,
@@ -1726,6 +1729,26 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
                     .parse::<u64>()
                     .map_err(|_| format!("--shm-size must be a number of bytes, got {value:?}"))?,
             );
+            continue;
+        }
+        if arg == guest_network::ADD_HOST_ARG {
+            let name = args.next().ok_or("--add-host needs <name> <ip>")?;
+            let address = args.next().ok_or("--add-host needs <name> <ip>")?;
+            parsed
+                .hosts
+                .push(guest_network::GuestHost { name, address });
+            continue;
+        }
+        if arg == guest_network::DNS_SEARCH_ARG {
+            parsed
+                .dns_search
+                .push(args.next().ok_or("--dns-search needs <domain>")?);
+            continue;
+        }
+        if arg == guest_network::DNS_OPTION_ARG {
+            parsed
+                .dns_options
+                .push(args.next().ok_or("--dns-option needs <option>")?);
             continue;
         }
         if arg == HOSTNAME_ARG {
@@ -1901,6 +1924,33 @@ mod mount_arg_tests {
     #[case::shm_missing(&["--shm-size"])]
     #[case::shm_not_a_number(&["--shm-size", "64m"])]
     fn given_bad_guest_mount_args_when_parsed_then_error(#[case] list: &[&str]) {
+        assert!(parse_args(args(list)).is_err());
+    }
+
+    #[test]
+    fn given_network_args_when_parsed_then_they_are_kept_in_order() {
+        let parsed = parse_args(args(&[
+            "--add-host",
+            "db",
+            "10.1.2.3",
+            "--dns-search",
+            "example.com",
+            "--dns-option",
+            "ndots:2",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.hosts.len(), 1);
+        assert_eq!(parsed.hosts[0].name, "db");
+        assert_eq!(parsed.dns_search, ["example.com"]);
+        assert_eq!(parsed.dns_options, ["ndots:2"]);
+    }
+
+    #[rstest::rstest]
+    #[case::host_without_ip(&["--add-host", "db"])]
+    #[case::search_missing(&["--dns-search"])]
+    #[case::option_missing(&["--dns-option"])]
+    fn given_truncated_network_args_when_parsed_then_error(#[case] list: &[&str]) {
         assert!(parse_args(args(list)).is_err());
     }
 

@@ -139,3 +139,62 @@ fn given_mount_flag_when_inspected_then_bind_and_tmpfs_map_onto_the_existing_mou
     assert!(mounts.contains(r#""Destination":"/other""#), "{mounts}");
     assert_eq!(tmpfs, r#"{"/cache":"rw,size=1048576"}"#);
 }
+
+#[test]
+fn given_hosts_and_resolver_flags_when_inspected_then_host_config_shows_them() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "net1",
+            "--add-host",
+            "db:10.1.2.3",
+            "--add-host",
+            "v6:[::1]",
+            "--add-host",
+            "gw:host-gateway",
+            "--dns-search",
+            "example.com",
+            "--dns-option",
+            "ndots:2",
+            ALPINE,
+        ],
+    );
+
+    // Act
+    let hosts = inspect(&d, "{{json .HostConfig.ExtraHosts}}", "net1");
+    let search = inspect(&d, "{{json .HostConfig.DnsSearch}}", "net1");
+    let options = inspect(&d, "{{json .HostConfig.DnsOptions}}", "net1");
+
+    // Assert
+    assert_eq!(hosts, r#"["db:10.1.2.3","v6:::1","gw:10.0.2.2"]"#);
+    assert_eq!(search, r#"["example.com"]"#);
+    assert_eq!(options, r#"["ndots:2"]"#);
+}
+
+#[test]
+fn given_bad_hosts_or_dns_flags_when_created_then_each_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+    let cases: [(&[&str], &str); 4] = [
+        (&["--add-host", "db"], "use HOST:IP"),
+        (&["--add-host", "db:nope"], "not an IP"),
+        (&["--dns-option", "ndots 2"], "invalid --dns-option"),
+        (&["--dns", "1.1.1.1"], "--egress"),
+    ];
+
+    for (flags, reason) in cases {
+        // Act
+        let mut args = vec!["create"];
+        args.extend(flags);
+        args.push(ALPINE);
+        let out = run(&d, &args);
+
+        // Assert
+        assert!(!out.status.success(), "{flags:?}");
+        assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
+    }
+}
