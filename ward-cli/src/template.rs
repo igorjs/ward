@@ -1,7 +1,7 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 //! The small part of Go templates that Docker's `--format` flags use:
-//! `{{.Field}}`, `{{json .}}`, the `\t` and `\n` escapes, and a `table `
+//! `{{.Field}}`, `{{.Nested.Field}}`, `{{json .}}`, `{{json .Field}}`, the `\t` and `\n` escapes, and a `table `
 //! prefix that adds a header row and aligns the columns.
 
 use anyhow::{Result, anyhow, bail};
@@ -14,14 +14,22 @@ const JSON_TEMPLATE: &str = "{{json .}}";
 const ACTION_OPEN: &str = "{{";
 const ACTION_CLOSE: &str = "}}";
 const FIELD_PREFIX: &str = ".";
-const JSON_ACTION: &str = "json .";
+const JSON_ACTION: &str = "json";
+const WHOLE_RECORD: &str = ".";
+/// A column that accepts any field path, for records without a fixed shape.
+pub const ANY_FIELD: &str = "*";
+const PATH_SEPARATOR: char = '.';
 const COLUMN_SEPARATOR: char = '\t';
 const COLUMN_PADDING: usize = 3;
 
 enum Part {
     Text(String),
-    Field { name: String, title: &'static str },
-    Json,
+    Field {
+        name: String,
+        title: &'static str,
+    },
+    /// The whole record, or the value at a path.
+    Json(Option<String>),
 }
 
 /// A parsed `--format` template.
@@ -64,17 +72,28 @@ impl Template {
     }
 
     fn action(action: &str, columns: &[(&str, &'static str)]) -> Result<Part> {
-        if action == JSON_ACTION {
-            return Ok(Part::Json);
+        if let Some(target) = action.strip_prefix(JSON_ACTION).map(str::trim) {
+            if target == WHOLE_RECORD {
+                return Ok(Part::Json(None));
+            }
+            if let Some(name) = target.strip_prefix(FIELD_PREFIX) {
+                Self::check_field(name, columns)?;
+                return Ok(Part::Json(Some(name.to_string())));
+            }
         }
         let Some(name) = action.strip_prefix(FIELD_PREFIX) else {
             bail!("unsupported action {{{{{action}}}}} in --format");
         };
+        let title = Self::check_field(name, columns)?;
+        Ok(Part::Field {
+            name: name.to_string(),
+            title,
+        })
+    }
+
+    fn check_field(name: &str, columns: &[(&str, &'static str)]) -> Result<&'static str> {
         match columns.iter().find(|(field, _)| names_field(field, name)) {
-            Some((_, title)) => Ok(Part::Field {
-                name: name.to_string(),
-                title,
-            }),
+            Some((_, title)) => Ok(title),
             None => bail!("unknown field .{name} in --format"),
         }
     }
@@ -85,13 +104,16 @@ impl Template {
         let cell = |part: &Part| match (part, record) {
             (Part::Text(text), _) => text.clone(),
             (Part::Field { title, .. }, None) => (*title).to_string(),
-            (Part::Field { name, .. }, Some(r)) => match r.get(name) {
+            (Part::Field { name, .. }, Some(r)) => match lookup(r, name) {
                 Some(Value::String(text)) => text.clone(),
                 Some(other) => other.to_string(),
                 None => String::new(),
             },
-            (Part::Json, None) => String::new(),
-            (Part::Json, Some(r)) => Value::Object(r.clone()).to_string(),
+            (Part::Json(_), None) => String::new(),
+            (Part::Json(None), Some(r)) => Value::Object(r.clone()).to_string(),
+            (Part::Json(Some(name)), Some(r)) => {
+                lookup(r, name).map(Value::to_string).unwrap_or_default()
+            }
         };
         self.parts.iter().map(cell).collect()
     }
@@ -108,10 +130,23 @@ impl Template {
     }
 }
 
+/// The value at `name`: a key of the record, or a path through nested objects.
+fn lookup<'a>(record: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
+    if let Some(value) = record.get(name) {
+        return Some(value);
+    }
+    let mut keys = name.split(PATH_SEPARATOR);
+    let mut value = record.get(keys.next()?)?;
+    for key in keys {
+        value = value.get(key)?;
+    }
+    Some(value)
+}
+
 /// A column ending in `.` stands for every key under it, such as
 /// `Actor.Attributes.` for `Actor.Attributes.name`.
 fn names_field(column: &str, name: &str) -> bool {
-    column == name || (column.ends_with('.') && name.starts_with(column))
+    column == ANY_FIELD || column == name || (column.ends_with('.') && name.starts_with(column))
 }
 
 /// Lines of cells as columns padded to their longest cell. The last column
@@ -141,6 +176,7 @@ mod tests {
     use serde_json::json;
 
     const COLUMNS: [(&str, &str); 2] = [("Name", "NAME"), ("PIDs", "PIDS")];
+    const ANY: [(&str, &str); 1] = [(ANY_FIELD, "")];
 
     fn records() -> Vec<Map<String, Value>> {
         let object = |name: &str, pids: u32| match json!({"Name": name, "PIDs": pids}) {
@@ -177,5 +213,22 @@ mod tests {
         let error = Template::parse(format, &COLUMNS).err().expect("rejected");
 
         assert!(error.to_string().contains(named), "{error}");
+    }
+
+    #[rstest::rstest]
+    #[case::nested("{{.State.Status}}", "running\n")]
+    #[case::json_of_path("{{json .State}}", "{\"Status\":\"running\"}\n")]
+    #[case::missing_is_empty("[{{.State.Nope}}]", "[]\n")]
+    fn given_free_fields_when_rendered_then_paths_walk_nested_objects(
+        #[case] format: &str,
+        #[case] expected: &str,
+    ) {
+        let record = match json!({"State": {"Status": "running"}}) {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+        let template = Template::parse(format, &ANY).expect("parse");
+
+        assert_eq!(template.render(&[record]), expected);
     }
 }

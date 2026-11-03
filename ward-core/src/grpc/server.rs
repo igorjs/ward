@@ -23,10 +23,10 @@ use crate::pb::{
     HealthStatus, KillProcessRequest, ListImagesResponse, ListSandboxesResponse,
     ListSnapshotsRequest, ListSnapshotsResponse, ListVolumesResponse, Message, ProcessInfo,
     PublishRequest, PullImageRequest, PullProgress, RemoveSandboxRequest, RemoveVolumeRequest,
-    RestartRequest, RestoreSnapshotRequest, RunRequest, SandboxEvent as PbSandboxEvent,
-    SandboxInfo, SnapshotInfo, StartRequest, StatsRequest, StatsResponse, StopRequest, StreamEvent,
-    StreamOutputRequest, SubscribeRequest, TopProcess, TopRequest, TopResponse, VolumeInfo,
-    WaitRequest, WaitResponse, WriteStdinRequest,
+    RenameSandboxRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
+    SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
+    StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
+    TopRequest, TopResponse, VolumeInfo, WaitRequest, WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::{ApiError, ISSUES_URL};
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -291,6 +291,26 @@ impl Ward for WardGrpcServer {
             .map_err(api_err_to_status)?;
         self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.rename_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn rename_sandbox(
+        &self,
+        request: Request<RenameSandboxRequest>,
+    ) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self
+            .sandbox
+            .rename(&id, &req.new_name)
+            .await
+            .map_err(api_err_to_status)?;
+        Ok(Response::new(info))
     }
 
     #[tracing::instrument(
