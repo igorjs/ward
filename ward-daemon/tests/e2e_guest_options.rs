@@ -198,3 +198,85 @@ fn given_bad_hosts_or_dns_flags_when_created_then_each_fails_with_a_clear_error(
         assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
     }
 }
+
+#[test]
+fn given_limit_flags_when_inspected_then_host_config_shows_them() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "lim1",
+            "-m",
+            "64m",
+            "--ulimit",
+            "nofile=1024:2048",
+            "--ulimit",
+            "core=0",
+            "--group-add",
+            "audio",
+            "--group-add",
+            "1234",
+            "--memory-swap",
+            "64m",
+            "--memory-reservation",
+            "32m",
+            "--cpu-shares",
+            "512",
+            "--cpuset-cpus",
+            "0-1",
+            "--cpu-period",
+            "50000",
+            "--cpu-quota",
+            "25000",
+            ALPINE,
+        ],
+    );
+
+    // Act
+    let ulimits = inspect(&d, "{{json .HostConfig.Ulimits}}", "lim1");
+    let groups = inspect(&d, "{{json .HostConfig.GroupAdd}}", "lim1");
+    let swap = inspect(&d, "{{.HostConfig.MemorySwap}}", "lim1");
+    let reservation = inspect(&d, "{{.HostConfig.MemoryReservation}}", "lim1");
+    let shares = inspect(&d, "{{.HostConfig.CpuShares}}", "lim1");
+    let cpuset = inspect(&d, "{{.HostConfig.CpusetCpus}}", "lim1");
+    let quota = inspect(&d, "{{.HostConfig.CpuQuota}}", "lim1");
+
+    // Assert
+    assert!(ulimits.contains(r#""Name":"nofile""#), "{ulimits}");
+    assert!(ulimits.contains(r#""Hard":2048"#), "{ulimits}");
+    assert_eq!(groups, r#"["audio","1234"]"#);
+    assert_eq!(swap, "67108864");
+    assert_eq!(reservation, "33554432");
+    assert_eq!(shares, "512");
+    assert_eq!(cpuset, "0-1");
+    assert_eq!(quota, "25000");
+}
+
+#[test]
+fn given_bad_limit_flags_when_created_then_each_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+    let cases: [(&[&str], &str); 6] = [
+        (&["--ulimit", "files=1"], "invalid ulimit type"),
+        (&["--ulimit", "nofile=10:5"], "soft limit"),
+        (&["--group-add", "bad group"], "invalid --group-add"),
+        (&["-m", "64m", "--memory-swap", "128m"], "no swap"),
+        (&["--memory-swap", "-1"], "no swap"),
+        (&["--cpuset-cpus", "x"], "--cpuset-cpus"),
+    ];
+
+    for (flags, reason) in cases {
+        // Act
+        let mut args = vec!["create"];
+        args.extend(flags);
+        args.push(ALPINE);
+        let out = run(&d, &args);
+
+        // Assert
+        assert!(!out.status.success(), "{flags:?}");
+        assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
+    }
+}

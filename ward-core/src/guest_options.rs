@@ -4,7 +4,7 @@
 //! request asks for, and the arguments that hand it to the guest agent.
 
 use crate::pb;
-use crate::protocol::{ApiError, GuestOptions, TmpfsMount};
+use crate::protocol::{ApiError, CgroupLimits, GuestOptions, TmpfsMount};
 
 /// Most tmpfs mounts one sandbox takes.
 pub const MAX_TMPFS_MOUNTS: usize = 64;
@@ -142,6 +142,7 @@ fn is_reserved(path: &str) -> bool {
 pub fn validate(
     guest: Option<&pb::GuestOptions>,
     mounts: &[pb::Mount],
+    memory_mb: u32,
 ) -> Result<GuestOptions, ApiError> {
     let Some(guest) = guest else {
         return Ok(GuestOptions::default());
@@ -175,7 +176,21 @@ pub fn validate(
     }
     crate::guest_network::search_domains(&guest.dns_search)?;
     crate::guest_network::dns_options(&guest.dns_options)?;
+    let cgroup = guest.cgroup.clone().unwrap_or_default();
+    let cgroup = CgroupLimits {
+        memory_swap_bytes: cgroup.memory_swap_bytes,
+        memory_reservation_bytes: cgroup.memory_reservation_bytes,
+        cpu_shares: cgroup.cpu_shares,
+        cpuset_cpus: cgroup.cpuset_cpus,
+        cpu_period: cgroup.cpu_period,
+        cpu_quota: cgroup.cpu_quota,
+    };
+    crate::guest_limits::cgroup(&cgroup, memory_mb)?;
+    crate::guest_limits::group_add(&guest.group_add)?;
     Ok(GuestOptions {
+        ulimits: crate::guest_limits::ulimits(&guest.ulimits)?,
+        group_add: guest.group_add.clone(),
+        cgroup,
         read_only_rootfs: guest.read_only_rootfs,
         tmpfs,
         shm_size_bytes: guest.shm_size_bytes,
@@ -202,6 +217,24 @@ pub fn to_pb(guest: &GuestOptions) -> pb::GuestOptions {
         extra_hosts: guest.extra_hosts.clone(),
         dns_search: guest.dns_search.clone(),
         dns_options: guest.dns_options.clone(),
+        ulimits: guest
+            .ulimits
+            .iter()
+            .map(|u| pb::Ulimit {
+                name: u.name.clone(),
+                soft: u.soft,
+                hard: u.hard,
+            })
+            .collect(),
+        group_add: guest.group_add.clone(),
+        cgroup: Some(pb::CgroupLimits {
+            memory_swap_bytes: guest.cgroup.memory_swap_bytes,
+            memory_reservation_bytes: guest.cgroup.memory_reservation_bytes,
+            cpu_shares: guest.cgroup.cpu_shares,
+            cpuset_cpus: guest.cgroup.cpuset_cpus.clone(),
+            cpu_period: guest.cgroup.cpu_period,
+            cpu_quota: guest.cgroup.cpu_quota,
+        }),
     }
 }
 
@@ -224,6 +257,11 @@ pub fn agent_args(guest: &GuestOptions) -> Vec<String> {
         &guest.extra_hosts,
         &guest.dns_search,
         &guest.dns_options,
+    ));
+    args.extend(crate::guest_limits::agent_args(
+        &guest.ulimits,
+        &guest.group_add,
+        &guest.cgroup,
     ));
     args
 }
@@ -292,7 +330,7 @@ mod tests {
         let request = guest(vec![tmpfs("/var//cache/", "size=1m")]);
 
         // Act
-        let stored = validate(Some(&request), &[]).unwrap();
+        let stored = validate(Some(&request), &[], 0).unwrap();
 
         // Assert
         assert_eq!(stored.tmpfs[0].path, "/var/cache");
@@ -312,7 +350,7 @@ mod tests {
         let request = guest(vec![tmpfs(path, "")]);
 
         // Act
-        let result = validate(Some(&request), &[]);
+        let result = validate(Some(&request), &[], 0);
 
         // Assert
         assert!(result.is_err(), "{path}");
@@ -329,7 +367,7 @@ mod tests {
         };
 
         // Act
-        let error = validate(Some(&request), &[bind]).unwrap_err();
+        let error = validate(Some(&request), &[bind], 0).unwrap_err();
 
         // Assert
         assert!(error.to_string().contains("Duplicate mount point: /data"));
@@ -343,7 +381,7 @@ mod tests {
             .collect();
 
         // Act
-        let result = validate(Some(&guest(many)), &[]);
+        let result = validate(Some(&guest(many)), &[], 0);
 
         // Assert
         assert!(result.is_err());

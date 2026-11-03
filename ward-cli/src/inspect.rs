@@ -30,6 +30,7 @@ const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const UNLIMITED_SWAP: i64 = -1;
 const READ_ONLY_MODE: &str = "ro";
 const BIND_PROPAGATION: &str = "rprivate";
 const NANOS_PER_CPU: u64 = 1_000_000_000;
@@ -345,6 +346,16 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     })
 }
 
+/// Docker's `HostConfig.MemorySwap`: the value given, else twice the memory
+/// limit, or -1 (unlimited) when memory has no limit.
+fn memory_swap(given: i64, memory: u64) -> i64 {
+    match (given, memory) {
+        (0, 0) => UNLIMITED_SWAP,
+        (0, memory) => i64::try_from(memory.saturating_mul(2)).unwrap_or(i64::MAX),
+        (given, _) => given,
+    }
+}
+
 /// Docker's top-level `Mounts`: the bind mounts, then the tmpfs mounts.
 fn mounts(info: &SandboxInfo) -> Vec<Value> {
     let binds = info.mounts.iter().map(|m| {
@@ -391,9 +402,11 @@ fn host_config(info: &SandboxInfo) -> Value {
         },
         ..restart
     };
+    let memory = u64::from(resources.memory_mb) * BYTES_PER_MIB;
     let guest = info.guest.clone().unwrap_or_default();
+    let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
-        "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
+        "Memory": memory,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
@@ -406,7 +419,24 @@ fn host_config(info: &SandboxInfo) -> Value {
         "Dns": [],
         "DnsSearch": guest.dns_search,
         "DnsOptions": guest.dns_options,
+        "Ulimits": (!guest.ulimits.is_empty()).then(|| {
+            guest
+                .ulimits
+                .iter()
+                .map(|u| json!({"Name": u.name, "Soft": u.soft, "Hard": u.hard}))
+                .collect::<Vec<_>>()
+        }),
+        "MemorySwap": memory_swap(cgroup.memory_swap_bytes, memory),
+        "MemoryReservation": cgroup.memory_reservation_bytes,
+        "CpuShares": cgroup.cpu_shares,
+        "CpusetCpus": cgroup.cpuset_cpus,
+        "CpuPeriod": cgroup.cpu_period,
+        "CpuQuota": cgroup.cpu_quota,
     });
+    // Docker leaves GroupAdd out until a group is added.
+    if !guest.group_add.is_empty() {
+        config["GroupAdd"] = json!(guest.group_add);
+    }
     // Docker leaves Tmpfs out until a tmpfs is mounted.
     if !guest.tmpfs.is_empty() {
         let tmpfs: serde_json::Map<String, Value> = guest
@@ -793,6 +823,13 @@ mod tests {
                     "Dns": [],
                     "DnsSearch": [],
                     "DnsOptions": [],
+                    "Ulimits": null,
+                    "MemorySwap": -1,
+                    "MemoryReservation": 0,
+                    "CpuShares": 0,
+                    "CpusetCpus": "",
+                    "CpuPeriod": 0,
+                    "CpuQuota": 0,
                 },
                 "Mounts": [],
                 "RestartCount": 0,
@@ -880,8 +917,27 @@ mod tests {
                 "Dns": [],
                 "DnsSearch": [],
                 "DnsOptions": [],
+                "Ulimits": null,
+                "MemorySwap": 1_073_741_824_u64,
+                "MemoryReservation": 0,
+                "CpuShares": 0,
+                "CpusetCpus": "",
+                "CpuPeriod": 0,
+                "CpuQuota": 0,
             })
         );
+    }
+
+    #[rstest::rstest]
+    #[case::unset_with_memory(0, 512 << 20, 1 << 30)]
+    #[case::unset_without_memory(0, 0, -1)]
+    #[case::given(256 << 20, 256 << 20, 256 << 20)]
+    fn given_memory_swap_when_inspected_then_unset_is_twice_memory_like_docker(
+        #[case] given: i64,
+        #[case] memory: u64,
+        #[case] want: i64,
+    ) {
+        assert_eq!(memory_swap(given, memory), want);
     }
 
     #[test]
@@ -894,6 +950,17 @@ mod tests {
                 extra_hosts: vec!["db:10.1.2.3".into()],
                 dns_search: vec!["example.com".into()],
                 dns_options: vec![],
+                ulimits: vec![ward_core::pb::Ulimit {
+                    name: "nofile".into(),
+                    soft: 1024,
+                    hard: 2048,
+                }],
+                group_add: vec!["audio".into()],
+                cgroup: Some(ward_core::pb::CgroupLimits {
+                    cpu_shares: 512,
+                    cpuset_cpus: "0-1".into(),
+                    ..Default::default()
+                }),
                 tmpfs: vec![
                     ward_core::pb::TmpfsMount {
                         path: "/run".into(),
@@ -921,6 +988,13 @@ mod tests {
         assert_eq!(value["HostConfig"]["ShmSize"], 134_217_728);
         assert_eq!(value["HostConfig"]["ExtraHosts"], json!(["db:10.1.2.3"]));
         assert_eq!(value["HostConfig"]["DnsSearch"], json!(["example.com"]));
+        assert_eq!(value["HostConfig"]["GroupAdd"], json!(["audio"]));
+        assert_eq!(
+            value["HostConfig"]["Ulimits"],
+            json!([{"Name": "nofile", "Soft": 1024, "Hard": 2048}])
+        );
+        assert_eq!(value["HostConfig"]["CpuShares"], 512);
+        assert_eq!(value["HostConfig"]["CpusetCpus"], "0-1");
         assert_eq!(
             value["HostConfig"]["Tmpfs"],
             json!({"/run": "size=64m", "/frozen": "rw,ro"})

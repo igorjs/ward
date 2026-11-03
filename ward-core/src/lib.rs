@@ -6,6 +6,7 @@ pub mod comms;
 pub mod config;
 pub mod egress;
 pub mod grpc;
+pub mod guest_limits;
 pub mod guest_network;
 pub mod guest_options;
 pub mod protocol;
