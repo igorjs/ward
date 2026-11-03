@@ -27,6 +27,7 @@ mod archive;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod cgroup;
 mod freezer;
+pub mod guest_mounts;
 mod oom;
 mod pty;
 mod secrets;
@@ -1648,6 +1649,11 @@ const HOSTNAME_FILE: &str = "/etc/hostname";
 /// What the agent was launched with.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentArgs {
+    /// Mount the root filesystem read-only once the guest is set up.
+    pub read_only: bool,
+    pub tmpfs: Vec<guest_mounts::GuestTmpfs>,
+    /// Size of `/dev/shm` in bytes; `None` leaves it alone.
+    pub shm_size: Option<u64>,
     /// Host name for the guest; `None` keeps the kernel's.
     pub hostname: Option<String>,
     pub mounts: Vec<GuestMount>,
@@ -1665,6 +1671,27 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
     let mut args = args.into_iter();
     let mut parsed = AgentArgs::default();
     while let Some(arg) = args.next() {
+        if arg == guest_mounts::READ_ONLY_ARG {
+            parsed.read_only = true;
+            continue;
+        }
+        if arg == guest_mounts::TMPFS_ARG {
+            let target = args.next().ok_or("--tmpfs needs <path> <options>")?;
+            let options = args.next().ok_or("--tmpfs needs <path> <options>")?;
+            parsed
+                .tmpfs
+                .push(guest_mounts::GuestTmpfs { target, options });
+            continue;
+        }
+        if arg == guest_mounts::SHM_SIZE_ARG {
+            let value = args.next().ok_or("--shm-size needs <bytes>")?;
+            parsed.shm_size = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("--shm-size must be a number of bytes, got {value:?}"))?,
+            );
+            continue;
+        }
         if arg == HOSTNAME_ARG {
             let value = args.next().ok_or("--hostname needs <name>")?;
             if value.is_empty() {
@@ -1807,6 +1834,37 @@ mod mount_arg_tests {
     #[case::missing(&["--hostname"])]
     #[case::empty(&["--hostname", ""])]
     fn given_bad_hostname_when_parsed_then_error(#[case] list: &[&str]) {
+        assert!(parse_args(args(list)).is_err());
+    }
+
+    #[test]
+    fn given_guest_mount_args_when_parsed_then_they_are_kept() {
+        let parsed = parse_args(args(&[
+            "--read-only",
+            "--tmpfs",
+            "/scratch",
+            "size=1m,noexec",
+            "--shm-size",
+            "1048576",
+        ]))
+        .unwrap();
+
+        assert!(parsed.read_only);
+        assert_eq!(parsed.shm_size, Some(1_048_576));
+        assert_eq!(
+            parsed.tmpfs,
+            [guest_mounts::GuestTmpfs {
+                target: "/scratch".into(),
+                options: "size=1m,noexec".into()
+            }]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::tmpfs_without_options(&["--tmpfs", "/x"])]
+    #[case::shm_missing(&["--shm-size"])]
+    #[case::shm_not_a_number(&["--shm-size", "64m"])]
+    fn given_bad_guest_mount_args_when_parsed_then_error(#[case] list: &[&str]) {
         assert!(parse_args(args(list)).is_err());
     }
 

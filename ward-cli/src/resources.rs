@@ -15,25 +15,7 @@ const UNLIMITED_PIDS: i64 = -1;
 /// bytes) into whole MiB, rounding down. `0` means "daemon default" and is
 /// passed through. Fails below 1 MiB or above what the limit holds.
 pub fn parse_memory_mib(value: &str) -> Result<u32> {
-    let lowered = value.trim().to_ascii_lowercase();
-    // Docker accepts a trailing `b` and, after a unit letter, an `i`.
-    let without_b = lowered.strip_suffix('b').unwrap_or(&lowered);
-    let without_i = without_b
-        .strip_suffix('i')
-        .filter(|rest| rest.ends_with(['k', 'm', 'g', 't']))
-        .unwrap_or(without_b);
-    let (digits, unit) = match without_i.char_indices().last() {
-        Some((i, 'k')) => (&without_i[..i], KIB),
-        Some((i, 'm')) => (&without_i[..i], MIB),
-        Some((i, 'g')) => (&without_i[..i], GIB),
-        Some((i, 't')) => (&without_i[..i], TIB),
-        _ => (without_i, 1),
-    };
-    let has_unit = digits.len() != lowered.len();
-    let Some(count) = parse_decimal(digits) else {
-        bail!("invalid memory size '{value}': use a number with an optional k, m, g or t suffix");
-    };
-    let bytes = count * unit as f64;
+    let (bytes, has_unit) = split_size(value)?;
     if bytes == 0.0 {
         return Ok(0);
     }
@@ -50,6 +32,39 @@ pub fn parse_memory_mib(value: &str) -> Result<u32> {
         bail!("memory limit '{value}' is too large");
     }
     Ok(mib as u32)
+}
+
+/// Parses a Docker size (`64m`, `1g`, plain bytes) into whole bytes,
+/// rounding down.
+pub fn parse_size_bytes(value: &str) -> Result<u64> {
+    let (bytes, _) = split_size(value)?;
+    if bytes >= u64::MAX as f64 {
+        bail!("size '{value}' is too large");
+    }
+    Ok(bytes as u64)
+}
+
+/// The size in bytes, and whether the text carried a unit suffix.
+fn split_size(value: &str) -> Result<(f64, bool)> {
+    let lowered = value.trim().to_ascii_lowercase();
+    // Docker accepts a trailing `b` and, after a unit letter, an `i`.
+    let without_b = lowered.strip_suffix('b').unwrap_or(&lowered);
+    let without_i = without_b
+        .strip_suffix('i')
+        .filter(|rest| rest.ends_with(['k', 'm', 'g', 't']))
+        .unwrap_or(without_b);
+    let (digits, unit) = match without_i.char_indices().last() {
+        Some((i, 'k')) => (&without_i[..i], KIB),
+        Some((i, 'm')) => (&without_i[..i], MIB),
+        Some((i, 'g')) => (&without_i[..i], GIB),
+        Some((i, 't')) => (&without_i[..i], TIB),
+        _ => (without_i, 1),
+    };
+    let has_unit = digits.len() != lowered.len();
+    let Some(count) = parse_decimal(digits) else {
+        bail!("invalid size '{value}': use a number with an optional k, m, g or t suffix");
+    };
+    Ok((count * unit as f64, has_unit))
 }
 
 /// Parses a plain non-negative decimal such as `2` or `1.5`, rejecting signs,
