@@ -9,10 +9,11 @@ use serde_json::{Value, json};
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
+use ward_core::protocol::RestartKind;
 
 use crate::lifecycle::Failures;
 use crate::ps_filter::{self, Filters};
-use crate::template::{ANY_FIELD, Template};
+use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
 
 pub const PS_HEADERS: [&str; 6] = [
@@ -48,54 +49,10 @@ const JANUARY_INDEX: i64 = 10;
 const MARCH_NUMBER: i64 = 3;
 const JANUARY_NUMBER_OFFSET: i64 = 9;
 
-/// Signal numbers on Linux, which is what the guest runs.
-const SIGNALS: [(&str, i32); 30] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("STOP", 19),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
-/// Highest signal number Linux accepts (the last real-time signal).
-const MAX_SIGNAL: i32 = 64;
-
 /// Accept `TERM`, `SIGTERM` or a number, like `docker kill -s`.
 pub fn parse_signal(text: &str) -> Result<i32> {
-    if let Ok(number) = text.parse::<i32>() {
-        if (1..=MAX_SIGNAL).contains(&number) {
-            return Ok(number);
-        }
-        bail!("invalid signal: {text}");
-    }
-    let name = text.to_ascii_uppercase();
-    let name = name.strip_prefix("SIG").unwrap_or(&name);
-    match SIGNALS.iter().find(|(known, _)| *known == name) {
-        Some((_, number)) => Ok(*number),
+    match ward_core::signal::parse(text) {
+        Some(number) => Ok(number),
         None => bail!("invalid signal: {text}"),
     }
 }
@@ -209,11 +166,19 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Status": status_text(info, now_seconds),
         "Reason": reason_name(info),
         "Names": info.name,
+        "Labels": labels_text(&info.labels),
     })
 }
 
+/// Docker's `ps` rendering of labels: `key=value` pairs joined by commas.
+fn labels_text(labels: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
 /// Each `ps --format` field with the header a `table` template gives it.
-const PS_FIELDS: [(&str, &str); 9] = [
+const PS_FIELDS: [(&str, &str); 10] = [
     ("ID", "CONTAINER ID"),
     ("Image", "IMAGE"),
     ("Command", "COMMAND"),
@@ -223,6 +188,7 @@ const PS_FIELDS: [(&str, &str); 9] = [
     ("Status", "STATUS"),
     ("Reason", "REASON"),
     ("Names", "NAMES"),
+    (LABELS_FIELD, "LABELS"),
 ];
 
 pub struct PsOptions {
@@ -260,14 +226,15 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         object["ID"] = Value::String(id_text(info, options.no_trunc));
         object
     };
+    let template_record = |info: &SandboxInfo| match object(info) {
+        Value::Object(mut map) => {
+            map.insert(LABEL_MAP_KEY.to_string(), json!(info.labels));
+            Some(map)
+        }
+        _ => None,
+    };
     if let Some(template) = template {
-        let records: Vec<_> = shown
-            .into_iter()
-            .filter_map(|info| match object(info) {
-                Value::Object(map) => Some(map),
-                _ => None,
-            })
-            .collect();
+        let records: Vec<_> = shown.into_iter().filter_map(template_record).collect();
         print!("{}", template.render(&records));
         return Ok(());
     }
@@ -317,6 +284,22 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     };
     // Docker reports an unset entrypoint as null.
     let entrypoint = (entrypoint_len > 0).then_some(&info.entrypoint);
+    let mut config = json!({
+        "Hostname": info.hostname,
+        "Image": info.image,
+        "Cmd": cmd,
+        "Entrypoint": entrypoint,
+        "WorkingDir": info.workdir,
+        "User": info.user,
+        "Labels": info.labels,
+    });
+    // Docker leaves these out of Config until they are set.
+    if !info.stop_signal.is_empty() {
+        config["StopSignal"] = json!(info.stop_signal);
+    }
+    if let Some(seconds) = info.stop_timeout {
+        config["StopTimeout"] = json!(seconds);
+    }
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
@@ -330,13 +313,8 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "StartedAt": state_time(&info.started_at),
             "FinishedAt": state_time(&info.finished_at),
         },
-        "Config": {
-            "Image": info.image,
-            "Cmd": cmd,
-            "Entrypoint": entrypoint,
-            "WorkingDir": info.workdir,
-            "User": info.user,
-        },
+        "Config": config,
+        "RestartCount": info.restart_count,
         "HostConfig": host_config(info),
     })
 }
@@ -344,10 +322,23 @@ fn inspect_value(info: &SandboxInfo) -> Value {
 /// Docker `HostConfig` limits. Unlimited is 0, and null for pids.
 fn host_config(info: &SandboxInfo) -> Value {
     let resources = info.resources.unwrap_or_default();
+    let restart = info.restart_policy.clone().unwrap_or_default();
+    let restart = ward_core::pb::RestartPolicy {
+        name: if restart.name.is_empty() {
+            RestartKind::No.as_str().to_string()
+        } else {
+            restart.name
+        },
+        ..restart
+    };
     json!({
         "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
+        "RestartPolicy": {
+            "Name": restart.name,
+            "MaximumRetryCount": restart.maximum_retry_count,
+        },
     })
 }
 
@@ -632,6 +623,7 @@ mod tests {
                 "Status": "Up 2 minutes",
                 "Reason": "",
                 "Names": "web1",
+                "Labels": "",
             })
         );
     }
@@ -702,19 +694,73 @@ mod tests {
                     "FinishedAt": "0001-01-01T00:00:00Z",
                 },
                 "Config": {
+                    "Hostname": "",
                     "Image": "alpine",
                     "Cmd": ["sh"],
                     "Entrypoint": null,
                     "WorkingDir": "",
                     "User": "",
+                    "Labels": {},
                 },
                 "HostConfig": {
                     "Memory": 0,
                     "NanoCpus": 0,
                     "PidsLimit": null,
+                    "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 },
+                "RestartCount": 0,
             })
         );
+    }
+
+    #[test]
+    fn given_hostname_and_stop_settings_when_inspected_then_config_shows_them() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            hostname: "web1".into(),
+            stop_signal: "SIGINT".into(),
+            stop_timeout: Some(30),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(value["Config"]["Hostname"], "web1");
+        assert_eq!(value["Config"]["StopSignal"], "SIGINT");
+        assert_eq!(value["Config"]["StopTimeout"], 30);
+    }
+
+    #[test]
+    fn given_no_stop_settings_when_inspected_then_config_leaves_them_out() {
+        // Act
+        let value = inspect_value(&info(SandboxStatus::Running, None));
+
+        // Assert
+        assert!(value["Config"].get("StopSignal").is_none());
+        assert!(value["Config"].get("StopTimeout").is_none());
+    }
+
+    #[test]
+    fn given_labels_when_inspected_then_config_labels_is_a_map_and_ps_joins_pairs() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            labels: [
+                ("b".to_string(), "2".to_string()),
+                ("a".to_string(), "1".to_string()),
+            ]
+            .into(),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+        let object = ps_json_object(&sandbox, 0);
+
+        // Assert
+        assert_eq!(value["Config"]["Labels"], json!({"a": "1", "b": "2"}));
+        assert_eq!(object["Labels"], "a=1,b=2");
     }
 
     #[test]
@@ -736,8 +782,36 @@ mod tests {
         // Assert
         assert_eq!(
             host_config,
-            json!({"Memory": 536_870_912_u64, "NanoCpus": 2_000_000_000_u64, "PidsLimit": 100})
+            json!({
+                "Memory": 536_870_912_u64,
+                "NanoCpus": 2_000_000_000_u64,
+                "PidsLimit": 100,
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            })
         );
+    }
+
+    #[test]
+    fn given_restart_policy_and_count_when_inspected_then_docker_places_them() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            restart_policy: Some(ward_core::pb::RestartPolicy {
+                name: "on-failure".into(),
+                maximum_retry_count: 3,
+            }),
+            restart_count: 2,
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(
+            value["HostConfig"]["RestartPolicy"],
+            json!({"Name": "on-failure", "MaximumRetryCount": 3})
+        );
+        assert_eq!(value["RestartCount"], 2);
     }
 
     #[rstest::rstest]

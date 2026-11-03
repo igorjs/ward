@@ -122,6 +122,96 @@ pub fn exited_ttl(seconds: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Most labels one sandbox may carry.
+const MAX_LABELS: usize = 128;
+/// Longest label key, in bytes.
+const MAX_LABEL_KEY_LEN: usize = 256;
+/// Longest label value, in bytes.
+const MAX_LABEL_VALUE_LEN: usize = 4096;
+
+/// Validate sandbox labels: a bounded count, non-empty keys without control
+/// characters, and bounded values.
+pub fn labels(labels: &std::collections::HashMap<String, String>) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS {
+        return Err(ApiError::InvalidRequest(format!(
+            "a sandbox takes at most {MAX_LABELS} labels"
+        )));
+    }
+    for (key, value) in labels {
+        if key.is_empty() || key.len() > MAX_LABEL_KEY_LEN || key.chars().any(char::is_control) {
+            return Err(ApiError::InvalidRequest(format!(
+                "label key must be 1 to {MAX_LABEL_KEY_LEN} bytes without control characters"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::InvalidRequest(format!(
+                "label value for '{key}' exceeds {MAX_LABEL_VALUE_LEN} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Longest host name Linux accepts (`HOST_NAME_MAX`).
+const MAX_HOSTNAME_LEN: usize = 64;
+
+/// Validate a guest host name. Empty means the default.
+pub fn hostname(name: &str) -> Result<(), ApiError> {
+    let first_ok = name
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_ascii_alphanumeric());
+    let chars_ok = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'));
+    if name.len() > MAX_HOSTNAME_LEN || !first_ok || !chars_ok {
+        return Err(ApiError::InvalidRequest(format!(
+            "hostname must be at most {MAX_HOSTNAME_LEN} characters of letters, digits, '-', '.' and '_', starting with a letter or digit"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a stop signal. Empty means SIGTERM.
+pub fn stop_signal(signal: &str) -> Result<(), ApiError> {
+    if !signal.is_empty() && crate::signal::parse(signal).is_none() {
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid stop signal: {signal}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a stop timeout: -1 waits forever, 0 kills at once.
+pub fn stop_timeout(seconds: Option<i32>) -> Result<(), ApiError> {
+    let in_range = |s: i32| s == -1 || u64::try_from(s).is_ok_and(|s| s <= MAX_TIMEOUT_SECONDS);
+    if seconds.is_some_and(|s| !in_range(s)) {
+        return Err(ApiError::InvalidRequest(format!(
+            "stop_timeout must be -1 or from 0 to {MAX_TIMEOUT_SECONDS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a restart policy. A sandbox that removes itself cannot also be
+/// restarted, as in Docker.
+pub fn restart_policy(
+    policy: Option<&crate::pb::RestartPolicy>,
+    auto_remove: bool,
+) -> Result<crate::protocol::RestartPolicy, ApiError> {
+    let policy = policy
+        .map_or(Ok(crate::protocol::RestartPolicy::default()), |p| {
+            crate::protocol::RestartPolicy::from_parts(&p.name, p.maximum_retry_count)
+        })
+        .map_err(ApiError::InvalidRequest)?;
+    if auto_remove && policy.kind != crate::protocol::RestartKind::No {
+        return Err(ApiError::InvalidRequest(
+            "conflicting options: a restart policy and auto_remove".into(),
+        ));
+    }
+    Ok(policy)
+}
+
 /// Validate a volume name.
 /// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
@@ -1492,5 +1582,116 @@ mod proptests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::plain("team", "infra", true)]
+    #[case::empty_value("team", "", true)]
+    #[case::empty_key("", "x", false)]
+    #[case::control_in_key("a\nb", "x", false)]
+    fn labels_accept_plain_pairs_only(#[case] key: &str, #[case] value: &str, #[case] ok: bool) {
+        // Arrange
+        let given = [(key.to_string(), value.to_string())].into();
+
+        // Act
+        let result = labels(&given);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn labels_reject_oversized_value_and_too_many_pairs() {
+        // Arrange
+        let long = [("k".to_string(), "v".repeat(MAX_LABEL_VALUE_LEN + 1))].into();
+        let many = (0..=MAX_LABELS)
+            .map(|n| (format!("k{n}"), String::new()))
+            .collect();
+
+        // Act and assert
+        assert!(labels(&long).is_err());
+        assert!(labels(&many).is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::empty("", true)]
+    #[case::short("web1", true)]
+    #[case::fqdn("web.example-1.com", true)]
+    #[case::underscore("a_b", true)]
+    #[case::leading_dash("-web", false)]
+    #[case::leading_dot(".web", false)]
+    #[case::space("my host", false)]
+    #[case::slash("a/b", false)]
+    fn hostname_accepts_plain_names_only(#[case] name: &str, #[case] ok: bool) {
+        // Act
+        let result = hostname(name);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn hostname_rejects_a_name_longer_than_the_kernel_allows() {
+        // Act
+        let result = hostname(&"a".repeat(MAX_HOSTNAME_LEN + 1));
+
+        // Assert
+        assert!(result.is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::none(None, true)]
+    #[case::zero(Some(0), true)]
+    #[case::forever(Some(-1), true)]
+    #[case::too_negative(Some(-2), false)]
+    #[case::too_long(Some(i32::MAX), false)]
+    fn stop_timeout_accepts_minus_one_to_a_month(#[case] seconds: Option<i32>, #[case] ok: bool) {
+        // Act
+        let result = stop_timeout(seconds);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[rstest::rstest]
+    #[case::empty("", true)]
+    #[case::name("SIGINT", true)]
+    #[case::number("2", true)]
+    #[case::unknown("SIGNOPE", false)]
+    fn stop_signal_accepts_known_signals_only(#[case] signal: &str, #[case] ok: bool) {
+        // Act
+        let result = stop_signal(signal);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    fn policy(name: &str, retries: u32) -> crate::pb::RestartPolicy {
+        crate::pb::RestartPolicy {
+            name: name.into(),
+            maximum_retry_count: retries,
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None, false, true)]
+    #[case::empty(Some(policy("", 0)), false, true)]
+    #[case::always(Some(policy("always", 0)), false, true)]
+    #[case::on_failure_with_cap(Some(policy("on-failure", 3)), false, true)]
+    #[case::unknown(Some(policy("sometimes", 0)), false, false)]
+    #[case::cap_on_always(Some(policy("always", 3)), false, false)]
+    #[case::cap_on_no(Some(policy("no", 1)), false, false)]
+    #[case::with_auto_remove(Some(policy("always", 0)), true, false)]
+    #[case::no_with_auto_remove(Some(policy("no", 0)), true, true)]
+    fn restart_policy_follows_docker_rules(
+        #[case] given: Option<crate::pb::RestartPolicy>,
+        #[case] auto_remove: bool,
+        #[case] ok: bool,
+    ) {
+        // Act
+        let result = restart_policy(given.as_ref(), auto_remove);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok, "{result:?}");
     }
 }

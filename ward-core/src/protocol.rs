@@ -1,6 +1,6 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,112 @@ pub struct SandboxSpec {
     /// Manifest digest the image resolved to at creation. Empty when unknown.
     #[serde(default)]
     pub image_digest: String,
+    /// User metadata from `--label`.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Guest host name from `--hostname`. Empty means the short sandbox id.
+    #[serde(default)]
+    pub hostname: String,
+    /// Signal that stops the main process, as given (`SIGINT`, `2`). Empty
+    /// means SIGTERM.
+    #[serde(default)]
+    pub stop_signal: String,
+    /// Seconds the main process gets after the stop signal. `None` uses the
+    /// daemon default.
+    #[serde(default)]
+    pub stop_timeout: Option<i32>,
+    /// What to do when the main process ends.
+    #[serde(default)]
+    pub restart: RestartPolicy,
+}
+
+/// When the daemon starts a sandbox again, as in `docker run --restart`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartKind {
+    #[default]
+    No,
+    OnFailure,
+    Always,
+    UnlessStopped,
+}
+
+impl RestartKind {
+    /// The name `--restart` and `inspect` use.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::OnFailure => "on-failure",
+            Self::Always => "always",
+            Self::UnlessStopped => "unless-stopped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RestartPolicy {
+    pub kind: RestartKind,
+    /// Restarts `on-failure` may make; 0 is no limit.
+    #[serde(default)]
+    pub max_retries: u32,
+}
+
+impl RestartPolicy {
+    /// Build a policy from its name and retry limit, refusing a limit on a
+    /// policy that has none.
+    ///
+    /// # Errors
+    ///
+    /// Fails on an unknown name, or a limit on any policy but `on-failure`.
+    pub fn from_parts(name: &str, max_retries: u32) -> Result<Self, String> {
+        let kind = match name {
+            "" | "no" => RestartKind::No,
+            "on-failure" => RestartKind::OnFailure,
+            "always" => RestartKind::Always,
+            "unless-stopped" => RestartKind::UnlessStopped,
+            other => return Err(format!("invalid restart policy '{other}'")),
+        };
+        if max_retries > 0 && kind != RestartKind::OnFailure {
+            return Err(format!(
+                "maximum retry count cannot be used with restart policy '{}'",
+                kind.as_str()
+            ));
+        }
+        Ok(Self { kind, max_retries })
+    }
+
+    /// Parse the `--restart` value: `NAME` or `on-failure:COUNT`.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`from_parts`](Self::from_parts), and on a count that is
+    /// not a number.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let Some((name, count)) = text.split_once(':') else {
+            return Self::from_parts(text, 0);
+        };
+        let count = count.parse().map_err(|_| {
+            format!("invalid restart policy '{text}': the retry count is not a number")
+        })?;
+        Self::from_parts(name, count)
+    }
+}
+
+/// Characters of the sandbox id that make the default host name, as Docker
+/// uses the first 12 of a container id.
+const DEFAULT_HOSTNAME_LEN: usize = 12;
+
+impl SandboxSpec {
+    /// The host name the guest gets: the requested one, else the short id.
+    #[must_use]
+    pub fn hostname_for(&self, id: &str) -> String {
+        if self.hostname.is_empty() {
+            id.chars().take(DEFAULT_HOSTNAME_LEN).collect()
+        } else {
+            self.hostname.clone()
+        }
+    }
 }
 
 /// A host TCP port forwarded to a guest port.
@@ -170,6 +276,8 @@ pub struct SandboxInfo {
     pub finished_at: Option<SystemTime>,
     /// Why the sandbox last ended, if it has.
     pub end_reason: Option<EndReason>,
+    /// Restarts the daemon made since the sandbox was last started by hand.
+    pub restart_count: u32,
 }
 
 /// Why a sandbox ended.
@@ -610,5 +718,36 @@ mod tests {
         let err = ApiError::InvalidRequest("topic must not be empty".to_string());
         let msg = format!("{err}");
         assert!(msg.contains("topic must not be empty"), "got: {msg}");
+    }
+
+    #[rstest::rstest]
+    #[case::no("no", RestartKind::No, 0)]
+    #[case::always("always", RestartKind::Always, 0)]
+    #[case::unless_stopped("unless-stopped", RestartKind::UnlessStopped, 0)]
+    #[case::on_failure("on-failure", RestartKind::OnFailure, 0)]
+    #[case::on_failure_with_cap("on-failure:5", RestartKind::OnFailure, 5)]
+    fn restart_policy_parses_docker_spellings(
+        #[case] text: &str,
+        #[case] kind: RestartKind,
+        #[case] max_retries: u32,
+    ) {
+        // Act
+        let policy = RestartPolicy::parse(text).expect("parse");
+
+        // Assert
+        assert_eq!(policy, RestartPolicy { kind, max_retries });
+    }
+
+    #[rstest::rstest]
+    #[case::unknown("sometimes", "invalid restart policy")]
+    #[case::cap_not_a_number("on-failure:many", "not a number")]
+    #[case::cap_on_always("always:3", "cannot be used")]
+    #[case::cap_on_no("no:1", "cannot be used")]
+    fn restart_policy_refuses_bad_spellings(#[case] text: &str, #[case] said: &str) {
+        // Act
+        let error = RestartPolicy::parse(text).expect_err("rejected");
+
+        // Assert
+        assert!(error.contains(said), "{error}");
     }
 }

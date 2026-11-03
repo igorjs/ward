@@ -166,6 +166,29 @@ message CreateSandboxRequest {
   // Files written to /run/secrets before the main process starts. The daemon
   // keeps them in memory only and never stores or reports them.
   repeated SecretFile secrets = 20;
+  // Key/value metadata kept on the sandbox, like `docker run --label`.
+  map<string, string> labels = 21;
+  // Host name inside the guest, like `docker run --hostname`. Empty means the
+  // first 12 characters of the sandbox id.
+  string hostname = 22;
+  // Signal that stops the main process, like `docker run --stop-signal`:
+  // a name (SIGINT, INT) or a number. Empty means SIGTERM.
+  string stop_signal = 23;
+  // Seconds the main process gets after the stop signal before SIGKILL, like
+  // `docker run --stop-timeout`. Absent uses the daemon default, 0 kills at
+  // once and -1 waits forever.
+  optional int32 stop_timeout = 24;
+  // What to do when the main process ends, like `docker run --restart`.
+  // Absent means "no".
+  RestartPolicy restart_policy = 25;
+}
+
+// Mirrors Docker's restart policy.
+message RestartPolicy {
+  // "no", "on-failure", "always" or "unless-stopped". Empty means "no".
+  string name = 1;
+  // Restarts "on-failure" may make. 0 means no limit; other names need 0.
+  uint32 maximum_retry_count = 2;
 }
 
 // A secret delivered to the guest as the read-only file /run/secrets/<name>
@@ -269,6 +292,14 @@ message SandboxInfo {
   // Manifest digest the image resolved to when the sandbox was created,
   // e.g. sha256:... Empty for a sandbox created before it was recorded.
   string image_digest = 20;
+  map<string, string> labels = 21;
+  // The host name the guest has: the request's, else the short sandbox id.
+  string hostname = 22;
+  string stop_signal = 23;
+  optional int32 stop_timeout = 24;
+  RestartPolicy restart_policy = 25;
+  // Times the daemon restarted the sandbox since it was last started by hand.
+  uint32 restart_count = 26;
 }
 
 enum EndReason {

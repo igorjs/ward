@@ -27,6 +27,7 @@ pub struct RunFlags {
     pub tty: bool,
     pub rm: bool,
     pub detach: bool,
+    pub hooks: crate::create_opts::Hooks,
 }
 
 /// Creates a sandbox, runs its main command and returns the exit code.
@@ -38,7 +39,13 @@ pub async fn run(
 ) -> Result<i32> {
     require_terminal(flags.tty, flags.interactive)?;
     let mut c = client::connect(socket).await?;
-    let created = c.create_sandbox(request).await?.into_inner();
+    flags.hooks.begin(&mut c, token_store).await?;
+    let created = flags.hooks.finish(
+        c.create_sandbox(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(Into::into),
+    )?;
     if let Err(e) = tokens::save(token_store, &created.id, &created.token) {
         eprintln!("warning: could not persist token locally: {e}");
     }

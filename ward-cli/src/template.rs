@@ -21,6 +21,12 @@ pub const ANY_FIELD: &str = "*";
 const PATH_SEPARATOR: char = '.';
 const COLUMN_SEPARATOR: char = '\t';
 const COLUMN_PADDING: usize = 3;
+/// The column that allows `{{.Label "key"}}`.
+pub const LABELS_FIELD: &str = "Labels";
+/// The record key that holds the label map `{{.Label "key"}}` reads.
+pub const LABEL_MAP_KEY: &str = "Label";
+const LABEL_ACTION: &str = ".Label";
+const QUOTE: char = '"';
 
 enum Part {
     Text(String),
@@ -30,6 +36,8 @@ enum Part {
     },
     /// The whole record, or the value at a path.
     Json(Option<String>),
+    /// `{{.Label "key"}}`: one entry of the record's label map.
+    Label(String),
 }
 
 /// A parsed `--format` template.
@@ -81,6 +89,14 @@ impl Template {
                 return Ok(Part::Json(Some(name.to_string())));
             }
         }
+        if let Some(key) = action
+            .strip_prefix(LABEL_ACTION)
+            .and_then(|rest| rest.trim().strip_prefix(QUOTE))
+            .and_then(|rest| rest.strip_suffix(QUOTE))
+            .filter(|_| columns.iter().any(|(field, _)| *field == LABELS_FIELD))
+        {
+            return Ok(Part::Label(key.to_string()));
+        }
         let Some(name) = action.strip_prefix(FIELD_PREFIX) else {
             bail!("unsupported action {{{{{action}}}}} in --format");
         };
@@ -109,7 +125,13 @@ impl Template {
                 Some(other) => other.to_string(),
                 None => String::new(),
             },
-            (Part::Json(_), None) => String::new(),
+            (Part::Json(_) | Part::Label(_), None) => String::new(),
+            (Part::Label(key), Some(r)) => r
+                .get(LABEL_MAP_KEY)
+                .and_then(|labels| labels.get(key))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             (Part::Json(None), Some(r)) => Value::Object(r.clone()).to_string(),
             (Part::Json(Some(name)), Some(r)) => {
                 lookup(r, name).map(Value::to_string).unwrap_or_default()
@@ -201,6 +223,33 @@ mod tests {
         let template = Template::parse(format, &COLUMNS).expect("parse");
 
         assert_eq!(template.render(&records()), expected);
+    }
+
+    #[test]
+    fn given_label_action_when_rendered_then_the_label_value_or_empty() {
+        // Arrange
+        let record = match json!({"Labels": "a=1", "Label": {"a": "1"}}) {
+            Value::Object(map) => map,
+            _ => unreachable!(),
+        };
+        let columns = [(LABELS_FIELD, "LABELS")];
+        let template =
+            Template::parse("{{.Label \"a\"}}|{{.Label \"b\"}}", &columns).expect("parse");
+
+        // Act
+        let out = template.render(&[record]);
+
+        // Assert
+        assert_eq!(out, "1|\n");
+    }
+
+    #[test]
+    fn given_label_action_without_a_labels_column_when_parsed_then_it_is_refused() {
+        // Act
+        let result = Template::parse("{{.Label \"a\"}}", &COLUMNS);
+
+        // Assert
+        assert!(result.is_err());
     }
 
     #[rstest::rstest]

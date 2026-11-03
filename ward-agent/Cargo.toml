@@ -31,7 +31,7 @@ rustix = { version = "1", features = ["fs", "pty", "termios", "process", "param"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio-vsock = "0.7"
-rustix = { version = "1", features = ["mount", "fs"] }
+rustix = { version = "1", features = ["mount", "fs", "system"] }
 libc = "0.2"
 
 [build-dependencies]

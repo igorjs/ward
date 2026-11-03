@@ -30,6 +30,8 @@ pub struct Filters {
     names: Vec<String>,
     ids: Vec<String>,
     statuses: Vec<String>,
+    /// `key` or `key=value`; a sandbox must match every one.
+    labels: Vec<String>,
 }
 
 impl Filters {
@@ -49,7 +51,10 @@ impl Filters {
                     filters.statuses.push(value.to_string());
                 }
                 FILTER_STATUS => bail!("invalid filter 'status={value}'"),
-                FILTER_LABEL => bail!("label filters are not supported yet"),
+                FILTER_LABEL if value.is_empty() || value.starts_with('=') => {
+                    bail!("invalid filter 'label={value}'")
+                }
+                FILTER_LABEL => filters.labels.push(value.to_string()),
                 _ => bail!("invalid filter '{key}'"),
             }
         }
@@ -63,6 +68,10 @@ impl Filters {
         any(&self.names, &|w| info.name.contains(w))
             && any(&self.ids, &|w| info.id.starts_with(w))
             && any(&self.statuses, &|w| w == status_word(info.status))
+            && self.labels.iter().all(|label| match label.split_once('=') {
+                Some((key, value)) => info.labels.get(key).is_some_and(|v| v == value),
+                None => info.labels.contains_key(label),
+            })
     }
 }
 
@@ -173,6 +182,34 @@ mod tests {
         assert_eq!(names(&shown), expected);
     }
 
+    #[rstest::rstest]
+    #[case::key_only(&["label=team"], &["web1", "db"])]
+    #[case::key_and_value(&["label=team=infra"], &["web1"])]
+    #[case::wrong_value(&["label=team=none"], &[])]
+    #[case::all_must_match(&["label=team", "label=tier=1"], &["db"])]
+    fn given_label_filters_when_selected_then_every_label_must_match(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let mut listed = fleet();
+        let label = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        listed[0].labels = label(&[("team", "infra")]);
+        listed[2].labels = label(&[("team", "data"), ("tier", "1")]);
+
+        let shown = select(&listed, true, &parse(specs), None);
+
+        let mut got = names(&shown);
+        got.sort();
+        let mut want: Vec<String> = expected.iter().map(ToString::to_string).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn given_status_filter_without_all_when_selected_then_that_state_is_still_listed() {
         let listed = fleet();
@@ -185,7 +222,7 @@ mod tests {
     #[rstest::rstest]
     #[case::unknown_key("color=red", "invalid filter 'color'")]
     #[case::bad_status("status=sleeping", "status=sleeping")]
-    #[case::label("label=a=b", "not supported")]
+    #[case::empty_label("label=", "label=")]
     #[case::no_value("name", "name=value")]
     fn given_bad_filter_when_parsed_then_error_says_why(#[case] spec: &str, #[case] said: &str) {
         let error = Filters::parse(&[spec.to_string()]).expect_err("rejected");

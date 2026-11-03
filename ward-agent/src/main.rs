@@ -26,6 +26,12 @@ async fn main() -> std::io::Result<()> {
 
     let args = ward_agent::parse_args(std::env::args().skip(1))
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if let Some(hostname) = &args.hostname {
+        match ward_agent::set_hostname(hostname) {
+            Ok(()) => tracing::info!(hostname, "guest host name set"),
+            Err(e) => tracing::warn!(hostname, error = %e, "cannot set the guest host name"),
+        }
+    }
     ward_agent::mount_all(&args.mounts)?;
     match ward_agent::setup_cgroup(args.pids_max) {
         Ok(()) => tracing::info!(pids_max = ?args.pids_max, "sandbox cgroup ready"),
