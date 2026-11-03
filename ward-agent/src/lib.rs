@@ -26,10 +26,13 @@ mod archive;
 // Only the Linux build calls into it; other hosts compile it for the tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod cgroup;
+pub mod cgroup_limits;
 mod freezer;
 pub mod guest_mounts;
 pub mod guest_network;
+mod limits;
 mod oom;
+pub mod process_limits;
 mod pty;
 mod secrets;
 mod stats;
@@ -253,9 +256,9 @@ fn exited_event(code: i32, wait_status: i32) -> Event {
 /// Handle a single daemon connection, dispatching on its opening frame:
 /// `Exec` runs a process and streams its output until it exits, `Ping`
 /// answers `Pong`, `PutArchive` and `GetArchive` transfer a tar stream,
-/// `PutSecrets` writes secret files, `Freeze` pauses or resumes the sandbox's
-/// processes, and
-/// `Top` lists the guest's processes and `Stats` reports its resource use.
+/// `PutSecrets` writes secret files, `SetLimits` changes the sandbox's limits,
+/// `Freeze` pauses or resumes the sandbox's processes, `Top` lists the
+/// guest's processes and `Stats` reports its resource use.
 pub async fn handle_connection<S>(stream: S) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -294,6 +297,10 @@ where
             let mut writer = writer;
             return answer_secrets(put, &mut writer).await;
         }
+        Some(request::Kind::SetLimits(set)) => {
+            let mut writer = writer;
+            return answer_set_limits(&set, &mut writer).await;
+        }
         Some(request::Kind::Freeze(freeze)) => {
             let mut writer = writer;
             return answer_freeze(freeze.frozen, &mut writer).await;
@@ -314,7 +321,7 @@ where
         _ => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, Freeze, Top or Stats",
+                "first frame must be Exec, Ping, PutArchive, GetArchive, PutSecrets, SetLimits, Freeze, Top or Stats",
             ));
         }
     };
@@ -337,6 +344,35 @@ async fn answer_secrets<W: AsyncWrite + Unpin>(
         Err(e) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             e.to_string(),
+        )),
+    };
+    let kind = match outcome {
+        Ok(()) => event::Kind::ArchiveDone(proto::ArchiveDone {}),
+        Err(e) => event::Kind::ArchiveError(proto::ArchiveError {
+            message: e.to_string(),
+            ..Default::default()
+        }),
+    };
+    write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await
+}
+
+async fn answer_set_limits<W: AsyncWrite + Unpin>(
+    set: &proto::SetLimits,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let limits = limits::Limits {
+        memory_bytes: set.memory_bytes,
+        nano_cpus: set.nano_cpus,
+        pids_max: set.pids_max,
+    };
+    let outcome = match SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir) {
+        Some(dir) => {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || limits::apply(&dir, limits)).await?
+        }
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "the guest has no sandbox cgroup to limit",
         )),
     };
     let kind = match outcome {
@@ -479,6 +515,49 @@ fn spawn_process_io_sampler() {
     });
 }
 
+/// Resource limits for every child, set once at agent start.
+#[cfg(target_os = "linux")]
+static CHILD_RLIMITS: OnceLock<Vec<(rustix::process::Resource, rustix::process::Rlimit)>> =
+    OnceLock::new();
+/// Supplementary groups for every child, set once at agent start.
+static CHILD_GROUPS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Remember the limits and groups every process the agent starts gets.
+pub fn set_process_limits(ulimits: &[process_limits::GuestUlimit], groups: &[String]) {
+    #[cfg(target_os = "linux")]
+    let _ = CHILD_RLIMITS.set(process_limits::kernel_limits(ulimits));
+    #[cfg(not(target_os = "linux"))]
+    let _ = ulimits;
+    let _ = CHILD_GROUPS.set(groups.to_vec());
+}
+
+/// Set the limits on the child before it runs. They come before the
+/// privilege drop, which only root may undo.
+fn apply_child_limits(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    if let Some(limits) = CHILD_RLIMITS.get().filter(|l| !l.is_empty()).cloned() {
+        // SAFETY: the closure runs between fork and exec and only makes
+        // setrlimit system calls, which do not allocate.
+        unsafe {
+            cmd.pre_exec(move || process_limits::apply(&limits));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
+/// Give a child with no `--user` its supplementary groups.
+fn apply_root_groups(cmd: &mut Command, gids: Vec<u32>) {
+    if gids.is_empty() {
+        return;
+    }
+    // SAFETY: the closure runs between fork and exec and only makes the
+    // setgroups system call, which does not allocate.
+    unsafe {
+        cmd.pre_exec(move || user::PrivilegeDropper::set_groups(&user::SystemDropper, &gids));
+    }
+}
+
 /// Make the child move itself into the sandbox cgroup before it runs, so
 /// nothing it forks can escape the cap or the OOM accounting. A failed move fails the spawn.
 fn join_pids_cgroup(cmd: &mut Command) {
@@ -497,6 +576,7 @@ fn join_pids_cgroup(cmd: &mut Command) {
 fn spawn_child(
     exec: &Exec,
     identity: Option<&user::Identity>,
+    root_groups: &[u32],
 ) -> std::io::Result<(Child, ChildIo)> {
     let mut cmd = Command::new(&exec.command[0]);
     cmd.args(&exec.command[1..]);
@@ -507,6 +587,8 @@ fn spawn_child(
     }
     cmd.envs(exec.env.iter());
     join_pids_cgroup(&mut cmd);
+    apply_child_limits(&mut cmd);
+    apply_root_groups(&mut cmd, root_groups.to_vec());
     if let Some(identity) = identity
         && !exec.env.contains_key(HOME_ENV)
     {
@@ -644,6 +726,7 @@ async fn apply_request(
         | request::Kind::ArchiveChunk(_)
         | request::Kind::ArchiveEnd(_)
         | request::Kind::PutSecrets(_)
+        | request::Kind::SetLimits(_)
         | request::Kind::Freeze(_)
         | request::Kind::Top(_)
         | request::Kind::Stats(_) => {}
@@ -736,6 +819,26 @@ fn load_identity(
     Ok(Some(user::resolve(spec, &passwd, &group)?))
 }
 
+/// Add the `--group-add` groups: to the identity's groups when there is one,
+/// else returned for a child that keeps the agent's own identity.
+fn with_group_add(
+    identity: Option<user::Identity>,
+) -> Result<(Option<user::Identity>, Vec<u32>), user::UserError> {
+    let names = CHILD_GROUPS.get().map(Vec::as_slice).unwrap_or_default();
+    if names.is_empty() {
+        return Ok((identity, Vec::new()));
+    }
+    let group_db = read_user_db(Path::new(GROUP_PATH), "group")?;
+    let gids = user::resolve_group_add(names, &group_db)?;
+    Ok(match identity {
+        Some(mut identity) => {
+            user::add_groups(&mut identity, &gids);
+            (Some(identity), Vec::new())
+        }
+        None => (None, gids),
+    })
+}
+
 /// The file's text, empty when it is missing or unreadable so a numeric uid
 /// still resolves, or an error when it is over the size limit.
 fn read_user_db(path: &Path, name: &'static str) -> Result<String, user::UserError> {
@@ -780,9 +883,17 @@ where
         }
     };
 
+    let (identity, root_groups) = match with_group_add(identity) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            end_without_process(event_tx, writer_task, &e.to_string(), EXIT_NOT_INVOKABLE).await;
+            return Ok(());
+        }
+    };
+
     let oom_counter = oom_counter();
     let oom_before = oom_counter.read();
-    let (mut child, io) = match spawn_child(&exec, identity.as_ref()) {
+    let (mut child, io) = match spawn_child(&exec, identity.as_ref(), &root_groups) {
         Ok(spawned) => spawned,
         Err(e) => {
             // Surface the OS error on stderr too, with the step that failed.
@@ -1658,6 +1769,9 @@ pub struct AgentArgs {
     pub hosts: Vec<guest_network::GuestHost>,
     pub dns_search: Vec<String>,
     pub dns_options: Vec<String>,
+    pub ulimits: Vec<process_limits::GuestUlimit>,
+    pub group_add: Vec<String>,
+    pub cgroup_settings: cgroup_limits::CgroupSettings,
     /// Host name for the guest; `None` keeps the kernel's.
     pub hostname: Option<String>,
     pub mounts: Vec<GuestMount>,
@@ -1694,6 +1808,46 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
                     .parse::<u64>()
                     .map_err(|_| format!("--shm-size must be a number of bytes, got {value:?}"))?,
             );
+            continue;
+        }
+        if arg == process_limits::ULIMIT_ARG {
+            let (name, soft, hard) = (args.next(), args.next(), args.next());
+            let (Some(name), Some(soft), Some(hard)) = (name, soft, hard) else {
+                return Err("--ulimit needs <name> <soft> <hard>".to_string());
+            };
+            parsed
+                .ulimits
+                .push(process_limits::GuestUlimit::parse(&name, &soft, &hard)?);
+            continue;
+        }
+        if arg == process_limits::GROUP_ADD_ARG {
+            parsed
+                .group_add
+                .push(args.next().ok_or("--group-add needs <name|gid>")?);
+            continue;
+        }
+        if arg == cgroup_limits::MEMORY_LOW_ARG {
+            let value = args.next().ok_or("--memory-low needs <bytes>")?;
+            parsed.cgroup_settings.memory_low = Some(parse_number(&arg, &value)?);
+            continue;
+        }
+        if arg == cgroup_limits::CPU_WEIGHT_ARG {
+            let value = args.next().ok_or("--cpu-weight needs <weight>")?;
+            parsed.cgroup_settings.cpu_weight = Some(parse_number(&arg, &value)?);
+            continue;
+        }
+        if arg == cgroup_limits::CPU_MAX_ARG {
+            let (quota, period) = (args.next(), args.next());
+            let (Some(quota), Some(period)) = (quota, period) else {
+                return Err("--cpu-max needs <quota|max> <period>".to_string());
+            };
+            let period = parse_number(&arg, &period)?;
+            parsed.cgroup_settings.cpu_max = Some((quota, period));
+            continue;
+        }
+        if arg == cgroup_limits::CPUSET_ARG {
+            parsed.cgroup_settings.cpuset_cpus =
+                Some(args.next().ok_or("--cpuset-cpus needs <list>")?);
             continue;
         }
         if arg == guest_network::ADD_HOST_ARG {
@@ -1750,6 +1904,29 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<AgentArgs, 
         });
     }
     Ok(parsed)
+}
+
+fn parse_number(flag: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} must be a number, got {value:?}"))
+}
+
+/// Apply the CPU and memory settings to the sandbox cgroup.
+///
+/// # Errors
+///
+/// Fails with the reason when the cgroup was not set up or the guest kernel
+/// refuses a setting.
+#[cfg(target_os = "linux")]
+pub fn apply_cgroup_limits(settings: &cgroup_limits::CgroupSettings) -> Result<(), String> {
+    if settings.is_empty() {
+        return Ok(());
+    }
+    let group = SANDBOX_CGROUP
+        .get()
+        .ok_or("the sandbox cgroup is not set up")?;
+    cgroup_limits::apply(Path::new(cgroup::CGROUP_ROOT), group.dir(), settings)
 }
 
 /// Give the guest its host name, in the kernel and in `/etc/hostname`.
@@ -1916,6 +2093,42 @@ mod mount_arg_tests {
     #[case::search_missing(&["--dns-search"])]
     #[case::option_missing(&["--dns-option"])]
     fn given_truncated_network_args_when_parsed_then_error(#[case] list: &[&str]) {
+        assert!(parse_args(args(list)).is_err());
+    }
+
+    #[test]
+    fn given_limit_args_when_parsed_then_they_are_kept() {
+        let parsed = parse_args(args(&[
+            "--group-add",
+            "audio",
+            "--memory-low",
+            "4096",
+            "--cpu-weight",
+            "39",
+            "--cpu-max",
+            "max",
+            "50000",
+            "--cpuset-cpus",
+            "0-1",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.group_add, ["audio"]);
+        assert_eq!(parsed.cgroup_settings.memory_low, Some(4096));
+        assert_eq!(parsed.cgroup_settings.cpu_weight, Some(39));
+        assert_eq!(
+            parsed.cgroup_settings.cpu_max,
+            Some(("max".to_string(), 50_000))
+        );
+        assert_eq!(parsed.cgroup_settings.cpuset_cpus.as_deref(), Some("0-1"));
+    }
+
+    #[rstest::rstest]
+    #[case::ulimit_short(&["--ulimit", "nofile", "1"])]
+    #[case::weight_not_a_number(&["--cpu-weight", "heavy"])]
+    #[case::cpu_max_short(&["--cpu-max", "max"])]
+    #[case::group_missing(&["--group-add"])]
+    fn given_bad_limit_args_when_parsed_then_error(#[case] list: &[&str]) {
         assert!(parse_args(args(list)).is_err());
     }
 

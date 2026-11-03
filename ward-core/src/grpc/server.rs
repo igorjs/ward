@@ -26,8 +26,8 @@ use crate::pb::{
     RemoveVolumeRequest, RenameSandboxRequest, RestartRequest, RestoreSnapshotRequest, RunRequest,
     SandboxEvent as PbSandboxEvent, SandboxInfo, SnapshotInfo, StartRequest, StatsRequest,
     StatsResponse, StopRequest, StreamEvent, StreamOutputRequest, SubscribeRequest, TopProcess,
-    TopRequest, TopResponse, UnpauseRequest, VolumeInfo, WaitRequest, WaitResponse,
-    WriteStdinRequest,
+    TopRequest, TopResponse, UnpauseRequest, UpdateSandboxRequest, VolumeInfo, WaitRequest,
+    WaitResponse, WriteStdinRequest,
 };
 use crate::protocol::{ApiError, ISSUES_URL};
 use crate::sandbox::{MAIN_PROCESS_PID, SandboxManager};
@@ -292,6 +292,22 @@ impl Ward for WardGrpcServer {
             .map_err(api_err_to_status)?;
         self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
         Ok(Response::new(()))
+    }
+
+    #[tracing::instrument(
+        name = "rpc.update_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().id)
+    )]
+    async fn update_sandbox(
+        &self,
+        request: Request<UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxInfo>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let mut req = request.into_inner();
+        req.id = authorized_id(&self.sandbox, &req.id, &token).await?;
+        let info = self.sandbox.update(req).await.map_err(api_err_to_status)?;
+        Ok(Response::new(info))
     }
 
     #[tracing::instrument(

@@ -71,6 +71,9 @@ pub struct SandboxSpec {
     /// mounts when the spec is reported; never stored here.
     #[serde(skip)]
     pub mounts: Vec<Mount>,
+    /// Filled from the health monitor when the spec is reported.
+    #[serde(skip)]
+    pub health: Option<HealthState>,
 }
 
 /// Guest setup options of `docker run`, kept on the sandbox record.
@@ -91,6 +94,70 @@ pub struct GuestOptions {
     pub dns_search: Vec<String>,
     #[serde(default)]
     pub dns_options: Vec<String>,
+    #[serde(default)]
+    pub ulimits: Vec<Ulimit>,
+    /// Supplementary groups by name or id.
+    #[serde(default)]
+    pub group_add: Vec<String>,
+    #[serde(default)]
+    pub cgroup: CgroupLimits,
+    #[serde(default)]
+    pub healthcheck: Option<Healthcheck>,
+}
+
+/// Docker's `Config.Healthcheck`. A zero value uses the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Healthcheck {
+    pub test: Vec<String>,
+    #[serde(default)]
+    pub interval_ns: u64,
+    #[serde(default)]
+    pub timeout_ns: u64,
+    #[serde(default)]
+    pub start_period_ns: u64,
+    #[serde(default)]
+    pub retries: u32,
+}
+
+/// Health of the current run, as reported. Never stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthState {
+    pub status: String,
+    pub failing_streak: u32,
+    pub log: Vec<HealthLogEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthLogEntry {
+    pub start: SystemTime,
+    pub end: SystemTime,
+    pub exit_code: i32,
+    pub output: String,
+}
+
+/// A resource limit for every process, `-1` meaning unlimited.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Ulimit {
+    pub name: String,
+    pub soft: i64,
+    pub hard: i64,
+}
+
+/// Docker's cgroup options as given. 0 means not set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CgroupLimits {
+    #[serde(default)]
+    pub memory_swap_bytes: i64,
+    #[serde(default)]
+    pub memory_reservation_bytes: u64,
+    #[serde(default)]
+    pub cpu_shares: u32,
+    #[serde(default)]
+    pub cpuset_cpus: String,
+    #[serde(default)]
+    pub cpu_period: u64,
+    #[serde(default)]
+    pub cpu_quota: i64,
 }
 
 /// Docker's default size for `/dev/shm`: 64 MiB.
@@ -286,9 +353,58 @@ pub struct ResourceLimits {
     pub timeout_seconds: u64,
     #[serde(default)]
     pub exited_ttl_seconds: u64,
+    /// CPU limit in billionths of a CPU. 0 means the whole `cpus`.
+    #[serde(default)]
+    pub nano_cpus: u64,
+}
+
+/// Bytes in one MiB.
+pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+/// Billionths of a CPU in one CPU.
+pub const NANOS_PER_CPU: u64 = 1_000_000_000;
+
+/// Limits `update` changes. A field left `None` is kept, and 0 removes that
+/// limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LimitsUpdate {
+    pub memory_mb: Option<u32>,
+    pub nano_cpus: Option<u64>,
+    pub pids_max: Option<u32>,
+}
+
+impl LimitsUpdate {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The whole CPUs the VM needs to honour `nano_cpus`.
+    pub fn whole_cpus(nano_cpus: u64) -> u32 {
+        u32::try_from(nano_cpus.div_ceil(NANOS_PER_CPU)).unwrap_or(u32::MAX)
+    }
 }
 
 impl ResourceLimits {
+    /// These limits with `update` applied. A CPU limit also sets the VM's CPU
+    /// count for the next boot, rounded up.
+    #[must_use]
+    pub fn updated(&self, update: &LimitsUpdate) -> Self {
+        let mut next = self.clone();
+        if let Some(memory_mb) = update.memory_mb {
+            next.memory_mb = memory_mb;
+        }
+        if let Some(nano_cpus) = update.nano_cpus {
+            next.nano_cpus = nano_cpus;
+            if nano_cpus > 0 {
+                next.cpus = LimitsUpdate::whole_cpus(nano_cpus);
+            }
+        }
+        if let Some(pids_max) = update.pids_max {
+            next.pids_max = pids_max;
+        }
+        next
+    }
+
     /// Fill each CPU, memory and pids field left at 0 from `defaults`.
     /// A field the request set is kept.
     pub fn with_defaults(self, defaults: &crate::config::DefaultLimits) -> Self {

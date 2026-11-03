@@ -58,9 +58,19 @@ fn nested(value: &Value) -> String {
                 .collect();
             format!("map[{}]", parts.join(" "))
         }
+        Value::Number(n) => integral(n).unwrap_or_else(|| n.to_string()),
         other => other.to_string(),
     }
 }
+
+/// A float that holds a whole number prints without a fraction, as in Go.
+fn integral(number: &serde_json::Number) -> Option<String> {
+    let float = number.as_f64().filter(|_| number.is_f64())?;
+    (float.fract() == 0.0 && float.abs() < WHOLE_FLOAT_LIMIT).then(|| format!("{float:.0}"))
+}
+
+/// Go prints a float with an exponent from here on.
+const WHOLE_FLOAT_LIMIT: f64 = 1e21;
 
 /// Calls the function `name`; the parser has already checked that it exists.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
@@ -295,6 +305,10 @@ fn spaced(args: &[Value]) -> String {
     parts.join(" ")
 }
 
+/// Widest field or precision `printf` accepts, so a format cannot ask for a
+/// huge allocation.
+const MAX_PRINTF_WIDTH: usize = 4096;
+
 /// Flags, width and precision of one `printf` verb.
 #[derive(Default)]
 struct Spec {
@@ -306,15 +320,20 @@ struct Spec {
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
-fn number(chars: &mut Chars) -> usize {
-    let mut total = 0;
+fn number(chars: &mut Chars) -> Result<usize> {
+    let mut total: usize = 0;
     while let Some(digit) = chars.next_if(char::is_ascii_digit) {
-        total = total * 10 + digit.to_digit(DECIMAL_RADIX).unwrap_or(0) as usize;
+        let digit = digit.to_digit(DECIMAL_RADIX).unwrap_or(0) as usize;
+        total = total
+            .checked_mul(DECIMAL_RADIX as usize)
+            .and_then(|t| t.checked_add(digit))
+            .filter(|t| *t <= MAX_PRINTF_WIDTH)
+            .ok_or_else(|| anyhow!("printf width or precision is too large"))?;
     }
-    total
+    Ok(total)
 }
 
-fn spec(chars: &mut Chars) -> Spec {
+fn spec(chars: &mut Chars) -> Result<Spec> {
     let mut spec = Spec::default();
     while let Some(flag) = chars.next_if(|f| matches!(f, '-' | '0' | '+' | ' ' | '#')) {
         match flag {
@@ -323,11 +342,11 @@ fn spec(chars: &mut Chars) -> Spec {
             _ => {}
         }
     }
-    spec.width = number(chars);
+    spec.width = number(chars)?;
     if chars.next_if_eq(&'.').is_some() {
-        spec.precision = Some(number(chars));
+        spec.precision = Some(number(chars)?);
     }
-    spec
+    Ok(spec)
 }
 
 fn printf(args: &[Value]) -> Result<Value> {
@@ -342,7 +361,7 @@ fn printf(args: &[Value]) -> Result<Value> {
             out.push(c);
             continue;
         }
-        let spec = spec(&mut chars);
+        let spec = spec(&mut chars)?;
         let Some(verb) = chars.next() else {
             out.push_str("%!(NOVERB)");
             break;
@@ -356,29 +375,91 @@ fn printf(args: &[Value]) -> Result<Value> {
             None => out.push_str(&format!("%!{verb}(MISSING)")),
         }
     }
+    let extra: Vec<String> = values
+        .map(|v| format!("{}={}", type_name(v), display(v)))
+        .collect();
+    if !extra.is_empty() {
+        out.push_str(&format!("%!(EXTRA {})", extra.join(", ")));
+    }
     Ok(Value::String(out))
 }
 
-fn verb_text(verb: char, value: &Value, spec: &Spec) -> String {
-    match verb {
-        's' | 'v' => {
-            let shown = display(value);
-            match spec.precision {
-                Some(keep) => shown.chars().take(keep).collect(),
-                None => shown,
+/// The Go type name `printf` shows in its error forms.
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "<nil>",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "float64",
+        Value::Number(_) => "int",
+        Value::String(_) => "string",
+        Value::Array(_) => "[]interface {}",
+        Value::Object(_) => "map[string]interface {}",
+    }
+}
+
+/// Go's `%!verb(type=value)` for a value the verb cannot print.
+fn bad_verb(verb: char, value: &Value) -> String {
+    format!("%!{verb}({}={})", type_name(value), display(value))
+}
+
+/// `strconv.Quote`: escapes for control characters, keeps printable text.
+fn go_quote(text: &str) -> String {
+    let mut out = String::from('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\u{7}' => out.push_str("\\a"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\u{b}' => out.push_str("\\v"),
+            c if c.is_control() && u32::from(c) < 0x100 => {
+                out.push_str(&format!("\\x{:02x}", u32::from(c)));
             }
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
         }
-        'q' => Value::String(display(value)).to_string(),
-        'd' | 't' => display(value),
-        'f' => match value.as_f64() {
-            Some(f) => format!("{f:.*}", spec.precision.unwrap_or(DEFAULT_FLOAT_PRECISION)),
-            None => format!("%!f({}={})", kind(value), display(value)),
+    }
+    out.push('"');
+    out
+}
+
+fn hex(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(n) if n.is_i64() => {
+            let int = n.as_i64()?;
+            let sign = if int < 0 { "-" } else { "" };
+            Some(format!("{sign}{:x}", int.unsigned_abs()))
+        }
+        Value::Number(n) => n.as_u64().map(|u| format!("{u:x}")),
+        Value::String(text) => Some(text.bytes().map(|b| format!("{b:02x}")).collect()),
+        _ => None,
+    }
+}
+
+fn verb_text(verb: char, value: &Value, spec: &Spec) -> String {
+    match (verb, value) {
+        ('v', _) => display(value),
+        ('s', Value::String(text)) => match spec.precision {
+            Some(keep) => text.chars().take(keep).collect(),
+            None => text.clone(),
         },
-        'x' => match value {
-            Value::Number(n) => format!("{:x}", n.as_i64().unwrap_or_default()),
-            other => display(other).bytes().map(|b| format!("{b:02x}")).collect(),
-        },
-        other => format!("%!{other}({}={})", kind(value), display(value)),
+        ('s', Value::Array(_) | Value::Object(_)) => display(value),
+        ('q', Value::String(text)) => go_quote(text),
+        ('d', Value::Number(n)) if !n.is_f64() => n.to_string(),
+        ('t', Value::Bool(flag)) => flag.to_string(),
+        ('f', Value::Number(n)) if n.is_f64() => {
+            let float = n.as_f64().unwrap_or_default();
+            format!(
+                "{float:.*}",
+                spec.precision.unwrap_or(DEFAULT_FLOAT_PRECISION)
+            )
+        }
+        ('x', _) => hex(value).unwrap_or_else(|| bad_verb(verb, value)),
+        _ => bad_verb(verb, value),
     }
 }
 
@@ -446,6 +527,13 @@ mod tests {
     )]
     #[case::printf_precision("printf", json!(["%.2f %.1s %%", 1.23456, "xyz"]), json!("1.23 x %"))]
     #[case::printf_missing("printf", json!(["%d"]), json!("%!d(MISSING)"))]
+    #[case::printf_d_string("printf", json!(["%d", "x"]), json!("%!d(string=x)"))]
+    #[case::printf_s_number("printf", json!(["%s", 5]), json!("%!s(int=5)"))]
+    #[case::printf_hex_negative("printf", json!(["%x", -255]), json!("-ff"))]
+    #[case::printf_hex_string("printf", json!(["%x", "hi"]), json!("6869"))]
+    #[case::printf_extra("printf", json!(["a", 1, "b"]), json!("a%!(EXTRA int=1, string=b)"))]
+    #[case::printf_quote("printf", json!(["%q", "a\nb\"\u{1}"]), json!("\"a\\nb\\\"\\x01\""))]
+    #[case::printf_whole_float("printf", json!(["%v", 2.0]), json!("2"))]
     fn given_a_function_when_called_then_it_matches_go(
         #[case] name: &str,
         #[case] args: Value,
@@ -462,6 +550,8 @@ mod tests {
     #[case::mixed_compare("eq", json!([1, "a"]))]
     #[case::index_out_of_range("index", json!([[1], 4]))]
     #[case::slice_past_end("slice", json!(["ab", 0, 5]))]
+    #[case::printf_huge_width("printf", json!(["%99999999999999999999d", 1]))]
+    #[case::printf_wide("printf", json!(["%5000s", "x"]))]
     #[case::len_of_number("len", json!([3]))]
     #[case::wrong_arity("lower", json!(["a", "b"]))]
     fn given_bad_arguments_when_called_then_it_fails(#[case] name: &str, #[case] args: Value) {
@@ -475,6 +565,8 @@ mod tests {
     #[case::map(json!({"b": 2, "a": [true]}), "map[a:[true] b:2]")]
     #[case::null_inside(json!([null]), "[<nil>]")]
     #[case::null_alone(json!(null), "")]
+    #[case::whole_float(json!(1.0), "1")]
+    #[case::fraction(json!(1.5), "1.5")]
     fn given_a_value_when_displayed_then_it_prints_like_go(
         #[case] value: Value,
         #[case] expected: &str,

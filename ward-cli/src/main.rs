@@ -15,6 +15,7 @@ mod diff;
 mod docker;
 mod egress;
 mod events;
+mod exists;
 mod export;
 mod guest_opts;
 mod history;
@@ -22,6 +23,7 @@ mod images;
 mod import;
 mod inspect;
 mod isolation;
+mod latest;
 mod lifecycle;
 mod load;
 mod log_output;
@@ -31,6 +33,7 @@ mod pause;
 mod ports;
 mod prune;
 mod prune_filter;
+mod ps_columns;
 mod ps_filter;
 mod pull;
 mod resources;
@@ -48,7 +51,7 @@ mod terminal;
 mod tokens;
 mod top;
 mod unpause;
-mod volume;
+mod update;
 mod wait;
 
 use clap::{Args, Parser, Subcommand};
@@ -245,7 +248,8 @@ enum Commands {
         #[arg(short, long)]
         quiet: bool,
         /// Go template for each sandbox, or `json`. Fields: .ID .Image
-        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names.
+        /// .Command .CreatedAt .RunningFor .State .Status .Reason .Names
+        /// .Labels .Ports .Mounts .Networks .Size.
         #[arg(long)]
         format: Option<String>,
         /// Print the full sandbox ID.
@@ -263,11 +267,20 @@ enum Commands {
         /// Show the most recently created sandbox in any state.
         #[arg(short = 'l', long)]
         latest: bool,
-        /// Only sandboxes matching name=, id= (a prefix) or status=
-        /// (created, running, stopping, stopped, exited, failed). Repeatable.
+        /// Only sandboxes matching name=, id= (a prefix), status=
+        /// (created, running, stopping, stopped, exited, failed), label= or
+        /// health= (starting, healthy, unhealthy, none). Repeatable.
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
+        /// Order the list by this column, ascending (Podman): created is
+        /// oldest first, runningfor newest first. Podman's size is not offered.
+        #[arg(long, value_enum, ignore_case = true, value_name = "FIELD")]
+        sort: Option<ps_filter::SortField>,
+        /// Add a SIZE column: the writable layer is not measured, so it shows
+        /// `--` next to the image's size.
+        #[arg(short, long)]
+        size: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -407,6 +420,15 @@ enum Commands {
         /// Prefix every line with its RFC3339 arrival time.
         #[arg(short = 't', long, conflicts_with = "pid")]
         timestamps: bool,
+        /// Only output before this time, in the forms --since takes. With
+        /// --follow, stops at that time.
+        #[arg(long, conflicts_with = "pid")]
+        until: Option<String>,
+        /// Accepted for Docker compatibility. Docker adds the --log-opt
+        /// labels and env to each line; Ward has no such options, so there
+        /// is nothing to add.
+        #[arg(long, conflicts_with = "pid")]
+        details: bool,
     },
 
     /// Write bytes to a process's stdin.
@@ -561,7 +583,8 @@ enum Commands {
     /// The daemon answers without a sandbox token, like `ward ps`, and keeps
     /// only the last 1024 events in memory, destroyed sandboxes included and
     /// none across a restart. --since replays from that history. --filter
-    /// takes type, event, container or name (a name or ID prefix), image and
+    /// takes type, event, reason (why a die event ended), container or name
+    /// (a name or ID prefix), image and
     /// label (an attribute, as key or key=value). --format takes a Go
     /// template over .Type .Action .Status .ID .From .Scope .Time .TimeNano
     /// .Actor.ID .Actor.Attributes.<key>, or json.
@@ -723,6 +746,16 @@ enum Commands {
         new_name: String,
     },
 
+    /// Exit 0 if the sandbox exists, 1 if not, 125 on an error. Prints
+    /// nothing, as `podman container exists` does.
+    #[command(name = "container-exists", hide = true)]
+    ContainerExists(exists::Args),
+
+    /// Exit 0 if the image is cached, 1 if not, 125 on an error. Prints
+    /// nothing, as `podman image exists` does.
+    #[command(name = "image-exists", hide = true)]
+    ImageExists(exists::Args),
+
     /// Remove every stopped and exited sandbox.
     Prune,
 
@@ -733,6 +766,9 @@ enum Commands {
     /// Remove images no sandbox uses, asking first unless -f is given.
     #[command(name = "image-prune", hide = true)]
     ImagePrune(prune::ImageArgs),
+
+    /// Change the limits or restart policy of one or more sandboxes.
+    Update(update::Args),
 
     /// Freeze the processes of one or more running sandboxes.
     Pause(pause::Args),
@@ -754,7 +790,7 @@ enum Commands {
 
     /// Manage sandboxes: ls, ps, create, run, start, stop, restart, rm, kill,
     /// logs, inspect, exec, cp, top, stats, wait, diff, commit, prune, port,
-    /// rename, pause, unpause and attach. Each is the top-level command of the same name.
+    /// rename, pause, unpause, attach and update. Each is the top-level command of the same name.
     Container {
         /// Subcommand and its arguments.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -803,19 +839,25 @@ enum Commands {
     Health,
 
     /// Show daemon information.
-    Info,
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SystemCommands {
     /// Show daemon information.
-    Info,
-    /// Count sandboxes and cached images.
-    Df {
-        /// Show a table per sandbox, image and volume.
+    Info {
+        /// Go template over .ServerVersion .OSType .Architecture .Driver
+        /// .Containers .ContainersRunning .ContainersStopped .Images.
         #[arg(short, long)]
-        verbose: bool,
+        format: Option<String>,
     },
+    /// Count sandboxes and cached images.
+    Df,
     /// Remove stopped sandboxes, and with -a unused images and with
     /// --volumes volumes, asking first unless -f is given.
     Prune(prune::SystemArgs),
@@ -848,14 +890,13 @@ enum VolumeCommands {
         #[arg(long, default_value = "1024")]
         size: u32,
     },
-    /// List volumes.
-    #[command(alias = "ls")]
-    List(volume::ListArgs),
-    /// Show details of one or more volumes as a JSON array.
-    Inspect(volume::InspectArgs),
-    /// Remove one or more volumes, by name or ID.
-    #[command(alias = "rm")]
-    Remove(volume::RemoveArgs),
+    /// List all volumes.
+    List,
+    /// Remove a volume.
+    Remove {
+        /// Volume ID.
+        id: String,
+    },
     /// Remove unused volumes, asking first.
     Prune(prune::VolumeArgs),
 }
@@ -948,6 +989,7 @@ fn create_request(
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
+        nano_cpus: 0,
     };
     opts.isolation.check()?;
     let mounts = opts
@@ -1018,7 +1060,8 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 25] = [
+const CONTAINER_COMMANDS: [(&str, &str); 27] = [
+    ("exists", "container-exists"),
     ("ls", "ps"),
     ("ps", "ps"),
     ("create", "create"),
@@ -1041,12 +1084,14 @@ const CONTAINER_COMMANDS: [(&str, &str); 25] = [
     ("prune", "container-prune"),
     ("port", "port"),
     ("rename", "rename"),
+    ("update", "update"),
     ("attach", "attach"),
     ("pause", "pause"),
     ("unpause", "unpause"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 11] = [
+const IMAGE_COMMANDS: [(&str, &str); 12] = [
+    ("exists", "image-exists"),
     ("prune", "image-prune"),
     ("ls", "images"),
     ("list", "images"),
@@ -1081,15 +1126,31 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// `run` and `exec` report their own failures as 125, so that scripts can tell
-/// them apart from the exit code of the command they ran.
+/// `run`, `exec` and the Podman `exists` commands report their own failures as
+/// 125, so that scripts can tell them apart from the exit code of the command
+/// they ran.
 fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
-    matches!(subcommand, Some("run" | "exec"))
+    matches!(
+        subcommand,
+        Some("run" | "exec" | "container-exists" | "image-exists")
+    )
 }
 
 #[tokio::main]
 async fn main() {
-    let args = expand_groups(std::env::args().collect());
+    let original = expand_groups(std::env::args().collect());
+    let args = match latest::expand(original.clone()).await {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            let code = if reports_cli_failure_as_125(subcommand_name(original).as_deref()) {
+                CLI_FAILURE_EXIT_CODE
+            } else {
+                GENERIC_FAILURE_EXIT_CODE
+            };
+            std::process::exit(code);
+        }
+    };
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
@@ -1222,6 +1283,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             last,
             latest,
             filter,
+            sort,
+            size,
         } => {
             let mut c = client::connect(&socket_path).await?;
             let options = inspect::PsOptions {
@@ -1233,6 +1296,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 no_trunc,
                 filters: ps_filter::Filters::parse(&filter)?,
                 limit: ps_filter::limit(last, latest),
+                sort,
+                size,
             };
             inspect::ps(&mut c, options).await?;
         }
@@ -1369,11 +1434,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tail,
             since,
             timestamps,
+            until,
+            details: _,
         } => {
             let options = log_output::LogOptions {
                 tail: docker::parse_tail(&tail)?,
                 since: since
                     .map(|value| log_output::parse_since(&value, chrono::Utc::now()))
+                    .transpose()?,
+                until: until
+                    .map(|value| log_output::parse_until(&value, chrono::Utc::now()))
                     .transpose()?,
                 timestamps,
             };
@@ -1717,6 +1787,16 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             lifecycle::rename(&mut c, &token_store, &reference, &new_name, json).await?;
         }
 
+        Commands::ContainerExists(args) => {
+            std::process::exit(exists::container(&socket_path, &args.name).await)
+        }
+
+        Commands::ImageExists(args) => {
+            std::process::exit(exists::image(&socket_path, &args.name).await)
+        }
+
+        Commands::Update(args) => update::run(&socket_path, &token_store, args, json).await?,
+
         Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Unpause(args) => unpause::run(&socket_path, &token_store, args, json).await?,
@@ -1781,10 +1861,33 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     println!("mount_path: {}", resp.mount_path);
                 }
             }
-            VolumeCommands::List(args) => volume::list(&socket_path, args, json, no_pretty).await?,
-            VolumeCommands::Inspect(args) => volume::inspect(&socket_path, args).await?,
+            VolumeCommands::List => {
+                let mut c = client::connect(&socket_path).await?;
+                let resp = c.list_volumes(()).await?.into_inner();
+                let rows: Vec<Vec<Value>> = resp
+                    .volumes
+                    .into_iter()
+                    .map(|v| {
+                        vec![
+                            Value::String(v.id),
+                            Value::String(v.name),
+                            Value::from(v.size_mb),
+                        ]
+                    })
+                    .collect();
+                output::emit_rows(json, no_pretty, &["id", "name", "size_mb"], &rows)?;
+            }
             VolumeCommands::Prune(args) => prune::volume(&socket_path, args, json).await?,
-            VolumeCommands::Remove(args) => volume::remove(&socket_path, args, json).await?,
+            VolumeCommands::Remove { id } => {
+                let mut c = client::connect(&socket_path).await?;
+                c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
+                    .await?;
+                if json {
+                    println!("{}", json!({"removed": id}));
+                } else {
+                    println!("{id}");
+                }
+            }
         },
 
         Commands::Publish {
@@ -1865,8 +1968,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         }
 
-        Commands::Info | Commands::System(SystemCommands::Info) => {
-            system::info(&socket_path, json).await?;
+        Commands::Info { format } | Commands::System(SystemCommands::Info { format }) => {
+            system::info(&socket_path, format.as_deref(), json).await?;
         }
     }
 

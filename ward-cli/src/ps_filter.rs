@@ -9,6 +9,10 @@ const FILTER_NAME: &str = "name";
 const FILTER_ID: &str = "id";
 const FILTER_STATUS: &str = "status";
 const FILTER_LABEL: &str = "label";
+const FILTER_HEALTH: &str = "health";
+/// Docker's word for a sandbox with no health check.
+const HEALTH_NONE: &str = "none";
+const HEALTHS: [&str; 4] = ["starting", "healthy", "unhealthy", HEALTH_NONE];
 /// Docker's name for a sandbox that exists but has not started.
 const STATUS_CREATED: &str = "created";
 const STATUS_PAUSED: &str = "paused";
@@ -32,6 +36,7 @@ pub struct Filters {
     names: Vec<String>,
     ids: Vec<String>,
     statuses: Vec<String>,
+    healths: Vec<String>,
     /// `key` or `key=value`; a sandbox must match every one.
     labels: Vec<String>,
 }
@@ -53,6 +58,10 @@ impl Filters {
                     filters.statuses.push(value.to_string());
                 }
                 FILTER_STATUS => bail!("invalid filter 'status={value}'"),
+                FILTER_HEALTH if HEALTHS.contains(&value) => {
+                    filters.healths.push(value.to_string());
+                }
+                FILTER_HEALTH => bail!("invalid filter 'health={value}'"),
                 FILTER_LABEL if value.is_empty() || value.starts_with('=') => {
                     bail!("invalid filter 'label={value}'")
                 }
@@ -70,6 +79,12 @@ impl Filters {
         any(&self.names, &|w| info.name.contains(w))
             && any(&self.ids, &|w| info.id.starts_with(w))
             && any(&self.statuses, &|w| w == status_word(info))
+            && any(&self.healths, &|w| {
+                w == info
+                    .health
+                    .as_ref()
+                    .map_or(HEALTH_NONE, |h| h.status.as_str())
+            })
             && self.labels.iter().all(|label| match label.split_once('=') {
                 Some((key, value)) => info.labels.get(key).is_some_and(|v| v == value),
                 None => info.labels.contains_key(label),
@@ -110,12 +125,45 @@ pub fn select<'a>(
         .filter(|s| every_state || s.status == SandboxStatus::Running as i32)
         .filter(|s| filters.allows(s))
         .collect();
-    let created = |s: &SandboxInfo| s.created_at.map(|t| (t.seconds, t.nanos));
     shown.sort_by(|a, b| created(b).cmp(&created(a)).then_with(|| a.id.cmp(&b.id)));
     if let Some(limit) = limit {
         shown.truncate(limit);
     }
     shown
+}
+
+fn created(info: &SandboxInfo) -> Option<(i64, i32)> {
+    info.created_at.map(|t| (t.seconds, t.nanos))
+}
+
+/// A column `ps --sort` orders by, as Podman names them. Podman's `size` is
+/// left out because Ward does not measure it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SortField {
+    Command,
+    Created,
+    Id,
+    Image,
+    Names,
+    Runningfor,
+    Status,
+}
+
+/// Orders `shown` by `field`, ascending: oldest first for `created`, newest
+/// first for `runningfor`. Ties fall back to the ID.
+pub fn sort(shown: &mut [&SandboxInfo], field: SortField) {
+    shown.sort_by(|a, b| {
+        let order = match field {
+            SortField::Command => a.command_name.cmp(&b.command_name),
+            SortField::Created => created(a).cmp(&created(b)),
+            SortField::Id => a.id.cmp(&b.id),
+            SortField::Image => a.image.cmp(&b.image),
+            SortField::Names => a.name.cmp(&b.name),
+            SortField::Runningfor => created(b).cmp(&created(a)),
+            SortField::Status => status_word(a).cmp(status_word(b)),
+        };
+        order.then_with(|| a.id.cmp(&b.id))
+    });
 }
 
 #[cfg(test)]
@@ -171,6 +219,24 @@ mod tests {
     }
 
     #[rstest::rstest]
+    #[case::created(SortField::Created, &["web1", "db", "web2"])]
+    #[case::runningfor(SortField::Runningfor, &["web2", "db", "web1"])]
+    #[case::names(SortField::Names, &["db", "web1", "web2"])]
+    #[case::id(SortField::Id, &["web1", "web2", "db"])]
+    #[case::status(SortField::Status, &["db", "web2", "web1"])]
+    fn given_a_sort_field_when_sorted_then_the_order_is_ascending(
+        #[case] field: SortField,
+        #[case] expected: &[&str],
+    ) {
+        let listed = fleet();
+        let mut shown = select(&listed, true, &Filters::default(), None);
+
+        sort(&mut shown, field);
+
+        assert_eq!(names(&shown), expected);
+    }
+
+    #[rstest::rstest]
     #[case::substring_name(&["name=web"], &["web2", "web1"])]
     #[case::id_prefix(&["id=ccc"], &["db"])]
     #[case::created_status(&["status=created"], &["db"])]
@@ -213,6 +279,36 @@ mod tests {
         let mut want: Vec<String> = expected.iter().map(ToString::to_string).collect();
         want.sort();
         assert_eq!(got, want);
+    }
+
+    #[rstest::rstest]
+    #[case::healthy("health=healthy", &["ok"])]
+    #[case::unhealthy("health=unhealthy", &["sick"])]
+    #[case::none("health=none", &["plain"])]
+    fn given_a_health_filter_when_selected_then_only_that_health_remains(
+        #[case] spec: &str,
+        #[case] want: &[&str],
+    ) {
+        // Arrange
+        let with_health = |name: &str, status: Option<&str>| SandboxInfo {
+            health: status.map(|status| ward_core::pb::HealthState {
+                status: status.into(),
+                ..Default::default()
+            }),
+            ..sandbox(name, name, SandboxStatus::Running, 1)
+        };
+        let fleet = [
+            with_health("ok", Some("healthy")),
+            with_health("sick", Some("unhealthy")),
+            with_health("plain", None),
+        ];
+
+        // Act
+        let shown = select(&fleet, false, &parse(&[spec]), None);
+
+        // Assert
+        assert_eq!(names(&shown), want);
+        assert!(Filters::parse(&["health=sleepy".to_string()]).is_err());
     }
 
     #[test]

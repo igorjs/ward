@@ -37,6 +37,8 @@ pub struct LogOptions {
     pub tail: Option<usize>,
     pub since: Option<DateTime<Utc>>,
     pub timestamps: bool,
+    /// Output at or after this time is left out.
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// A replayed chunk held back until the replay ends and `--tail` can trim it.
@@ -121,6 +123,11 @@ impl LogPrinter {
         {
             return Vec::new();
         }
+        if let (Some(until), Some(at)) = (self.options.until, chunk.at)
+            && at >= until
+        {
+            return Vec::new();
+        }
         if self.replaying {
             self.held.push(Held {
                 stream: chunk.stream,
@@ -202,13 +209,22 @@ fn last_lines(output: &[u8], count: usize) -> &[u8] {
 /// `1h30m`) counted back from `now`, an RFC3339 timestamp, a date or date
 /// time without a zone (local time), or Unix seconds with an optional fraction.
 pub fn parse_since(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    parse_time(value, now, "--since")
+}
+
+/// `--until` takes the same forms as `--since`.
+pub fn parse_until(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    parse_time(value, now, "--until")
+}
+
+fn parse_time(value: &str, now: DateTime<Utc>, flag: &str) -> Result<DateTime<Utc>> {
     parse_duration(value)
         .and_then(|ago| chrono::Duration::from_std(ago).ok())
         .and_then(|ago| now.checked_sub_signed(ago))
         .or_else(|| parse_timestamp(value))
         .ok_or_else(|| {
             anyhow!(
-                "invalid value '{value}' for --since: use a duration like 10m, a timestamp like 2026-01-02T03:04:05Z, or Unix seconds"
+                "invalid value '{value}' for {flag}: use a duration like 10m, a timestamp like 2026-01-02T03:04:05Z, or Unix seconds"
             )
         })
 }
@@ -312,6 +328,7 @@ mod tests {
             tail: None,
             since: None,
             timestamps: true,
+            until: None,
         });
 
         // Act
@@ -329,6 +346,7 @@ mod tests {
             tail: Some(2),
             since: None,
             timestamps: false,
+            until: None,
         });
         let held = printer.accept(data(AttachStream::Stdout, b"1\n2\n3\n", STAMP));
 
@@ -349,6 +367,7 @@ mod tests {
             tail: None,
             since: Some(at("2026-10-22T10:00:00Z")),
             timestamps: false,
+            until: None,
         });
 
         // Act
@@ -456,6 +475,7 @@ mod tests {
             tail: Some(1),
             since: None,
             timestamps: false,
+            until: None,
         });
         let untimed = |bytes| {
             Output::Data(Chunk {
@@ -474,6 +494,32 @@ mod tests {
         assert_eq!(text(&after), "2\n3\n");
     }
 
+    #[test]
+    fn given_until_when_chunks_arrive_then_output_at_or_after_it_is_dropped() {
+        // Arrange
+        let mut printer = LogPrinter::new(LogOptions {
+            tail: None,
+            since: None,
+            timestamps: false,
+            until: Some(at("2026-10-22T10:00:00Z")),
+        });
+
+        // Act
+        let before = printer.accept(data(AttachStream::Stdout, b"old\n", "2026-10-22T09:59:59Z"));
+        let at_until = printer.accept(data(AttachStream::Stdout, b"on\n", "2026-10-22T10:00:00Z"));
+
+        // Assert
+        assert_eq!(text(&before), "old\n");
+        assert!(at_until.is_empty());
+    }
+
+    #[test]
+    fn given_until_flag_with_a_bad_value_when_parsed_then_the_error_names_until() {
+        let error = parse_until("soon", Utc::now()).unwrap_err().to_string();
+
+        assert!(error.contains("--until"), "{error}");
+    }
+
     #[rstest]
     #[case(Some("2026-10-22T10:00:00Z"), false, 1)]
     #[case(None, true, 1)]
@@ -488,6 +534,7 @@ mod tests {
             tail: None,
             since: since.map(at),
             timestamps,
+            until: None,
         });
         let untimed = || {
             Output::Data(Chunk {

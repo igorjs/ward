@@ -50,6 +50,32 @@ impl LabelTest {
     }
 }
 
+/// What a prune removes, which decides the filters that make sense.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Containers,
+    Images,
+    Volumes,
+    /// `system prune`, which removes all of them.
+    System,
+}
+
+impl Kind {
+    /// Only sandboxes carry labels.
+    fn has_labels(self) -> bool {
+        self == Self::Containers
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Containers => "container prune",
+            Self::Images => "image prune",
+            Self::Volumes => "volume prune",
+            Self::System => "system prune",
+        }
+    }
+}
+
 /// Parsed `--filter` values. An object must pass every one of them.
 #[derive(Debug, Default)]
 pub struct Filter {
@@ -63,8 +89,9 @@ impl Filter {
     /// # Errors
     ///
     /// Fails on a value that is not `key=value`, an unknown key, or a value
-    /// the key does not take. `dangling` is accepted only when `images` is set.
-    pub fn parse(specs: &[String], now: DateTime<Utc>, images: bool) -> Result<Self> {
+    /// the key does not take. `dangling` is accepted only for images, and a
+    /// label filter only for sandboxes, since nothing else carries labels.
+    pub fn parse(specs: &[String], now: DateTime<Utc>, kind: Kind) -> Result<Self> {
         let mut filter = Self::default();
         for spec in specs {
             let Some((key, value)) = spec.split_once('=') else {
@@ -78,9 +105,13 @@ impl Filter {
                         )
                     })?);
                 }
+                FILTER_LABEL | FILTER_LABEL_NOT if !kind.has_labels() => bail!(
+                    "label filters are only supported by container prune, not {}",
+                    kind.noun()
+                ),
                 FILTER_LABEL => filter.labels.push(LabelTest::parse(value, false)?),
                 FILTER_LABEL_NOT => filter.labels.push(LabelTest::parse(value, true)?),
-                FILTER_DANGLING if images => {
+                FILTER_DANGLING if kind == Kind::Images => {
                     filter.dangling = Some(match value {
                         "true" => true,
                         "false" => false,
@@ -99,11 +130,12 @@ impl Filter {
     }
 
     /// Whether an object created at `created` with `labels` passes. An object
-    /// with no creation time passes `until`, since its age is unknown.
+    /// with no creation time is kept by `until`, since its age is unknown.
     pub fn allows(&self, created: Option<i64>, labels: &HashMap<String, String>) -> bool {
         let old_enough = match (self.until, created) {
             (Some(until), Some(seconds)) => seconds < until.timestamp(),
-            _ => true,
+            (Some(_), None) => false,
+            (None, _) => true,
         };
         old_enough && self.labels.iter().all(|test| test.allows(labels))
     }
@@ -121,7 +153,7 @@ mod tests {
 
     fn filter(specs: &[&str]) -> Filter {
         let specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
-        Filter::parse(&specs, now(), true).expect("parse")
+        Filter::parse(&specs, now(), Kind::Containers).expect("parse")
     }
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -134,7 +166,7 @@ mod tests {
     #[rstest::rstest]
     #[case::older(&["until=10m"], Some(NOW_SECONDS - 601), &[], true)]
     #[case::newer(&["until=10m"], Some(NOW_SECONDS - 599), &[], false)]
-    #[case::unknown_age(&["until=10m"], None, &[], true)]
+    #[case::unknown_age(&["until=10m"], None, &[], false)]
     #[case::timestamp(&["until=1970-01-01T00:00:10Z"], Some(9), &[], true)]
     #[case::label_present(&["label=env"], Some(0), &[("env", "x")], true)]
     #[case::label_absent(&["label=env"], Some(0), &[], false)]
@@ -158,21 +190,50 @@ mod tests {
     #[case::unknown_key("colour=red")]
     #[case::bad_until("until=soon")]
     #[case::empty_label("label=")]
-    #[case::bad_dangling("dangling=maybe")]
+
     fn given_a_bad_filter_when_parsed_then_it_is_refused(#[case] spec: &str) {
-        assert!(Filter::parse(&[spec.to_string()], now(), true).is_err());
+        assert!(Filter::parse(&[spec.to_string()], now(), Kind::Containers).is_err());
+    }
+
+    fn parse_for(kind: Kind, spec: &str) -> Result<Filter> {
+        Filter::parse(&[spec.to_string()], now(), kind)
     }
 
     #[test]
     fn given_dangling_false_when_parsed_then_every_unused_image_is_wanted() {
-        assert!(filter(&["dangling=false"]).wants_all_images());
-        assert!(!filter(&["dangling=true"]).wants_all_images());
+        let wants = |spec| {
+            parse_for(Kind::Images, spec)
+                .expect("parse")
+                .wants_all_images()
+        };
+
+        assert!(wants("dangling=false"));
+        assert!(!wants("dangling=true"));
+        assert!(parse_for(Kind::Images, "dangling=maybe").is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::dangling_on_containers(Kind::Containers, "dangling=true")]
+    #[case::dangling_on_volumes(Kind::Volumes, "dangling=true")]
+    #[case::dangling_on_system(Kind::System, "dangling=true")]
+    #[case::label_on_images(Kind::Images, "label=a")]
+    #[case::label_not_on_volumes(Kind::Volumes, "label!=a")]
+    #[case::label_on_system(Kind::System, "label=a")]
+    fn given_a_filter_the_kind_cannot_use_when_parsed_then_it_is_refused(
+        #[case] kind: Kind,
+        #[case] spec: &str,
+    ) {
+        assert!(parse_for(kind, spec).is_err());
     }
 
     #[test]
-    fn given_dangling_outside_image_prune_when_parsed_then_it_is_refused() {
-        let result = Filter::parse(&["dangling=true".to_string()], now(), false);
+    fn given_a_label_filter_on_images_when_refused_then_the_error_says_why() {
+        let error = parse_for(Kind::Images, "label!=a").expect_err("refused");
 
-        assert!(result.is_err());
+        assert!(
+            error
+                .to_string()
+                .contains("only supported by container prune")
+        );
     }
 }

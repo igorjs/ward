@@ -305,6 +305,7 @@ impl WardClient {
                 pids_max: 0,
                 timeout_seconds: opts.timeout_seconds,
                 exited_ttl_seconds: 0,
+                nano_cpus: 0,
             }),
             env: opts.env,
             comms: Some(pb::CommunicationPolicy {

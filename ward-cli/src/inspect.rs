@@ -12,24 +12,31 @@ use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInf
 use ward_core::protocol::RestartKind;
 
 use crate::lifecycle::Failures;
+use crate::ps_columns::{image_sizes, ports_text, size_column};
 use crate::ps_filter::{self, Filters};
 use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
 
-pub const PS_HEADERS: [&str; 6] = [
+pub const PS_HEADERS: [&str; 7] = [
     "CONTAINER ID",
     "IMAGE",
     "COMMAND",
     "CREATED",
     "STATUS",
+    "PORTS",
     "NAMES",
 ];
+
+/// The column `ps -s` adds.
+const PS_SIZE_HEADER: &str = "SIZE";
 
 /// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
+const UNLIMITED_SWAP: i64 = -1;
+const STATUS_STARTING: &str = "starting";
 const READ_ONLY_MODE: &str = "ro";
 const BIND_PROPAGATION: &str = "rprivate";
 const NANOS_PER_CPU: u64 = 1_000_000_000;
@@ -136,7 +143,10 @@ fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
         SandboxStatus::Running => {
             let uptime = seconds_since(&info.started_at, now_seconds).unwrap_or(since_created);
             let paused = if info.paused { PAUSED_SUFFIX } else { "" };
-            format!("Up {}{paused}", duration_text(uptime))
+            match health_suffix(info).filter(|_| !info.paused) {
+                Some(suffix) => format!("Up {} ({suffix})", duration_text(uptime)),
+                None => format!("Up {}{paused}", duration_text(uptime)),
+            }
         }
         SandboxStatus::Exited => {
             let code = info.exit_code.unwrap_or_default();
@@ -153,6 +163,16 @@ fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
     }
 }
 
+/// Docker's note after a running sandbox's uptime: `healthy`, `unhealthy` or
+/// `health: starting`. `None` without a health check.
+fn health_suffix(info: &SandboxInfo) -> Option<String> {
+    let status = info.health.as_ref()?.status.as_str();
+    Some(match status {
+        STATUS_STARTING => format!("health: {STATUS_STARTING}"),
+        other => other.to_string(),
+    })
+}
+
 /// One `ps` row. Only argv[0] of the command is shown, since arguments can
 /// hold secrets.
 pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
@@ -165,6 +185,7 @@ pub fn ps_row(info: &SandboxInfo, now_seconds: i64) -> Vec<Value> {
         Value::String(info.command_name.clone()),
         Value::String(created),
         Value::String(status_text(info, now_seconds)),
+        Value::String(ports_text(info)),
         Value::String(info.name.clone()),
     ]
 }
@@ -185,6 +206,10 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Reason": reason_name(info),
         "Names": info.name,
         "Labels": labels_text(&info.labels),
+        "Ports": ports_text(info),
+        "Mounts": "",
+        "Networks": "",
+        "Size": "",
     })
 }
 
@@ -196,7 +221,7 @@ fn labels_text(labels: &std::collections::HashMap<String, String>) -> String {
 }
 
 /// Each `ps --format` field with the header a `table` template gives it.
-const PS_FIELDS: [(&str, &str); 10] = [
+const PS_FIELDS: [(&str, &str); 14] = [
     ("ID", "CONTAINER ID"),
     ("Image", "IMAGE"),
     ("Command", "COMMAND"),
@@ -207,6 +232,10 @@ const PS_FIELDS: [(&str, &str); 10] = [
     ("Reason", "REASON"),
     ("Names", "NAMES"),
     (LABELS_FIELD, "LABELS"),
+    ("Ports", "PORTS"),
+    ("Mounts", "MOUNTS"),
+    ("Networks", "NETWORKS"),
+    ("Size", "SIZE"),
 ];
 
 pub struct PsOptions {
@@ -220,6 +249,9 @@ pub struct PsOptions {
     pub no_trunc: bool,
     pub filters: Filters,
     pub limit: Option<usize>,
+    pub sort: Option<ps_filter::SortField>,
+    /// `-s`: add the SIZE column.
+    pub size: bool,
 }
 
 pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
@@ -232,16 +264,27 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    let mut shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    if let Some(field) = options.sort {
+        ps_filter::sort(&mut shown, field);
+    }
     if options.quiet {
         for info in shown {
             println!("{}", id_text(info, options.no_trunc));
         }
         return Ok(());
     }
+    let sizes = if options.size {
+        image_sizes(&c.list_images(()).await?.into_inner().images)
+    } else {
+        Default::default()
+    };
     let object = |info: &SandboxInfo| {
         let mut object = ps_json_object(info, now);
         object["ID"] = Value::String(id_text(info, options.no_trunc));
+        if options.size {
+            object["Size"] = Value::String(size_column(info, &sizes));
+        }
         object
     };
     let template_record = |info: &SandboxInfo| match object(info) {
@@ -266,13 +309,20 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .map(|s| {
             let mut row = ps_row(s, now);
             row[0] = Value::String(id_text(s, options.no_trunc));
+            if options.size {
+                row.push(Value::String(size_column(s, &sizes)));
+            }
             row
         })
         .collect();
-    if let Some(header) = output::tsv_header(options.no_pretty, &PS_HEADERS) {
+    let mut headers = PS_HEADERS.to_vec();
+    if options.size {
+        headers.push(PS_SIZE_HEADER);
+    }
+    if let Some(header) = output::tsv_header(options.no_pretty, &headers) {
         println!("{header}");
     }
-    output::emit_rows(false, options.no_pretty, &PS_HEADERS, &rows)
+    output::emit_rows(false, options.no_pretty, &headers, &rows)
 }
 
 /// The id Docker shows: 12 characters unless `--no-trunc`.
@@ -319,25 +369,90 @@ fn inspect_value(info: &SandboxInfo) -> Value {
     if let Some(seconds) = info.stop_timeout {
         config["StopTimeout"] = json!(seconds);
     }
+    if let Some(check) = info.guest.as_ref().and_then(|g| g.healthcheck.as_ref()) {
+        config["Healthcheck"] = healthcheck_value(check);
+    }
+    let mut state = json!({
+        "Status": state_name(info),
+        "Running": info.status == SandboxStatus::Running as i32,
+        "Paused": info.paused,
+        "ExitCode": state_exit_code(info),
+        "OOMKilled": info.end_reason == EndReason::Oom as i32,
+        "Reason": reason_name(info),
+        "StartedAt": state_time(&info.started_at),
+        "FinishedAt": state_time(&info.finished_at),
+    });
+    if let Some(health) = &info.health {
+        state["Health"] = health_value(health);
+    }
     json!({
         "Id": info.id,
         "Name": format!("/{}", info.name),
         "Image": info.image_digest,
         "Created": info.created_at.as_ref().map(|t| rfc3339(t.seconds)),
-        "State": {
-            "Status": state_name(info),
-            "Running": info.status == SandboxStatus::Running as i32,
-            "Paused": info.paused,
-            "ExitCode": state_exit_code(info),
-            "OOMKilled": info.end_reason == EndReason::Oom as i32,
-            "Reason": reason_name(info),
-            "StartedAt": state_time(&info.started_at),
-            "FinishedAt": state_time(&info.finished_at),
-        },
+        "State": state,
         "Config": config,
         "RestartCount": info.restart_count,
         "HostConfig": host_config(info),
         "Mounts": mounts(info),
+    })
+}
+
+/// The CPU limit: the exact quota from `update`, else the VM's whole CPUs.
+fn nano_cpus(resources: &ward_core::pb::ResourceLimits) -> u64 {
+    if resources.nano_cpus > 0 {
+        resources.nano_cpus
+    } else {
+        u64::from(resources.cpus) * NANOS_PER_CPU
+    }
+}
+
+/// Docker's `HostConfig.MemorySwap`: the value given, else twice the memory
+/// limit, or -1 (unlimited) when memory has no limit.
+fn memory_swap(given: i64, memory: u64) -> i64 {
+    match (given, memory) {
+        (0, 0) => UNLIMITED_SWAP,
+        (0, memory) => i64::try_from(memory.saturating_mul(2)).unwrap_or(i64::MAX),
+        (given, _) => given,
+    }
+}
+
+/// Docker's `Config.Healthcheck`: only the fields that were set.
+fn healthcheck_value(check: &ward_core::pb::Healthcheck) -> Value {
+    let mut value = json!({"Test": check.test});
+    for (key, nanos) in [
+        ("Interval", check.interval_ns),
+        ("Timeout", check.timeout_ns),
+        ("StartPeriod", check.start_period_ns),
+    ] {
+        if nanos != 0 {
+            value[key] = json!(nanos);
+        }
+    }
+    if check.retries != 0 {
+        value["Retries"] = json!(check.retries);
+    }
+    value
+}
+
+/// Docker's `State.Health`.
+fn health_value(health: &ward_core::pb::HealthState) -> Value {
+    let log: Vec<Value> = health
+        .log
+        .iter()
+        .map(|entry| {
+            json!({
+                "Start": state_time(&entry.start),
+                "End": state_time(&entry.end),
+                "ExitCode": entry.exit_code,
+                "Output": entry.output,
+            })
+        })
+        .collect();
+    json!({
+        "Status": health.status,
+        "FailingStreak": health.failing_streak,
+        "Log": log,
     })
 }
 
@@ -387,10 +502,12 @@ fn host_config(info: &SandboxInfo) -> Value {
         },
         ..restart
     };
+    let memory = u64::from(resources.memory_mb) * BYTES_PER_MIB;
     let guest = info.guest.clone().unwrap_or_default();
+    let cgroup = guest.cgroup.clone().unwrap_or_default();
     let mut config = json!({
-        "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
-        "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
+        "Memory": memory,
+        "NanoCpus": nano_cpus(&resources),
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
         "RestartPolicy": {
             "Name": restart.name,
@@ -402,7 +519,24 @@ fn host_config(info: &SandboxInfo) -> Value {
         "Dns": [],
         "DnsSearch": guest.dns_search,
         "DnsOptions": guest.dns_options,
+        "Ulimits": (!guest.ulimits.is_empty()).then(|| {
+            guest
+                .ulimits
+                .iter()
+                .map(|u| json!({"Name": u.name, "Soft": u.soft, "Hard": u.hard}))
+                .collect::<Vec<_>>()
+        }),
+        "MemorySwap": memory_swap(cgroup.memory_swap_bytes, memory),
+        "MemoryReservation": cgroup.memory_reservation_bytes,
+        "CpuShares": cgroup.cpu_shares,
+        "CpusetCpus": cgroup.cpuset_cpus,
+        "CpuPeriod": cgroup.cpu_period,
+        "CpuQuota": cgroup.cpu_quota,
     });
+    // Docker leaves GroupAdd out until a group is added.
+    if !guest.group_add.is_empty() {
+        config["GroupAdd"] = json!(guest.group_add);
+    }
     // Docker leaves Tmpfs out until a tmpfs is mounted.
     if !guest.tmpfs.is_empty() {
         let tmpfs: serde_json::Map<String, Value> = guest
@@ -647,6 +781,7 @@ mod tests {
                 "COMMAND",
                 "CREATED",
                 "STATUS",
+                "PORTS",
                 "NAMES"
             ]
         );
@@ -670,6 +805,7 @@ mod tests {
                 "sh",
                 "2 minutes ago",
                 "Exited (7)",
+                "",
                 "web1"
             ]
         );
@@ -697,6 +833,10 @@ mod tests {
                 "Reason": "",
                 "Names": "web1",
                 "Labels": "",
+                "Ports": "",
+                "Mounts": "",
+                "Networks": "",
+                "Size": "",
             })
         );
     }
@@ -789,6 +929,13 @@ mod tests {
                     "Dns": [],
                     "DnsSearch": [],
                     "DnsOptions": [],
+                    "Ulimits": null,
+                    "MemorySwap": -1,
+                    "MemoryReservation": 0,
+                    "CpuShares": 0,
+                    "CpusetCpus": "",
+                    "CpuPeriod": 0,
+                    "CpuQuota": 0,
                 },
                 "Mounts": [],
                 "RestartCount": 0,
@@ -876,8 +1023,84 @@ mod tests {
                 "Dns": [],
                 "DnsSearch": [],
                 "DnsOptions": [],
+                "Ulimits": null,
+                "MemorySwap": 1_073_741_824_u64,
+                "MemoryReservation": 0,
+                "CpuShares": 0,
+                "CpusetCpus": "",
+                "CpuPeriod": 0,
+                "CpuQuota": 0,
             })
         );
+    }
+
+    #[rstest::rstest]
+    #[case::unset_with_memory(0, 512 << 20, 1 << 30)]
+    #[case::unset_without_memory(0, 0, -1)]
+    #[case::given(256 << 20, 256 << 20, 256 << 20)]
+    fn given_memory_swap_when_inspected_then_unset_is_twice_memory_like_docker(
+        #[case] given: i64,
+        #[case] memory: u64,
+        #[case] want: i64,
+    ) {
+        assert_eq!(memory_swap(given, memory), want);
+    }
+
+    fn health(status: &str) -> Option<ward_core::pb::HealthState> {
+        Some(ward_core::pb::HealthState {
+            status: status.into(),
+            failing_streak: 1,
+            log: vec![ward_core::pb::HealthLogEntry {
+                exit_code: 1,
+                output: "down".into(),
+                ..Default::default()
+            }],
+        })
+    }
+
+    #[rstest::rstest]
+    #[case::starting("starting", "Up 5 seconds (health: starting)")]
+    #[case::healthy("healthy", "Up 5 seconds (healthy)")]
+    #[case::unhealthy("unhealthy", "Up 5 seconds (unhealthy)")]
+    fn given_a_health_check_when_status_built_then_docker_adds_it_after_the_uptime(
+        #[case] status: &str,
+        #[case] want: &str,
+    ) {
+        // Arrange
+        let sandbox = SandboxInfo {
+            health: health(status),
+            started_at: Some(prost_types::Timestamp {
+                seconds: 100,
+                nanos: 0,
+            }),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let text = status_text(&sandbox, 105);
+
+        // Assert
+        assert_eq!(text, want);
+    }
+
+    #[test]
+    fn given_health_state_when_inspected_then_state_health_follows_docker() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            health: health("unhealthy"),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        let shown = &value["State"]["Health"];
+        assert_eq!(shown["Status"], "unhealthy");
+        assert_eq!(shown["FailingStreak"], 1);
+        assert_eq!(shown["Log"][0]["ExitCode"], 1);
+        assert_eq!(shown["Log"][0]["Output"], "down");
+        assert!(value["Config"].get("Healthcheck").is_none());
     }
 
     #[test]
@@ -890,6 +1113,23 @@ mod tests {
                 extra_hosts: vec!["db:10.1.2.3".into()],
                 dns_search: vec!["example.com".into()],
                 dns_options: vec![],
+                healthcheck: Some(ward_core::pb::Healthcheck {
+                    test: vec!["CMD-SHELL".into(), "true".into()],
+                    interval_ns: 5_000_000_000,
+                    retries: 2,
+                    ..Default::default()
+                }),
+                ulimits: vec![ward_core::pb::Ulimit {
+                    name: "nofile".into(),
+                    soft: 1024,
+                    hard: 2048,
+                }],
+                group_add: vec!["audio".into()],
+                cgroup: Some(ward_core::pb::CgroupLimits {
+                    cpu_shares: 512,
+                    cpuset_cpus: "0-1".into(),
+                    ..Default::default()
+                }),
                 tmpfs: vec![
                     ward_core::pb::TmpfsMount {
                         path: "/run".into(),
@@ -917,6 +1157,17 @@ mod tests {
         assert_eq!(value["HostConfig"]["ShmSize"], 134_217_728);
         assert_eq!(value["HostConfig"]["ExtraHosts"], json!(["db:10.1.2.3"]));
         assert_eq!(value["HostConfig"]["DnsSearch"], json!(["example.com"]));
+        assert_eq!(value["HostConfig"]["GroupAdd"], json!(["audio"]));
+        assert_eq!(
+            value["HostConfig"]["Ulimits"],
+            json!([{"Name": "nofile", "Soft": 1024, "Hard": 2048}])
+        );
+        assert_eq!(
+            value["Config"]["Healthcheck"],
+            json!({"Test": ["CMD-SHELL", "true"], "Interval": 5_000_000_000_u64, "Retries": 2})
+        );
+        assert_eq!(value["HostConfig"]["CpuShares"], 512);
+        assert_eq!(value["HostConfig"]["CpusetCpus"], "0-1");
         assert_eq!(
             value["HostConfig"]["Tmpfs"],
             json!({"/run": "size=64m", "/frozen": "rw,ro"})
