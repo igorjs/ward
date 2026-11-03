@@ -239,6 +239,8 @@ mod tests {
                     stop_signal: String::new(),
                     stop_timeout: None,
                     restart: Default::default(),
+                    guest: Default::default(),
+                    mounts: Default::default(),
                 },
             },
             created_at: SystemTime::now(),
