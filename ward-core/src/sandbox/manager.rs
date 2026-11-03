@@ -430,7 +430,7 @@ pub const MAIN_PROCESS_PID: &str = "0";
 
 /// How often `wait` looks at the recorded state.
 const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-const BYTES_PER_MIB: u64 = 1024 * 1024;
+use crate::protocol::BYTES_PER_MIB;
 
 /// One reading of a running sandbox's resource use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -860,6 +860,8 @@ pub struct SandboxManager {
     store: Option<MetaStore>,
     /// Names claimed by creates that have not yet inserted their entry.
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// One lock per sandbox, held while its limits change.
+    update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
     forwarder: Arc<dyn PortForwarder>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
@@ -897,6 +899,7 @@ impl SandboxManager {
             stop_grace: std::time::Duration::from_secs(STOP_GRACE_SECONDS),
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            update_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             events: EventLog::default(),
             exited_ttl: None,
             default_limits: crate::config::DefaultLimits::default(),
@@ -2320,7 +2323,13 @@ impl SandboxManager {
             self.mark_failed(id).await;
             return Err(e);
         }
-        self.reapply_cpu_quota(id).await;
+        if let Err(e) = self.reapply_cpu_quota(id).await {
+            if let Err(stop_err) = self.backend.stop_sandbox(id).await {
+                tracing::warn!(sandbox_id = %id, error = %stop_err, "cannot end the VM after its CPU limit failed");
+            }
+            self.mark_failed(id).await;
+            return Err(e);
+        }
         self.commit_running_and_register(id, comms).await?;
         self.emit_event(id, EventAction::Start, None).await;
         if let Err(e) = self.spawn_main(id).await {

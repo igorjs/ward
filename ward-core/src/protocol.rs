@@ -291,6 +291,9 @@ pub struct ResourceLimits {
     pub nano_cpus: u64,
 }
 
+/// Bytes in one MiB.
+pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 /// Billionths of a CPU in one CPU.
 pub const NANOS_PER_CPU: u64 = 1_000_000_000;
 

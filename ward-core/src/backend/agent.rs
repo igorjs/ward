@@ -447,7 +447,9 @@ where
 {
     let open = Request {
         kind: Some(request::Kind::SetLimits(proto::SetLimits {
-            memory_bytes: update.memory_mb.map(|mb| u64::from(mb) * BYTES_PER_MIB),
+            memory_bytes: update
+                .memory_mb
+                .map(|mb| u64::from(mb) * crate::protocol::BYTES_PER_MIB),
             nano_cpus: update.nano_cpus,
             pids_max: update.pids_max,
         })),
@@ -569,8 +571,6 @@ where
         _ => Err(protocol_error("agent answered a Top with another event").into()),
     }
 }
-
-const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 /// How long the agent has to answer a Stats before the poll gives up.
 const STATS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

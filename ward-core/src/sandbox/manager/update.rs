@@ -4,11 +4,12 @@
 //! exists, running or not.
 
 use super::{
-    ApiError, CommandView, EventAction, PbSandboxInfo, RESTART_WITHOUT_SECRETS, Result,
+    ApiError, Arc, CommandView, EventAction, PbSandboxInfo, RESTART_WITHOUT_SECRETS, Result,
     SandboxEvent, SandboxManager, backend_err,
 };
 use crate::pb::UpdateSandboxRequest;
 use crate::protocol::{LimitsUpdate, RestartKind, RestartPolicy};
+use crate::sync::LockUnpoisoned;
 
 /// Docker's wording for `docker update` without a flag.
 const NOTHING_TO_UPDATE: &str = "You must provide one or more flags when using this command.";
@@ -16,7 +17,9 @@ const NOTHING_TO_UPDATE: &str = "You must provide one or more flags when using t
 impl SandboxManager {
     /// Apply `req` to the sandbox it names. A running sandbox gets the new
     /// limits at once, inside its VM; the record keeps them for the next
-    /// boot, where memory and CPUs also size the VM.
+    /// boot, where memory and CPUs also size the VM. The record is written
+    /// before success is reported, and a failed write puts the old limits
+    /// back in the VM.
     pub async fn update(&self, req: UpdateSandboxRequest) -> Result<PbSandboxInfo> {
         let id = self.resolve(&req.id).await?;
         let limits = LimitsUpdate {
@@ -27,12 +30,14 @@ impl SandboxManager {
         if limits.is_empty() && req.restart_policy.is_none() {
             return Err(ApiError::InvalidRequest(NOTHING_TO_UPDATE.into()));
         }
+        let lock = self.update_lock(&id);
+        let _held = lock.lock().await;
         let restart = self
             .checked_restart(&id, req.restart_policy.as_ref())
             .await?;
+        let previous = self.recorded_limits(&id).await?;
         if !limits.is_empty() {
-            let current = self.recorded_limits(&id).await?;
-            let next = current.updated(&limits);
+            let next = previous.updated(&limits);
             crate::validate::resource_limits(
                 next.cpus,
                 next.memory_mb,
@@ -44,26 +49,60 @@ impl SandboxManager {
                 .await
                 .map_err(backend_err)?;
         }
-        self.record_update(&id, &limits, restart).await?;
+        if let Err(e) = self.record_update(&id, &limits, restart).await {
+            self.restore_limits(&id, &limits, &previous).await;
+            return Err(e);
+        }
         tracing::info!(sandbox = %id, "sandbox updated");
         self.info(&id, CommandView::Full).await
     }
 
-    /// Re-apply a CPU quota to a freshly booted VM, which starts unlimited.
-    pub(super) async fn reapply_cpu_quota(&self, id: &str) {
-        let Ok(limits) = self.recorded_limits(id).await else {
-            return;
+    /// Put back the values `limits` changed, after the record could not be
+    /// written.
+    async fn restore_limits(
+        &self,
+        id: &str,
+        limits: &LimitsUpdate,
+        previous: &crate::protocol::ResourceLimits,
+    ) {
+        let undo = LimitsUpdate {
+            memory_mb: limits.memory_mb.map(|_| previous.memory_mb),
+            nano_cpus: limits.nano_cpus.map(|_| previous.nano_cpus),
+            pids_max: limits.pids_max.map(|_| previous.pids_max),
         };
-        if limits.nano_cpus == 0 {
+        if undo.is_empty() {
             return;
+        }
+        if let Err(e) = self.backend.update_limits(id, &undo).await {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot put the old limits back");
+        }
+    }
+
+    fn update_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.update_locks.lock_unpoisoned();
+        Arc::clone(locks.entry(id.to_string()).or_default())
+    }
+
+    /// Re-apply a CPU quota to a freshly booted VM, which starts unlimited.
+    /// A quota that cannot be applied fails the start, because the sandbox
+    /// would run without the limit `inspect` reports.
+    pub(super) async fn reapply_cpu_quota(&self, id: &str) -> Result<()> {
+        let lock = self.update_lock(id);
+        let _held = lock.lock().await;
+        let limits = self.recorded_limits(id).await?;
+        if limits.nano_cpus == 0 {
+            return Ok(());
         }
         let update = LimitsUpdate {
             nano_cpus: Some(limits.nano_cpus),
             ..LimitsUpdate::default()
         };
-        if let Err(e) = self.backend.update_limits(id, &update).await {
-            tracing::warn!(sandbox_id = %id, error = %e, "cannot re-apply the CPU limit");
-        }
+        self.backend.update_limits(id, &update).await.map_err(|e| {
+            ApiError::InvalidRequest(format!(
+                "cannot apply the CPU limit of {} nano CPUs: {e}",
+                limits.nano_cpus
+            ))
+        })
     }
 
     async fn checked_restart(

@@ -274,3 +274,94 @@ async fn given_update_when_events_read_then_update_is_announced() {
     }
     assert_eq!(last, Some(EventAction::Update));
 }
+
+#[tokio::test]
+async fn given_a_record_that_cannot_be_written_when_limits_updated_then_the_old_limits_are_put_back()
+ {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let id = mgr.create(sized(), "").await.unwrap().id;
+    // A directory where the record's temp file goes makes every save fail.
+    let dir = mgr.store.as_ref().expect("store").sandbox_dir(&id);
+    std::fs::create_dir(dir.join("meta.json.tmp")).unwrap();
+
+    // Act
+    let result = mgr
+        .update(UpdateSandboxRequest {
+            memory_mb: Some(SMALLER_MEMORY_MB),
+            pids_max: Some(PIDS),
+            ..change(&id)
+        })
+        .await;
+
+    // Assert
+    assert!(result.is_err());
+    let live = mgr.backend.get_sandbox(&id).await.unwrap().resources;
+    assert_eq!((live.memory_mb, live.pids_max), (VM_MEMORY_MB, 0));
+    assert_eq!(limits_of(&mgr, &id).await.memory_mb, VM_MEMORY_MB);
+}
+
+#[tokio::test]
+async fn given_a_stored_cpu_quota_the_vm_cannot_take_when_started_then_the_start_fails() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let id = mgr.create(sized(), "").await.unwrap().id;
+    mgr.stop_within(&id, Some(0)).await.unwrap();
+    mgr.entries
+        .write()
+        .await
+        .get_mut(&id)
+        .expect("entry")
+        .meta
+        .options
+        .resources
+        .nano_cpus = THREE_CPUS;
+
+    // Act
+    let err = mgr.start(&id).await.unwrap_err();
+
+    // Assert
+    assert!(
+        err.to_string().contains("cannot apply the CPU limit"),
+        "{err}"
+    );
+    assert_eq!(
+        mgr.get(&id).await.unwrap().status,
+        crate::pb::SandboxStatus::Failed as i32
+    );
+}
+
+#[tokio::test]
+async fn given_concurrent_updates_when_they_finish_then_record_and_vm_agree() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let id = mgr.create(sized(), "").await.unwrap().id;
+    let spawn_update = |memory_mb: u32, pids_max: u32| {
+        let (mgr, id) = (Arc::clone(&mgr), id.clone());
+        tokio::spawn(async move {
+            mgr.update(UpdateSandboxRequest {
+                memory_mb: Some(memory_mb),
+                pids_max: Some(pids_max),
+                ..change(&id)
+            })
+            .await
+        })
+    };
+    let first = spawn_update(SMALLER_MEMORY_MB, PIDS);
+    let second = spawn_update(SMALLER_MEMORY_MB / 2, PIDS * 2);
+
+    // Act
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+
+    // Assert
+    let recorded = limits_of(&mgr, &id).await;
+    let live = mgr.backend.get_sandbox(&id).await.unwrap().resources;
+    assert_eq!(
+        (recorded.memory_mb, recorded.pids_max),
+        (live.memory_mb, live.pids_max)
+    );
+}
