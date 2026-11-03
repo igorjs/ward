@@ -60,7 +60,7 @@ pub async fn version(socket: &str, format: Option<&str>, json: bool) -> Result<(
     .await;
     let record = version_record(server.as_ref().ok());
     match (template, record) {
-        (Some(template), Value::Object(map)) => print!("{}", template.render(&[map])),
+        (Some(template), Value::Object(map)) => print!("{}", template.render(&[map])?),
         (_, record) if json => println!("{record}"),
         (_, record) => print!("{}", version_text(&record)),
     }
@@ -162,7 +162,7 @@ mod tests {
         )
         .expect("parse");
 
-        let rendered = template.render(&[map]);
+        let rendered = template.render(&[map]).unwrap();
 
         assert_eq!(rendered, format!("1.2.3/{CLIENT_VERSION}\n"));
     }

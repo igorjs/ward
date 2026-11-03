@@ -201,7 +201,7 @@ impl Row {
     }
 }
 
-fn render(rows: &[Row], template: &Template) -> String {
+fn render(rows: &[Row], template: &Template) -> Result<String> {
     let records: Vec<_> = rows
         .iter()
         .filter_map(|r| r.json().as_object().cloned())
@@ -254,7 +254,7 @@ pub async fn run(
     loop {
         tokio::time::sleep(SAMPLE_INTERVAL).await;
         let rows = round(&mut c, token_store, named.as_deref(), &mut session, false).await?;
-        let frame = render(&rows, &template);
+        let frame = render(&rows, &template)?;
         write_frame(&mut out, &frame, clear && !options.no_stream)?;
         if options.no_stream {
             return Ok(());

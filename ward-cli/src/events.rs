@@ -76,7 +76,7 @@ pub async fn run(socket: &str, options: Options) -> Result<()> {
             );
         }
         if filters.allows(&event) {
-            print!("{}", format.render(&event));
+            print!("{}", format.render(&event)?);
         }
     }
     Ok(())
@@ -169,10 +169,10 @@ impl Format {
         })
     }
 
-    fn render(&self, event: &SandboxEvent) -> String {
+    fn render(&self, event: &SandboxEvent) -> Result<String> {
         match self {
-            Self::Default => default_line(event),
-            Self::Json => format!("{}\n", docker_json(event)),
+            Self::Default => Ok(default_line(event)),
+            Self::Json => Ok(format!("{}\n", docker_json(event))),
             Self::Template(template) => template.render(&[record(event)]),
         }
     }
@@ -299,7 +299,7 @@ mod tests {
         .unwrap();
 
         // Act
-        let line = format.render(&event("die", "web1"));
+        let line = format.render(&event("die", "web1")).unwrap();
 
         // Assert
         assert_eq!(line, format!("container die {ID} web1\n"));
@@ -311,7 +311,7 @@ mod tests {
         let format = Format::choose(None, true).unwrap();
 
         // Act
-        let line = format.render(&event("die", "web1"));
+        let line = format.render(&event("die", "web1")).unwrap();
 
         // Assert
         let parsed: Value = serde_json::from_str(&line).unwrap();
