@@ -16,6 +16,7 @@ mod history;
 mod images;
 mod import;
 mod inspect;
+mod isolation;
 mod lifecycle;
 mod load;
 mod log_output;
@@ -151,6 +152,8 @@ struct SandboxOpts {
     exited_ttl: Option<u64>,
     #[command(flatten)]
     extras: create_opts::CreateExtras,
+    #[command(flatten)]
+    isolation: isolation::IsolationFlags,
 }
 
 /// Parse `--exited-ttl` into whole seconds, rounding a fraction up.
@@ -919,6 +922,7 @@ fn create_request(
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
     };
+    opts.isolation.check()?;
     let mounts = opts
         .volume
         .iter()
