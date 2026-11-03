@@ -76,6 +76,21 @@ fn given_go_template_syntax_when_inspect_and_ps_format_then_range_if_and_functio
     assert_eq!(ps.trim(), "web1||||1");
     let header = sized.lines().next().expect("header");
     assert!(header.ends_with("\tNAMES\tSIZE"), "{header}");
+    let row = sized.lines().nth(1).expect("row");
+    assert!(row.contains("-- (virtual "), "{row}");
+}
+
+#[test]
+fn given_an_untagged_image_name_when_ps_size_then_the_cached_tag_is_found() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["create", "--name", "web1", "alpine"]);
+
+    // Act
+    let sized = ok(&d, &["ps", "-a", "-s", "--format", "{{.Names}} {{.Size}}"]);
+
+    // Assert
+    assert!(sized.contains("web1 -- (virtual "), "{sized}");
 }
 
 #[test]
@@ -83,22 +98,22 @@ fn given_a_sandbox_when_info_format_then_docker_named_fields_render() {
     // Arrange
     let d = Daemon::spawn();
     ok(&d, &["create", "--name", "web1", ALPINE]);
+    let format = "{{.Containers}} {{.ContainersRunning}} {{.ContainersStopped}} {{.OSType}}";
 
     // Act
-    let line = ok(
-        &d,
-        &[
-            "system",
-            "info",
-            "--format",
-            "{{.Containers}} {{.ContainersRunning}} {{.ContainersStopped}} {{.OSType}}",
-        ],
-    );
+    let created = ok(&d, &["system", "info", "--format", format]);
+    let status = ok(&d, &["inspect", "-f", "{{.State.Status}}", "web1"]);
+    ok(&d, &["stop", "web1"]);
+    let stopped = ok(&d, &["system", "info", "--format", format]);
 
     // Assert
-    let fields: Vec<&str> = line.split_whitespace().collect();
+    // Ward starts a sandbox on create, so it counts as running right away.
+    assert_eq!(status.trim(), "running");
+    let fields: Vec<&str> = created.split_whitespace().collect();
     assert_eq!(&fields[..3], ["1", "1", "0"]);
-    assert!(!fields[3].is_empty(), "{line}");
+    assert!(!fields[3].is_empty(), "{created}");
+    let fields: Vec<&str> = stopped.split_whitespace().collect();
+    assert_eq!(&fields[..3], ["1", "0", "1"]);
 }
 
 #[test]
