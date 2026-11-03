@@ -184,7 +184,7 @@ fn created_seconds(info: &SandboxInfo) -> Option<i64> {
 }
 
 /// Removes the stopped and exited sandboxes that pass `filter`. One the CLI
-/// holds no token for is skipped with a note.
+/// holds no token for stays and counts as a failure.
 async fn prune_containers(
     c: &mut WardClient<Channel>,
     token_store: &Path,
@@ -193,6 +193,13 @@ async fn prune_containers(
 ) -> Result<()> {
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
     for info in &listed {
+        let stopped = matches!(
+            SandboxStatus::try_from(info.status),
+            Ok(SandboxStatus::Stopped | SandboxStatus::Exited)
+        );
+        if !stopped || !filter.allows(created_seconds(info), &info.labels) {
+            continue;
+        }
         let target = match Resolved::from_info(token_store, info) {
             Ok(target) => target,
             Err(e) => {
@@ -201,14 +208,8 @@ async fn prune_containers(
                 continue;
             }
         };
-        let stopped = matches!(
-            target.status,
-            SandboxStatus::Stopped | SandboxStatus::Exited
-        );
-        if !stopped || !filter.allows(created_seconds(info), &info.labels) {
-            continue;
-        }
         if !target.has_token() {
+            report.failures += 1;
             eprintln!("skipped: {}: no token in the local token store", target.id);
             continue;
         }
@@ -365,6 +366,22 @@ pub async fn volume(socket: &str, args: VolumeArgs, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Runs each prune in turn. A failed list call stops the rest, but whatever was
+/// removed before it stays in `report` for the caller to print.
+async fn system_steps(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    args: &SystemArgs,
+    filter: &Filter,
+    report: &mut Report,
+) -> Result<()> {
+    prune_containers(c, token_store, filter, report).await?;
+    if args.volumes {
+        prune_volumes(c, filter, report).await?;
+    }
+    prune_images(c, filter, args.all, report).await
+}
+
 pub async fn system(socket: &str, token_store: &Path, args: SystemArgs, json: bool) -> Result<()> {
     let filter = Filter::parse(&args.filter, Utc::now(), Kind::System)?;
     let images = if args.all {
@@ -380,12 +397,9 @@ pub async fn system(socket: &str, token_store: &Path, args: SystemArgs, json: bo
     ask(args.force, &warning)?;
     let mut c = client::connect(socket).await?;
     let mut report = Report::default();
-    prune_containers(&mut c, token_store, &filter, &mut report).await?;
-    if args.volumes {
-        prune_volumes(&mut c, &filter, &mut report).await?;
-    }
-    prune_images(&mut c, &filter, args.all, &mut report).await?;
+    let steps = system_steps(&mut c, token_store, &args, &filter, &mut report).await;
     report.print(json);
+    steps?;
     report.finish()?;
     Ok(())
 }

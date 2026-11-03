@@ -173,6 +173,39 @@ fn given_a_recent_sandbox_when_pruned_by_until_then_it_is_kept() {
 }
 
 #[test]
+fn given_a_stopped_sandbox_without_a_token_when_pruned_then_it_stays_and_the_prune_fails() {
+    // Arrange
+    let d = Daemon::spawn();
+    stopped(&d, "tokenless", &[]);
+    let store = d.socket.parent().expect("socket dir").join("tokens.json");
+    std::fs::remove_file(&store).expect("remove token store");
+
+    // Act
+    let out = run(&d, &["container", "prune", "-f"]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no token"), "{}", stderr(&out));
+    assert!(names(&d).contains("tokenless"));
+}
+
+#[test]
+fn given_an_unreadable_token_store_and_only_running_sandboxes_when_pruned_then_it_succeeds() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["run", "-d", "--name", "busy", ALPINE, "sleep", "300"]);
+    let store = d.socket.parent().expect("socket dir").join("tokens.json");
+    std::fs::write(&store, "not json").expect("corrupt token store");
+
+    // Act
+    let out = run(&d, &["container", "prune", "-f"]);
+
+    // Assert
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(names(&d).contains("busy"));
+}
+
+#[test]
 fn given_a_stopped_sandbox_when_system_prune_forced_then_it_is_removed_and_reported() {
     // Arrange
     let d = Daemon::spawn();
