@@ -24,6 +24,7 @@ use crate::protocol::{
 use crate::sandbox::copy;
 use crate::sandbox::events::{EventAction, EventLog, SandboxEvent};
 use crate::sandbox::launch::{self, Launch, Overrides};
+use crate::sandbox::restart::{self, RestartRequest};
 use crate::sandbox::store::{MetaStore, SandboxMeta, hash_token, token_hash_eq};
 use crate::signal::{MAX_SIGNAL, SIGKILL, SIGTERM};
 use crate::sync::LockUnpoisoned;
@@ -687,6 +688,8 @@ struct Teardown {
     events: EventLog,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
     exited_ttl: Option<std::time::Duration>,
+    /// Where a main process that may need starting again is reported.
+    restarts: mpsc::UnboundedSender<RestartRequest>,
 }
 
 fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
@@ -740,6 +743,7 @@ async fn mark_exited_on_main_end(
                     SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
                 died.reason = entry.meta.end_reason;
                 teardown.events.emit(died);
+                request_restart(&teardown, entry, code);
             }
             Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
         }
@@ -748,6 +752,30 @@ async fn mark_exited_on_main_end(
     // subscriptions, so removing now cannot cut their output short.
     if auto_remove {
         auto_remove_ended(&teardown, &id, &pid).await;
+    }
+}
+
+/// Ask for a restart when the sandbox's policy calls for one after the run
+/// that just ended with `code`. A sandbox that removes itself never does.
+fn request_restart(teardown: &Teardown, entry: &SandboxEntry, code: i32) {
+    let meta = &entry.meta;
+    let spec = &meta.options.spec;
+    if spec.auto_remove || !restart::wants_restart(spec.restart, code, meta.restart_count) {
+        return;
+    }
+    let ran_for = meta
+        .started_at
+        .zip(meta.finished_at)
+        .and_then(|(start, end)| end.duration_since(start).ok())
+        .unwrap_or_default();
+    let request = RestartRequest {
+        id: meta.id.clone(),
+        exit_code: code,
+        ran_for,
+        finished_at: meta.finished_at,
+    };
+    if teardown.restarts.send(request).is_err() {
+        tracing::warn!(sandbox_id = %meta.id, "restart supervisor is gone, not restarting");
     }
 }
 
@@ -833,6 +861,11 @@ pub struct SandboxManager {
     exited_ttl: Option<std::time::Duration>,
     /// Daemon-wide limits for fields a create request leaves at 0.
     default_limits: crate::config::DefaultLimits,
+    restart_tx: mpsc::UnboundedSender<RestartRequest>,
+    /// Taken by [`spawn_restart_supervisor`](Self::spawn_restart_supervisor).
+    restart_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<RestartRequest>>>,
+    /// The wait before each sandbox's next restart, kept while it restarts.
+    restart_delays: std::sync::Mutex<HashMap<String, std::time::Duration>>,
 }
 
 impl SandboxManager {
@@ -843,6 +876,7 @@ impl SandboxManager {
         allow_host_mounts: bool,
         network_backend: crate::config::NetworkBackendChoice,
     ) -> Self {
+        let (restart_tx, restart_rx) = mpsc::unbounded_channel();
         Self {
             forwarder: Arc::new(BackendForwarder(Arc::clone(&backend))),
             backend,
@@ -861,6 +895,9 @@ impl SandboxManager {
             events: EventLog::default(),
             exited_ttl: None,
             default_limits: crate::config::DefaultLimits::default(),
+            restart_tx,
+            restart_rx: std::sync::Mutex::new(Some(restart_rx)),
+            restart_delays: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -892,6 +929,7 @@ impl SandboxManager {
             processes: Arc::clone(&self.processes),
             events: self.events.clone(),
             exited_ttl: self.exited_ttl,
+            restarts: self.restart_tx.clone(),
         }
     }
 
@@ -996,6 +1034,132 @@ impl SandboxManager {
         for meta in metas {
             self.adopt_persisted(meta).await;
         }
+        self.restart_at_boot().await;
+    }
+
+    /// Start the sandboxes whose policy asks for it when the daemon starts.
+    async fn restart_at_boot(&self) {
+        use crate::protocol::SandboxStatus as State;
+        let due: Vec<String> = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| {
+                let meta = &entry.meta;
+                matches!(meta.status, State::Stopped | State::Exited)
+                    && !meta.had_secrets
+                    && restart::restarts_at_boot(meta.options.spec.restart, meta.manually_stopped)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Err(e) = self.start_resolved(&id).await {
+                tracing::warn!(sandbox_id = %id, error = %e, "cannot restart sandbox at boot");
+            }
+        }
+    }
+
+    /// Start sandboxes again as their restart policies ask, after their main
+    /// process ends. Runs until the manager is dropped.
+    pub fn spawn_restart_supervisor(self: &Arc<Self>) {
+        let Some(mut requests) = self.restart_rx.lock_unpoisoned().take() else {
+            return;
+        };
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                tokio::spawn(async move { manager.restart_after_exit(request).await });
+            }
+        });
+    }
+
+    /// Wait out the back-off, then start the sandbox again unless a stop,
+    /// removal or newer run got there first.
+    async fn restart_after_exit(&self, request: RestartRequest) {
+        let delay = {
+            let mut delays = self.restart_delays.lock_unpoisoned();
+            let delay = restart::next_delay(delays.get(&request.id).copied(), request.ran_for);
+            delays.insert(request.id.clone(), delay);
+            delay
+        };
+        tokio::time::sleep(delay).await;
+        if !self.claim_restart(&request).await {
+            return;
+        }
+        tracing::info!(sandbox_id = %request.id, "restarting sandbox per its restart policy");
+        if let Err(e) = self.start_resolved(&request.id).await {
+            tracing::warn!(sandbox_id = %request.id, error = %e, "cannot restart sandbox");
+        }
+    }
+
+    /// Count the restart if the sandbox still sits in the run that ended and
+    /// its policy still allows one.
+    async fn claim_restart(&self, request: &RestartRequest) -> bool {
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(&request.id) else {
+            self.restart_delays.lock_unpoisoned().remove(&request.id);
+            return false;
+        };
+        let meta = &entry.meta;
+        let current = meta.status == crate::protocol::SandboxStatus::Exited
+            && !meta.manually_stopped
+            && !meta.had_secrets
+            && meta.finished_at == request.finished_at;
+        if !current
+            || !restart::wants_restart(
+                meta.options.spec.restart,
+                request.exit_code,
+                meta.restart_count,
+            )
+        {
+            return false;
+        }
+        let mut next = meta.clone();
+        next.restart_count += 1;
+        if let Err(e) = persist_meta(self.store.as_ref(), next.clone()).await {
+            tracing::warn!(sandbox_id = %request.id, error = %e, "cannot record the restart");
+            return false;
+        }
+        entry.meta = next;
+        true
+    }
+
+    /// A start by hand begins a fresh restart history.
+    async fn clear_restart_history(&self, id: &str) -> Result<()> {
+        self.restart_delays.lock_unpoisoned().remove(id);
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(id) else {
+            return Ok(());
+        };
+        if entry.meta.restart_count == 0 {
+            return Ok(());
+        }
+        let mut next = entry.meta.clone();
+        next.restart_count = 0;
+        persist_meta(self.store.as_ref(), next.clone()).await?;
+        entry.meta = next;
+        Ok(())
+    }
+
+    /// Record that a user stopped or killed the sandbox, so its policy leaves
+    /// it alone until it is started again.
+    async fn mark_manually_stopped(&self, id: &str) -> Result<()> {
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(id) else {
+            return Ok(());
+        };
+        if entry.meta.manually_stopped {
+            return Ok(());
+        }
+        let mut next = entry.meta.clone();
+        next.manually_stopped = true;
+        persist_meta(self.store.as_ref(), next.clone()).await?;
+        entry.meta = next;
+        Ok(())
     }
 
     /// Record a state change and write it to disk.
@@ -1115,6 +1279,7 @@ impl SandboxManager {
             started_at: meta.started_at,
             finished_at: meta.finished_at,
             end_reason: meta.end_reason,
+            restart_count: meta.restart_count,
         };
         if let Err(e) = self
             .backend
@@ -1226,6 +1391,12 @@ impl SandboxManager {
         crate::validate::hostname(&req.hostname)?;
         crate::validate::stop_signal(&req.stop_signal)?;
         crate::validate::stop_timeout(req.stop_timeout)?;
+        let restart =
+            crate::validate::restart_policy(req.restart_policy.as_ref(), req.auto_remove)?;
+        // A fresh VM has no secrets, so a restart could not deliver them.
+        if !req.secrets.is_empty() && restart.kind != crate::protocol::RestartKind::No {
+            return Err(ApiError::InvalidRequest(RESTART_WITHOUT_SECRETS.into()));
+        }
         // Held for delivery only: never copied into the stored options.
         let secrets = std::mem::take(&mut req.secrets);
         if let Some(ref r) = req.resources {
@@ -1365,6 +1536,7 @@ impl SandboxManager {
                 hostname: req.hostname.clone(),
                 stop_signal: req.stop_signal.clone(),
                 stop_timeout: req.stop_timeout,
+                restart,
             },
         };
 
@@ -1410,6 +1582,8 @@ impl SandboxManager {
             end_reason: None,
             token_hash: hash_token(&token),
             had_secrets: !secrets.is_empty(),
+            restart_count: 0,
+            manually_stopped: false,
         };
         info.started_at = meta.started_at;
         if let Err(e) = self.persist(meta.clone()).await {
@@ -1906,6 +2080,7 @@ impl SandboxManager {
         if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
             self.refuse_if_had_secrets(&id).await?;
         }
+        self.clear_restart_history(&id).await?;
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
     }
@@ -1930,6 +2105,7 @@ impl SandboxManager {
             let grace = self.grace_for(&id, grace_seconds).await;
             self.stop_resolved(&id, grace).await?;
         }
+        self.clear_restart_history(&id).await?;
         self.start_resolved(&id).await?;
         self.info(&id, CommandView::Full).await
     }
@@ -2473,6 +2649,9 @@ impl SandboxManager {
             return Err(not_running(&id));
         }
         let signal = if signal == 0 { SIGKILL } else { signal };
+        if signal == SIGKILL || signal == self.stop_signal_of(&id).await {
+            self.mark_manually_stopped(&id).await?;
+        }
         control
             .send(ProcessControl::Signal(signal))
             .await
@@ -2580,7 +2759,12 @@ impl SandboxManager {
         };
         let exit_code = entry.meta.exit_code;
         let meta = entry.meta.clone();
-        self.commit(entry, State::Stopping, exit_code).await?;
+        // Saved by the commit below, and undone if that fails.
+        let was_manual = std::mem::replace(&mut entry.meta.manually_stopped, true);
+        if let Err(e) = self.commit(entry, State::Stopping, exit_code).await {
+            entry.meta.manually_stopped = was_manual;
+            return Err(e);
+        }
         Ok(Some((before, meta)))
     }
 
@@ -2598,7 +2782,11 @@ impl SandboxManager {
             State::Stopped | State::Exited | State::Failed => {}
             ref other => return Err(wrong_state(id, other, "start")),
         }
-        self.commit(entry, State::Creating, None).await?;
+        let was_manual = std::mem::replace(&mut entry.meta.manually_stopped, false);
+        if let Err(e) = self.commit(entry, State::Creating, None).await {
+            entry.meta.manually_stopped = was_manual;
+            return Err(e);
+        }
         Ok(Some(entry.meta.options.comms.clone()))
     }
 
@@ -3071,6 +3259,8 @@ fn recorded_state(
         info.spec.hostname = entry.meta.options.spec.hostname.clone();
         info.spec.stop_signal = entry.meta.options.spec.stop_signal.clone();
         info.spec.stop_timeout = entry.meta.options.spec.stop_timeout;
+        info.spec.restart = entry.meta.options.spec.restart;
+        info.restart_count = entry.meta.restart_count;
         info.spec.name = entry.meta.options.spec.name.clone();
     }
     info
@@ -3151,6 +3341,11 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
         hostname,
         stop_signal: info.spec.stop_signal.clone(),
         stop_timeout: info.spec.stop_timeout,
+        restart_policy: Some(crate::pb::RestartPolicy {
+            name: info.spec.restart.kind.as_str().to_string(),
+            maximum_retry_count: info.spec.restart.max_retries,
+        }),
+        restart_count: info.restart_count,
         command_name: info.spec.command.first().cloned().unwrap_or_default(),
         published_ports: info
             .spec
@@ -5203,6 +5398,246 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 
+    // ----- restart policy -------------------------------------------------
+
+    fn with_restart(name: &str, retries: u32) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            restart_policy: Some(crate::pb::RestartPolicy {
+                name: name.into(),
+                maximum_retry_count: retries,
+            }),
+            ..create_req("alpine")
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::always_after_manual_stop("always", true, SandboxStatus::Running)]
+    #[case::always("always", false, SandboxStatus::Running)]
+    #[case::unless_stopped("unless-stopped", false, SandboxStatus::Running)]
+    #[case::unless_stopped_after_manual_stop("unless-stopped", true, SandboxStatus::Stopped)]
+    #[case::on_failure("on-failure", false, SandboxStatus::Stopped)]
+    #[case::no("no", false, SandboxStatus::Stopped)]
+    #[tokio::test]
+    async fn given_policy_when_the_daemon_restarts_then_only_always_and_unless_stopped_start(
+        #[case] policy: &str,
+        #[case] stopped_by_hand: bool,
+        #[case] want: SandboxStatus,
+    ) {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let first = manager_on(tmp.path(), 4);
+        let id = first.create(with_restart(policy, 0), "").await.unwrap().id;
+        if stopped_by_hand {
+            first.stop(&id).await.unwrap();
+        }
+        let second = manager_on(tmp.path(), 4);
+
+        // Act
+        second.restore().await;
+
+        // Assert
+        assert_eq!(status_of(&second, &id).await, want);
+    }
+
+    #[tokio::test]
+    async fn given_restart_policy_when_created_then_get_reports_it_with_a_zero_count() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let created = mgr.create(with_restart("on-failure", 3), "").await.unwrap();
+        let fetched = mgr.get(&created.id).await.unwrap();
+
+        // Assert
+        let policy = fetched.restart_policy.expect("policy");
+        assert_eq!(policy.name, "on-failure");
+        assert_eq!(policy.maximum_retry_count, 3);
+        assert_eq!(fetched.restart_count, 0);
+    }
+
+    #[tokio::test]
+    async fn given_restart_policy_with_secrets_when_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            secrets: vec![crate::pb::SecretFile {
+                name: "token".into(),
+                content: b"s3cret".to_vec(),
+            }],
+            ..with_restart("always", 0)
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("conflict");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn given_restart_policy_with_auto_remove_when_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let req = CreateSandboxRequest {
+            auto_remove: true,
+            ..with_restart("always", 0)
+        };
+
+        // Act
+        let err = mgr.create(req, "").await.expect_err("conflict");
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err}");
+    }
+
+    /// Let the supervisor act, or fail to, before the counts are read.
+    #[cfg(not(feature = "krunvm"))]
+    const RESTART_SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn restart_count_of(mgr: &SandboxManager, id: &str) -> u32 {
+        mgr.get(id).await.expect("get").restart_count
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn wait_for_restarts(mgr: &SandboxManager, id: &str, want: u32) {
+        let deadline = std::time::Instant::now() + TEST_POLL_DEADLINE;
+        while restart_count_of(mgr, id).await < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never restarted {want} times"
+            );
+            tokio::time::sleep(TEST_POLL_STEP).await;
+        }
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    async fn create_restarting(
+        mgr: &SandboxManager,
+        script: &str,
+        policy: &str,
+        retries: u32,
+    ) -> String {
+        let req = CreateSandboxRequest {
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            ..with_restart(policy, retries)
+        };
+        mgr.create(req, "").await.expect("create").id
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_on_failure_cap_when_the_process_keeps_failing_then_it_restarts_that_many_times()
+    {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+
+        // Act
+        let id = create_restarting(&mgr, "exit 3", "on-failure", 2).await;
+        wait_for_restarts(&mgr, &id, 2).await;
+        tokio::time::sleep(RESTART_SETTLE).await;
+
+        // Assert
+        assert_eq!(restart_count_of(&mgr, &id).await, 2);
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Exited);
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(3));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::no_policy("exit 1", "no")]
+    #[case::on_failure_and_success("exit 0", "on-failure")]
+    #[tokio::test]
+    async fn given_policy_that_does_not_apply_when_the_process_ends_then_it_stays_exited(
+        #[case] script: &str,
+        #[case] policy: &str,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+
+        // Act
+        let id = create_restarting(&mgr, script, policy, 0).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        tokio::time::sleep(RESTART_SETTLE).await;
+
+        // Assert
+        assert_eq!(restart_count_of(&mgr, &id).await, 0);
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Exited);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_always_when_stopped_by_hand_then_it_is_not_restarted() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+        let id = create_restarting(&mgr, "sleep 30", "always", 0).await;
+
+        // Act
+        mgr.stop_within(&id, Some(0)).await.expect("stop");
+        tokio::time::sleep(RESTART_SETTLE).await;
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+        assert_eq!(restart_count_of(&mgr, &id).await, 0);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_always_when_killed_by_hand_then_it_is_not_restarted() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+        let id = create_restarting(&mgr, "sleep 30", "always", 0).await;
+
+        // Act
+        mgr.signal_main_process(&id, 0).await.expect("kill");
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+        tokio::time::sleep(RESTART_SETTLE).await;
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Exited);
+        assert_eq!(restart_count_of(&mgr, &id).await, 0);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_always_when_the_process_exits_then_it_runs_again_until_stopped() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+        let id = create_restarting(&mgr, "exit 0", "always", 0).await;
+
+        // Act
+        wait_for_restarts(&mgr, &id, 2).await;
+        mgr.stop_within(&id, Some(0)).await.expect("stop");
+        let at_stop = restart_count_of(&mgr, &id).await;
+        tokio::time::sleep(RESTART_SETTLE).await;
+
+        // Assert
+        assert_eq!(status_of(&mgr, &id).await, SandboxStatus::Stopped);
+        assert_eq!(restart_count_of(&mgr, &id).await, at_stop);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_restarts_made_when_started_by_hand_then_the_count_starts_over() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        mgr.spawn_restart_supervisor();
+        let id = create_restarting(&mgr, "sleep 0.5; exit 1", "on-failure", 1).await;
+        wait_for_restarts(&mgr, &id, 1).await;
+        wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+
+        // Act
+        mgr.start(&id).await.expect("start");
+
+        // Assert
+        assert_eq!(restart_count_of(&mgr, &id).await, 0);
+    }
+
     // ----- names and id lookup -------------------------------------------
 
     const ID_A: &str = "aaaaaaaa-0000-4000-8000-000000000001";
@@ -5247,6 +5682,8 @@ pub(crate) mod tests {
             end_reason: None,
             token_hash: hash_token(SEED_TOKEN),
             had_secrets: false,
+            restart_count: 0,
+            manually_stopped: false,
         };
         MetaStore::new(path).save(&meta).unwrap();
     }

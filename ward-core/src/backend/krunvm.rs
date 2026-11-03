@@ -397,6 +397,7 @@ impl Backend for KrunvmBackend {
             started_at: None,
             finished_at: None,
             end_reason: None,
+            restart_count: 0,
         };
 
         #[cfg(feature = "krunvm")]

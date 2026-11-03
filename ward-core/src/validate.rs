@@ -193,6 +193,25 @@ pub fn stop_timeout(seconds: Option<i32>) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Validate a restart policy. A sandbox that removes itself cannot also be
+/// restarted, as in Docker.
+pub fn restart_policy(
+    policy: Option<&crate::pb::RestartPolicy>,
+    auto_remove: bool,
+) -> Result<crate::protocol::RestartPolicy, ApiError> {
+    let policy = policy
+        .map_or(Ok(crate::protocol::RestartPolicy::default()), |p| {
+            crate::protocol::RestartPolicy::from_parts(&p.name, p.maximum_retry_count)
+        })
+        .map_err(ApiError::InvalidRequest)?;
+    if auto_remove && policy.kind != crate::protocol::RestartKind::No {
+        return Err(ApiError::InvalidRequest(
+            "conflicting options: a restart policy and auto_remove".into(),
+        ));
+    }
+    Ok(policy)
+}
+
 /// Validate a volume name.
 /// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
@@ -1645,5 +1664,34 @@ mod proptests {
 
         // Assert
         assert_eq!(result.is_ok(), ok);
+    }
+
+    fn policy(name: &str, retries: u32) -> crate::pb::RestartPolicy {
+        crate::pb::RestartPolicy {
+            name: name.into(),
+            maximum_retry_count: retries,
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::absent(None, false, true)]
+    #[case::empty(Some(policy("", 0)), false, true)]
+    #[case::always(Some(policy("always", 0)), false, true)]
+    #[case::on_failure_with_cap(Some(policy("on-failure", 3)), false, true)]
+    #[case::unknown(Some(policy("sometimes", 0)), false, false)]
+    #[case::cap_on_always(Some(policy("always", 3)), false, false)]
+    #[case::cap_on_no(Some(policy("no", 1)), false, false)]
+    #[case::with_auto_remove(Some(policy("always", 0)), true, false)]
+    #[case::no_with_auto_remove(Some(policy("no", 0)), true, true)]
+    fn restart_policy_follows_docker_rules(
+        #[case] given: Option<crate::pb::RestartPolicy>,
+        #[case] auto_remove: bool,
+        #[case] ok: bool,
+    ) {
+        // Act
+        let result = restart_policy(given.as_ref(), auto_remove);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok, "{result:?}");
     }
 }

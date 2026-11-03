@@ -1218,6 +1218,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             detach,
             secret,
         } => {
+            opts.extras.check_rm(rm)?;
             let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
             request.secrets = secrets::load_all(&secret)?;

@@ -428,3 +428,91 @@ fn given_bad_hostname_or_stop_signal_when_created_then_it_fails_with_a_clear_err
         stderr(&signal)
     );
 }
+
+#[test]
+fn given_restart_policy_when_inspected_then_host_config_shows_it_and_the_count_is_zero() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "web1",
+            "--restart",
+            "on-failure:3",
+            ALPINE,
+        ],
+    );
+    ok(&d, &["create", "--name", "plain1", ALPINE]);
+
+    // Act
+    let set = ok(
+        &d,
+        &[
+            "inspect",
+            "--format",
+            "{{json .HostConfig.RestartPolicy}}",
+            "web1",
+        ],
+    );
+    let unset = ok(
+        &d,
+        &[
+            "inspect",
+            "--format",
+            "{{.HostConfig.RestartPolicy.Name}}",
+            "plain1",
+        ],
+    );
+    let count = ok(&d, &["inspect", "--format", "{{.RestartCount}}", "web1"]);
+
+    // Assert
+    assert_eq!(set.trim(), r#"{"MaximumRetryCount":3,"Name":"on-failure"}"#);
+    assert_eq!(unset.trim(), "no");
+    assert_eq!(count.trim(), "0");
+}
+
+#[test]
+fn given_bad_restart_policy_when_created_then_it_fails_with_a_clear_error() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let unknown = run(&d, &["create", "--restart", "sometimes", ALPINE]);
+    let capped = run(&d, &["create", "--restart", "always:3", ALPINE]);
+
+    // Assert
+    assert!(!unknown.status.success());
+    assert!(
+        stderr(&unknown).contains("invalid restart policy"),
+        "{}",
+        stderr(&unknown)
+    );
+    assert!(!capped.status.success());
+    assert!(
+        stderr(&capped).contains("cannot be used"),
+        "{}",
+        stderr(&capped)
+    );
+}
+
+#[test]
+fn given_restart_policy_with_rm_when_run_then_it_is_refused() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(
+        &d,
+        &["run", "-d", "--rm", "--restart", "always", ALPINE, COMMAND],
+    );
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--restart and --rm"),
+        "{}",
+        stderr(&out)
+    );
+}

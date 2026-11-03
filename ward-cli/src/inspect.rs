@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
+use ward_core::protocol::RestartKind;
 
 use crate::lifecycle::Failures;
 use crate::ps_filter::{self, Filters};
@@ -313,6 +314,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "FinishedAt": state_time(&info.finished_at),
         },
         "Config": config,
+        "RestartCount": info.restart_count,
         "HostConfig": host_config(info),
     })
 }
@@ -320,10 +322,23 @@ fn inspect_value(info: &SandboxInfo) -> Value {
 /// Docker `HostConfig` limits. Unlimited is 0, and null for pids.
 fn host_config(info: &SandboxInfo) -> Value {
     let resources = info.resources.unwrap_or_default();
+    let restart = info.restart_policy.clone().unwrap_or_default();
+    let restart = ward_core::pb::RestartPolicy {
+        name: if restart.name.is_empty() {
+            RestartKind::No.as_str().to_string()
+        } else {
+            restart.name
+        },
+        ..restart
+    };
     json!({
         "Memory": u64::from(resources.memory_mb) * BYTES_PER_MIB,
         "NanoCpus": u64::from(resources.cpus) * NANOS_PER_CPU,
         "PidsLimit": (resources.pids_max > 0).then_some(resources.pids_max),
+        "RestartPolicy": {
+            "Name": restart.name,
+            "MaximumRetryCount": restart.maximum_retry_count,
+        },
     })
 }
 
@@ -691,7 +706,9 @@ mod tests {
                     "Memory": 0,
                     "NanoCpus": 0,
                     "PidsLimit": null,
+                    "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 },
+                "RestartCount": 0,
             })
         );
     }
@@ -765,8 +782,36 @@ mod tests {
         // Assert
         assert_eq!(
             host_config,
-            json!({"Memory": 536_870_912_u64, "NanoCpus": 2_000_000_000_u64, "PidsLimit": 100})
+            json!({
+                "Memory": 536_870_912_u64,
+                "NanoCpus": 2_000_000_000_u64,
+                "PidsLimit": 100,
+                "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
+            })
         );
+    }
+
+    #[test]
+    fn given_restart_policy_and_count_when_inspected_then_docker_places_them() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            restart_policy: Some(ward_core::pb::RestartPolicy {
+                name: "on-failure".into(),
+                maximum_retry_count: 3,
+            }),
+            restart_count: 2,
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+
+        // Assert
+        assert_eq!(
+            value["HostConfig"]["RestartPolicy"],
+            json!({"Name": "on-failure", "MaximumRetryCount": 3})
+        );
+        assert_eq!(value["RestartCount"], 2);
     }
 
     #[rstest::rstest]
