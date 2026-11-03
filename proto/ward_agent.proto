@@ -32,6 +32,7 @@ message Request {
     Top top = 11;
     Stats stats = 12;
     PutSecrets put_secrets = 13;
+    Freeze freeze = 14;
   }
 }
 
@@ -185,6 +186,13 @@ message StatsSample {
   // devices.
   uint64 block_read_bytes = 7;
   uint64 block_write_bytes = 8;
+}
+
+// Must be the first and only frame on a connection. The agent freezes or
+// thaws every process of the sandbox cgroup, waits until the kernel reports
+// the new state, and answers with one ArchiveDone or ArchiveError.
+message Freeze {
+  bool frozen = 1;
 }
 
 // Answer to Ping.

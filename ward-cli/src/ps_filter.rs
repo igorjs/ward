@@ -11,9 +11,11 @@ const FILTER_STATUS: &str = "status";
 const FILTER_LABEL: &str = "label";
 /// Docker's name for a sandbox that exists but has not started.
 const STATUS_CREATED: &str = "created";
-const STATUSES: [&str; 6] = [
+const STATUS_PAUSED: &str = "paused";
+const STATUSES: [&str; 7] = [
     STATUS_CREATED,
     "running",
+    STATUS_PAUSED,
     "stopping",
     "stopped",
     "exited",
@@ -67,7 +69,7 @@ impl Filters {
         };
         any(&self.names, &|w| info.name.contains(w))
             && any(&self.ids, &|w| info.id.starts_with(w))
-            && any(&self.statuses, &|w| w == status_word(info.status))
+            && any(&self.statuses, &|w| w == status_word(info))
             && self.labels.iter().all(|label| match label.split_once('=') {
                 Some((key, value)) => info.labels.get(key).is_some_and(|v| v == value),
                 None => info.labels.contains_key(label),
@@ -75,10 +77,13 @@ impl Filters {
     }
 }
 
-fn status_word(status: i32) -> &'static str {
-    match SandboxStatus::try_from(status).unwrap_or(SandboxStatus::Unspecified) {
+fn status_word(info: &SandboxInfo) -> &'static str {
+    if info.paused {
+        return STATUS_PAUSED;
+    }
+    match SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified) {
         SandboxStatus::Creating => STATUS_CREATED,
-        _ => crate::status_name(status),
+        _ => crate::status_name(info.status),
     }
 }
 
@@ -208,6 +213,19 @@ mod tests {
         let mut want: Vec<String> = expected.iter().map(ToString::to_string).collect();
         want.sort();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn given_paused_sandbox_when_filtered_then_paused_matches_and_running_does_not() {
+        let mut listed = fleet();
+        let web1 = listed.iter_mut().find(|s| s.name == "web1").expect("web1");
+        web1.paused = true;
+
+        let paused = select(&listed, true, &parse(&["status=paused"]), None);
+        let running = select(&listed, true, &parse(&["status=running"]), None);
+
+        assert_eq!(names(&paused), ["web1"]);
+        assert!(!names(&running).contains(&"web1".to_string()));
     }
 
     #[test]
