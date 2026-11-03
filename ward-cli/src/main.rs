@@ -1099,11 +1099,17 @@ fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let args = match latest::expand(expand_groups(std::env::args().collect())).await {
+    let original = expand_groups(std::env::args().collect());
+    let args = match latest::expand(original.clone()).await {
         Ok(args) => args,
         Err(e) => {
             eprintln!("Error: {e:?}");
-            std::process::exit(GENERIC_FAILURE_EXIT_CODE);
+            let code = if reports_cli_failure_as_125(subcommand_name(original).as_deref()) {
+                CLI_FAILURE_EXIT_CODE
+            } else {
+                GENERIC_FAILURE_EXIT_CODE
+            };
+            std::process::exit(code);
         }
     };
     let cli = match Cli::try_parse_from(&args) {

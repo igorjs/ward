@@ -175,3 +175,16 @@ fn given_no_sandbox_when_latest_is_used_then_it_fails_with_a_reason() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no sandbox"));
 }
+
+#[test]
+fn given_no_sandbox_when_exec_latest_is_used_then_it_exits_125() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["exec", "-l", "sh", "-c", "x", "--socket=/other.sock"]);
+
+    // Assert
+    assert_eq!(out.status.code(), Some(125));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no sandbox"));
+}

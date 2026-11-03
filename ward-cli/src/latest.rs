@@ -70,10 +70,15 @@ fn splice(args: &[String], command: usize, flag: usize, id: &str) -> Vec<String>
 /// The socket the arguments name, as `--socket PATH` or `--socket=PATH`
 /// anywhere before `--`. The last one wins, as in clap.
 fn socket_in(args: &[String]) -> Option<String> {
+    let command = subcommand_index(args).unwrap_or(args.len());
+    let with_value = COMMANDS
+        .iter()
+        .find(|(name, _)| args.get(command).is_some_and(|arg| arg == name))
+        .map_or(&[][..], |(_, flags)| *flags);
     let mut found = None;
     let mut at = 1;
     while let Some(arg) = args.get(at) {
-        if arg == END_OF_OPTIONS {
+        if at > command && (arg == END_OF_OPTIONS || !arg.starts_with('-')) {
             break;
         }
         if arg == SOCKET_FLAG {
@@ -81,6 +86,8 @@ fn socket_in(args: &[String]) -> Option<String> {
             at += 1;
         } else if let Some(path) = arg.strip_prefix(SOCKET_EQUALS) {
             found = Some(path.to_string());
+        } else if at > command && with_value.contains(&arg.as_str()) {
+            at += 1;
         }
         at += 1;
     }
@@ -126,6 +133,10 @@ mod tests {
     #[case::last_wins("ward --socket /a --socket=/d logs -l", Some("/d"))]
     #[case::after_end_of_options("ward exec -- --socket /e", None)]
     #[case::absent("ward logs -l", None)]
+    #[case::in_the_exec_command("ward exec -l sh -c x --socket=/other.sock", None)]
+    #[case::in_the_exec_command_separate("ward exec -l sh --socket /other.sock", None)]
+    #[case::before_the_exec_command("ward --socket /a exec -l sh --socket=/other.sock", Some("/a"))]
+    #[case::option_value_is_not_a_flag("ward exec -e --socket=/x -l sh", None)]
     fn given_arguments_when_the_socket_is_read_then_both_flag_forms_count(
         #[case] line: &str,
         #[case] expected: Option<&str>,
