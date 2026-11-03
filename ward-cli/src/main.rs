@@ -52,6 +52,7 @@ mod tokens;
 mod top;
 mod unpause;
 mod update;
+mod volume;
 mod wait;
 
 use clap::{Args, Parser, Subcommand};
@@ -857,7 +858,11 @@ enum SystemCommands {
         format: Option<String>,
     },
     /// Count sandboxes and cached images.
-    Df,
+    Df {
+        /// Show a table per sandbox, image and volume.
+        #[arg(short, long)]
+        verbose: bool,
+    },
     /// Remove stopped sandboxes, and with -a unused images and with
     /// --volumes volumes, asking first unless -f is given.
     Prune(prune::SystemArgs),
@@ -890,13 +895,14 @@ enum VolumeCommands {
         #[arg(long, default_value = "1024")]
         size: u32,
     },
-    /// List all volumes.
-    List,
-    /// Remove a volume.
-    Remove {
-        /// Volume ID.
-        id: String,
-    },
+    /// List volumes.
+    #[command(alias = "ls")]
+    List(volume::ListArgs),
+    /// Show details of one or more volumes as a JSON array.
+    Inspect(volume::InspectArgs),
+    /// Remove one or more volumes, by name or ID.
+    #[command(alias = "rm")]
+    Remove(volume::RemoveArgs),
     /// Remove unused volumes, asking first.
     Prune(prune::VolumeArgs),
 }
@@ -1861,33 +1867,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     println!("mount_path: {}", resp.mount_path);
                 }
             }
-            VolumeCommands::List => {
-                let mut c = client::connect(&socket_path).await?;
-                let resp = c.list_volumes(()).await?.into_inner();
-                let rows: Vec<Vec<Value>> = resp
-                    .volumes
-                    .into_iter()
-                    .map(|v| {
-                        vec![
-                            Value::String(v.id),
-                            Value::String(v.name),
-                            Value::from(v.size_mb),
-                        ]
-                    })
-                    .collect();
-                output::emit_rows(json, no_pretty, &["id", "name", "size_mb"], &rows)?;
-            }
+            VolumeCommands::List(args) => volume::list(&socket_path, args, json, no_pretty).await?,
+            VolumeCommands::Inspect(args) => volume::inspect(&socket_path, args).await?,
             VolumeCommands::Prune(args) => prune::volume(&socket_path, args, json).await?,
-            VolumeCommands::Remove { id } => {
-                let mut c = client::connect(&socket_path).await?;
-                c.remove_volume(ward_core::pb::RemoveVolumeRequest { id: id.clone() })
-                    .await?;
-                if json {
-                    println!("{}", json!({"removed": id}));
-                } else {
-                    println!("{id}");
-                }
-            }
+            VolumeCommands::Remove(args) => volume::remove(&socket_path, args, json).await?,
         },
 
         Commands::Publish {

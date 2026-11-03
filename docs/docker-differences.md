@@ -156,15 +156,6 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 - `inspect` prints a JSON array with Docker's `CreatedAt`, `Driver`, `Labels`, `Mountpoint`, `Name`, `Options` and `Scope`, plus Ward's `Id` and `SizeMB`. `--format` is a Go template over one object. A missing volume is reported on stderr and makes the command fail, as for `ward inspect`.
 - `rm` takes several volumes, prints the name it was given for each removed one and keeps going after a failure. `-f` skips a volume that does not exist.
 
-## Prune
-
-`ward container prune`, `image prune`, `volume prune` and `system prune` take `-f` and `--filter` (`until=TIME`, `label=KEY[=VALUE]`, `label!=KEY[=VALUE]`, and `dangling=true|false` on images). Without `-f` they print Docker's warning and read one line from stdin; only `y` or `Y` goes ahead. Anything else, including a closed stdin, fails with `prune cancelled`. They print Docker's report: `Deleted Containers:`, `Deleted Volumes:` and `Deleted Images:` sections, then `Total reclaimed space:`. `--json` prints Docker's API names (`ContainersDeleted`, `VolumesDeleted`, `ImagesDeleted`, `SpaceReclaimed`).
-
-- `container prune` and `system prune` remove stopped and exited sandboxes that the local token store holds a token for; the others are skipped with a note. Ward does not measure what a sandbox wrote, so sandboxes count as 0B reclaimed. `ward prune` is unchanged: no prompt, no flags.
-- `image prune` removes nothing without `-a` or `dangling=false`, because Ward has no dangling images. With them it removes every image no sandbox uses, in any state, by tag or by the digest the sandbox resolved to. Images carry no labels, so `label=` matches none and `label!=` matches all.
-- `volume prune` removes every volume that passes the filters. Docker keeps named volumes unless `-a` is given, but every Ward volume is named, and sandboxes cannot mount a volume yet, so none counts as in use. `-a` is accepted and changes nothing. Reclaimed space is the volume's size.
-- `system prune` also removes volumes with `--volumes` and unused images with `-a`. Ward has no networks or build cache to prune.
-
 ## Events
 
 `ward events` needs no sandbox token. The daemon keeps only the last 1024 events in memory. Nothing survives a daemon restart, so `--since` cannot reach further back than that ring. `--until` ends the stream at that time. `--filter` takes `type`, `event`, `container` (also `name`), `image`, `label` and Ward's `reason` (the `reason` attribute of a `die` event). Events carry no labels of their own, so `label` matches an event attribute. Values of one key are alternatives and different keys all must match; `key!=value` negation is not supported.
