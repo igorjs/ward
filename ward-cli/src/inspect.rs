@@ -111,6 +111,21 @@ fn reason_name(info: &SandboxInfo) -> &'static str {
     }
 }
 
+/// What Docker appends to `Up` while a container is paused.
+const PAUSED_SUFFIX: &str = " (Paused)";
+/// Docker's state name for a paused container.
+const PAUSED_STATE: &str = "paused";
+
+/// The lowercase state `ps` and `inspect` show: Docker reports `paused`
+/// where Ward's status stays `running`.
+fn state_name(info: &SandboxInfo) -> &'static str {
+    if info.paused {
+        PAUSED_STATE
+    } else {
+        status_name(info.status)
+    }
+}
+
 /// Docker style status: `Up 5 minutes`, `Exited (7) 5 minutes ago`, `Created`.
 /// `Up` counts from the last start, falling back to the creation time for
 /// records that predate it. `Exited` counts from the finish and shows only the
@@ -120,7 +135,8 @@ fn status_text(info: &SandboxInfo, now_seconds: i64) -> String {
     match SandboxStatus::try_from(info.status).unwrap_or(SandboxStatus::Unspecified) {
         SandboxStatus::Running => {
             let uptime = seconds_since(&info.started_at, now_seconds).unwrap_or(since_created);
-            format!("Up {}", duration_text(uptime))
+            let paused = if info.paused { PAUSED_SUFFIX } else { "" };
+            format!("Up {}{paused}", duration_text(uptime))
         }
         SandboxStatus::Exited => {
             let code = info.exit_code.unwrap_or_default();
@@ -164,7 +180,7 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Command": info.command_name,
         "CreatedAt": created.map(created_at_text),
         "RunningFor": format!("{} ago", duration_text(elapsed)),
-        "State": status_name(info.status),
+        "State": state_name(info),
         "Status": status_text(info, now_seconds),
         "Reason": reason_name(info),
         "Names": info.name,
@@ -294,6 +310,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "WorkingDir": info.workdir,
         "User": info.user,
         "Labels": info.labels,
+        "Tty": info.tty,
     });
     // Docker leaves these out of Config until they are set.
     if !info.stop_signal.is_empty() {
@@ -308,7 +325,9 @@ fn inspect_value(info: &SandboxInfo) -> Value {
         "Image": info.image_digest,
         "Created": info.created_at.as_ref().map(|t| rfc3339(t.seconds)),
         "State": {
-            "Status": status_name(info.status),
+            "Status": state_name(info),
+            "Running": info.status == SandboxStatus::Running as i32,
+            "Paused": info.paused,
             "ExitCode": state_exit_code(info),
             "OOMKilled": info.end_reason == EndReason::Oom as i32,
             "Reason": reason_name(info),
@@ -759,6 +778,8 @@ mod tests {
                 "Created": "1970-01-12T13:44:40Z",
                 "State": {
                     "Status": "exited",
+                    "Running": false,
+                    "Paused": false,
                     "ExitCode": 7,
                     "OOMKilled": false,
                     "Reason": "",
@@ -773,6 +794,7 @@ mod tests {
                     "WorkingDir": "",
                     "User": "",
                     "Labels": {},
+                    "Tty": false,
                 },
                 "HostConfig": {
                     "Memory": 0,
@@ -1090,6 +1112,24 @@ mod tests {
         #[case] want: &str,
     ) {
         assert_eq!(status_text(&info(status, exit_code), NOW), want);
+    }
+
+    #[test]
+    fn given_paused_sandbox_when_listed_and_inspected_then_docker_shows_paused() {
+        // Arrange
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.paused = true;
+
+        // Act
+        let listed = ps_json_object(&sandbox, NOW);
+        let state = inspect_value(&sandbox)["State"].clone();
+
+        // Assert
+        assert_eq!(listed["Status"], "Up 2 minutes (Paused)");
+        assert_eq!(listed["State"], "paused");
+        assert_eq!(state["Status"], "paused");
+        assert_eq!(state["Paused"], true);
+        assert_eq!(state["Running"], true);
     }
 
     #[test]

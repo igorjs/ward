@@ -126,6 +126,12 @@ service Ward {
   // Check that a registry accepts a login, for `ward login`. Needs no sandbox
   // token. The daemon keeps nothing; the CLI stores the credentials.
   rpc CheckRegistryLogin(CheckRegistryLoginRequest) returns (google.protobuf.Empty);
+  // Freeze every process of a running sandbox, like `docker pause`. The
+  // microVM keeps running; only the sandbox's processes stop. The token
+  // travels in call metadata.
+  rpc Pause(PauseRequest) returns (SandboxInfo);
+  // Thaw a paused sandbox, like `docker unpause`.
+  rpc Unpause(UnpauseRequest) returns (SandboxInfo);
 }
 
 // ---------------------------------------------------------------------------
@@ -360,9 +366,14 @@ message SandboxInfo {
   RestartPolicy restart_policy = 25;
   // Times the daemon restarted the sandbox since it was last started by hand.
   uint32 restart_count = 26;
-  GuestOptions guest = 27;
+  // Whether the main process runs on a pseudo-terminal.
+  bool tty = 30;
+  // True while the sandbox's processes are frozen by Pause. Its status stays
+  // running, as Docker's State.Running does.
+  bool paused = 27;
+  GuestOptions guest = 28;
   // Host directories shared into the guest, from `-v` and `--mount`.
-  repeated Mount mounts = 28;
+  repeated Mount mounts = 29;
 }
 
 enum EndReason {
@@ -658,6 +669,18 @@ message StatsResponse {
 
 message WaitRequest {
   string sandbox_id = 1;
+  // When to stop waiting. Absent means not running, as before.
+  WaitCondition condition = 2;
+}
+
+// Docker's `wait --condition` values.
+enum WaitCondition {
+  // The sandbox is not running, or stops running.
+  WAIT_CONDITION_NOT_RUNNING = 0;
+  // The sandbox's main process exits next, in this run or the next one.
+  WAIT_CONDITION_NEXT_EXIT = 1;
+  // The sandbox is removed.
+  WAIT_CONDITION_REMOVED = 2;
 }
 
 message WaitResponse {
@@ -1012,4 +1035,14 @@ message CheckRegistryLoginRequest {
   string server = 1;
   string username = 2;
   string password = 3;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message PauseRequest {
+  string id = 1;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message UnpauseRequest {
+  string id = 1;
 }
