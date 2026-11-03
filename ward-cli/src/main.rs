@@ -1077,10 +1077,14 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// `run` and `exec` report their own failures as 125, so that scripts can tell
-/// them apart from the exit code of the command they ran.
+/// `run`, `exec` and the Podman `exists` commands report their own failures as
+/// 125, so that scripts can tell them apart from the exit code of the command
+/// they ran.
 fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
-    matches!(subcommand, Some("run" | "exec"))
+    matches!(
+        subcommand,
+        Some("run" | "exec" | "container-exists" | "image-exists")
+    )
 }
 
 #[tokio::main]

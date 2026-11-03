@@ -66,7 +66,8 @@ fn code_of(answer: anyhow::Result<i32>) -> i32 {
 /// Whether `reference` is one of the image's tags, with `:latest` implied, or
 /// a prefix of its ID.
 fn names_image(image: &ImageInfo, reference: &str) -> bool {
-    if reference.is_empty() {
+    let wanted = reference.trim_start_matches(DIGEST_PREFIX);
+    if wanted.is_empty() {
         return false;
     }
     let tagged = match reference.rsplit_once(':') {
@@ -74,9 +75,7 @@ fn names_image(image: &ImageInfo, reference: &str) -> bool {
         _ => format!("{reference}:{DEFAULT_TAG}"),
     };
     let id = image.digest.trim_start_matches(DIGEST_PREFIX);
-    image.reference == tagged
-        || image.reference == reference
-        || id.starts_with(reference.trim_start_matches(DIGEST_PREFIX))
+    image.reference == tagged || image.reference == reference || id.starts_with(wanted)
 }
 
 #[cfg(test)]
@@ -99,6 +98,7 @@ mod tests {
     #[case::full_digest("sha256:abc123def", true)]
     #[case::unrelated_prefix("fff", false)]
     #[case::empty("", false)]
+    #[case::bare_digest_prefix("sha256:", false)]
     fn given_an_image_when_named_then_tag_and_id_prefix_match(
         #[case] reference: &str,
         #[case] expected: bool,

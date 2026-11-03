@@ -10,6 +10,7 @@ use crate::{client, ps_filter, socket, subcommand_index};
 
 const LATEST_FLAGS: [&str; 2] = ["-l", "--latest"];
 const SOCKET_FLAG: &str = "--socket";
+const SOCKET_EQUALS: &str = "--socket=";
 const END_OF_OPTIONS: &str = "--";
 const TIME_OPTIONS: [&str; 3] = ["-t", "--time", "--timeout"];
 
@@ -49,7 +50,7 @@ fn flag_position(args: &[String]) -> Option<(usize, usize)> {
         if arg == END_OF_OPTIONS || !arg.starts_with('-') {
             return None;
         }
-        at += if with_value.contains(&arg.as_str()) {
+        at += if with_value.contains(&arg.as_str()) || arg == SOCKET_FLAG {
             2
         } else {
             1
@@ -66,12 +67,30 @@ fn splice(args: &[String], command: usize, flag: usize, id: &str) -> Vec<String>
     out
 }
 
+/// The socket the arguments name, as `--socket PATH` or `--socket=PATH`
+/// anywhere before `--`. The last one wins, as in clap.
+fn socket_in(args: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut at = 1;
+    while let Some(arg) = args.get(at) {
+        if arg == END_OF_OPTIONS {
+            break;
+        }
+        if arg == SOCKET_FLAG {
+            found = args.get(at + 1).cloned();
+            at += 1;
+        } else if let Some(path) = arg.strip_prefix(SOCKET_EQUALS) {
+            found = Some(path.to_string());
+        }
+        at += 1;
+    }
+    found
+}
+
+/// The socket the command will use: the flag, then `WARD_SOCKET`, then the
+/// default, which is the order clap and `socket::default_socket` apply.
 fn socket_of(args: &[String]) -> String {
-    args.iter()
-        .position(|arg| arg == SOCKET_FLAG)
-        .and_then(|at| args.get(at + 1))
-        .cloned()
-        .unwrap_or_else(socket::default_socket)
+    socket_in(args).unwrap_or_else(socket::default_socket)
 }
 
 /// Replaces `-l/--latest` with the ID of the newest sandbox, in any state.
@@ -98,6 +117,38 @@ mod tests {
 
     fn words(line: &str) -> Vec<String> {
         line.split_whitespace().map(String::from).collect()
+    }
+
+    #[rstest::rstest]
+    #[case::separate("ward --socket /a logs -l", Some("/a"))]
+    #[case::equals("ward --socket=/b logs -l", Some("/b"))]
+    #[case::after_the_command("ward logs -l --socket /c", Some("/c"))]
+    #[case::last_wins("ward --socket /a --socket=/d logs -l", Some("/d"))]
+    #[case::after_end_of_options("ward exec -- --socket /e", None)]
+    #[case::absent("ward logs -l", None)]
+    fn given_arguments_when_the_socket_is_read_then_both_flag_forms_count(
+        #[case] line: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(socket_in(&words(line)).as_deref(), expected);
+    }
+
+    #[test]
+    fn given_a_socket_flag_after_the_command_when_spliced_then_its_value_is_not_the_name() {
+        let args = words("ward logs --socket /s -l");
+
+        let spliced =
+            flag_position(&args).map(|(command, flag)| splice(&args, command, flag, "ID"));
+
+        assert_eq!(spliced, Some(words("ward logs ID --socket /s")));
+    }
+
+    #[test]
+    fn given_the_env_socket_when_resolved_then_it_is_the_default() {
+        assert_eq!(
+            socket::resolve(Some("/env.sock"), None, None, None),
+            "/env.sock"
+        );
     }
 
     #[rstest::rstest]

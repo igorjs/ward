@@ -110,6 +110,60 @@ fn given_two_sandboxes_when_latest_is_used_then_the_newest_is_acted_on() {
 }
 
 #[test]
+fn given_two_daemons_when_latest_is_used_with_a_socket_flag_then_that_daemon_answers() {
+    // Arrange
+    let with_sandbox = Daemon::spawn();
+    let empty = Daemon::spawn();
+    create(&with_sandbox, "only-here");
+    let socket = with_sandbox.socket.to_string_lossy().into_owned();
+    let query = |args: &[&str]| {
+        let out = empty.cli().args(args).output().expect("run ward");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Act
+    let separate = query(&["--socket", &socket, "inspect", "-l", "-f", "{{.Name}}"]);
+    let joined = query(&[
+        &format!("--socket={socket}"),
+        "inspect",
+        "-l",
+        "-f",
+        "{{.Name}}",
+    ]);
+    let after = query(&["inspect", "-l", "-f", "{{.Name}}", "--socket", &socket]);
+    let env_only = with_sandbox
+        .cli()
+        .args(["inspect", "-l", "-f", "{{.Name}}"])
+        .output()
+        .expect("run ward");
+
+    // Assert
+    assert_eq!(separate.trim(), "/only-here");
+    assert_eq!(joined.trim(), "/only-here");
+    assert_eq!(after.trim(), "/only-here");
+    assert_eq!(
+        String::from_utf8_lossy(&env_only.stdout).trim(),
+        "/only-here"
+    );
+}
+
+#[test]
+fn given_missing_arguments_when_exists_is_used_then_the_usage_error_exits_125() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let container = run(&d, &["container", "exists"]);
+    let image = run(&d, &["image", "exists"]);
+    let bare_digest = run(&d, &["image", "exists", "sha256:"]);
+
+    // Assert
+    assert_eq!(container.status.code(), Some(125));
+    assert_eq!(image.status.code(), Some(125));
+    assert_eq!(bare_digest.status.code(), Some(1));
+}
+
+#[test]
 fn given_no_sandbox_when_latest_is_used_then_it_fails_with_a_reason() {
     // Arrange
     let d = Daemon::spawn();
