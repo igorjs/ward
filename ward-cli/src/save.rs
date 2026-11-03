@@ -3,7 +3,7 @@
 //! `ward save [-o FILE] IMAGE...`: writes images as an OCI layout tar.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -22,11 +22,7 @@ pub struct Args {
 }
 
 pub async fn run(socket: &str, args: Args) -> Result<()> {
-    if args.output.is_none() && std::io::stdout().is_terminal() {
-        return Err(anyhow::Error::new(client::PlainError(
-            "cowardly refusing to save to a terminal. Use the -o flag or redirect".to_string(),
-        )));
-    }
+    refuse_terminal(args.output.as_deref())?;
     let mut c = client::connect(socket).await?;
     let mut stream = c
         .save_images(SaveImagesRequest {
@@ -34,18 +30,37 @@ pub async fn run(socket: &str, args: Args) -> Result<()> {
         })
         .await?
         .into_inner();
-    match &args.output {
+    write_stream(&mut stream, args.output.as_deref()).await
+}
+
+/// Docker will not write an archive onto a terminal.
+pub fn refuse_terminal(output: Option<&Path>) -> Result<()> {
+    if output.is_none() && std::io::stdout().is_terminal() {
+        return Err(anyhow::Error::new(client::PlainError(
+            "cowardly refusing to save to a terminal. Use the -o flag or redirect".to_string(),
+        )));
+    }
+    Ok(())
+}
+
+/// Writes the chunks to `output` or standard output. A file that is only
+/// partly written is removed.
+pub async fn write_stream(
+    stream: &mut tonic::Streaming<ward_core::pb::ArchiveChunk>,
+    output: Option<&Path>,
+) -> Result<()> {
+    match output {
         Some(path) => {
             let file = tokio::fs::File::create(path)
                 .await
                 .with_context(|| format!("cannot create {}", path.display()))?;
-            let copied = copy_chunks(&mut stream, file).await;
+            let copied = copy_chunks(stream, file).await;
             if copied.is_err() {
                 let _ = tokio::fs::remove_file(path).await;
             }
             copied
         }
-        None => copy_chunks(&mut stream, tokio::io::stdout()).await,
+        None => copy_chunks(stream, tokio::io::stdout()).await,
     }
 }
 

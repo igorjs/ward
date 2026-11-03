@@ -75,6 +75,11 @@ Each attach session is separate. A client that disconnects only detaches and lea
 - `ward save` writes an OCI image layout that also carries Docker's `manifest.json`. Ward keeps unpacked files, not registry layers, so each image is one flattened layer. File owners are not kept, so the layer records root, and directory and symlink times are zero. Hard links become copies, and sockets, pipes and device nodes are left out. Saving an image that was loaded gives the same archive. A tag given to `save` saves that tag only; an ID saves every tag of the image. Writing to a terminal is refused.
 - `ward load` reads `ward save`, Docker and OCI layout archives, gzip or plain layers. An image index with several platforms is not supported. The loaded image gets the digest of the archive's manifest, or, for a Docker archive with no manifest, of its config. Because the layers are flattened, a pulled image saved and loaded gets a new digest, so a `@sha256` pin from the registry no longer matches. Layer and manifest digests are checked. A loaded image is never evicted from the cache, since nothing can pull it back. Archives up to 2 GiB are accepted.
 
+- `ward export` reads the sandbox's files from the host, so it works in any state without a running guest. Owners are written as root, directory and symlink times are zero, hard links become copies, and sockets, pipes and device nodes are left out. Files Ward wrote at boot are left out.
+- `ward import` takes a file or `-`, plain or gzip. A URL is not supported, and `--platform` is not accepted. `-c` takes CMD, ENTRYPOINT, ENV, WORKDIR and USER. The image is kept like a committed one: it is never evicted.
+- `ward pull --platform` accepts only `linux/` plus this machine's architecture, because a microVM runs the host's architecture. `--all-tags` is refused. `ward search` is not available; Docker Hub's search API has no OCI equivalent.
+- `ward login` and `ward logout` are not available yet. Pulls are anonymous, so private registries cannot be reached.
+
 ## Events
 
 `ward events` needs no sandbox token. The daemon keeps only the last 1024 events in memory. Nothing survives a daemon restart.

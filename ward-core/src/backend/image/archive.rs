@@ -23,10 +23,11 @@ use tokio::sync::mpsc;
 
 use super::manage::Matched;
 use super::{
-    BackendError, CacheMeta, DIGEST_ALGORITHM_PREFIX, ImageConfig, ImageStore,
+    BackendError, CacheMeta, DIGEST_ALGORITHM_PREFIX, HistoryEntry, ImageConfig, ImageStore,
     MAX_UNPACKED_IMAGE_BYTES, OnFull, PulledImage, Result, STAGING_PREFIX, StagingDir,
     dir_size_bytes, unpack_into, validate_reference,
 };
+use crate::backend::commit;
 use crate::sync::LockUnpoisoned;
 
 const ARCHIVE_FILE: &str = "archive.tar";
@@ -56,6 +57,16 @@ const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
 pub struct SavedArchive {
     pub path: PathBuf,
     _staging: StagingDir,
+}
+
+/// What `docker import` was given besides the tar.
+#[derive(Debug, Clone, Default)]
+pub struct ImportSpec {
+    /// Local tag for the image; unset leaves it untagged.
+    pub reference: Option<String>,
+    pub message: String,
+    /// Dockerfile instructions applied to the image config.
+    pub changes: Vec<String>,
 }
 
 /// An image a load added to the cache.
@@ -130,13 +141,21 @@ impl<R: Read> Read for HashingReader<R> {
 }
 
 /// Adds the files under `dir` to `builder` in name order.
-fn append_tree<W: Write>(builder: &mut tar::Builder<W>, root: &Path, dir: &Path) -> io::Result<()> {
+fn append_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    root: &Path,
+    dir: &Path,
+    skip: &[&str],
+) -> io::Result<()> {
     let mut entries = std::fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
         let meta = std::fs::symlink_metadata(&path)?;
         let name = path.strip_prefix(root).map_err(io::Error::other)?;
+        if skip.contains(&format!("/{}", name.display()).as_str()) {
+            continue;
+        }
         let kind = meta.file_type();
         let mut header = tar::Header::new_gnu();
         header.set_mode(meta.mode() & MODE_MASK);
@@ -151,7 +170,7 @@ fn append_tree<W: Write>(builder: &mut tar::Builder<W>, root: &Path, dir: &Path)
             header.set_entry_type(tar::EntryType::Directory);
             header.set_size(0);
             builder.append_data(&mut header, name, io::empty())?;
-            append_tree(builder, root, &path)?;
+            append_tree(builder, root, &path, skip)?;
         } else if kind.is_symlink() {
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
@@ -184,12 +203,12 @@ fn architecture() -> &'static str {
     }
 }
 
-fn config_json(meta: &CacheMeta, layer_digest: &str) -> Vec<u8> {
-    let created = meta
-        .created_at
-        .unwrap_or(meta.last_used_at)
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let runtime = meta.config.clone().unwrap_or_default();
+fn config_json(
+    created: chrono::DateTime<chrono::Utc>,
+    runtime: ImageConfig,
+    layer_digest: &str,
+) -> Vec<u8> {
+    let created = created.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let mut config = Map::new();
     for (key, value) in [
         ("Entrypoint", runtime.entrypoint),
@@ -224,7 +243,7 @@ fn build_image(position: usize, source: &SaveSource, scratch: &Path) -> Result<B
         written: 0,
     };
     let mut builder = tar::Builder::new(&mut writer);
-    append_tree(&mut builder, &source.rootfs, &source.rootfs)?;
+    append_tree(&mut builder, &source.rootfs, &source.rootfs, &[])?;
     builder.finish()?;
     drop(builder);
     writer.flush()?;
@@ -234,7 +253,11 @@ fn build_image(position: usize, source: &SaveSource, scratch: &Path) -> Result<B
     );
     let layer_size = writer.written;
 
-    let config = config_json(&source.meta, &layer_digest);
+    let config = config_json(
+        source.meta.created_at.unwrap_or(source.meta.last_used_at),
+        source.meta.config.clone().unwrap_or_default(),
+        &layer_digest,
+    );
     let config_digest = sha256_of(&config);
     let manifest = json!({
         "schemaVersion": 2,
@@ -490,6 +513,18 @@ fn layer_size(archive: &Path, name: &str) -> Result<u64> {
     Err(bad_archive(format!("layer {name} is missing")))
 }
 
+/// Unpacks a tar layer, gzip or plain, into `rootfs`.
+fn unpack_auto<R: Read>(source: R, rootfs: &Path) -> Result<()> {
+    let mut buffered = BufReader::new(source);
+    let media = if buffered.fill_buf()?.starts_with(&GZIP_MAGIC) {
+        MEDIA_GZIP_SUFFIX
+    } else {
+        MEDIA_TAR_SUFFIX
+    };
+    let limit = MAX_UNPACKED_IMAGE_BYTES.saturating_sub(dir_size_bytes(rootfs)?);
+    unpack_into(&mut buffered, media, rootfs, limit)
+}
+
 /// Unpacks the layer `name`, checking its digest when one is given.
 fn unpack_layer(archive: &Path, name: &str, expected: Option<&str>, rootfs: &Path) -> Result<()> {
     let mut tar = tar::Archive::new(File::open(archive)?);
@@ -498,18 +533,11 @@ fn unpack_layer(archive: &Path, name: &str, expected: Option<&str>, rootfs: &Pat
         if !entry.header().entry_type().is_file() || entry_name(&entry)? != name {
             continue;
         }
-        let mut buffered = BufReader::new(entry);
-        let media = if buffered.fill_buf()?.starts_with(&GZIP_MAGIC) {
-            MEDIA_GZIP_SUFFIX
-        } else {
-            MEDIA_TAR_SUFFIX
-        };
         let mut reader = HashingReader {
-            inner: buffered,
+            inner: entry,
             hasher: Sha256::new(),
         };
-        let limit = MAX_UNPACKED_IMAGE_BYTES.saturating_sub(dir_size_bytes(rootfs)?);
-        unpack_into(&mut reader, media, rootfs, limit)?;
+        unpack_auto(&mut reader, rootfs)?;
         io::copy(&mut reader, &mut io::sink())?;
         let actual = format!("{DIGEST_ALGORITHM_PREFIX}{:x}", reader.hasher.finalize());
         return match expected {
@@ -619,7 +647,7 @@ impl ImageStore {
     /// are kept like committed images: nothing can pull them back.
     pub async fn load_images(
         &self,
-        mut chunks: mpsc::Receiver<io::Result<Bytes>>,
+        chunks: mpsc::Receiver<io::Result<Bytes>>,
     ) -> Result<Vec<LoadedImage>> {
         let staging = StagingDir(
             self.cache_dir
@@ -627,22 +655,7 @@ impl ImageStore {
         );
         std::fs::create_dir_all(&staging.0)?;
         let archive = staging.0.join(ARCHIVE_FILE);
-        let mut file = tokio::fs::File::create(&archive).await?;
-        let mut received = 0u64;
-        while let Some(chunk) = chunks.recv().await {
-            let chunk = chunk
-                .map_err(|e| BackendError::InvalidArgument(format!("the upload failed: {e}")))?;
-            received += chunk.len() as u64;
-            if received > self.max_pull_bytes {
-                return Err(BackendError::ResourceExhausted(format!(
-                    "the archive is larger than {} bytes",
-                    self.max_pull_bytes
-                )));
-            }
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        drop(file);
+        self.spool(chunks, &archive).await?;
         let cache_dir = self.cache_dir.clone();
         let prepared = tokio::task::spawn_blocking(move || unpack_archive(&archive, &cache_dir))
             .await
@@ -661,6 +674,121 @@ impl ImageStore {
             });
         }
         Ok(loaded)
+    }
+
+    /// Write an uploaded stream to `path`, refusing more than the pull cap.
+    async fn spool(
+        &self,
+        mut chunks: mpsc::Receiver<io::Result<Bytes>>,
+        path: &Path,
+    ) -> Result<()> {
+        let mut file = tokio::fs::File::create(path).await?;
+        let mut received = 0u64;
+        while let Some(chunk) = chunks.recv().await {
+            let chunk = chunk
+                .map_err(|e| BackendError::InvalidArgument(format!("the upload failed: {e}")))?;
+            received += chunk.len() as u64;
+            if received > self.max_pull_bytes {
+                return Err(BackendError::ResourceExhausted(format!(
+                    "the archive is larger than {} bytes",
+                    self.max_pull_bytes
+                )));
+            }
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+
+    /// Write the files of a sandbox root filesystem as a tar archive, like
+    /// `docker export`. `skip` holds guest paths the backend wrote itself.
+    pub async fn export_rootfs(
+        &self,
+        rootfs: &Path,
+        skip: &'static [&'static str],
+    ) -> Result<SavedArchive> {
+        let staging = self.staging_dir()?;
+        let path = staging.0.join(ARCHIVE_FILE);
+        let (rootfs, out) = (rootfs.to_path_buf(), path.clone());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut tar = tar::Builder::new(BufWriter::new(File::create(out)?));
+            append_tree(&mut tar, &rootfs, &rootfs, skip)?;
+            tar.into_inner()?.flush()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("export task: {e}")))??;
+        Ok(SavedArchive {
+            path,
+            _staging: staging,
+        })
+    }
+
+    /// Make a one-layer image from a tar stream, like `docker import`. The
+    /// image is kept like a committed one.
+    pub async fn import_image(
+        &self,
+        spec: ImportSpec,
+        chunks: mpsc::Receiver<io::Result<Bytes>>,
+    ) -> Result<LoadedImage> {
+        if let Some(reference) = &spec.reference {
+            validate_reference(reference)?;
+        }
+        let mut config = ImageConfig::default();
+        commit::apply_changes(&mut config, &spec.changes)?;
+        let staging = self.staging_dir()?;
+        let archive = staging.0.join(ARCHIVE_FILE);
+        self.spool(chunks, &archive).await?;
+        let rootfs = staging.0.join("rootfs");
+        let layer_digest = tokio::task::spawn_blocking(move || -> Result<String> {
+            std::fs::create_dir_all(&rootfs)?;
+            let mut reader = HashingReader {
+                inner: File::open(&archive)?,
+                hasher: Sha256::new(),
+            };
+            unpack_auto(&mut reader, &rootfs).map_err(|e| match e {
+                BackendError::Internal(_) => {
+                    BackendError::InvalidArgument("the file is not a tar archive".to_string())
+                }
+                other => other,
+            })?;
+            io::copy(&mut reader, &mut io::sink())?;
+            std::fs::remove_file(&archive)?;
+            Ok(format!(
+                "{DIGEST_ALGORITHM_PREFIX}{:x}",
+                reader.hasher.finalize()
+            ))
+        })
+        .await
+        .map_err(|e| BackendError::Internal(format!("import task: {e}")))??;
+
+        let now = chrono::Utc::now();
+        config.history.push(HistoryEntry {
+            created: Some(now),
+            created_by: String::new(),
+            comment: spec.message,
+            empty_layer: false,
+            size_bytes: 0,
+        });
+        let digest = sha256_of(&config_json(now, config.clone(), &layer_digest));
+        let first = spec.reference.clone().unwrap_or_else(|| digest.clone());
+        let pulled = PulledImage {
+            digest: digest.clone(),
+            config,
+        };
+        self.install_entry(staging, &first, pulled, OnFull::Fail, None)?;
+        let references: Vec<String> = spec.reference.into_iter().collect();
+        self.keep_loaded(&digest, &references, Some(now))?;
+        Ok(LoadedImage { digest, references })
+    }
+
+    fn staging_dir(&self) -> Result<StagingDir> {
+        let staging = StagingDir(
+            self.cache_dir
+                .join(format!("{STAGING_PREFIX}{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&staging.0)?;
+        Ok(staging)
     }
 
     /// Give the loaded image all its names, its original creation time, and
@@ -859,5 +987,76 @@ mod tests {
 
         // Assert
         assert!(matches!(error, BackendError::InvalidArgument(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn given_an_exported_tree_when_imported_then_it_is_a_tagged_image_with_the_changes() {
+        // Arrange
+        let (_a, source) = store().await;
+        source.pull(REFERENCE, None).await.expect("pull");
+        let rootfs = source
+            .cached_rootfs(REFERENCE)
+            .await
+            .expect("lookup")
+            .expect("cached");
+        std::fs::write(rootfs.join(".agent"), "boot").expect("write");
+        let exported = source
+            .export_rootfs(&rootfs, &["/.agent"])
+            .await
+            .expect("export");
+        let (_b, target) = store().await;
+        let spec = ImportSpec {
+            reference: Some("imported:v1".to_string()),
+            message: "from a tar".to_string(),
+            changes: vec!["CMD [\"/run\"]".to_string()],
+        };
+
+        // Act
+        let imported = target
+            .import_image(spec, upload(&exported.path).await)
+            .await
+            .expect("import");
+
+        // Assert
+        assert_eq!(imported.references, ["imported:v1"]);
+        let copy = target
+            .cached_rootfs("imported:v1")
+            .await
+            .expect("lookup")
+            .expect("cached");
+        assert_eq!(
+            std::fs::read_to_string(copy.join("etc.conf")).expect("read"),
+            "k=v\n"
+        );
+        assert!(!copy.join(".agent").exists());
+        let view = target.image_history("imported:v1").expect("history");
+        assert_eq!(view.entries[0].comment, "from a tar");
+        assert_eq!(
+            target.config("imported:v1").await.expect("config").cmd,
+            ["/run"]
+        );
+    }
+
+    #[tokio::test]
+    async fn given_bytes_that_are_not_a_tar_when_imported_then_it_is_refused() {
+        // Arrange
+        let (_dir, target) = store().await;
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(
+            b"plain text, not a tar archive at all",
+        )))
+        .await
+        .expect("send");
+        drop(tx);
+
+        // Act
+        let error = target
+            .import_image(ImportSpec::default(), rx)
+            .await
+            .expect_err("refused");
+
+        // Assert
+        assert!(matches!(error, BackendError::InvalidArgument(_)), "{error}");
+        assert!(target.list().await.is_empty());
     }
 }

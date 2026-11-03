@@ -3,7 +3,7 @@
 //! `ward load [-i FILE]`: reads a Docker or OCI layout tar into the cache.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -26,22 +26,10 @@ pub struct Args {
 }
 
 pub async fn run(socket: &str, args: Args) -> Result<()> {
-    let source: Box<dyn AsyncRead + Unpin + Send> = match &args.input {
-        Some(path) => Box::new(
-            tokio::fs::File::open(path)
-                .await
-                .with_context(|| format!("open {}: no such file or directory", path.display()))?,
-        ),
-        None if std::io::stdin().is_terminal() => {
-            return Err(anyhow::Error::new(client::PlainError(
-                "requested load from stdin, but stdin is empty".to_string(),
-            )));
-        }
-        None => Box::new(tokio::io::stdin()),
-    };
+    let source = open_input(args.input.as_deref()).await?;
     let mut c = client::connect(socket).await?;
     let (tx, rx) = tokio::sync::mpsc::channel(UPLOAD_BUFFER);
-    let reader = tokio::spawn(read_chunks(source, tx));
+    let reader = tokio::spawn(read_chunks(source, tx, |data| ArchiveChunk { data }));
     let reply = c
         .load_images(tokio_stream::wrappers::ReceiverStream::new(rx))
         .await;
@@ -60,9 +48,27 @@ pub async fn run(socket: &str, args: Args) -> Result<()> {
     Ok(())
 }
 
-async fn read_chunks(
-    mut source: Box<dyn AsyncRead + Unpin + Send>,
-    tx: tokio::sync::mpsc::Sender<ArchiveChunk>,
+pub type Source = Box<dyn AsyncRead + Unpin + Send>;
+
+/// The file at `path`, or standard input when there is none. Docker refuses
+/// to read an archive from a terminal.
+pub async fn open_input(path: Option<&Path>) -> Result<Source> {
+    match path {
+        Some(path) => Ok(Box::new(tokio::fs::File::open(path).await.with_context(
+            || format!("open {}: no such file or directory", path.display()),
+        )?)),
+        None if std::io::stdin().is_terminal() => Err(anyhow::Error::new(client::PlainError(
+            "requested load from stdin, but stdin is empty".to_string(),
+        ))),
+        None => Ok(Box::new(tokio::io::stdin())),
+    }
+}
+
+/// Sends `source` to `tx` in chunks, each wrapped into a message by `wrap`.
+pub async fn read_chunks<T>(
+    mut source: Source,
+    tx: tokio::sync::mpsc::Sender<T>,
+    wrap: impl Fn(Vec<u8>) -> T,
 ) -> Result<()> {
     loop {
         let mut data = vec![0; CHUNK_BYTES];
@@ -71,7 +77,7 @@ async fn read_chunks(
             return Ok(());
         }
         data.truncate(read);
-        if tx.send(ArchiveChunk { data }).await.is_err() {
+        if tx.send(wrap(data)).await.is_err() {
             return Ok(());
         }
     }

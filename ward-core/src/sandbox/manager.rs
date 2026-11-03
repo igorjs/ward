@@ -1888,6 +1888,30 @@ impl SandboxManager {
             .map_err(image_backend_err)
     }
 
+    /// Write a sandbox's filesystem to a tar archive on disk.
+    pub async fn export_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<crate::backend::image::SavedArchive> {
+        let id = self.resolve(sandbox_id).await?;
+        self.backend
+            .export_sandbox(&id)
+            .await
+            .map_err(image_backend_err)
+    }
+
+    /// Make an image from a tar archive.
+    pub async fn import_image(
+        &self,
+        spec: crate::backend::image::ImportSpec,
+        chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<crate::backend::image::LoadedImage> {
+        self.backend
+            .import_image(spec, chunks)
+            .await
+            .map_err(image_backend_err)
+    }
+
     /// List all sandboxes.
     pub async fn list(&self) -> Result<Vec<PbSandboxInfo>> {
         let infos = self.backend.list_sandboxes().await.map_err(backend_err)?;

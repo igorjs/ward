@@ -3860,6 +3860,7 @@ dependencies = [
  "predicates",
  "rustix",
  "serde_json",
+ "tar",
  "tempfile",
  "tokio",
  "tokio-stream",

@@ -1118,6 +1118,73 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(crate::pb::LoadImagesResponse { images }))
     }
 
+    type ExportSandboxStream =
+        tokio_stream::wrappers::ReceiverStream<Result<crate::pb::ArchiveChunk, Status>>;
+
+    #[tracing::instrument(
+        name = "rpc.export_sandbox",
+        skip_all,
+        fields(request_id = %uuid::Uuid::new_v4(), sandbox_id = %request.get_ref().sandbox_id)
+    )]
+    async fn export_sandbox(
+        &self,
+        request: Request<crate::pb::ExportSandboxRequest>,
+    ) -> Result<Response<Self::ExportSandboxStream>, Status> {
+        let token = token_from_metadata(&request).to_string();
+        let req = request.into_inner();
+        let id = authorized_id(&self.sandbox, &req.sandbox_id, &token).await?;
+        let archive = self
+            .sandbox
+            .export_sandbox(&id)
+            .await
+            .map_err(api_err_to_status)?;
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        tokio::spawn(stream_archive(archive, out_tx));
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            out_rx,
+        )))
+    }
+
+    #[tracing::instrument(name = "rpc.import_image", skip_all, fields(request_id = %uuid::Uuid::new_v4()))]
+    async fn import_image(
+        &self,
+        request: Request<tonic::Streaming<crate::pb::ImportImageMessage>>,
+    ) -> Result<Response<crate::pb::ImportImageResponse>, Status> {
+        let mut upload = request.into_inner();
+        let first = upload
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("the upload is empty"))?;
+        let spec = crate::backend::image::ImportSpec {
+            reference: Some(first.reference).filter(|r| !r.is_empty()),
+            message: first.message,
+            changes: first.changes,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(PULL_STREAM_BUFFER);
+        let first_data = first.data;
+        let pump = async move {
+            if !first_data.is_empty() && tx.send(Ok(bytes::Bytes::from(first_data))).await.is_err()
+            {
+                return;
+            }
+            while let Some(next) = upload.message().await.transpose() {
+                let chunk = next
+                    .map(|message| bytes::Bytes::from(message.data))
+                    .map_err(std::io::Error::other);
+                let failed = chunk.is_err();
+                if tx.send(chunk).await.is_err() || failed {
+                    break;
+                }
+            }
+        };
+        let _slot = PULL_SLOTS.acquire().await;
+        let (imported, ()) = tokio::join!(self.sandbox.import_image(spec, rx), pump);
+        let image = imported.map_err(api_err_to_status)?;
+        Ok(Response::new(crate::pb::ImportImageResponse {
+            image_id: image.digest,
+        }))
+    }
+
     #[tracing::instrument(
         name = "rpc.commit",
         skip_all,

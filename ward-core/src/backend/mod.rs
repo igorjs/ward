@@ -207,6 +207,23 @@ pub trait Backend: Send + Sync + 'static {
         Err(no_image_cache())
     }
 
+    /// Write a sandbox's filesystem to a tar archive on disk, like
+    /// `docker export`.
+    async fn export_sandbox(&self, _sandbox_id: &str) -> Result<image::SavedArchive> {
+        Err(BackendError::InvalidArgument(
+            "this backend cannot export a sandbox".to_string(),
+        ))
+    }
+
+    /// Make a one-layer image from a tar archive received in chunks.
+    async fn import_image(
+        &self,
+        _spec: image::ImportSpec,
+        _chunks: tokio::sync::mpsc::Receiver<std::io::Result<bytes::Bytes>>,
+    ) -> Result<image::LoadedImage> {
+        Err(no_image_cache())
+    }
+
     async fn get_sandbox(&self, id: &str) -> Result<crate::protocol::SandboxInfo>;
 
     async fn list_sandboxes(&self) -> Result<Vec<crate::protocol::SandboxInfo>>;
