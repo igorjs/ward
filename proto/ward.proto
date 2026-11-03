@@ -18,6 +18,9 @@ service Ward {
   rpc Stop(StopRequest) returns (SandboxInfo);
   rpc Start(StartRequest) returns (SandboxInfo);
   rpc Restart(RestartRequest) returns (SandboxInfo);
+  // Give a sandbox a new name, like `docker rename`. The token travels in call
+  // metadata. A name held by another sandbox is refused.
+  rpc RenameSandbox(RenameSandboxRequest) returns (SandboxInfo);
 
   // Execution
   rpc Exec(ExecRequest) returns (ProcessInfo);
@@ -203,6 +206,12 @@ message GetSandboxRequest {
 
 message RemoveSandboxRequest {
   string id = 1;
+}
+
+// `id` is a sandbox name, id or unique id prefix.
+message RenameSandboxRequest {
+  string id = 1;
+  string new_name = 2;
 }
 
 // `id` is a sandbox name, id or unique id prefix.
