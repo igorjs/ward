@@ -81,14 +81,15 @@ fn given_read_only_tmpfs_and_shm_size_when_inspected_then_host_config_and_mounts
 fn given_bad_guest_flags_when_created_then_each_fails_with_a_clear_error() {
     // Arrange
     let d = Daemon::spawn();
-    let cases: [(&[&str], &str); 5] = [
+    let cases: [(&[&str], &str); 6] = [
         (&["--tmpfs", "/x:bogus"], "invalid tmpfs option"),
         (&["--tmpfs", "relative"], "absolute"),
         (&["--tmpfs", "/proc"], "reserved"),
         (
-            &["--tmpfs", "/data", "--tmpfs", "/data/"],
+            &["--tmpfs", "/data", "--mount", "type=tmpfs,dst=/data"],
             "Duplicate mount point: /data",
         ),
+        (&["--mount", "type=volume,src=v,dst=/v"], "named volumes"),
         (&["--shm-size", "lots"], "invalid size"),
     ];
 
@@ -103,4 +104,38 @@ fn given_bad_guest_flags_when_created_then_each_fails_with_a_clear_error() {
         assert!(!out.status.success(), "{flags:?}");
         assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
     }
+}
+
+#[test]
+fn given_mount_flag_when_inspected_then_bind_and_tmpfs_map_onto_the_existing_mounts() {
+    // Arrange
+    let d = Daemon::spawn();
+    // The stub daemon only shares paths under its default allowlist.
+    let dir = tempfile::tempdir_in("/tmp").expect("tempdir");
+    let source = dir.path().to_str().unwrap().to_string();
+    let bind = format!("type=bind,src={source},dst=/data,readonly");
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "m1",
+            "--mount",
+            &bind,
+            "--mount",
+            "type=tmpfs,dst=/cache,tmpfs-size=1m",
+            "-v",
+            &format!("{source}:/other"),
+            ALPINE,
+        ],
+    );
+
+    // Act
+    let tmpfs = inspect(&d, "{{json .HostConfig.Tmpfs}}", "m1");
+    let mounts = inspect(&d, "{{json .Mounts}}", "m1");
+
+    // Assert
+    assert!(mounts.contains(r#""Mode":"ro""#), "{mounts}");
+    assert!(mounts.contains(r#""Destination":"/other""#), "{mounts}");
+    assert_eq!(tmpfs, r#"{"/cache":"rw,size=1048576"}"#);
 }
