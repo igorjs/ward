@@ -193,7 +193,7 @@ fn given_a_stopped_sandbox_without_a_token_when_pruned_then_it_stays_and_the_pru
 fn given_an_unreadable_token_store_and_only_running_sandboxes_when_pruned_then_it_succeeds() {
     // Arrange
     let d = Daemon::spawn();
-    ok(&d, &["run", "-d", "--name", "busy", ALPINE, "sleep", "300"]);
+    ok(&d, &["create", "--name", "busy", ALPINE]);
     let store = d.socket.parent().expect("socket dir").join("tokens.json");
     std::fs::write(&store, "not json").expect("corrupt token store");
 
