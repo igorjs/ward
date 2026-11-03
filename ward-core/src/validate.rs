@@ -122,6 +122,36 @@ pub fn exited_ttl(seconds: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Most labels one sandbox may carry.
+const MAX_LABELS: usize = 128;
+/// Longest label key, in bytes.
+const MAX_LABEL_KEY_LEN: usize = 256;
+/// Longest label value, in bytes.
+const MAX_LABEL_VALUE_LEN: usize = 4096;
+
+/// Validate sandbox labels: a bounded count, non-empty keys without control
+/// characters, and bounded values.
+pub fn labels(labels: &std::collections::HashMap<String, String>) -> Result<(), ApiError> {
+    if labels.len() > MAX_LABELS {
+        return Err(ApiError::InvalidRequest(format!(
+            "a sandbox takes at most {MAX_LABELS} labels"
+        )));
+    }
+    for (key, value) in labels {
+        if key.is_empty() || key.len() > MAX_LABEL_KEY_LEN || key.chars().any(char::is_control) {
+            return Err(ApiError::InvalidRequest(format!(
+                "label key must be 1 to {MAX_LABEL_KEY_LEN} bytes without control characters"
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::InvalidRequest(format!(
+                "label value for '{key}' exceeds {MAX_LABEL_VALUE_LEN} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a volume name.
 /// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
@@ -1492,5 +1522,34 @@ mod proptests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[rstest::rstest]
+    #[case::plain("team", "infra", true)]
+    #[case::empty_value("team", "", true)]
+    #[case::empty_key("", "x", false)]
+    #[case::control_in_key("a\nb", "x", false)]
+    fn labels_accept_plain_pairs_only(#[case] key: &str, #[case] value: &str, #[case] ok: bool) {
+        // Arrange
+        let given = [(key.to_string(), value.to_string())].into();
+
+        // Act
+        let result = labels(&given);
+
+        // Assert
+        assert_eq!(result.is_ok(), ok);
+    }
+
+    #[test]
+    fn labels_reject_oversized_value_and_too_many_pairs() {
+        // Arrange
+        let long = [("k".to_string(), "v".repeat(MAX_LABEL_VALUE_LEN + 1))].into();
+        let many = (0..=MAX_LABELS)
+            .map(|n| (format!("k{n}"), String::new()))
+            .collect();
+
+        // Act and assert
+        assert!(labels(&long).is_err());
+        assert!(labels(&many).is_err());
     }
 }

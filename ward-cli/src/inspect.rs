@@ -12,7 +12,7 @@ use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInf
 
 use crate::lifecycle::Failures;
 use crate::ps_filter::{self, Filters};
-use crate::template::{ANY_FIELD, Template};
+use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
 
 pub const PS_HEADERS: [&str; 6] = [
@@ -209,11 +209,19 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Status": status_text(info, now_seconds),
         "Reason": reason_name(info),
         "Names": info.name,
+        "Labels": labels_text(&info.labels),
     })
 }
 
+/// Docker's `ps` rendering of labels: `key=value` pairs joined by commas.
+fn labels_text(labels: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs.join(",")
+}
+
 /// Each `ps --format` field with the header a `table` template gives it.
-const PS_FIELDS: [(&str, &str); 9] = [
+const PS_FIELDS: [(&str, &str); 10] = [
     ("ID", "CONTAINER ID"),
     ("Image", "IMAGE"),
     ("Command", "COMMAND"),
@@ -223,6 +231,7 @@ const PS_FIELDS: [(&str, &str); 9] = [
     ("Status", "STATUS"),
     ("Reason", "REASON"),
     ("Names", "NAMES"),
+    (LABELS_FIELD, "LABELS"),
 ];
 
 pub struct PsOptions {
@@ -260,14 +269,15 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         object["ID"] = Value::String(id_text(info, options.no_trunc));
         object
     };
+    let template_record = |info: &SandboxInfo| match object(info) {
+        Value::Object(mut map) => {
+            map.insert(LABEL_MAP_KEY.to_string(), json!(info.labels));
+            Some(map)
+        }
+        _ => None,
+    };
     if let Some(template) = template {
-        let records: Vec<_> = shown
-            .into_iter()
-            .filter_map(|info| match object(info) {
-                Value::Object(map) => Some(map),
-                _ => None,
-            })
-            .collect();
+        let records: Vec<_> = shown.into_iter().filter_map(template_record).collect();
         print!("{}", template.render(&records));
         return Ok(());
     }
@@ -336,6 +346,7 @@ fn inspect_value(info: &SandboxInfo) -> Value {
             "Entrypoint": entrypoint,
             "WorkingDir": info.workdir,
             "User": info.user,
+            "Labels": info.labels,
         },
         "HostConfig": host_config(info),
     })
@@ -632,6 +643,7 @@ mod tests {
                 "Status": "Up 2 minutes",
                 "Reason": "",
                 "Names": "web1",
+                "Labels": "",
             })
         );
     }
@@ -707,6 +719,7 @@ mod tests {
                     "Entrypoint": null,
                     "WorkingDir": "",
                     "User": "",
+                    "Labels": {},
                 },
                 "HostConfig": {
                     "Memory": 0,
@@ -715,6 +728,27 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn given_labels_when_inspected_then_config_labels_is_a_map_and_ps_joins_pairs() {
+        // Arrange
+        let sandbox = SandboxInfo {
+            labels: [
+                ("b".to_string(), "2".to_string()),
+                ("a".to_string(), "1".to_string()),
+            ]
+            .into(),
+            ..info(SandboxStatus::Running, None)
+        };
+
+        // Act
+        let value = inspect_value(&sandbox);
+        let object = ps_json_object(&sandbox, 0);
+
+        // Assert
+        assert_eq!(value["Config"]["Labels"], json!({"a": "1", "b": "2"}));
+        assert_eq!(object["Labels"], "a=1,b=2");
     }
 
     #[test]

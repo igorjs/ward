@@ -1356,10 +1356,10 @@ async fn forward_events(
 
 fn event_to_pb(delivered: crate::sandbox::events::Delivered) -> PbSandboxEvent {
     let event = delivered.event;
-    let mut attributes = std::collections::HashMap::from([
-        (EVENT_IMAGE_ATTRIBUTE.to_string(), event.image),
-        (EVENT_NAME_ATTRIBUTE.to_string(), event.name),
-    ]);
+    let mut attributes: std::collections::HashMap<String, String> =
+        event.labels.into_iter().collect();
+    attributes.insert(EVENT_IMAGE_ATTRIBUTE.to_string(), event.image);
+    attributes.insert(EVENT_NAME_ATTRIBUTE.to_string(), event.name);
     if let Some(code) = event.exit_code {
         attributes.insert(EVENT_EXIT_CODE_ATTRIBUTE.to_string(), code.to_string());
     }

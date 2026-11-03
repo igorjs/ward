@@ -6,6 +6,7 @@ mod attach;
 mod client;
 mod commit;
 mod cp;
+mod create_opts;
 mod diff;
 mod docker;
 mod egress;
@@ -136,6 +137,8 @@ struct SandboxOpts {
     /// 10m or 1h30m. Off unless set here or by the daemon.
     #[arg(long = "exited-ttl", value_name = "DURATION", value_parser = parse_exited_ttl)]
     exited_ttl: Option<u64>,
+    #[command(flatten)]
+    extras: create_opts::CreateExtras,
 }
 
 /// Parse `--exited-ttl` into whole seconds, rounding a fraction up.
@@ -840,7 +843,7 @@ fn create_request(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let published_ports = ports::parse_all(&opts.publish)?;
     ports::warn_if_exposed(&published_ports);
-    Ok(ward_core::pb::CreateSandboxRequest {
+    let mut request = ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
         published_ports,
@@ -849,12 +852,13 @@ fn create_request(
             domains: opts.allow_domain,
         }),
         resources: Some(resources),
-        env: parse_env(&opts.env),
         name: opts.name.unwrap_or_default(),
         user: opts.user.unwrap_or_default(),
         pull_policy: ward_core::pb::PullPolicy::from(opts.pull) as i32,
         ..Default::default()
-    })
+    };
+    opts.extras.apply(&mut request, &opts.env)?;
+    Ok(request)
 }
 
 /// `--json` / `--no-pretty` accept either the flag or a truthy env
@@ -1011,6 +1015,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 "group" => ward_core::pb::CommunicationMode::Group,
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
+            let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut req = create_request(image, opts, timeout)?;
             req.command = command;
             req.comms = Some(ward_core::pb::CommunicationPolicy {
@@ -1019,17 +1024,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             });
             req.from_snapshot = from_snapshot.clone().unwrap_or_default();
             let mut c = client::connect(&socket_path).await?;
+            hooks.begin(&mut c, &token_store).await?;
 
-            let resp = if let (Some(_), Some(source_sandbox)) = (&from_snapshot, &source_sandbox) {
-                // Restoring from a snapshot requires the source sandbox's
-                // token to authorize the daemon's from_snapshot gate.
-                let source_token = tokens::load(&token_store, source_sandbox)?;
-                let mut request = tonic::Request::new(req);
-                tokens::attach_token(&mut request, source_token)?;
-                c.create_sandbox(request).await?.into_inner()
-            } else {
-                c.create_sandbox(req).await?.into_inner()
-            };
+            let created = async {
+                if let (Some(_), Some(source_sandbox)) = (&from_snapshot, &source_sandbox) {
+                    // Restoring from a snapshot requires the source sandbox's
+                    // token to authorize the daemon's from_snapshot gate.
+                    let source_token = tokens::load(&token_store, source_sandbox)?;
+                    let mut request = tonic::Request::new(req);
+                    tokens::attach_token(&mut request, source_token)?;
+                    Ok(c.create_sandbox(request).await?.into_inner())
+                } else {
+                    Ok(c.create_sandbox(req).await?.into_inner())
+                }
+            }
+            .await;
+            let resp = hooks.finish(created)?;
 
             // The sandbox already exists on the daemon, and without its
             // token no later command can manage or remove it, so the token
@@ -1175,6 +1185,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             detach,
             secret,
         } => {
+            let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
             request.secrets = secrets::load_all(&secret)?;
             request.command = command;
@@ -1190,6 +1201,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 tty,
                 rm,
                 detach,
+                hooks,
             };
             let code = docker::run(&socket_path, &token_store, request, flags).await?;
             std::process::exit(code);
