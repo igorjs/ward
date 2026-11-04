@@ -37,6 +37,8 @@ const FIELDS: [(&str, &str); 7] = [
     ("Size", "SIZE"),
 ];
 
+pub const BYTES_PER_MIB: u64 = 1024 * 1024;
+
 /// A byte count in Docker's decimal units.
 pub fn size_text(bytes: u64) -> String {
     human_size(bytes, BYTES_PER_UNIT, &SIZE_UNITS)
@@ -160,7 +162,7 @@ fn split_reference(reference: &str) -> (&str, &str) {
     }
 }
 
-fn record(image: &ImageInfo, no_trunc: bool, now: DateTime<Utc>) -> Map<String, Value> {
+pub(crate) fn record(image: &ImageInfo, no_trunc: bool, now: DateTime<Utc>) -> Map<String, Value> {
     let (repository, tag) = split_reference(&image.reference);
     let id = if no_trunc {
         image.digest.clone()

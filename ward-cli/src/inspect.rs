@@ -589,7 +589,7 @@ fn civil(seconds: i64) -> Civil {
     }
 }
 
-fn rfc3339(seconds: i64) -> String {
+pub(crate) fn rfc3339(seconds: i64) -> String {
     let c = civil(seconds);
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
