@@ -116,13 +116,15 @@ fn given_create_then_exec_in_new_process_when_token_persisted_then_succeeds() {
     // Act: `ward exec` in a second, independent invocation against the
     // same token store, exactly as a user's two shell commands would.
     let mut cmd = daemon.cli();
-    let assertion = cmd.args(["exec", "-d", &id, "--", "echo", "hi"]).assert();
+    let assertion = cmd
+        .args(["--json", "exec", "-d", &id, "--", "echo", "hi"])
+        .assert();
 
     // Assert: the persisted token authorizes the second process.
     assertion
         .success()
-        .stdout(predicate::str::contains("pid:"))
-        .stdout(predicate::str::contains("status: running"));
+        .stdout(predicate::str::contains("\"pid\""))
+        .stdout(predicate::str::contains("\"status\":\"running\""));
 }
 
 // ---------------------------------------------------------------------------

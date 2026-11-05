@@ -227,7 +227,7 @@ fn given_a_named_sandbox_when_plain_exec_runs_then_the_name_is_resolved() {
 
 #[cfg(not(feature = "krunvm"))]
 #[test]
-fn given_exec_d_when_it_runs_then_it_prints_the_pid_and_status_and_exits_zero() {
+fn given_exec_d_when_it_runs_then_it_prints_nothing_and_exits_zero() {
     // Arrange
     let daemon = Daemon::spawn();
     let mut cmd = daemon.cli();
@@ -239,15 +239,34 @@ fn given_exec_d_when_it_runs_then_it_prints_the_pid_and_status_and_exits_zero() 
     let assertion = cmd.args(["exec", "-d", "detached-exec", "echo"]).assert();
 
     // Assert
-    assertion
-        .success()
-        .stdout(predicate::str::contains("pid:"))
-        .stdout(predicate::str::contains("status:"));
+    assertion.success().stdout(predicate::str::is_empty());
 }
 
 #[cfg(not(feature = "krunvm"))]
 #[test]
-fn given_exec_dit_when_it_runs_then_it_is_detached_and_prints_the_pid() {
+fn given_exec_d_with_json_when_it_runs_then_it_prints_the_pid_and_status() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["run", "-d", "--name", "detached-json", "alpine", "true"]);
+    assert!(cmd.output().expect("run -d").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["--json", "exec", "-d", "detached-json", "echo"])
+        .assert();
+
+    // Assert
+    assertion
+        .success()
+        .stdout(predicate::str::contains("\"pid\""))
+        .stdout(predicate::str::contains("\"status\""));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_exec_dit_when_it_runs_then_it_is_detached_and_prints_nothing() {
     // Arrange
     let daemon = Daemon::spawn();
     let mut cmd = daemon.cli();
@@ -259,7 +278,7 @@ fn given_exec_dit_when_it_runs_then_it_is_detached_and_prints_the_pid() {
     let assertion = cmd.args(["exec", "-dit", "detached-it", "echo"]).assert();
 
     // Assert
-    assertion.success().stdout(predicate::str::contains("pid:"));
+    assertion.success().stdout(predicate::str::is_empty());
 }
 
 #[cfg(not(feature = "krunvm"))]
@@ -310,7 +329,7 @@ fn given_an_unknown_flag_when_run_or_exec_is_parsed_then_usage_error_exits_125()
 
 #[cfg(not(feature = "krunvm"))]
 #[test]
-fn given_an_unknown_flag_when_another_command_is_parsed_then_clap_exits_2() {
+fn given_an_unknown_flag_when_another_command_is_parsed_then_it_exits_125() {
     // Arrange
     let daemon = Daemon::spawn();
 
@@ -319,7 +338,21 @@ fn given_an_unknown_flag_when_another_command_is_parsed_then_clap_exits_2() {
     let assertion = cmd.args(["ps", "--bogus"]).assert();
 
     // Assert
-    assertion.code(2);
+    assertion.code(DOCKER_CLI_FAILURE);
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_an_unknown_subcommand_when_parsed_then_it_exits_1() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["frobnicate"]).assert();
+
+    // Assert
+    assertion.code(1);
 }
 
 #[cfg(not(feature = "krunvm"))]
@@ -495,4 +528,47 @@ fn given_logs_since_in_the_future_or_an_invalid_value_when_run_then_old_output_i
     assert!(hidden.status.success() && hidden.stdout.is_empty());
     assert!(String::from_utf8_lossy(&shown.stdout).contains("stub: echo"));
     assert!(!invalid.status.success());
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_create_with_workdir_and_tty_when_inspected_then_both_are_recorded() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["create", "-it", "-w", "/srv", "--name", "made", "alpine"]);
+    assert!(cmd.output().expect("create").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args([
+            "inspect",
+            "--format",
+            "{{.Config.WorkingDir}} {{.Config.Tty}}",
+            "made",
+        ])
+        .assert();
+
+    // Assert
+    assertion
+        .success()
+        .stdout(predicate::str::contains("/srv true"));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_rm_with_volumes_flag_when_it_runs_then_the_sandbox_is_removed() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["create", "--name", "gone", "alpine"]);
+    assert!(cmd.output().expect("create").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["rm", "-fv", "gone"]).assert();
+
+    // Assert
+    assertion.success().stdout("gone\n");
 }

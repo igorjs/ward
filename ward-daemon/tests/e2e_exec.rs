@@ -19,17 +19,8 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
 // ---------------------------------------------------------------------------
-// Helpers: parse `id:` and `pid:` lines out of stdout for chained commands.
+// Helpers: read the PID out of `--json` output for chained commands.
 // ---------------------------------------------------------------------------
-
-fn extract_field(stdout: &str, prefix: &str) -> String {
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            return rest.trim().to_string();
-        }
-    }
-    panic!("no {prefix:?} line in stdout:\n{stdout}");
-}
 
 // ---------------------------------------------------------------------------
 // Feature: exec
@@ -53,14 +44,14 @@ fn given_existing_sandbox_when_user_runs_exec_echo_then_returns_pid_and_running_
     // Act: the user types `ward exec <id> -- echo hello`.
     let mut cmd = daemon.cli();
     let assertion = cmd
-        .args(["exec", "-d", &id, "--", "echo", "hello"])
+        .args(["--json", "exec", "-d", &id, "--", "echo", "hello"])
         .assert();
 
     // Assert: success plus pid + status fields scripts can grep.
     assertion
         .success()
-        .stdout(predicate::str::contains("pid:"))
-        .stdout(predicate::str::contains("status: running"));
+        .stdout(predicate::str::contains("\"pid\""))
+        .stdout(predicate::str::contains("\"status\":\"running\""));
 }
 
 #[test]
@@ -208,10 +199,10 @@ fn given_exec_when_user_runs_logs_then_streams_stdout_and_exit() {
         .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", "-d", &id, "--", "echo", "hello"])
+        .args(["--json", "exec", "-d", &id, "--", "echo", "hello"])
         .output()
         .expect("exec");
-    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act
     let mut cmd = daemon.cli();
@@ -289,10 +280,10 @@ fn given_exec_when_user_writes_stdin_then_command_succeeds() {
         .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", "-d", &id, "--", "cat"])
+        .args(["--json", "exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
-    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act: literal-arg form — avoids touching the CLI's own stdin in tests.
     let mut cmd = daemon.cli();
@@ -363,10 +354,10 @@ fn given_exec_when_user_runs_kill_then_succeeds_and_subsequent_stdin_fails() {
         .to_string();
     let exec_out = daemon
         .cli()
-        .args(["exec", "-d", &id, "--", "cat"])
+        .args(["--json", "exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
-    let pid = extract_field(std::str::from_utf8(&exec_out.stdout).unwrap(), "pid: ");
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act: kill succeeds and prints the sandbox reference, like `docker kill`.
     daemon

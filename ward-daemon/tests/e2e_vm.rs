@@ -81,12 +81,12 @@ struct Finished {
 /// Start a process and return its pid without waiting.
 fn start(d: &Daemon, id: &str, workdir: Option<&str>, argv: &[&str]) -> String {
     let mut cmd = d.cli();
-    cmd.args(["exec", "-d", id]);
+    cmd.args(["--json", "exec", "-d", id]);
     if let Some(dir) = workdir {
         cmd.args(["--workdir", dir]);
     }
     cmd.arg("--").args(argv);
-    field(&run_ok(cmd), "pid: ")
+    common::json_pid(&run_ok(cmd))
 }
 
 /// Read a process's output until it exits.

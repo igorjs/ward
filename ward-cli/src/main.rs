@@ -155,6 +155,12 @@ struct SandboxOpts {
     /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
     #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
     user: Option<String>,
+    /// Replace the image entrypoint. An empty value clears it.
+    #[arg(long)]
+    entrypoint: Option<String>,
+    /// Working directory.
+    #[arg(short = 'w', long)]
+    workdir: Option<String>,
     /// Publish a port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp|/udp]. Without
     /// HOST_PORT, or with 0, the daemon picks a free one. Either side can be a
     /// range such as 8000-8010:80 (the first free host port) or
@@ -225,6 +231,13 @@ enum Commands {
         command: Vec<String>,
         #[command(flatten)]
         opts: SandboxOpts,
+        /// Accepted for Docker scripts. Stdin is forwarded when you
+        /// `start -i` or `attach`, so this has no effect on its own.
+        #[arg(short, long)]
+        interactive: bool,
+        /// Give the main process a pseudo-terminal when it starts.
+        #[arg(short, long)]
+        tty: bool,
         /// Timeout in seconds (0 = no timeout).
         #[arg(long, default_value = "0")]
         timeout: u64,
@@ -339,7 +352,8 @@ enum Commands {
     /// Execute a command inside a sandbox.
     ///
     /// The command's output is printed and the CLI exits with its exit
-    /// code. With -d it starts in the background and prints its PID.
+    /// code. With -d it starts in the background and prints nothing, as
+    /// Docker does; with --json it prints the PID and status.
     Exec {
         /// Sandbox name, ID or ID prefix.
         id: String,
@@ -361,8 +375,8 @@ enum Commands {
         /// Run the command on a pseudo-terminal.
         #[arg(short, long)]
         tty: bool,
-        /// Start the command in the background and print its PID. Ignores
-        /// -i and -t, since nothing attaches to the command.
+        /// Start the command in the background. Ignores -i and -t, since
+        /// nothing attaches to the command.
         #[arg(short, long)]
         detach: bool,
         /// Give the command a secret file at /run/secrets/NAME, read from
@@ -381,12 +395,6 @@ enum Commands {
         command: Vec<String>,
         #[command(flatten)]
         opts: SandboxOpts,
-        /// Replace the image entrypoint. An empty value clears it.
-        #[arg(long)]
-        entrypoint: Option<String>,
-        /// Working directory.
-        #[arg(short = 'w', long)]
-        workdir: Option<String>,
         /// Keep stdin open and send it to the command.
         #[arg(short, long)]
         interactive: bool,
@@ -531,6 +539,10 @@ enum Commands {
         /// sandbox mounts them.
         #[arg(short = 'v', long = "volumes")]
         volumes: bool,
+        /// Not supported: sandboxes have no links to remove. Docker's short
+        /// -l is `--latest` here, as in Podman.
+        #[arg(long)]
+        link: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -1054,6 +1066,10 @@ fn create_request(
         resources: Some(resources),
         name: opts.name.unwrap_or_default(),
         user: opts.user.unwrap_or_default(),
+        // The image config only matters for an entrypoint override.
+        use_image_config: opts.entrypoint.is_some(),
+        entrypoint: opts.entrypoint,
+        workdir: opts.workdir.unwrap_or_default(),
         pull_policy: ward_core::pb::PullPolicy::from(opts.pull) as i32,
         ..Default::default()
     };
@@ -1191,6 +1207,33 @@ fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
     )
 }
 
+/// The exit code for a command line that did not parse, as Docker gives it: a
+/// bad flag is 125, while a wrong number of arguments or an unknown
+/// subcommand is 1. `run`, `exec` and the `exists` commands use 125 for all.
+fn parse_failure_code(error: &clap::Error, subcommand: Option<&str>) -> i32 {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if reports_cli_failure_as_125(subcommand) {
+        return CLI_FAILURE_EXIT_CODE;
+    }
+    let bad_flag = || {
+        matches!(
+            error.get(ContextKind::InvalidArg),
+            Some(ContextValue::String(arg)) if arg.starts_with('-')
+        )
+    };
+    match error.kind() {
+        ErrorKind::InvalidSubcommand
+        | ErrorKind::MissingSubcommand
+        | ErrorKind::MissingRequiredArgument
+        | ErrorKind::TooManyValues
+        | ErrorKind::TooFewValues
+        | ErrorKind::ArgumentConflict
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => GENERIC_FAILURE_EXIT_CODE,
+        ErrorKind::UnknownArgument if !bad_flag() => GENERIC_FAILURE_EXIT_CODE,
+        _ => CLI_FAILURE_EXIT_CODE,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let original = expand_groups(std::env::args().collect());
@@ -1209,10 +1252,8 @@ async fn main() {
     let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
-            let code = if e.use_stderr()
-                && reports_cli_failure_as_125(subcommand_name(args.clone()).as_deref())
-            {
-                CLI_FAILURE_EXIT_CODE
+            let code = if e.use_stderr() {
+                parse_failure_code(&e, subcommand_name(args.clone()).as_deref())
             } else {
                 e.exit_code()
             };
@@ -1248,6 +1289,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             image,
             command,
             opts,
+            interactive: _,
+            tty,
             timeout,
             comms_mode,
             comms_group,
@@ -1264,6 +1307,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let hooks = opts.extras.hooks(opts.name.as_deref());
             let mut req = create_request(image, opts, timeout)?;
             req.command = command;
+            req.tty = tty;
             req.comms = Some(ward_core::pb::CommunicationPolicy {
                 mode: comms_mode_pb as i32,
                 group: comms_group,
@@ -1430,12 +1474,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 secrets,
             })?;
             let resp = c.exec(request).await?.into_inner();
-            // pid is the handle the user passes back to `ward logs <id> <pid>`.
+            // Docker prints nothing for `exec -d`; --json keeps the PID that
+            // `ward logs <id> <pid>` takes.
             if json {
                 println!("{}", json!({"pid": resp.pid, "status": resp.status}));
-            } else {
-                println!("pid: {}", resp.pid);
-                println!("status: {}", resp.status);
             }
         }
 
@@ -1443,8 +1485,6 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             image,
             command,
             opts,
-            entrypoint,
-            workdir,
             interactive,
             tty,
             rm,
@@ -1462,10 +1502,8 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             request.secrets = secrets::load_all(&secret)?;
             request.command = command;
             request.use_image_config = true;
-            request.entrypoint = entrypoint;
             request.require_command = true;
             request.tty = tty;
-            request.workdir = workdir.unwrap_or_default();
             // A detached run has no client to remove it, so the daemon does.
             request.auto_remove = rm && detach;
             let flags = docker::RunFlags {
@@ -1726,7 +1764,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             refs,
             force,
             volumes,
+            link,
         } => {
+            lifecycle::refuse_link(link)?;
             let mut c = client::connect(&socket_path).await?;
             lifecycle::remove(&mut c, &token_store, &refs, force, volumes, json).await?;
         }
@@ -2407,8 +2447,87 @@ mod tests {
     }
 
     #[test]
-    fn given_create_with_entrypoint_flag_when_parsed_then_clap_error() {
-        assert!(Cli::try_parse_from(["ward", "create", "--entrypoint", "/x", "alpine"]).is_err());
+    fn given_create_with_entrypoint_and_workdir_when_request_built_then_both_are_sent() {
+        // Arrange
+        let cli = Cli::try_parse_from([
+            "ward",
+            "create",
+            "--entrypoint",
+            "/x",
+            "-w",
+            "/srv",
+            "alpine",
+        ])
+        .expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert_eq!(request.entrypoint.as_deref(), Some("/x"));
+        assert_eq!(request.workdir, "/srv");
+        assert!(request.use_image_config);
+    }
+
+    #[test]
+    fn given_create_without_entrypoint_when_request_built_then_image_config_is_not_used() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "create", "alpine"]).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        assert!(!request.use_image_config);
+        assert_eq!(request.entrypoint, None);
+    }
+
+    #[test]
+    fn given_create_with_interactive_and_tty_when_parsed_then_both_are_kept() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "create", "-it", "alpine"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Create {
+                interactive, tty, ..
+            } => assert!(interactive && tty),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_pull_with_disable_content_trust_when_parsed_then_it_is_accepted() {
+        match Cli::try_parse_from(["ward", "pull", "--disable-content-trust", "alpine"])
+            .expect("parse")
+            .command
+        {
+            Commands::Pull { flags, .. } => assert!(flags.disable_content_trust),
+            other => panic!("expected Pull, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_rm_with_volumes_flag_when_parsed_then_it_is_accepted() {
+        // Act
+        let cli = Cli::try_parse_from(["ward", "rm", "-fv", "web1"]).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Remove {
+                force,
+                volumes,
+                link,
+                ..
+            } => assert!(force && volumes && !link),
+            other => panic!("expected Remove, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2736,5 +2855,33 @@ mod tests {
             }
             other => panic!("expected Remove, got {other:?}"),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_flag(&["ward", "ps", "--nope"], CLI_FAILURE_EXIT_CODE)]
+    #[case::bad_flag_value(&["ward", "stop", "-t", "soon", "web1"], CLI_FAILURE_EXIT_CODE)]
+    #[case::unknown_subcommand(&["ward", "frobnicate"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::missing_argument(&["ward", "rm"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::extra_argument(&["ward", "port", "web1", "80", "extra"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::conflicting_flags(&["ward", "rmi", "-a", "alpine"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::json_before_bad_subcommand(&["ward", "--json", "frobnicate"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::json_before_bad_flag(&["ward", "--json", "ps", "--nope"], CLI_FAILURE_EXIT_CODE)]
+    #[case::run_unknown_flag(&["ward", "run", "--nope", "alpine"], CLI_FAILURE_EXIT_CODE)]
+    #[case::run_missing_image(&["ward", "run"], CLI_FAILURE_EXIT_CODE)]
+    fn given_a_bad_command_line_when_coded_then_it_follows_docker(
+        #[case] args: &[&str],
+        #[case] want: i32,
+    ) {
+        // Arrange
+        let error = Cli::try_parse_from(args).expect_err("must not parse");
+
+        // Act
+        let code = parse_failure_code(
+            &error,
+            subcommand_name(args.iter().map(|a| (*a).to_string())).as_deref(),
+        );
+
+        // Assert
+        assert_eq!(code, want, "{error}");
     }
 }

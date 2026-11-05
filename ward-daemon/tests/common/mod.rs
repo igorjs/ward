@@ -290,3 +290,10 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         }
     }
 }
+
+/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
+#[allow(dead_code)]
+pub fn json_pid(stdout: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
+    value["pid"].as_str().expect("pid").to_string()
+}

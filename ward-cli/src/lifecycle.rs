@@ -22,6 +22,9 @@ use crate::client::{self, Resolved};
 use crate::stop_options::StopOptions;
 use crate::tokens;
 
+/// Why `rm --link` is refused.
+const NO_LINKS: &str = "--link is not supported: sandboxes have no links to remove";
+
 /// The state change a lifecycle command asks for.
 #[derive(Clone, Copy)]
 pub enum Action {
@@ -123,6 +126,18 @@ pub async fn lifecycle(
         }
     }
     failures.finish(refs.len(), action.past())
+}
+
+/// Refuse `rm --link`, which Docker uses to drop a link between containers.
+///
+/// # Errors
+///
+/// Fails when `link` is set.
+pub fn refuse_link(link: bool) -> Result<()> {
+    if link {
+        anyhow::bail!(NO_LINKS);
+    }
+    Ok(())
 }
 
 pub async fn remove(
@@ -243,4 +258,24 @@ pub async fn remove_with_volumes(
         eprintln!("warning: could not prune local token store: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_link_flag_when_refused_then_the_error_is_one_line_with_the_reason() {
+        // Act
+        let error = refuse_link(true).unwrap_err().to_string();
+
+        // Assert
+        assert_eq!(error, NO_LINKS);
+        assert_eq!(error.lines().count(), 1);
+    }
+
+    #[test]
+    fn given_no_link_flag_when_refused_then_it_passes() {
+        assert!(refuse_link(false).is_ok());
+    }
 }

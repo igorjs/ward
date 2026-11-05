@@ -10,7 +10,8 @@ use std::time::Duration;
 use common::Daemon;
 
 const WAITER_HEAD_START: Duration = Duration::from_millis(500);
-const CLAP_USAGE_EXIT: i32 = 2;
+/// Docker's exit code for a bad flag value.
+const FLAG_ERROR_EXIT: i32 = 125;
 
 fn create(d: &Daemon) {
     let out = d
@@ -77,5 +78,5 @@ fn given_an_unknown_condition_when_parsed_then_clap_rejects_it() {
         .expect("wait");
 
     // Assert
-    assert_eq!(out.status.code(), Some(CLAP_USAGE_EXIT));
+    assert_eq!(out.status.code(), Some(FLAG_ERROR_EXIT));
 }
