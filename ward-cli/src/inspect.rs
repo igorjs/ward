@@ -660,14 +660,17 @@ pub struct InspectOptions<'a> {
     pub kind: Kind,
 }
 
-/// Whether the daemon said the object does not exist. A name no sandbox can
-/// have, such as an image tag with a colon, counts too.
+/// Words the daemon uses for a name no sandbox can have, such as an image tag
+/// with a colon.
+const BAD_NAME_WORDS: &str = "invalid characters";
+
+/// Whether the daemon said no sandbox has this name. Any other invalid
+/// argument is a real error and is not hidden by the image lookup.
 fn is_not_found(error: &anyhow::Error) -> bool {
     error.downcast_ref::<tonic::Status>().is_some_and(|status| {
-        matches!(
-            status.code(),
-            tonic::Code::NotFound | tonic::Code::InvalidArgument
-        )
+        status.code() == tonic::Code::NotFound
+            || (status.code() == tonic::Code::InvalidArgument
+                && status.message().contains(BAD_NAME_WORDS))
     })
 }
 
@@ -774,6 +777,21 @@ pub async fn kill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::missing(tonic::Status::not_found("No such container: x"), true)]
+    #[case::bad_name(
+        tonic::Status::invalid_argument("sandbox name or ID contains invalid characters"),
+        true
+    )]
+    #[case::other_invalid(tonic::Status::invalid_argument("limit is negative"), false)]
+    #[case::unavailable(tonic::Status::unavailable("down"), false)]
+    fn given_a_daemon_status_when_checked_then_only_a_missing_sandbox_falls_through(
+        #[case] status: tonic::Status,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_not_found(&anyhow::Error::from(status)), expected);
+    }
 
     #[rstest::rstest]
     #[case::unset(None, Some(Kind::Any))]

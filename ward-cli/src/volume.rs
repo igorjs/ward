@@ -17,6 +17,8 @@ use crate::{output, template};
 /// The only volume driver, and the only scope.
 const DRIVER: &str = "local";
 const SCOPE: &str = "local";
+/// Size of a new volume, in MiB.
+const DEFAULT_SIZE_MIB: u32 = 1024;
 /// Nothing links to a volume.
 const NO_LINKS: &str = "N/A";
 /// The words `dangling=` accepts, as Docker does.
@@ -60,7 +62,7 @@ pub struct CreateArgs {
     /// Volume name.
     pub name: String,
     /// Size in MiB.
-    #[arg(long, default_value = "1024")]
+    #[arg(long, default_value_t = DEFAULT_SIZE_MIB)]
     pub size: u32,
     /// Volume driver. Only `local` exists.
     #[arg(short, long, default_value = DRIVER)]
@@ -528,23 +530,36 @@ mod tests {
         assert_eq!(request.size_mb, 10);
     }
 
-    #[rstest::rstest]
-    #[case::other_driver("nfs", &[], "volume driver \"nfs\" is not supported")]
-    #[case::option("local", &["type=tmpfs"], "volume option \"type=tmpfs\" is not supported")]
-    #[case::empty_label_key("local", &["=x"], "the key is empty")]
-    fn given_unsupported_input_when_request_built_then_the_reason_is_given(
-        #[case] driver: &str,
-        #[case] extra: &[&str],
-        #[case] said: &str,
-    ) {
-        let args = if said.contains("option") {
-            create_args(driver, &[], extra)
-        } else {
-            create_args(driver, extra, &[])
-        };
+    #[test]
+    fn given_another_driver_when_request_built_then_it_is_refused() {
+        let error = create_args("nfs", &[], &[]).request().expect_err("refused");
 
-        let error = args.request().expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("volume driver \"nfs\" is not supported")
+        );
+    }
 
-        assert!(error.to_string().contains(said), "{error}");
+    #[test]
+    fn given_an_option_when_request_built_then_it_is_refused_with_the_reason() {
+        let error = create_args("local", &[], &["type=tmpfs"])
+            .request()
+            .expect_err("refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("volume option \"type=tmpfs\" is not supported")
+        );
+    }
+
+    #[test]
+    fn given_a_label_with_an_empty_key_when_request_built_then_it_is_refused() {
+        let error = create_args("local", &["=x"], &[])
+            .request()
+            .expect_err("refused");
+
+        assert!(error.to_string().contains("invalid label"), "{error}");
     }
 }

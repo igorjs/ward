@@ -18,11 +18,16 @@ const GRAPH_DRIVER: &str = "ward";
 /// Docker's zero time, for an image that was never tagged.
 const NEVER: &str = "0001-01-01T00:00:00Z";
 
+const UNAME_ARM64: &str = "aarch64";
+const UNAME_AMD64: &str = "x86_64";
+const DOCKER_ARM64: &str = "arm64";
+const DOCKER_AMD64: &str = "amd64";
+
 /// Docker's name for a CPU architecture, from the one `uname` reports.
 fn docker_arch(arch: &str) -> &str {
     match arch {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
+        UNAME_ARM64 => DOCKER_ARM64,
+        UNAME_AMD64 => DOCKER_AMD64,
         other => other,
     }
 }
@@ -31,7 +36,7 @@ fn created_text(image: &ImageInfo) -> String {
     image
         .created_at
         .as_ref()
-        .and_then(|t| DateTime::<Utc>::from_timestamp(t.seconds, t.nanos as u32))
+        .and_then(|t| DateTime::<Utc>::from_timestamp(t.seconds, u32::try_from(t.nanos).ok()?))
         .map_or_else(
             || NEVER.to_string(),
             |t| t.to_rfc3339_opts(SecondsFormat::AutoSi, true),
@@ -55,10 +60,11 @@ pub fn image_value(
     config: &ImageHistoryResponse,
     daemon_arch: &str,
 ) -> Value {
-    let digests: Vec<String> = tags
+    let mut digests: Vec<String> = tags
         .iter()
         .map(|tag| format!("{}@{}", split_reference(tag).0, image.digest))
         .collect();
+    digests.dedup();
     json!({
         "Id": image.digest,
         "RepoTags": tags,
@@ -165,6 +171,19 @@ mod tests {
         assert_eq!(value["Os"], "linux");
         assert_eq!(value["Size"], 7_800_000);
         assert_eq!(value["RootFS"]["Type"], "layers");
+    }
+
+    #[test]
+    fn given_two_tags_of_one_repository_when_valued_then_the_repo_digest_is_listed_once() {
+        let tags = vec![
+            "docker.io/library/alpine:3".to_string(),
+            "docker.io/library/alpine:latest".to_string(),
+        ];
+
+        let value = image_value(&cached(), &tags, &ImageHistoryResponse::default(), "x86_64");
+
+        assert_eq!(value["RepoTags"].as_array().unwrap().len(), 2);
+        assert_eq!(value["RepoDigests"].as_array().unwrap().len(), 1);
     }
 
     #[test]

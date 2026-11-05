@@ -129,8 +129,8 @@ const MAX_LABEL_KEY_LEN: usize = 256;
 /// Longest label value, in bytes.
 const MAX_LABEL_VALUE_LEN: usize = 4096;
 
-/// Validate sandbox or volume labels: a bounded count, non-empty keys without control
-/// characters, and bounded values.
+/// Validate sandbox or volume labels: a bounded count, non-empty keys
+/// without control characters, and bounded values.
 pub fn labels(labels: &std::collections::HashMap<String, String>) -> Result<(), ApiError> {
     if labels.len() > MAX_LABELS {
         return Err(ApiError::InvalidRequest(format!(
