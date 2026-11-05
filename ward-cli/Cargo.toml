@@ -23,7 +23,6 @@ tar = "0.4"
 # Aligned-column rendering for `ward list`, `ward volume list`, and
 # `ward snapshot list` when stdout is a TTY. Piped output stays
 # tab-separated so scripts keep working.
-tabled = { version = "0.21", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 # rustix: termios raw mode and window size without the libc unsafe surface.
 rustix = { version = "1", features = ["termios"] }

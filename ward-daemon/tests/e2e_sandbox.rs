@@ -77,7 +77,7 @@ fn given_running_daemon_when_user_creates_with_oversized_cpus_then_fails() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_no_sandboxes_when_user_runs_list_then_output_is_empty() {
+fn given_no_sandboxes_when_user_runs_list_then_only_the_header_prints() {
     // Arrange
     let daemon = common::Daemon::spawn();
 
@@ -85,9 +85,11 @@ fn given_no_sandboxes_when_user_runs_list_then_output_is_empty() {
     let mut cmd = daemon.cli();
     let assertion = cmd.arg("list").assert();
 
-    // Assert: empty stdout is the contract for "no matches" — distinct
-    // from "command failed" which would be a non-zero exit.
-    assertion.success().stdout(predicate::str::is_empty());
+    // Assert: like Docker, "no matches" still prints the header row.
+    assertion.success().stdout(
+        predicate::str::starts_with("ID ")
+            .and(predicate::function(|s: &str| s.lines().count() == 1)),
+    );
 }
 
 #[test]

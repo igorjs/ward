@@ -4,14 +4,11 @@
 //!
 //! Three modes per command family:
 //!
-//!   1. Default key/value or tab-separated (the historical behaviour;
-//!      stable for `grep` / `awk` pipelines).
+//!   1. Default: key/value lines, or Docker's aligned table with a header
+//!      for list commands, whether or not stdout is a TTY.
 //!   2. `--json` (or `WARD_JSON=1`): one JSON object per command,
 //!      array for list commands. Stable for `jq`.
-//!   3. List commands on a TTY: aligned tables via `tabled`. Piped
-//!      output stays tab-separated even without `--no-pretty` because
-//!      assert_cmd's child stdout is not a TTY; this matches the
-//!      isatty(stdout) detection ward-cli does.
+//!   3. `--no-pretty`: tab-separated list rows, a Ward only flag.
 //!
 //! Style mirrors the rest of `ward-daemon/tests/`: BDD names, one
 //! scenario per test, shared `common::Daemon` for daemon isolation.
@@ -98,7 +95,7 @@ fn given_list_with_json_flag_when_run_then_emits_array() {
 }
 
 #[test]
-fn given_list_when_run_piped_then_emits_tab_separated() {
+fn given_list_when_run_piped_then_emits_aligned_table_with_header() {
     // Arrange
     let daemon = common::Daemon::spawn();
     daemon
@@ -107,11 +104,31 @@ fn given_list_when_run_piped_then_emits_tab_separated() {
         .assert()
         .success();
 
-    // Act: assert_cmd's child stdout is not a TTY, so the CLI's
-    // isatty(stdout) check returns false and the default path stays
-    // tab-separated even without --no-pretty.
+    // Act: assert_cmd's child stdout is not a TTY, and Docker prints the
+    // same aligned table either way.
     let mut cmd = daemon.cli();
     let assertion = cmd.arg("list").assert();
+
+    // Assert: a header row plus one row, no tabs.
+    assertion.success().stdout(predicate::function(|s: &str| {
+        let lines: Vec<&str> = s.lines().collect();
+        lines.len() == 2 && lines[0].starts_with("ID ") && !s.contains('\t')
+    }));
+}
+
+#[test]
+fn given_list_with_no_pretty_when_run_then_emits_tab_separated_rows() {
+    // Arrange
+    let daemon = common::Daemon::spawn();
+    daemon
+        .cli()
+        .args(["create", "alpine:latest"])
+        .assert()
+        .success();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd.args(["--no-pretty", "list"]).assert();
 
     // Assert: exactly one row, three tab-separated columns.
     assertion.success().stdout(predicate::function(|s: &str| {

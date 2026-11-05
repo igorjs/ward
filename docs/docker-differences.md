@@ -59,6 +59,10 @@ Ward has three modes: `deny` (default), `allowlist` and `open`. In `allowlist` m
 
 A `deny` sandbox without published ports records nothing for `suggest`. The guest has no network card, so there is no outbound attempt for Ward to see. With published ports the stack runs and refusals are recorded.
 
+## Table output
+
+List commands (`ps`, `images`, `volume ls`, `system df` and so on) print Docker's space-aligned table with a header row, whether or not stdout is a terminal. `--no-pretty` (or `WARD_NO_PRETTY=1`) is a Ward only flag that switches them to tab-separated columns, with the header kept, for `cut -f` pipelines.
+
 ## Secrets in process lists
 
 - `ward ps` shows only `argv[0]` in the COMMAND column. Arguments often hold secrets.

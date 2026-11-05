@@ -41,7 +41,7 @@ fn ok(d: &Daemon, args: &[&str]) -> String {
 /// The status column of `ward list` for `id`, or None when it is not listed.
 fn status_of(d: &Daemon, id: &str) -> Option<String> {
     ok(d, &["list"]).lines().find_map(|l| {
-        let mut cols = l.split('\t');
+        let mut cols = l.split_whitespace();
         (cols.next() == Some(id)).then(|| cols.next().unwrap_or_default().to_string())
     })
 }
@@ -245,15 +245,15 @@ fn given_running_sandbox_when_ps_then_header_and_a_row_are_printed() {
 
     // Assert
     let mut lines = printed.lines();
-    assert_eq!(
-        lines.next(),
-        Some("CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES")
-    );
-    let row: Vec<&str> = lines.next().expect("row").split('\t').collect();
-    assert_eq!(row[0], &id[..12]);
-    assert_eq!(row[1], "alpine:latest");
-    assert!(row[4].starts_with("Up"), "{row:?}");
-    assert_eq!(row[6], "web1");
+    let header = lines.next().expect("header");
+    assert!(header.starts_with("CONTAINER ID   IMAGE "), "{header}");
+    assert!(header.ends_with("   NAMES"), "{header}");
+    let row = lines.next().expect("row");
+    assert!(row.starts_with(&id[..12]), "{row}");
+    assert!(row.contains("alpine:latest"), "{row}");
+    assert!(row.contains("Up"), "{row}");
+    assert!(row.ends_with("web1"), "{row}");
+    assert!(!printed.contains('\t'), "{printed}");
     assert_eq!(lines.next(), None);
 }
 
