@@ -49,6 +49,7 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         }
         ApiError::NameInUse { name, id } => Status::already_exists(name_conflict_message(name, id)),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
+        ApiError::VolumeInUse(msg) => Status::failed_precondition(msg.clone()),
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
         ApiError::ImageNotFound(msg) => Status::not_found(msg.clone()),
@@ -208,6 +209,11 @@ pub struct WardGrpcServer {
     pub sandbox: Arc<SandboxManager>,
     pub volume: Arc<VolumeManager>,
     pub started_at: Instant,
+    /// Host facts `GetInfo` reports, read once at startup.
+    host: crate::host_info::HostInfo,
+    /// Data directory and daemon id `GetInfo` reports; empty in embedded use.
+    root_dir: String,
+    daemon_id: String,
 }
 
 impl WardGrpcServer {
@@ -216,7 +222,18 @@ impl WardGrpcServer {
             sandbox,
             volume,
             started_at: Instant::now(),
+            host: crate::host_info::HostInfo::detect(),
+            root_dir: String::new(),
+            daemon_id: String::new(),
         }
+    }
+
+    /// Names the data directory `GetInfo` reports and keeps the daemon id in.
+    #[must_use]
+    pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
+        self.root_dir = data_dir.display().to_string();
+        self.daemon_id = crate::host_info::daemon_id(&data_dir);
+        self
     }
 }
 
@@ -708,7 +725,9 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         self.volume
-            .remove(&req.id)
+            .remove_if_unused(&req.id, |name| async move {
+                self.sandbox.volume_users(&name).await
+            })
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
@@ -1422,6 +1441,13 @@ impl Ward for WardGrpcServer {
             platform: std::env::consts::OS.to_string(),
             backend: "krunvm".to_string(),
             arch: std::env::consts::ARCH.to_string(),
+            hostname: self.host.hostname.clone(),
+            kernel_version: self.host.kernel_version.clone(),
+            operating_system: self.host.operating_system.clone(),
+            ncpu: self.host.ncpu,
+            mem_total_bytes: self.host.mem_total_bytes,
+            root_dir: self.root_dir.clone(),
+            id: self.daemon_id.clone(),
         }))
     }
 }

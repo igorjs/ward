@@ -43,12 +43,12 @@ fn given_running_daemon_when_user_runs_info_then_output_includes_version() {
     let mut cmd = daemon.cli();
     let assertion = cmd.arg("info").assert();
 
-    // Assert: stdout contains a `version: <semver>` line. We don't pin
+    // Assert: stdout contains a `Server Version: <semver>` line. We don't pin
     // the version string (it changes across releases) but the *prefix*
     // is the public CLI contract — scripts grep for it.
     assertion
         .success()
-        .stdout(predicate::str::contains("version:"));
+        .stdout(predicate::str::contains("Server Version:"));
 }
 
 #[test]
@@ -64,9 +64,9 @@ fn given_running_daemon_when_user_runs_info_then_output_includes_platform_arch_b
     // refactor accidentally drops one, this test fails loud.
     assertion
         .success()
-        .stdout(predicate::str::contains("platform:"))
-        .stdout(predicate::str::contains("arch:"))
-        .stdout(predicate::str::contains("backend: krunvm"));
+        .stdout(predicate::str::contains("OSType:"))
+        .stdout(predicate::str::contains("Architecture:"))
+        .stdout(predicate::str::contains("Isolation: microVM (krunvm)"));
 }
 
 // ---------------------------------------------------------------------------

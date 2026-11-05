@@ -441,10 +441,15 @@ where
 pub async fn set_limits<S>(
     mut stream: S,
     update: &crate::protocol::LimitsUpdate,
+    cgroup: &crate::guest_limits::LiveSettings,
 ) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let (cpu_max_quota, cpu_max_period) = match &cgroup.cpu_max {
+        Some((quota, period)) => (Some(quota.clone()), Some(*period)),
+        None => (None, None),
+    };
     let open = Request {
         kind: Some(request::Kind::SetLimits(proto::SetLimits {
             memory_bytes: update
@@ -452,6 +457,11 @@ where
                 .map(|mb| u64::from(mb) * crate::protocol::BYTES_PER_MIB),
             nano_cpus: update.nano_cpus,
             pids_max: update.pids_max,
+            memory_low_bytes: cgroup.memory_low_bytes,
+            cpu_weight: cgroup.cpu_weight,
+            cpu_max_quota,
+            cpu_max_period,
+            cpuset_cpus: cgroup.cpuset_cpus.clone(),
         })),
     };
     write_frame(&mut stream, &encode(&open)).await?;
@@ -1258,6 +1268,7 @@ mod tests {
             memory_mb: Some(2),
             nano_cpus: None,
             pids_max: Some(9),
+            ..Default::default()
         };
         let guest = tokio::spawn(async move {
             let (mut r, mut w) = split(guest);
@@ -1271,7 +1282,9 @@ mod tests {
         });
 
         // Act
-        set_limits(daemon, &update).await.unwrap();
+        set_limits(daemon, &update, &Default::default())
+            .await
+            .unwrap();
 
         // Assert
         let Some(request::Kind::SetLimits(sent)) = guest.await.unwrap().kind else {
@@ -1280,6 +1293,44 @@ mod tests {
         assert_eq!(sent.memory_bytes, Some(2 * 1024 * 1024));
         assert_eq!(sent.nano_cpus, None);
         assert_eq!(sent.pids_max, Some(9));
+        assert_eq!(sent.cpu_weight, None);
+    }
+
+    #[tokio::test]
+    async fn given_cgroup_settings_when_limits_set_then_the_agent_gets_them() {
+        // Arrange
+        let (daemon, guest) = tokio::io::duplex(64 * 1024);
+        let live = crate::guest_limits::LiveSettings {
+            memory_low_bytes: Some(1024),
+            cpu_weight: Some(39),
+            cpu_max: Some(("50000".into(), 100_000)),
+            cpuset_cpus: Some("0-1".into()),
+        };
+        let guest = tokio::spawn(async move {
+            let (mut r, mut w) = split(guest);
+            let frame = read_frame(&mut r).await.unwrap().expect("limits frame");
+            let req = Request::decode(&frame[..]).unwrap();
+            let done = Event {
+                kind: Some(event::Kind::ArchiveDone(proto::ArchiveDone {})),
+            };
+            write_frame(&mut w, &encode(&done)).await.unwrap();
+            req
+        });
+
+        // Act
+        set_limits(daemon, &crate::protocol::LimitsUpdate::default(), &live)
+            .await
+            .unwrap();
+
+        // Assert
+        let Some(request::Kind::SetLimits(sent)) = guest.await.unwrap().kind else {
+            panic!("expected a SetLimits frame");
+        };
+        assert_eq!(sent.memory_low_bytes, Some(1024));
+        assert_eq!(sent.cpu_weight, Some(39));
+        assert_eq!(sent.cpu_max_quota.as_deref(), Some("50000"));
+        assert_eq!(sent.cpu_max_period, Some(100_000));
+        assert_eq!(sent.cpuset_cpus.as_deref(), Some("0-1"));
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ use ward_core::pb::{
 };
 
 use crate::resources::parse_size_bytes;
+use crate::volume;
 
 const OPTION_SEPARATOR: char = ',';
 const KEY_VALUE_SEPARATOR: char = '=';
@@ -35,9 +36,9 @@ pub struct GuestExtras {
     /// Default 64m.
     #[arg(long = "shm-size", value_name = "SIZE")]
     shm_size: Option<String>,
-    /// Mount with Docker's key=value syntax: type=bind|tmpfs, source= (or
+    /// Mount with Docker's key=value syntax: type=bind|volume|tmpfs, source= (or
     /// src=), destination= (dst=, target=), readonly (ro), tmpfs-size= and
-    /// tmpfs-mode=. Named volumes cannot be attached yet. Repeatable.
+    /// tmpfs-mode=. Repeatable.
     #[arg(long, value_name = "type=TYPE,src=SRC,dst=DST[,ro]")]
     mount: Vec<String>,
     /// Add a line to /etc/hosts: HOST:IP. HOST:host-gateway is the host
@@ -288,6 +289,7 @@ fn parse_mount(spec: &str) -> Result<MountArg> {
                 source: source.to_string(),
                 target: target.to_string(),
                 readonly,
+                volume: String::new(),
             }))
         }
         TYPE_TMPFS => {
@@ -310,10 +312,18 @@ fn parse_mount(spec: &str) -> Result<MountArg> {
                 options,
             }))
         }
-        TYPE_VOLUME => bail!(
-            "--mount {spec}: named volumes cannot be attached to a sandbox yet; use type=bind or type=tmpfs"
-        ),
-        other => bail!("--mount {spec}: unsupported type '{other}', use bind or tmpfs"),
+        TYPE_VOLUME => {
+            let Some(source) = source else {
+                bail!("--mount {spec}: type=volume needs src=");
+            };
+            if size.is_some() || mode.is_some() {
+                bail!("--mount {spec}: tmpfs options need type=tmpfs");
+            }
+            Ok(MountArg::Bind(volume::named_mount(
+                source, target, readonly,
+            )))
+        }
+        other => bail!("--mount {spec}: unsupported type '{other}', use bind, volume or tmpfs"),
     }
 }
 
@@ -371,7 +381,25 @@ mod tests {
             MountArg::Bind(Mount {
                 source: "/tmp/a".into(),
                 target: "/data".into(),
-                readonly: true
+                readonly: true,
+                volume: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn given_volume_mount_when_parsed_then_it_names_the_volume() {
+        // Act
+        let parsed = parse_mount("type=volume,src=data,dst=/data,ro").unwrap();
+
+        // Assert
+        assert_eq!(
+            parsed,
+            MountArg::Bind(Mount {
+                source: String::new(),
+                target: "/data".into(),
+                readonly: true,
+                volume: "data".into(),
             })
         );
     }
@@ -393,8 +421,8 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::volume("type=volume,src=data,dst=/data", "named volumes")]
-    #[case::default_type_is_volume("src=data,dst=/data", "named volumes")]
+    #[case::volume_without_source("type=volume,dst=/data", "needs src")]
+    #[case::default_type_is_volume_without_source("dst=/data", "needs src")]
     #[case::unknown_type("type=npipe,dst=/x", "unsupported type")]
     #[case::unknown_key(
         "type=bind,src=/a,dst=/b,bind-propagation=rshared",

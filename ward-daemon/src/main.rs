@@ -143,7 +143,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         resource_metrics::spawn_collector(runtime.sandbox_manager());
     }
 
-    let grpc_service = WardGrpcServer::new(runtime.sandbox_manager(), runtime.volume_manager());
+    let grpc_service = WardGrpcServer::new(runtime.sandbox_manager(), runtime.volume_manager())
+        .with_data_dir(cfg.data_dir.clone());
 
     // SEC-009: cap per-message size on both decode and encode so a
     // hostile (or buggy) client can't force the daemon to allocate

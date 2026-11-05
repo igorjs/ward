@@ -13,7 +13,7 @@ use crate::images::size_text;
 const UNMEASURED: &str = "--";
 /// The protocol of a port that names none.
 const DEFAULT_PROTOCOL: &str = "tcp";
-const DEFAULT_TAG: &str = "latest";
+pub(crate) const DEFAULT_TAG: &str = "latest";
 const DIGEST_PREFIX: &str = "sha256:";
 /// Shortest digest or ID prefix that names an image.
 const MIN_ID_PREFIX: usize = 4;
@@ -105,7 +105,7 @@ pub fn image_sizes(images: &[ImageInfo]) -> HashMap<String, u64> {
 /// The size of the image a sandbox was created from. The digest it resolved to
 /// is exact; otherwise the reference as written, then with the default tag,
 /// then as a digest or ID prefix.
-fn image_size(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> Option<u64> {
+pub(crate) fn image_size(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> Option<u64> {
     let by_name = |name: &str| sizes.get(name).copied();
     let tagged = format!("{}:{DEFAULT_TAG}", info.image);
     let by_prefix = || {
@@ -177,12 +177,14 @@ mod tests {
                     host_port: 8080,
                     container_port: 80,
                     protocol: "tcp".into(),
+                    ..Default::default()
                 },
                 PortMapping {
                     host_ip: "0.0.0.0".into(),
                     host_port: 8443,
                     container_port: 443,
                     protocol: "tcp".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -203,6 +205,7 @@ mod tests {
             host_port,
             container_port,
             protocol: protocol.into(),
+            ..Default::default()
         }
     }
 

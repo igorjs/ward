@@ -9,6 +9,7 @@ pub mod grpc;
 pub mod guest_limits;
 pub mod guest_network;
 pub mod guest_options;
+pub mod host_info;
 pub mod protocol;
 pub mod registry_auth;
 pub mod sandbox;

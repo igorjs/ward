@@ -235,18 +235,12 @@ impl Server {
         #[derive(serde::Deserialize)]
         struct Args {
             image: String,
-            #[serde(default = "default_cpus")]
+            #[serde(default)]
             cpus: u32,
-            #[serde(default = "default_memory")]
+            #[serde(default)]
             memory_mb: u32,
             #[serde(default)]
             env: HashMap<String, String>,
-        }
-        fn default_cpus() -> u32 {
-            1
-        }
-        fn default_memory() -> u32 {
-            512
         }
         let args: Args = serde_json::from_value(args)
             .map_err(|e| RpcError::invalid_params(format!("ward_create_sandbox: {e}")))?;
@@ -612,8 +606,8 @@ fn tools_descriptors() -> serde_json::Value {
                 "type": "object",
                 "properties": {
                     "image": { "type": "string", "description": "OCI image reference, e.g. alpine:latest" },
-                    "cpus": { "type": "integer", "minimum": 1, "default": 1 },
-                    "memory_mb": { "type": "integer", "minimum": 64, "default": 512 },
+                    "cpus": { "type": "integer", "minimum": 1, "description": "Omit to use the daemon default (no limit unless the operator sets one)" },
+                    "memory_mb": { "type": "integer", "minimum": 64, "description": "Omit to use the daemon default (no limit unless the operator sets one)" },
                     "env": {
                         "type": "object",
                         "additionalProperties": { "type": "string" },
