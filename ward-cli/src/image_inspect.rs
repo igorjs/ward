@@ -64,6 +64,7 @@ pub fn image_value(
         .iter()
         .map(|tag| format!("{}@{}", split_reference(tag).0, image.digest))
         .collect();
+    digests.sort();
     digests.dedup();
     json!({
         "Id": image.digest,
