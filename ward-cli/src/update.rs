@@ -15,6 +15,12 @@ use crate::client;
 use crate::lifecycle::Failures;
 use crate::resources;
 
+/// Why the real-time flags are refused.
+const NO_REAL_TIME: &str = "the guest runs no real-time scheduling";
+/// The `--memory-swap` value for unlimited swap, as bytes.
+const UNLIMITED_SWAP_BYTES: i64 = -1;
+/// The `--memory-swap` text for unlimited swap.
+const UNLIMITED_SWAP: &str = "-1";
 /// Docker's wording when no flag is given.
 const NO_FLAGS: &str = "you must provide one or more flags when using this command";
 
@@ -38,6 +44,45 @@ pub struct Args {
     /// unless-stopped.
     #[arg(long, value_name = "POLICY", value_parser = RestartPolicy::parse)]
     pub restart: Option<RestartPolicy>,
+    /// Only a value equal to --memory is accepted: the guest has no swap.
+    #[arg(long = "memory-swap", value_name = "SIZE", allow_hyphen_values = true)]
+    pub memory_swap: Option<String>,
+    /// Memory the guest cgroup protects from reclaim (memory.low). Must not
+    /// exceed --memory.
+    #[arg(long = "memory-reservation", value_name = "SIZE")]
+    pub memory_reservation: Option<String>,
+    /// Relative CPU weight, 2 to 262144 (default 1024), as cgroup v2 cpu.weight.
+    #[arg(short = 'c', long = "cpu-shares", value_name = "N")]
+    pub cpu_shares: Option<u32>,
+    /// CPUs the processes may use, such as 0-1,3 (cpuset.cpus).
+    #[arg(long = "cpuset-cpus", value_name = "LIST")]
+    pub cpuset_cpus: Option<String>,
+    /// Length of a CPU scheduling period in microseconds, 1000 to 1000000.
+    #[arg(long = "cpu-period", value_name = "MICROSECONDS")]
+    pub cpu_period: Option<u64>,
+    /// CPU time per period in microseconds, at least 1000; -1 or 0 for none.
+    #[arg(
+        long = "cpu-quota",
+        value_name = "MICROSECONDS",
+        allow_negative_numbers = true
+    )]
+    pub cpu_quota: Option<i64>,
+    /// Accepted so the command line parses, then refused: the guest has no
+    /// block I/O controller.
+    #[arg(long = "blkio-weight", value_name = "N")]
+    blkio_weight: Option<String>,
+    /// Accepted so the command line parses, then refused: the guest has a
+    /// single memory node.
+    #[arg(long = "cpuset-mems", value_name = "LIST")]
+    cpuset_mems: Option<String>,
+    /// Accepted so the command line parses, then refused: the guest runs no
+    /// real-time scheduling.
+    #[arg(long = "cpu-rt-period", value_name = "N")]
+    cpu_rt_period: Option<String>,
+    /// Accepted so the command line parses, then refused: the guest runs no
+    /// real-time scheduling.
+    #[arg(long = "cpu-rt-runtime", value_name = "N")]
+    cpu_rt_runtime: Option<String>,
 }
 
 impl Args {
@@ -47,7 +92,40 @@ impl Args {
     ///
     /// Fails when no flag is given or a value cannot be parsed.
     pub fn request(&self, id: &str) -> Result<UpdateSandboxRequest> {
+        let refused = [
+            (
+                "--blkio-weight",
+                &self.blkio_weight,
+                "the guest has no block I/O controller",
+            ),
+            (
+                "--cpuset-mems",
+                &self.cpuset_mems,
+                "the guest has a single memory node",
+            ),
+            ("--cpu-rt-period", &self.cpu_rt_period, NO_REAL_TIME),
+            ("--cpu-rt-runtime", &self.cpu_rt_runtime, NO_REAL_TIME),
+        ];
+        for (flag, value, reason) in refused {
+            if value.is_some() {
+                bail!("{flag} is not supported: {reason}");
+            }
+        }
         let request = UpdateSandboxRequest {
+            memory_swap_bytes: self
+                .memory_swap
+                .as_deref()
+                .map(parse_memory_swap)
+                .transpose()?,
+            memory_reservation_bytes: self
+                .memory_reservation
+                .as_deref()
+                .map(resources::parse_size_bytes)
+                .transpose()?,
+            cpu_shares: self.cpu_shares,
+            cpuset_cpus: self.cpuset_cpus.clone(),
+            cpu_period: self.cpu_period,
+            cpu_quota: self.cpu_quota,
             id: id.to_string(),
             memory_mb: self
                 .memory
@@ -68,11 +146,29 @@ impl Args {
             && request.nano_cpus.is_none()
             && request.pids_max.is_none()
             && request.restart_policy.is_none()
+            && !changes_cgroup(&request)
         {
             bail!(NO_FLAGS);
         }
         Ok(request)
     }
+}
+
+fn changes_cgroup(request: &UpdateSandboxRequest) -> bool {
+    request.memory_swap_bytes.is_some()
+        || request.memory_reservation_bytes.is_some()
+        || request.cpu_shares.is_some()
+        || request.cpuset_cpus.is_some()
+        || request.cpu_period.is_some()
+        || request.cpu_quota.is_some()
+}
+
+/// `--memory-swap`: -1 for unlimited, else a size.
+fn parse_memory_swap(value: &str) -> Result<i64> {
+    if value.trim() == UNLIMITED_SWAP {
+        return Ok(UNLIMITED_SWAP_BYTES);
+    }
+    Ok(i64::try_from(resources::parse_size_bytes(value)?)?)
 }
 
 /// Parses `--cpus` into billionths of a CPU.
@@ -188,5 +284,50 @@ mod tests {
     #[case::not_finite("inf")]
     fn given_bad_cpus_when_parsed_then_it_fails(#[case] text: &str) {
         assert!(parse_nano_cpus(text).is_err());
+    }
+
+    #[test]
+    fn given_cgroup_flags_when_request_built_then_each_is_carried() {
+        let parsed = args(&[
+            "--cpu-shares",
+            "512",
+            "--cpuset-cpus",
+            "0-1",
+            "--memory-swap",
+            "-1",
+            "--memory-reservation",
+            "64m",
+            "--cpu-period",
+            "100000",
+            "--cpu-quota",
+            "-1",
+        ]);
+
+        let request = parsed.request("id1").unwrap();
+
+        assert_eq!(request.cpu_shares, Some(512));
+        assert_eq!(request.cpuset_cpus.as_deref(), Some("0-1"));
+        assert_eq!(request.memory_swap_bytes, Some(-1));
+        assert_eq!(request.memory_reservation_bytes, Some(64 << 20));
+        assert_eq!(request.cpu_period, Some(100_000));
+        assert_eq!(request.cpu_quota, Some(-1));
+    }
+
+    #[test]
+    fn given_a_cgroup_flag_alone_when_request_built_then_it_counts_as_a_flag() {
+        assert!(args(&["-c", "100"]).request("id1").is_ok());
+    }
+
+    #[rstest::rstest]
+    #[case::blkio(&["--blkio-weight", "100"], "--blkio-weight is not supported: the guest has no block I/O")]
+    #[case::mems(&["--cpuset-mems", "0"], "--cpuset-mems is not supported")]
+    #[case::rt(&["--cpu-rt-runtime", "5"], "--cpu-rt-runtime is not supported")]
+    fn given_a_docker_flag_with_no_guest_meaning_when_request_built_then_the_reason_is_given(
+        #[case] flags: &[&str],
+        #[case] said: &str,
+    ) {
+        let err = args(flags).request("id1").unwrap_err();
+
+        assert!(err.to_string().contains(said), "{err}");
     }
 }

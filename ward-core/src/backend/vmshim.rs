@@ -63,6 +63,14 @@ pub struct NetSpec {
     pub mac: [u8; 6],
 }
 
+/// libkrun takes the CPU count as one byte.
+const MAX_VCPUS: u32 = 255;
+
+/// The vCPU count as libkrun takes it.
+fn vcpus(cpus: u32) -> Result<u8, String> {
+    u8::try_from(cpus).map_err(|_| format!("cpus={cpus} exceeds libkrun's limit of {MAX_VCPUS}"))
+}
+
 /// Everything the shim needs to configure and boot one microVM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmSpec {
@@ -159,11 +167,9 @@ fn boot(spec: &VmSpec) -> Result<(), String> {
         krun_ffi::krun_set_log_level(KRUN_LOG_LEVEL_ERROR);
         let ctx = check(krun_ffi::krun_create_ctx(), "krun_create_ctx")?;
 
-        if spec.cpus > 0 {
-            let vcpus = u8::try_from(spec.cpus)
-                .map_err(|_| format!("cpus={} exceeds libkrun's limit of 255", spec.cpus))?;
+        if let Some((cpus, memory_mb)) = super::krunvm::vm_config(spec.cpus, spec.memory_mb) {
             check(
-                krun_ffi::krun_set_vm_config(ctx, vcpus, spec.memory_mb),
+                krun_ffi::krun_set_vm_config(ctx, vcpus(cpus)?, memory_mb),
                 "krun_set_vm_config",
             )?;
         }
@@ -321,6 +327,15 @@ mod tests {
                 mac: [2, 0, 0, 0, 0, 2],
             }),
         }
+    }
+
+    #[test]
+    fn given_more_cpus_than_libkrun_takes_when_converted_then_the_error_names_the_limit() {
+        assert_eq!(vcpus(MAX_VCPUS), Ok(255));
+        assert_eq!(
+            vcpus(MAX_VCPUS + 1),
+            Err("cpus=256 exceeds libkrun's limit of 255".to_string())
+        );
     }
 
     #[test]

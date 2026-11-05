@@ -143,6 +143,25 @@ const RENAME_SWAP: std::ffi::c_uint = 0x0000_0002;
 // Per-sandbox state
 // ---------------------------------------------------------------------------
 
+/// vCPUs libkrun gives a VM that is never sized. `krun_set_vm_config` takes
+/// both values, so a spec that sets only memory gets this many CPUs.
+const DEFAULT_VCPUS: u32 = 1;
+/// MiB of memory libkrun gives a VM that is never sized; used when a spec
+/// sets only CPUs.
+const DEFAULT_MEMORY_MIB: u32 = 512;
+/// The CPU count and memory to give libkrun, or `None` to keep its defaults.
+/// Setting only one of the two must not drop the other.
+pub(super) fn vm_config(cpus: u32, memory_mb: u32) -> Option<(u32, u32)> {
+    if cpus == 0 && memory_mb == 0 {
+        return None;
+    }
+    let or_default = |value: u32, default: u32| if value == 0 { default } else { value };
+    Some((
+        or_default(cpus, DEFAULT_VCPUS),
+        or_default(memory_mb, DEFAULT_MEMORY_MIB),
+    ))
+}
+
 /// What the running VM was booted with. Memory and CPUs cannot grow past it
 /// until the next boot.
 #[derive(Debug, Clone, Copy)]
@@ -152,15 +171,15 @@ struct VmSize {
 }
 
 impl VmSize {
+    /// The size the VM boots with. With neither limit set libkrun picks the
+    /// size, which is not known here, so both stay 0 and are not checked.
     fn of(resources: &crate::protocol::ResourceLimits) -> Self {
-        Self {
-            cpus: resources.cpus,
-            memory_mb: resources.memory_mb,
-        }
+        let (cpus, memory_mb) = vm_config(resources.cpus, resources.memory_mb).unwrap_or_default();
+        Self { cpus, memory_mb }
     }
 
-    /// Why `update` does not fit this VM, if it does not. A size of 0 is
-    /// libkrun's default, which is not known here, so it is not checked.
+    /// Why `update` does not fit this VM, if it does not. A size of 0 means
+    /// the VM was never sized, so it is not checked.
     fn refuses(&self, update: &crate::protocol::LimitsUpdate) -> Option<String> {
         let memory = update
             .memory_mb
@@ -903,10 +922,20 @@ impl Backend for KrunvmBackend {
             }
             state.vm_size.is_some()
         };
+        // Merged here and stored below under a later lock: the manager
+        // serialises the updates of one sandbox, which keeps the base fresh.
+        let merged = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(id)
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+            state.opts.spec.guest.cgroup.updated(&update.cgroup)
+        };
         #[cfg(feature = "krunvm")]
         if vm_up && self.boot_vms {
+            let live = crate::guest_limits::live_settings(&update.cgroup, &merged);
             let stream = self.agent_stream(id).await?;
-            super::agent::set_limits(stream, update)
+            super::agent::set_limits(stream, update, &live)
                 .await
                 .map_err(|e| BackendError::Exec(format!("update the sandbox limits: {e}")))?;
         }
@@ -916,6 +945,7 @@ impl Backend for KrunvmBackend {
         let state = sandboxes
             .get_mut(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        state.opts.spec.guest.cgroup = merged;
         state.opts.resources = state.opts.resources.updated(update);
         state.info.resources = state.opts.resources.clone();
         Ok(())
@@ -1765,6 +1795,19 @@ fn stub_exec_handle(pid: String, sandbox_id: &str, command: Vec<String>) -> Proc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    #[case::neither_set(0, 0, None)]
+    #[case::only_memory(0, 2048, Some((1, 2048)))]
+    #[case::only_cpus(4, 0, Some((4, 512)))]
+    #[case::both(2, 256, Some((2, 256)))]
+    fn given_partial_limits_when_vm_config_built_then_the_unset_one_gets_libkrun_default(
+        #[case] cpus: u32,
+        #[case] memory_mb: u32,
+        #[case] want: Option<(u32, u32)>,
+    ) {
+        assert_eq!(vm_config(cpus, memory_mb), want);
+    }
     use crate::backend::image::{ImagePuller, ImageStore};
     use crate::protocol::{CommunicationPolicy, CreateOpts, EgressPolicy};
     use pretty_assertions::assert_eq;

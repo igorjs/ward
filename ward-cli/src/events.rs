@@ -15,6 +15,8 @@ use crate::template::Template;
 /// Sandboxes are the only objects the daemon reports on.
 const EVENT_TYPE: &str = "container";
 const EVENT_SCOPE: &str = "local";
+/// Ends a filter key to refuse the value: `label!=env=dev`.
+const NEGATION_MARK: char = '!';
 const FILTER_TYPE: &str = "type";
 const FILTER_EVENT: &str = "event";
 const FILTER_CONTAINER: &str = "container";
@@ -96,30 +98,49 @@ fn timestamp(value: &str, now: DateTime<Utc>) -> Result<prost_types::Timestamp> 
     })
 }
 
+/// Values wanted and refused for one filter key.
+#[derive(Default)]
+struct Wanted {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl Wanted {
+    fn push(&mut self, value: &str, negated: bool) {
+        let list = if negated {
+            &mut self.exclude
+        } else {
+            &mut self.include
+        };
+        list.push(value.to_string());
+    }
+
+    /// True when some wanted value matches (or none is wanted) and no refused
+    /// value matches.
+    fn allows(&self, matches: &dyn Fn(&str) -> bool) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|w| matches(w)))
+            && !self.exclude.iter().any(|w| matches(w))
+    }
+}
+
 /// `--filter` values: different keys all must match, values of one key are
-/// alternatives.
+/// alternatives, and `key!=value` refuses a value.
+#[derive(Default)]
 struct Filters {
-    types: Vec<String>,
-    events: Vec<String>,
-    containers: Vec<String>,
-    images: Vec<String>,
+    types: Wanted,
+    events: Wanted,
+    containers: Wanted,
+    images: Wanted,
     /// Why a sandbox ended, as `die` events carry it.
-    reasons: Vec<String>,
+    reasons: Wanted,
     /// Attribute filters: `key` or `key=value`. Events carry no labels, so
     /// an attribute is the closest match.
-    labels: Vec<String>,
+    labels: Wanted,
 }
 
 impl Filters {
     fn parse(filters: &[String]) -> Result<Self> {
-        let mut parsed = Self {
-            types: Vec::new(),
-            events: Vec::new(),
-            containers: Vec::new(),
-            images: Vec::new(),
-            reasons: Vec::new(),
-            labels: Vec::new(),
-        };
+        let mut parsed = Self::default();
         for filter in filters {
             let (key, value) = filter
                 .split_once('=')
@@ -128,32 +149,34 @@ impl Filters {
                 .with_context(|| {
                     format!("invalid argument {filter:?} for \"-f, --filter\" flag")
                 })?;
-            match key {
-                FILTER_TYPE => parsed.types.push(value.to_string()),
-                FILTER_EVENT => parsed.events.push(value.to_string()),
-                FILTER_CONTAINER | FILTER_NAME => parsed.containers.push(value.to_string()),
-                FILTER_IMAGE => parsed.images.push(value.to_string()),
-                FILTER_REASON => parsed.reasons.push(value.to_string()),
-                FILTER_LABEL => parsed.labels.push(value.to_string()),
+            let (key, negated) = match key.strip_suffix(NEGATION_MARK) {
+                Some(key) => (key, true),
+                None => (key, false),
+            };
+            let wanted = match key {
+                FILTER_TYPE => &mut parsed.types,
+                FILTER_EVENT => &mut parsed.events,
+                FILTER_CONTAINER | FILTER_NAME => &mut parsed.containers,
+                FILTER_IMAGE => &mut parsed.images,
+                FILTER_REASON => &mut parsed.reasons,
+                FILTER_LABEL => &mut parsed.labels,
                 other => bail!("Invalid filter '{other}'"),
-            }
+            };
+            wanted.push(value, negated);
         }
         Ok(parsed)
     }
 
     fn allows(&self, event: &SandboxEvent) -> bool {
         let attribute = |key: &str| event.attributes.get(key).map_or("", String::as_str);
-        let any = |wanted: &[String], matches: &dyn Fn(&str) -> bool| {
-            wanted.is_empty() || wanted.iter().any(|w| matches(w))
-        };
-        any(&self.types, &|t| t == EVENT_TYPE)
-            && any(&self.events, &|e| e == event.action)
-            && any(&self.containers, &|c| {
-                c == attribute(NAME_ATTRIBUTE) || event.sandbox_id.starts_with(c)
-            })
-            && any(&self.images, &|i| i == attribute(IMAGE_ATTRIBUTE))
-            && any(&self.reasons, &|r| r == attribute(REASON_ATTRIBUTE))
-            && any(&self.labels, &|label| match label.split_once('=') {
+        self.types.allows(&|t| t == EVENT_TYPE)
+            && self.events.allows(&|e| e == event.action)
+            && self
+                .containers
+                .allows(&|c| c == attribute(NAME_ATTRIBUTE) || event.sandbox_id.starts_with(c))
+            && self.images.allows(&|i| i == attribute(IMAGE_ATTRIBUTE))
+            && self.reasons.allows(&|r| r == attribute(REASON_ATTRIBUTE))
+            && self.labels.allows(&|label| match label.split_once('=') {
                 Some((key, value)) => event.attributes.get(key).is_some_and(|v| v == value),
                 None => event.attributes.contains_key(label),
             })
@@ -342,6 +365,11 @@ mod tests {
     #[case::label_miss(&["label=name=db"], "start", "web1", false)]
     #[case::type_miss(&["type=image"], "start", "web1", false)]
     #[case::keys_combine(&["type=container", "event=die"], "start", "web1", false)]
+    #[case::event_refused(&["event!=start"], "start", "web1", false)]
+    #[case::event_not_refused(&["event!=die"], "start", "web1", true)]
+    #[case::container_refused(&["container!=web1"], "start", "web1", false)]
+    #[case::label_pair_refused(&["label!=name=web1"], "start", "web1", false)]
+    #[case::include_and_refuse(&["event=start", "event!=start"], "start", "web1", false)]
     fn given_filters_when_checked_then_only_matching_events_pass(
         #[case] given: &[&str],
         #[case] action: &str,

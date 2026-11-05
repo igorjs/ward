@@ -302,7 +302,7 @@ fn names_field(column: &str, name: &str) -> bool {
 
 /// Lines of cells as columns padded to their longest cell. The last column
 /// is left unpadded.
-fn align(lines: &[Vec<String>]) -> String {
+pub(crate) fn align(lines: &[Vec<String>]) -> String {
     let mut out = String::new();
     for line in lines {
         for (column, cell) in line.iter().enumerate() {

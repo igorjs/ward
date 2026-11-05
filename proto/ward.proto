@@ -919,6 +919,16 @@ message DaemonInfo {
   string platform = 2;
   string backend = 3;
   string arch = 4;
+  // Host figures for `docker info`. Empty or zero when unknown.
+  string hostname = 5;
+  string kernel_version = 6;
+  string operating_system = 7;
+  uint32 ncpu = 8;
+  uint64 mem_total_bytes = 9;
+  // The daemon's data directory.
+  string root_dir = 10;
+  // Stable identifier of this daemon's data directory.
+  string id = 11;
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1097,13 @@ message UpdateSandboxRequest {
   // New limit on processes. 0 removes the limit.
   optional uint32 pids_max = 4;
   optional RestartPolicy restart_policy = 5;
+  // Docker's cgroup options, as in CgroupLimits. A field left unset is kept.
+  optional int64 memory_swap_bytes = 6;
+  optional uint64 memory_reservation_bytes = 7;
+  optional uint32 cpu_shares = 8;
+  optional string cpuset_cpus = 9;
+  optional uint64 cpu_period = 10;
+  optional int64 cpu_quota = 11;
 }
 
 // `id` is a sandbox name, id or unique id prefix.
