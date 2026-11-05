@@ -570,6 +570,7 @@ async fn given_sandbox_removed_when_publish_with_old_id_then_not_found() {
         .remove_sandbox(common::with_token(
             RemoveSandboxRequest {
                 id: alice.id.clone(),
+                ..Default::default()
             },
             &alice.token,
         ))

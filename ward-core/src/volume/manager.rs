@@ -1,100 +1,39 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
-//! VolumeManager: daemon-managed shared persistent volumes.
+//! VolumeManager: daemon-managed persistent volumes.
+//!
+//! A volume is a host directory under the data dir. A sandbox mounts it like
+//! a bind mount, so the data outlives the sandbox and the daemon.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::RwLock;
+
+use crate::sync::LockUnpoisoned;
 
 use crate::pb::{CreateVolumeRequest, VolumeInfo as PbVolumeInfo};
 use crate::protocol::ApiError;
 
 type Result<T> = std::result::Result<T, ApiError>;
 
-/// Filename of the backing filesystem image inside a volume's directory.
-const VOLUME_IMAGE: &str = "volume.img";
-
-// ---------------------------------------------------------------------------
-// Volume formatter
-// ---------------------------------------------------------------------------
-
-/// Allocates and formats a volume's backing filesystem image.
-///
-/// Split out as a trait so tests can inject a no-op (the real formatter
-/// shells out to `mkfs.ext4`, which is Linux-only and unavailable on dev
-/// macOS hosts and in cross-platform unit tests).
-#[async_trait::async_trait]
-pub trait VolumeFormatter: Send + Sync + std::fmt::Debug {
-    /// Create a `size_mb`-megabyte filesystem image at `image_path`.
-    async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()>;
-}
-
-/// Production formatter: a sparse image sized with `truncate`-style
-/// `set_len`, then formatted ext4 via `mkfs.ext4`.
-#[derive(Debug, Default)]
-pub struct Ext4Formatter;
-
-#[async_trait::async_trait]
-impl VolumeFormatter for Ext4Formatter {
-    async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()> {
-        allocate_sparse_image(image_path, size_mb).await?;
-        run_mkfs_ext4(image_path).await
-    }
-}
-
-/// Create a sparse file of `size_mb` MiB at `path`. Sparse means the bytes
-/// are not written up front: the file reports the full length but only
-/// occupies disk as the guest writes into it.
-async fn allocate_sparse_image(path: &Path, size_mb: u32) -> Result<()> {
-    let len = u64::from(size_mb) * 1024 * 1024;
-    // SEC-004: force 0600 on the backing image. Default umask yields 0644
-    // which exposes the volume's filesystem blocks (and anything the guest
-    // writes into them — secrets, keys, OCI image content) to other local
-    // users on multi-user hosts.
-    let mut opts = tokio::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let file = opts
-        .open(path)
-        .await
-        .map_err(|e| ApiError::from_io(&format!("create volume image {}", path.display()), &e))?;
-    file.set_len(len)
-        .await
-        .map_err(|e| ApiError::from_io(&format!("size volume image to {len} bytes"), &e))?;
-    Ok(())
-}
-
-/// Format an existing image file as ext4. `-F` forces mkfs to operate on a
-/// regular file (not a block device); `-q` silences the banner.
-async fn run_mkfs_ext4(path: &Path) -> Result<()> {
-    let output = tokio::process::Command::new("mkfs.ext4")
-        .arg("-F")
-        .arg("-q")
-        .arg(path)
-        .output()
-        .await
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ApiError::Unavailable(
-                    "mkfs.ext4 not found; ext4 volume images require Linux (e2fsprogs)".to_string(),
-                )
-            } else {
-                ApiError::from_io("spawn mkfs.ext4", &e)
-            }
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ApiError::Internal(format!(
-            "mkfs.ext4 failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(())
-}
+/// Directory under the data dir that holds one directory per volume.
+const VOLUMES_DIR: &str = "volumes";
+/// Directory inside a volume's own directory that a sandbox sees.
+const DATA_DIR: &str = "data";
+/// Stands for a sandbox that is still being created in an in-use message.
+const CREATING_HOLDER: &str = "a sandbox being created";
+/// Owner-only modes: another local user must not read a volume.
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+/// File inside a volume's directory that records its identity.
+const META_FILE: &str = "volume.json";
+const META_TEMP_FILE: &str = "volume.json.tmp";
+/// Size recorded for a volume that a sandbox creates on first use.
+pub const IMPLICIT_VOLUME_SIZE_MB: u32 = 1024;
 
 // ---------------------------------------------------------------------------
 // Internal state
@@ -106,7 +45,23 @@ struct VolumeEntry {
     name: String,
     size_mb: u32,
     created_at: SystemTime,
-    mount_path: PathBuf,
+    /// The volume's own directory, which holds the metadata and the data.
+    dir: PathBuf,
+}
+
+impl VolumeEntry {
+    fn data_path(&self) -> PathBuf {
+        self.dir.join(DATA_DIR)
+    }
+}
+
+/// What is written to `volume.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VolumeMeta {
+    id: String,
+    name: String,
+    size_mb: u32,
+    created_at_secs: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,70 +74,128 @@ pub struct VolumeManager {
     volumes: Arc<RwLock<HashMap<String, VolumeEntry>>>,
     /// Maximum number of volumes. Prevents metadata and inode exhaustion.
     max_volumes: usize,
-    formatter: Arc<dyn VolumeFormatter>,
+    /// Volumes that a sandbox being created has named, with how many such
+    /// sandboxes. They cannot be removed until the sandbox is recorded.
+    claims: Claims,
+}
+
+type Claims = Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+/// Holds a volume against removal while a sandbox that names it is being
+/// created. Dropping it releases the hold.
+pub struct VolumeClaim {
+    claims: Claims,
+    name: String,
+}
+
+impl Drop for VolumeClaim {
+    fn drop(&mut self) {
+        let mut claims = self.claims.lock_unpoisoned();
+        if let Some(count) = claims.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                claims.remove(&self.name);
+            }
+        }
+    }
 }
 
 impl VolumeManager {
-    /// Production constructor: formats real ext4 images.
+    /// Open the volumes under `data_dir`, loading the ones a previous run
+    /// left behind.
     pub fn new(data_dir: PathBuf, max_volumes: usize) -> Self {
-        Self::with_formatter(data_dir, max_volumes, Arc::new(Ext4Formatter))
-    }
-
-    /// Construct with an injected formatter. Tests pass a no-op so they
-    /// don't depend on `mkfs.ext4`.
-    pub fn with_formatter(
-        data_dir: PathBuf,
-        max_volumes: usize,
-        formatter: Arc<dyn VolumeFormatter>,
-    ) -> Self {
+        let volumes = load_volumes(&data_dir.join(VOLUMES_DIR));
         Self {
             data_dir,
-            volumes: Arc::new(RwLock::new(HashMap::new())),
+            volumes: Arc::new(RwLock::new(volumes)),
             max_volumes,
-            formatter,
+            claims: Claims::default(),
         }
+    }
+
+    /// Hold the volume called `name` against removal, whether or not it
+    /// exists yet.
+    pub fn claim(&self, name: &str) -> VolumeClaim {
+        *self
+            .claims
+            .lock_unpoisoned()
+            .entry(name.to_string())
+            .or_default() += 1;
+        VolumeClaim {
+            claims: Arc::clone(&self.claims),
+            name: name.to_string(),
+        }
+    }
+
+    fn is_claimed(&self, name: &str) -> bool {
+        self.claims.lock_unpoisoned().contains_key(name)
     }
 
     // -----------------------------------------------------------------------
     // CRUD
     // -----------------------------------------------------------------------
 
-    /// Create a new volume, allocating backing storage on disk.
+    /// Create a volume. Creating a name that exists returns that volume, as
+    /// Docker does.
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
         crate::validate::volume_size(req.size_mb)?;
+        self.create_if_missing(&req.name, req.size_mb).await
+    }
 
+    /// The volume called `name`, created with the default size when missing.
+    pub async fn ensure(&self, name: &str) -> Result<PbVolumeInfo> {
+        crate::validate::volume_name(name)?;
+        self.create_if_missing(name, IMPLICIT_VOLUME_SIZE_MB).await
+    }
+
+    /// Create the volume called `name`, which must not exist yet.
+    pub async fn create_new(&self, name: &str) -> Result<PbVolumeInfo> {
+        crate::validate::volume_name(name)?;
+        self.insert_volume(name, IMPLICIT_VOLUME_SIZE_MB, true)
+            .await
+    }
+
+    async fn create_if_missing(&self, name: &str, size_mb: u32) -> Result<PbVolumeInfo> {
+        self.insert_volume(name, size_mb, false).await
+    }
+
+    async fn insert_volume(
+        &self,
+        name: &str,
+        size_mb: u32,
+        must_be_new: bool,
+    ) -> Result<PbVolumeInfo> {
+        // The write lock spans the check and the insert, so two sandboxes
+        // that name a new volume at once get the same one.
+        let mut volumes = self.volumes.write().await;
+        if let Some(existing) = volumes.values().find(|v| v.name == name) {
+            if must_be_new {
+                return Err(ApiError::InvalidRequest(format!(
+                    "volume {name} already exists"
+                )));
+            }
+            return Ok(entry_to_pb(existing.clone()));
+        }
         // Enforce volume cap to prevent resource exhaustion.
-        let current = self.volumes.read().await.len();
-        if current >= self.max_volumes {
+        if volumes.len() >= self.max_volumes {
             return Err(ApiError::InvalidRequest(format!(
                 "volume limit reached ({}/{})",
-                current, self.max_volumes,
+                volumes.len(),
+                self.max_volumes,
             )));
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let mount_path = self.data_dir.join("volumes").join(&id);
-
-        tokio::fs::create_dir_all(&mount_path)
-            .await
-            .map_err(|e| ApiError::from_io("create volume directory", &e))?;
-
-        // Allocate the fixed-size ext4 image the sandbox will mount. The
-        // image lives inside the volume's directory and is attached to a
-        // microVM via krun_add_disk2 (see the mounts/attach work).
-        let image_path = mount_path.join(VOLUME_IMAGE);
-        self.formatter.format(&image_path, req.size_mb).await?;
-
         let entry = VolumeEntry {
             id: id.clone(),
-            name: req.name.clone(),
-            size_mb: req.size_mb,
+            name: name.to_string(),
+            size_mb,
             created_at: SystemTime::now(),
-            mount_path: mount_path.clone(),
+            dir: self.data_dir.join(VOLUMES_DIR).join(&id),
         };
-
-        self.volumes.write().await.insert(id, entry.clone());
+        write_volume(&entry).await?;
+        volumes.insert(id, entry.clone());
         Ok(entry_to_pb(entry))
     }
 
@@ -210,24 +223,156 @@ impl VolumeManager {
             .collect())
     }
 
-    /// Remove a volume, deleting its backing storage.
-    pub async fn remove(&self, id: &str) -> Result<()> {
+    /// Remove a volume that nothing uses. `users` lists the sandboxes that
+    /// mount the volume; it runs under the manager's lock, so a sandbox
+    /// cannot claim the volume between the check and the removal.
+    pub async fn remove_if_unused<F, Fut>(&self, id: &str, users: F) -> Result<()>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
         crate::validate::entity_id(id, "volume")?;
-        let entry = self
-            .volumes
-            .write()
-            .await
-            .remove(id)
+        let mut volumes = self.volumes.write().await;
+        let entry = volumes
+            .get(id)
+            .cloned()
             .ok_or_else(|| ApiError::VolumeNotFound(id.to_string()))?;
-
-        if entry.mount_path.exists() {
-            tokio::fs::remove_dir_all(&entry.mount_path)
-                .await
-                .map_err(|e| ApiError::from_io("remove volume directory", &e))?;
+        let mut holders = users(entry.name.clone()).await;
+        if self.is_claimed(&entry.name) {
+            holders.push(CREATING_HOLDER.to_string());
         }
-
-        Ok(())
+        if !holders.is_empty() {
+            return Err(ApiError::VolumeInUse(format!(
+                "remove {}: volume is in use - [{}]",
+                entry.name,
+                holders.join(", ")
+            )));
+        }
+        // Without its metadata the volume no longer loads, so a failed
+        // delete below cannot bring back a half-removed volume on restart.
+        match tokio::fs::remove_file(entry.dir.join(META_FILE)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ApiError::from_io("remove volume metadata", &e)),
+        }
+        volumes.remove(id);
+        drop(volumes);
+        tokio::fs::remove_dir_all(&entry.dir)
+            .await
+            .map_err(|e| ApiError::from_io("remove volume directory", &e))
     }
+
+    /// Remove a volume, deleting its data.
+    pub async fn remove(&self, id: &str) -> Result<()> {
+        self.remove_if_unused(id, |_| async { Vec::new() }).await
+    }
+
+    /// Remove the volume called `name` if nothing uses it. Returns whether
+    /// it was removed.
+    pub async fn remove_unused_by_name<F, Fut>(&self, name: &str, users: F) -> Result<bool>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
+        let id = self
+            .volumes
+            .read()
+            .await
+            .values()
+            .find(|v| v.name == name)
+            .map(|v| v.id.clone());
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        match self.remove_if_unused(&id, users).await {
+            Ok(()) => Ok(true),
+            Err(ApiError::VolumeInUse(_) | ApiError::VolumeNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Create the volume's directories and record its identity. The record is
+/// written to a temporary file first, so a crash leaves no truncated one.
+async fn write_volume(entry: &VolumeEntry) -> Result<()> {
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(entry.data_path())
+        .await
+        .map_err(|e| ApiError::from_io("create volume directory", &e))?;
+    let meta = VolumeMeta {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        size_mb: entry.size_mb,
+        created_at_secs: entry
+            .created_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let json = serde_json::to_vec(&meta)
+        .map_err(|e| ApiError::Internal(format!("encode volume metadata: {e}")))?;
+    let write_err = |e: std::io::Error| ApiError::from_io("write volume metadata", &e);
+    let temp = entry.dir.join(META_TEMP_FILE);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(&temp)
+        .await
+        .map_err(write_err)?;
+    file.write_all(&json).await.map_err(write_err)?;
+    file.sync_all().await.map_err(write_err)?;
+    tokio::fs::rename(&temp, entry.dir.join(META_FILE))
+        .await
+        .map_err(write_err)
+}
+
+/// Read every volume directory under `root`. A directory whose metadata is
+/// missing, unreadable, inconsistent with its directory name, or a duplicate
+/// of an earlier name is skipped, with a warning.
+fn load_volumes(root: &Path) -> HashMap<String, VolumeEntry> {
+    let Ok(dirs) = std::fs::read_dir(root) else {
+        return HashMap::new();
+    };
+    let mut loaded: HashMap<String, VolumeEntry> = HashMap::new();
+    let mut paths: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
+    paths.sort();
+    for dir in paths {
+        let entry = match read_entry(&dir) {
+            Ok(entry) => entry,
+            Err(reason) => {
+                tracing::warn!(dir = %dir.display(), %reason, "skipping a volume directory");
+                continue;
+            }
+        };
+        if loaded.values().any(|v| v.name == entry.name) {
+            tracing::warn!(dir = %dir.display(), name = %entry.name, "skipping a duplicate volume name");
+            continue;
+        }
+        loaded.insert(entry.id.clone(), entry);
+    }
+    loaded
+}
+
+fn read_entry(dir: &Path) -> std::result::Result<VolumeEntry, String> {
+    let bytes = std::fs::read(dir.join(META_FILE)).map_err(|e| format!("no metadata: {e}"))?;
+    let meta: VolumeMeta =
+        serde_json::from_slice(&bytes).map_err(|e| format!("unreadable metadata: {e}"))?;
+    let dir_name = dir.file_name().and_then(|n| n.to_str());
+    if dir_name != Some(meta.id.as_str()) {
+        return Err("the id does not match the directory name".to_string());
+    }
+    crate::validate::volume_name(&meta.name).map_err(|e| e.to_string())?;
+    Ok(VolumeEntry {
+        id: meta.id,
+        name: meta.name,
+        size_mb: meta.size_mb,
+        created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(meta.created_at_secs),
+        dir: dir.to_path_buf(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +386,7 @@ fn entry_to_pb(e: VolumeEntry) -> PbVolumeInfo {
         .unwrap_or_default();
 
     PbVolumeInfo {
+        mount_path: e.data_path().to_string_lossy().into_owned(),
         id: e.id,
         name: e.name,
         size_mb: e.size_mb,
@@ -248,7 +394,6 @@ fn entry_to_pb(e: VolumeEntry) -> PbVolumeInfo {
             seconds: d.as_secs() as i64,
             nanos: d.subsec_nanos() as i32,
         }),
-        mount_path: e.mount_path.to_string_lossy().into_owned(),
     }
 }
 
@@ -265,18 +410,6 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
-    /// Test formatter: creates the image file at the requested size but
-    /// skips `mkfs.ext4`, so the CRUD tests run offline and on any OS.
-    #[derive(Debug)]
-    struct FakeFormatter;
-
-    #[async_trait::async_trait]
-    impl VolumeFormatter for FakeFormatter {
-        async fn format(&self, image_path: &Path, size_mb: u32) -> Result<()> {
-            allocate_sparse_image(image_path, size_mb).await
-        }
-    }
-
     /// Build a VolumeManager with a per-test temp data dir.
     /// The TempDir is leaked intentionally: tokio's async fs API outlives
     /// any test-local scope and clean-up happens on process exit.
@@ -284,7 +417,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
         std::mem::forget(dir);
-        VolumeManager::with_formatter(path, max_volumes, Arc::new(FakeFormatter))
+        VolumeManager::new(path, max_volumes)
     }
 
     fn req(name: &str, size_mb: u32) -> CreateVolumeRequest {
@@ -503,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn given_volume_removed_when_create_then_cap_slot_is_freed() {
-        // Arrange: regression — removing a volume must release its slot
+        // Arrange: regression: removing a volume must release its slot
         // in the cap counter, otherwise a manager could lock up over time.
         let mgr = build_manager(2);
         let v1 = mgr.create(req("v1", 100)).await.unwrap();
@@ -518,76 +651,149 @@ mod tests {
         assert!(v3.is_ok(), "removing a volume must free a slot");
     }
 
-    // ----- backing image -------------------------------------------------
+    // ----- named volumes -------------------------------------------------
 
     #[tokio::test]
-    async fn given_zero_size_when_create_then_returns_invalid_request() {
-        // Arrange: a sizeless volume can't be allocated.
-        let mgr = build_manager(4);
-
-        // Act
-        let err = mgr.create(req("demo", 0)).await.expect_err("zero size");
-
-        // Assert: rejected before any disk work, as InvalidRequest.
-        match err {
-            ApiError::InvalidRequest(msg) => assert!(msg.contains("size_mb"), "got: {msg}"),
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn given_create_when_succeeds_then_image_allocated_at_requested_size() {
+    async fn given_existing_name_when_create_then_returns_the_same_volume() {
         // Arrange
         let mgr = build_manager(4);
+        let first = mgr.create(req("demo", 8)).await.unwrap();
 
         // Act
-        let v = mgr.create(req("demo", 8)).await.expect("create");
-
-        // Assert: the backing image exists inside the volume dir and reports
-        // the requested size (sparse, so on-disk usage may be less).
-        let image = std::path::Path::new(&v.mount_path).join(VOLUME_IMAGE);
-        let meta = std::fs::metadata(&image).expect("image metadata");
-        assert_eq!(meta.len(), 8 * 1024 * 1024);
-    }
-
-    #[tokio::test]
-    async fn given_allocate_sparse_image_when_called_then_file_has_exact_length() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("v.img");
-
-        // Act
-        allocate_sparse_image(&path, 4).await.expect("allocate");
+        let second = mgr.create(req("demo", 16)).await.unwrap();
 
         // Assert
-        let meta = std::fs::metadata(&path).expect("metadata");
-        assert_eq!(meta.len(), 4 * 1024 * 1024);
+        assert_eq!(second.id, first.id);
+        assert_eq!(mgr.list().await.unwrap().len(), 1);
     }
 
-    /// Real `mkfs.ext4` path. Skips cleanly where e2fsprogs is absent (dev
-    /// macOS), so it's a no-op locally and exercises the real tool on Linux
-    /// CI.
     #[tokio::test]
-    async fn given_ext4_formatter_when_format_then_produces_ext4_image() {
-        // Arrange: only meaningful where mkfs.ext4 exists.
-        let probe = tokio::process::Command::new("mkfs.ext4")
-            .arg("-V")
-            .output()
-            .await;
-        if probe.is_err() {
-            eprintln!("mkfs.ext4 unavailable — skipping real-format test");
-            return;
-        }
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let image = dir.path().join("real.img");
+    async fn given_missing_name_when_ensure_then_volume_is_created_with_data_dir() {
+        // Arrange
+        let mgr = build_manager(4);
 
         // Act
-        Ext4Formatter.format(&image, 8).await.expect("format ext4");
+        let v = mgr.ensure("cache").await.unwrap();
 
-        // Assert: ext4 superblock magic 0xEF53 sits at offset 0x438
-        // (little-endian: bytes 0x53, 0xEF).
-        let bytes = std::fs::read(&image).expect("read image");
-        assert_eq!(&bytes[0x438..0x43A], &[0x53, 0xEF], "missing ext4 magic");
+        // Assert
+        assert_eq!(v.name, "cache");
+        assert_eq!(v.size_mb, IMPLICIT_VOLUME_SIZE_MB);
+        assert!(Path::new(&v.mount_path).is_dir());
+        assert!(v.mount_path.ends_with(DATA_DIR));
+    }
+
+    #[tokio::test]
+    async fn given_ensure_called_twice_when_same_name_then_one_volume_exists() {
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let a = mgr.ensure("cache").await.unwrap();
+        let b = mgr.ensure("cache").await.unwrap();
+
+        // Assert
+        assert_eq!(a.id, b.id);
+    }
+
+    #[tokio::test]
+    async fn given_volume_with_data_when_manager_reopens_then_volume_is_listed() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let first = VolumeManager::new(dir.path().to_path_buf(), 4);
+        let v = first.ensure("keep").await.unwrap();
+        std::fs::write(Path::new(&v.mount_path).join("f"), b"x").unwrap();
+
+        // Act
+        let second = VolumeManager::new(dir.path().to_path_buf(), 4);
+        let listed = second.list().await.unwrap();
+
+        // Assert
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, v.id);
+        assert_eq!(listed[0].name, "keep");
+        assert!(Path::new(&listed[0].mount_path).join("f").exists());
+    }
+
+    #[tokio::test]
+    async fn given_an_existing_name_when_create_new_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.ensure("taken").await.unwrap();
+
+        // Act
+        let err = mgr.create_new("taken").await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn given_a_claimed_volume_when_removed_then_it_is_in_use_until_the_claim_drops() {
+        // Arrange
+        let mgr = build_manager(4);
+        let v = mgr.ensure("busy").await.unwrap();
+        let claim = mgr.claim("busy");
+
+        // Act
+        let while_claimed = mgr.remove(&v.id).await;
+        drop(claim);
+        let after = mgr.remove(&v.id).await;
+
+        // Assert
+        assert!(matches!(while_claimed, Err(ApiError::VolumeInUse(_))));
+        assert!(after.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_a_sandbox_using_the_volume_when_removed_then_the_error_lists_it() {
+        // Arrange
+        let mgr = build_manager(4);
+        let v = mgr.ensure("busy").await.unwrap();
+
+        // Act
+        let err = mgr
+            .remove_if_unused(&v.id, |_| async { vec!["sandbox-1".to_string()] })
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            err.to_string(),
+            "remove busy: volume is in use - [sandbox-1]"
+        );
+        assert!(mgr.get(&v.id).await.is_ok());
+    }
+
+    #[test]
+    fn given_a_volume_directory_with_a_mismatched_id_when_loaded_then_it_is_skipped() {
+        // Arrange
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(VOLUMES_DIR).join("not-the-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = r#"{"id":"other","name":"x","size_mb":1,"created_at_secs":0}"#;
+        std::fs::write(dir.join(META_FILE), meta).unwrap();
+
+        // Act
+        let loaded = load_volumes(&root.path().join(VOLUMES_DIR));
+
+        // Assert
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_new_volume_when_created_then_its_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let v = mgr.ensure("private").await.unwrap();
+
+        // Assert
+        let data_mode = std::fs::metadata(&v.mount_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(data_mode & 0o777, DIR_MODE);
     }
 }

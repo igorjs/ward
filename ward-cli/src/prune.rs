@@ -20,6 +20,7 @@ use crate::client::{self, Resolved};
 use crate::images::size_text;
 use crate::lifecycle::remove_resolved;
 use crate::prune_filter::{Filter, Kind};
+use crate::volume::link_counts;
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const PROMPT: &str = "Are you sure you want to continue? [y/N] ";
@@ -285,17 +286,19 @@ async fn prune_images(
     Ok(())
 }
 
-/// Removes the volumes that pass `filter`. None is in use: sandboxes cannot
-/// mount a volume yet.
+/// Removes the volumes that pass `filter` and that no sandbox mounts.
 async fn prune_volumes(
     c: &mut WardClient<Channel>,
     filter: &Filter,
     report: &mut Report,
 ) -> Result<()> {
     let volumes = c.list_volumes(()).await?.into_inner().volumes;
+    let links = link_counts(&c.list_sandboxes(()).await?.into_inner().sandboxes);
     let no_labels = HashMap::new();
     for volume in volumes {
-        if !filter.allows(volume.created_at.map(|t| t.seconds), &no_labels) {
+        if links.contains_key(&volume.name)
+            || !filter.allows(volume.created_at.map(|t| t.seconds), &no_labels)
+        {
             continue;
         }
         match c

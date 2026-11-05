@@ -32,6 +32,9 @@ fn create(d: &Daemon, extra: &[&str]) -> String {
     stdout(&out).trim().to_string()
 }
 
+/// Spaces Docker puts after the widest cell of a column.
+const COLUMN_GAP: usize = 3;
+
 fn ok(d: &Daemon, args: &[&str]) -> String {
     let out = run(d, args);
     assert!(out.status.success(), "{args:?} failed: {}", stderr(&out));
@@ -40,7 +43,7 @@ fn ok(d: &Daemon, args: &[&str]) -> String {
 
 /// The status column of `ward list` for `id`, or None when it is not listed.
 fn status_of(d: &Daemon, id: &str) -> Option<String> {
-    ok(d, &["list"]).lines().find_map(|l| {
+    ok(d, &["--no-pretty", "list"]).lines().find_map(|l| {
         let mut cols = l.split('\t');
         (cols.next() == Some(id)).then(|| cols.next().unwrap_or_default().to_string())
     })
@@ -245,15 +248,19 @@ fn given_running_sandbox_when_ps_then_header_and_a_row_are_printed() {
 
     // Assert
     let mut lines = printed.lines();
-    assert_eq!(
-        lines.next(),
-        Some("CONTAINER ID\tIMAGE\tCOMMAND\tCREATED\tSTATUS\tPORTS\tNAMES")
+    let header = lines.next().expect("header");
+    let gap = " ".repeat(COLUMN_GAP);
+    assert!(
+        header.starts_with(&format!("CONTAINER ID{gap}IMAGE ")),
+        "{header}"
     );
-    let row: Vec<&str> = lines.next().expect("row").split('\t').collect();
-    assert_eq!(row[0], &id[..12]);
-    assert_eq!(row[1], "alpine:latest");
-    assert!(row[4].starts_with("Up"), "{row:?}");
-    assert_eq!(row[6], "web1");
+    assert!(header.ends_with(&format!("{gap}NAMES")), "{header}");
+    let row = lines.next().expect("row");
+    assert!(row.starts_with(&id[..12]), "{row}");
+    assert!(row.contains("alpine:latest"), "{row}");
+    assert!(row.contains("Up"), "{row}");
+    assert!(row.ends_with("web1"), "{row}");
+    assert!(!printed.contains('\t'), "{printed}");
     assert_eq!(lines.next(), None);
 }
 
@@ -308,4 +315,40 @@ fn given_only_unknown_references_when_inspect_then_empty_array_and_nonzero_exit(
     assert!(!out.status.success());
     let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).expect("json array");
     assert!(entries.is_empty());
+}
+
+#[test]
+fn given_a_signal_flag_when_stop_and_restart_then_both_succeed_and_print_the_name() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "sig1"]);
+
+    // Act
+    let stopped = ok(&d, &["stop", "-s", "SIGINT", "sig1"]);
+    let restarted = ok(&d, &["restart", "--signal", "2", "sig1"]);
+
+    // Assert
+    assert_eq!(stopped.trim(), "sig1");
+    assert_eq!(restarted.trim(), "sig1");
+    assert_eq!(status_of(&d, &id).as_deref(), Some("running"));
+}
+
+#[test]
+fn given_an_unknown_signal_when_stop_then_it_fails_and_the_sandbox_is_untouched() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "sig2"]);
+    let before = status_of(&d, &id);
+
+    // Act
+    let out = run(&d, &["stop", "-s", "SIGNOPE", "sig2"]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("invalid stop signal: SIGNOPE"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(status_of(&d, &id), before);
 }

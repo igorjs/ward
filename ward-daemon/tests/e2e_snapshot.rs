@@ -178,7 +178,7 @@ fn given_malformed_snapshot_id_when_user_runs_snapshot_restore_then_fails_with_i
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_no_snapshots_when_user_runs_snapshot_list_then_stdout_is_empty() {
+fn given_no_snapshots_when_user_runs_snapshot_list_then_only_the_header_prints() {
     // Arrange: brand-new sandbox with no snapshots.
     let daemon = common::Daemon::spawn();
     let create_out = daemon
@@ -198,15 +198,11 @@ fn given_no_snapshots_when_user_runs_snapshot_list_then_stdout_is_empty() {
         .output()
         .expect("snapshot list");
 
-    // Assert: success exit, empty stdout. The convention across the CLI
-    // is "no rows = empty output"; callers distinguish "no snapshots"
-    // from "command failed" via the exit code.
+    // Assert: success exit and the header row alone, as Docker prints.
     assert!(out.status.success(), "list should succeed: {:?}", out);
-    assert!(
-        out.stdout.is_empty(),
-        "expected empty stdout: {:?}",
-        out.stdout
-    );
+    let printed = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(printed.lines().count(), 1, "{printed}");
+    assert!(printed.starts_with("SNAPSHOT_ID "), "{printed}");
 }
 
 #[test]

@@ -136,7 +136,10 @@ async fn given_run_rm_when_it_completes_then_a_second_remove_is_not_found() {
         .expect("run");
     let mut client = common::connect(&daemon.socket).await;
     let second = client
-        .remove_sandbox(RemoveSandboxRequest { id: name.into() })
+        .remove_sandbox(RemoveSandboxRequest {
+            id: name.into(),
+            ..Default::default()
+        })
         .await;
 
     // Assert

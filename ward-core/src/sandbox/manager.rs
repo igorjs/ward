@@ -155,6 +155,18 @@ impl Drop for NameReservation {
     }
 }
 
+/// The signal of `stop -s`, checked before anything is stopped. Empty means
+/// the sandbox's own stop signal.
+fn parse_stop_override(signal: Option<&str>) -> Result<Option<i32>> {
+    signal
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            crate::signal::parse(text)
+                .ok_or_else(|| ApiError::InvalidRequest(format!("invalid stop signal: {text}")))
+        })
+        .transpose()
+}
+
 fn name_in_use(name: &str, id: Option<&str>) -> ApiError {
     ApiError::NameInUse {
         name: name.to_string(),
@@ -701,6 +713,55 @@ struct Teardown {
     exited_ttl: Option<std::time::Duration>,
     /// Where a main process that may need starting again is reported.
     restarts: mpsc::UnboundedSender<RestartRequest>,
+    volumes: Option<Arc<crate::volume::VolumeManager>>,
+}
+
+/// Separates the sandbox from the mode in a `volumes_from` entry.
+const VOLUMES_FROM_MODE_SEPARATOR: char = ':';
+
+/// IDs of the sandboxes in `entries` that mount the volume called `name`.
+async fn volume_users_in(
+    entries: &RwLock<HashMap<String, SandboxEntry>>,
+    name: &str,
+) -> Vec<String> {
+    entries
+        .read()
+        .await
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .meta
+                .options
+                .mounts
+                .iter()
+                .any(|m| m.volume.as_deref() == Some(name))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Remove the anonymous volumes among `mounts` that no sandbox mounts or is
+/// being created to mount. One that cannot be removed stays; nothing depends
+/// on it.
+async fn release_anonymous_volumes(teardown: &Teardown, mounts: &[crate::protocol::Mount]) {
+    let Some(volumes) = &teardown.volumes else {
+        return;
+    };
+    for name in mounts
+        .iter()
+        .filter(|m| m.anonymous)
+        .filter_map(|m| m.volume.as_deref())
+    {
+        let entries = &teardown.entries;
+        let result = volumes
+            .remove_unused_by_name(name, |volume| async move {
+                volume_users_in(entries, &volume).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(volume = name, error = %e, "cannot remove an anonymous volume");
+        }
+    }
 }
 
 fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
@@ -844,6 +905,8 @@ pub struct SandboxManager {
     /// once and cannot mutate mid-process (in particular, a sandbox
     /// escape that touches `/proc/<pid>/environ` cannot widen it).
     allow_host_mounts: bool,
+    /// Volumes a sandbox may mount by name; `None` refuses named volumes.
+    volumes: Option<Arc<crate::volume::VolumeManager>>,
     /// Snapshot of `Config::network_backend`, same rationale as
     /// `allow_host_mounts`. Only the smoltcp backend has a datapath that
     /// enforces `EgressMode::Allowlist` (its per-flow guard in
@@ -898,6 +961,7 @@ impl SandboxManager {
             max_sandboxes,
             create_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sandboxes)),
             allow_host_mounts,
+            volumes: None,
             network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
             mains: Arc::new(RwLock::new(HashMap::new())),
@@ -945,6 +1009,7 @@ impl SandboxManager {
             events: self.events.clone(),
             exited_ttl: self.exited_ttl,
             restarts: self.restart_tx.clone(),
+            volumes: self.volumes.clone(),
         }
     }
 
@@ -1012,6 +1077,85 @@ impl SandboxManager {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot end the VM after the main process failed");
         }
         self.broker.deregister_sandbox(id).await;
+    }
+
+    /// Let sandboxes mount named volumes from `volumes`.
+    pub fn with_volumes(mut self, volumes: Arc<crate::volume::VolumeManager>) -> Self {
+        self.volumes = Some(volumes);
+        self
+    }
+
+    /// Claim the volume called `name` and return its host path. A volume that
+    /// is not `must_be_new` is created when missing; one that is must not
+    /// exist yet.
+    async fn claim_volume(
+        &self,
+        name: &str,
+        must_be_new: bool,
+    ) -> Result<(crate::volume::VolumeClaim, String)> {
+        let volumes = self.volumes.as_ref().ok_or_else(|| {
+            ApiError::InvalidRequest("this daemon cannot mount named volumes".into())
+        })?;
+        let claim = volumes.claim(name);
+        let info = if must_be_new {
+            volumes.create_new(name).await?
+        } else {
+            volumes.ensure(name).await?
+        };
+        Ok((claim, info.mount_path))
+    }
+
+    /// The mounts that `volumes_from` ("SANDBOX[:ro|rw]") stands for, with a
+    /// claim on each volume. They are read and claimed under the entries
+    /// lock, so the source cannot lose a volume in between. A mount whose
+    /// target is in `taken` is skipped: the explicit one wins.
+    async fn inherit_mounts(
+        &self,
+        volumes_from: &[String],
+        taken: &std::collections::HashSet<String>,
+    ) -> Result<(Vec<crate::protocol::Mount>, Vec<crate::volume::VolumeClaim>)> {
+        let mut mounts: Vec<crate::protocol::Mount> = Vec::new();
+        let mut claims = Vec::new();
+        for spec in volumes_from {
+            let (reference, mode) = spec
+                .split_once(VOLUMES_FROM_MODE_SEPARATOR)
+                .map_or((spec.as_str(), None), |(r, m)| (r, Some(m)));
+            let readonly = match mode {
+                None | Some("rw") => false,
+                Some("ro") => true,
+                Some(other) => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "invalid volumes-from mode \"{other}\" in \"{spec}\": use ro or rw"
+                    )));
+                }
+            };
+            let id = self.resolve(reference).await?;
+            let entries = self.entries.read().await;
+            let source = entries
+                .get(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(reference.to_string()))?;
+            for mount in &source.meta.options.mounts {
+                let target_taken = taken.contains(&mount.target)
+                    || mounts.iter().any(|m| m.target == mount.target);
+                if target_taken {
+                    continue;
+                }
+                if let (Some(name), Some(volumes)) = (&mount.volume, &self.volumes) {
+                    claims.push(volumes.claim(name));
+                }
+                mounts.push(crate::protocol::Mount {
+                    readonly: mount.readonly || readonly,
+                    ..mount.clone()
+                });
+            }
+        }
+        Ok((mounts, claims))
+    }
+
+    /// IDs of the sandboxes, stopped ones included, that mount the volume
+    /// called `name`.
+    pub async fn volume_users(&self, name: &str) -> Vec<String> {
+        volume_users_in(&self.entries, name).await
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -1446,14 +1590,56 @@ impl SandboxManager {
         // mount allowlist, because the validator reads the snapshot,
         // not the live env.
         let mut mounts = Vec::with_capacity(req.mounts.len());
+        // Held until the sandbox is recorded, so a volume it names cannot be
+        // removed while the image is still being pulled.
+        let mut volume_claims = Vec::new();
         for m in &req.mounts {
-            crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
-            mounts.push(crate::protocol::Mount {
-                source: m.source.clone(),
-                target: m.target.clone(),
-                readonly: m.readonly,
-            });
+            if m.volume.is_empty() {
+                crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
+                mounts.push(crate::protocol::Mount {
+                    source: m.source.clone(),
+                    target: m.target.clone(),
+                    readonly: m.readonly,
+                    volume: None,
+                    anonymous: false,
+                });
+            } else {
+                // The host path is the daemon's own, so the client's source
+                // is ignored and the host allowlist does not apply.
+                crate::validate::volume_mount(&m.volume, &m.target)?;
+                // Only a volume the daemon makes for this mount is anonymous.
+                let anonymous = m.anonymous;
+                if anonymous {
+                    crate::validate::anonymous_volume_name(&m.volume)?;
+                }
+                let (claim, source) = self.claim_volume(&m.volume, anonymous).await?;
+                volume_claims.push(claim);
+                mounts.push(crate::protocol::Mount {
+                    source,
+                    target: m.target.clone(),
+                    readonly: m.readonly,
+                    volume: Some(m.volume.clone()),
+                    anonymous,
+                });
+            }
         }
+        let taken: std::collections::HashSet<String> = mounts
+            .iter()
+            .map(|m| m.target.clone())
+            .chain(
+                req.guest
+                    .iter()
+                    .flat_map(|guest| guest.tmpfs.iter().map(|t| t.path.clone())),
+            )
+            .collect();
+        let (inherited, inherited_claims) = self.inherit_mounts(&req.volumes_from, &taken).await?;
+        for m in &inherited {
+            if m.volume.is_none() {
+                crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
+            }
+        }
+        mounts.extend(inherited);
+        volume_claims.extend(inherited_claims);
 
         // Validate volume references before they reach the backend.
         for vid in &req.volume_ids {
@@ -2092,11 +2278,23 @@ impl SandboxManager {
 
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        self.remove_with_volumes(id, false).await
+    }
+
+    /// Remove a sandbox. With `remove_volumes`, its anonymous volumes go too,
+    /// unless another sandbox still mounts them.
+    pub async fn remove_with_volumes(&self, id: &str, remove_volumes: bool) -> Result<()> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
+        let mounts = match self.entries.read().await.get(id) {
+            Some(entry) if remove_volumes => entry.meta.options.mounts.clone(),
+            _ => Vec::new(),
+        };
         Self::cleanup_sandbox_inner(&self.teardown(), id, /* from_timeout = */ false)
             .await
-            .map_err(backend_err)
+            .map_err(backend_err)?;
+        release_anonymous_volumes(&self.teardown(), &mounts).await;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -2117,9 +2315,21 @@ impl SandboxManager {
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
+        self.stop_with_signal(reference, grace_seconds, None).await
+    }
+
+    /// Like [`stop_within`](Self::stop_within), asking the main process to
+    /// end with `signal` instead of the sandbox's stop signal.
+    pub async fn stop_with_signal(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+        signal: Option<&str>,
+    ) -> Result<PbSandboxInfo> {
+        let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         let grace = self.grace_for(&id, grace_seconds).await;
-        self.stop_resolved(&id, grace).await?;
+        self.stop_resolved(&id, grace, signal).await?;
         let info = self.info(&id, CommandView::Full).await?;
         if self.is_auto_remove(&id).await {
             self.remove(&id).await?;
@@ -2160,12 +2370,25 @@ impl SandboxManager {
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
+        self.restart_with_signal(reference, grace_seconds, None)
+            .await
+    }
+
+    /// Like [`restart_within`](Self::restart_within), with the stop signal
+    /// of [`stop_with_signal`](Self::stop_with_signal).
+    pub async fn restart_with_signal(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+        signal: Option<&str>,
+    ) -> Result<PbSandboxInfo> {
+        let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         self.refuse_if_had_secrets(&id).await?;
         let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
         if !failed {
             let grace = self.grace_for(&id, grace_seconds).await;
-            self.stop_resolved(&id, grace).await?;
+            self.stop_resolved(&id, grace, signal).await?;
         }
         self.clear_restart_history(&id).await?;
         self.start_resolved(&id).await?;
@@ -2229,7 +2452,12 @@ impl SandboxManager {
             .unwrap_or(SIGTERM)
     }
 
-    async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
+    async fn stop_resolved(
+        &self,
+        id: &str,
+        grace: Option<std::time::Duration>,
+        signal: Option<i32>,
+    ) -> Result<()> {
         let Some((before, meta)) = self.begin_stop(id).await? else {
             tracing::info!(sandbox_id = %id, "sandbox already stopped");
             return Ok(());
@@ -2239,7 +2467,7 @@ impl SandboxManager {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot thaw the paused sandbox before stopping it");
         }
         self.close_listeners(id).await;
-        let main_end = self.end_main_process(id, grace).await;
+        let main_end = self.end_main_process(id, grace, signal).await;
         let died_with = match main_end {
             MainEnd::NoMain => Some(0),
             MainEnd::Exited(code, _) => Some(code),
@@ -2286,7 +2514,12 @@ impl SandboxManager {
     /// and force it with SIGKILL once the grace period passes. Returns its exit code, or `None` when
     /// the sandbox has no main process, and unknown when it never reported an
     /// exit even after SIGKILL.
-    async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> MainEnd {
+    async fn end_main_process(
+        &self,
+        id: &str,
+        grace: Option<std::time::Duration>,
+        signal: Option<i32>,
+    ) -> MainEnd {
         let (control, mut exit, oom_killed) = {
             let mains = self.mains.read().await;
             let Some(main) = mains.get(id) else {
@@ -2299,9 +2532,13 @@ impl SandboxManager {
             )
         };
         if let Some(control) = &control {
-            let _ = control
-                .send(ProcessControl::Signal(self.stop_signal_of(id).await))
-                .await;
+            let signal = match signal {
+                Some(signal) => signal,
+                None => self.stop_signal_of(id).await,
+            };
+            if control.send(ProcessControl::Signal(signal)).await.is_err() {
+                tracing::warn!(sandbox_id = %id, signal, "cannot deliver the stop signal");
+            }
         }
         if !ended_within(&mut exit, grace).await {
             tracing::warn!(sandbox_id = %id, "main process ignored the stop signal, forcing it");
@@ -2364,15 +2601,16 @@ impl SandboxManager {
         ports: &mut [crate::protocol::PublishedPort],
     ) -> Result<Vec<PortListener>> {
         let mut listeners = Vec::with_capacity(ports.len());
-        for port in ports.iter_mut() {
+        // Fixed host ports go first, so a range cannot take one a later
+        // mapping asked for by number.
+        let mut order: Vec<usize> = (0..ports.len()).collect();
+        order.sort_by_key(|&index| ports[index].host_port_end != 0);
+        for index in order {
+            let port = &mut ports[index];
             if port.host_ip.is_unspecified() {
                 tracing::warn!(sandbox_id = %id, host_port = port.host_port, "publishing on all host interfaces");
             }
-            let listener = match self
-                .forwarder
-                .open(id, port.host_addr(), port.container_port)
-                .await
-            {
+            let listener = match self.open_in_range(id, port).await {
                 Ok(listener) => listener,
                 Err(e) => {
                     close_all(listeners).await;
@@ -2380,10 +2618,38 @@ impl SandboxManager {
                 }
             };
             port.host_port = listener.local_addr().port();
+            port.host_port_end = 0;
             tracing::info!(sandbox_id = %id, host_port = port.host_port, container_port = port.container_port, "published port");
             listeners.push(listener);
         }
         Ok(listeners)
+    }
+
+    /// Open `port`, trying each host port of its range until one is free.
+    async fn open_in_range(
+        &self,
+        id: &str,
+        port: &crate::protocol::PublishedPort,
+    ) -> crate::backend::Result<PortListener> {
+        let last = port.host_port_end.max(port.host_port);
+        let mut attempt = *port;
+        loop {
+            match self
+                .forwarder
+                .open(
+                    id,
+                    attempt.host_addr(),
+                    attempt.container_port,
+                    attempt.protocol,
+                )
+                .await
+            {
+                Err(BackendError::AddressInUse(_)) if attempt.host_port < last => {
+                    attempt.host_port += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Close the sandbox's ports and wait until the host frees them.
@@ -2954,6 +3220,9 @@ impl SandboxManager {
         }
         let result = teardown.backend.remove_sandbox(id).await;
         if let Some(RemovedEntry { meta, .. }) = removed {
+            if meta.options.spec.auto_remove {
+                release_anonymous_volumes(teardown, &meta.options.mounts).await;
+            }
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
             // Removing a running sandbox kills it, as `docker rm -f` does.
@@ -3472,6 +3741,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 source: m.source.clone(),
                 target: m.target.clone(),
                 readonly: m.readonly,
+                volume: m.volume.clone().unwrap_or_default(),
+                anonymous: m.anonymous,
             })
             .collect(),
         paused: info.paused,
@@ -3484,7 +3755,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 host_ip: port.host_ip.to_string(),
                 host_port: u32::from(port.host_port),
                 container_port: u32::from(port.container_port),
-                protocol: crate::validate::PUBLISH_PROTOCOL.to_string(),
+                protocol: port.protocol.as_str().to_string(),
+                host_port_end: 0,
             })
             .collect(),
         entrypoint: match view {
@@ -7998,6 +8270,11 @@ pub(crate) mod tests {
     const SIGKILL_EXIT_CODE: i32 = 137;
     #[cfg(not(feature = "krunvm"))]
     const STOP_SIGNAL_EXIT_CODE: i32 = 42;
+    /// A stop grace of -1 waits as long as it takes.
+    #[cfg(not(feature = "krunvm"))]
+    const WAIT_FOREVER: i32 = -1;
+    #[cfg(not(feature = "krunvm"))]
+    const RESTART_SIGNAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const DEFAULT_HOSTNAME_LEN: usize = 12;
     #[cfg(not(feature = "krunvm"))]
     const SIGTERM_EXIT_CODE: i32 = 143;
@@ -8387,6 +8664,79 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_signal_override_when_stopped_then_it_replaces_the_stop_signal() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        mgr.stop_with_signal(&id, None, Some("SIGHUP"))
+            .await
+            .expect("stop");
+
+        // Assert
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_signal_override_when_restarted_then_the_old_process_gets_it() {
+        // Arrange: only SIGHUP ends the process, and the stop waits forever.
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        let restarted = tokio::time::timeout(
+            RESTART_SIGNAL_DEADLINE,
+            mgr.restart_with_signal(&id, Some(WAIT_FOREVER), Some("SIGHUP")),
+        )
+        .await;
+
+        // Assert
+        assert!(
+            restarted
+                .expect("restart must not wait out the grace")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_signal_override_when_stopped_then_the_request_is_invalid() {
+        // Arrange
+        let mgr = build_manager(4);
+        let id = mgr.create(create_req("alpine"), "").await.unwrap().id;
+
+        // Act
+        let stop = mgr.stop_with_signal(&id, None, Some("SIGNOPE")).await;
+        let restart = mgr.restart_with_signal(&id, None, Some("99999")).await;
+
+        // Assert
+        assert!(matches!(stop, Err(ApiError::InvalidRequest(_))));
+        assert!(matches!(restart, Err(ApiError::InvalidRequest(_))));
     }
 
     #[tokio::test]

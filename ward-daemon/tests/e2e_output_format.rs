@@ -75,7 +75,7 @@ fn given_go_template_syntax_when_inspect_and_ps_format_then_range_if_and_functio
     assert_eq!(state.trim(), "RUNNING");
     assert_eq!(ps.trim(), "web1||||1");
     let header = sized.lines().next().expect("header");
-    assert!(header.ends_with("\tNAMES\tSIZE"), "{header}");
+    assert!(header.ends_with("NAMES   SIZE"), "{header}");
     let row = sized.lines().nth(1).expect("row");
     assert!(row.contains("-- (virtual "), "{row}");
 }

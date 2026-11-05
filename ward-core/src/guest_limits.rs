@@ -4,7 +4,7 @@
 //! the guest agent arguments that apply them.
 
 use crate::pb;
-use crate::protocol::{ApiError, CgroupLimits, Ulimit};
+use crate::protocol::{ApiError, CgroupLimits, CgroupUpdate, Ulimit};
 
 /// The limits `--ulimit` names, as `docker run --ulimit` lists them.
 pub const ULIMIT_NAMES: [&str; 15] = [
@@ -39,6 +39,8 @@ const MAX_CPU_WEIGHT: u64 = 10_000;
 const MIN_CPU_PERIOD: u64 = 1_000;
 const MAX_CPU_PERIOD: u64 = 1_000_000;
 const MIN_CPU_QUOTA: i64 = 1_000;
+/// Docker's default for `--cpu-shares`, which a value of 0 stands for.
+const DEFAULT_CPU_SHARES: u32 = 1024;
 /// The period the kernel uses when only a quota is set.
 const DEFAULT_CPU_PERIOD: u64 = 100_000;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -186,6 +188,73 @@ pub fn cpu_weight(shares: u32) -> u64 {
     MIN_CPU_WEIGHT + scaled
 }
 
+/// The `cpu.max` quota text and period, or `None` when nothing limits the
+/// CPU. A quota of -1 or 0 alone sets nothing, as in Docker.
+fn cpu_max(limits: &CgroupLimits) -> Option<(String, u64)> {
+    if limits.cpu_quota <= 0 && limits.cpu_period == 0 {
+        return None;
+    }
+    let quota = if limits.cpu_quota > 0 {
+        limits.cpu_quota.to_string()
+    } else {
+        CPU_MAX_UNLIMITED.to_string()
+    };
+    let period = if limits.cpu_period == 0 {
+        DEFAULT_CPU_PERIOD
+    } else {
+        limits.cpu_period
+    };
+    Some((quota, period))
+}
+
+/// `cpu.max` without a limit, for a quota of -1 or 0 and no period.
+fn cpu_max_removed() -> (String, u64) {
+    (CPU_MAX_UNLIMITED.to_string(), DEFAULT_CPU_PERIOD)
+}
+
+/// The cgroup settings a running sandbox needs to match `merged`, for the
+/// options `update` changes.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LiveSettings {
+    pub memory_low_bytes: Option<u64>,
+    pub cpu_weight: Option<u64>,
+    pub cpu_max: Option<(String, u64)>,
+    pub cpuset_cpus: Option<String>,
+}
+
+impl LiveSettings {
+    /// True when no running setting changes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// What to write into a running sandbox's cgroup after `update` turned the
+/// recorded options into `merged`. `--memory-swap` has nothing to write: the
+/// guest has no swap.
+#[must_use]
+pub fn live_settings(update: &CgroupUpdate, merged: &CgroupLimits) -> LiveSettings {
+    let changes_cpu_max = update.cpu_quota.is_some() || update.cpu_period.is_some();
+    LiveSettings {
+        memory_low_bytes: update
+            .memory_reservation_bytes
+            .map(|_| merged.memory_reservation_bytes),
+        cpu_weight: update.cpu_shares.map(|_| {
+            cpu_weight(if merged.cpu_shares == 0 {
+                DEFAULT_CPU_SHARES
+            } else {
+                merged.cpu_shares
+            })
+        }),
+        cpu_max: changes_cpu_max.then(|| cpu_max(merged).unwrap_or_else(cpu_max_removed)),
+        cpuset_cpus: update
+            .cpuset_cpus
+            .as_ref()
+            .map(|_| merged.cpuset_cpus.clone()),
+    }
+}
+
 /// The agent arguments that apply the limits at boot.
 #[must_use]
 pub fn agent_args(ulimits: &[Ulimit], groups: &[String], limits: &CgroupLimits) -> Vec<String> {
@@ -213,18 +282,7 @@ pub fn agent_args(ulimits: &[Ulimit], groups: &[String], limits: &CgroupLimits) 
             cpu_weight(limits.cpu_shares).to_string(),
         ]);
     }
-    // A quota of -1 or 0 alone sets nothing, as in Docker.
-    if limits.cpu_quota > 0 || limits.cpu_period != 0 {
-        let quota = if limits.cpu_quota > 0 {
-            limits.cpu_quota.to_string()
-        } else {
-            CPU_MAX_UNLIMITED.to_string()
-        };
-        let period = if limits.cpu_period == 0 {
-            DEFAULT_CPU_PERIOD
-        } else {
-            limits.cpu_period
-        };
+    if let Some((quota, period)) = cpu_max(limits) {
         args.extend([CPU_MAX_ARG.to_string(), quota, period.to_string()]);
     }
     if !limits.cpuset_cpus.is_empty() {
@@ -446,5 +504,67 @@ mod tests {
         };
 
         assert_eq!(agent_args(&[], &[], &limits), ["--cpu-max", "max", "50000"]);
+    }
+
+    #[test]
+    fn given_a_quota_update_when_live_settings_built_then_cpu_max_uses_the_recorded_period() {
+        let update = CgroupUpdate {
+            cpu_quota: Some(50_000),
+            ..Default::default()
+        };
+        let merged = CgroupLimits {
+            cpu_quota: 50_000,
+            cpu_period: 200_000,
+            ..Default::default()
+        };
+
+        let live = live_settings(&update, &merged);
+
+        assert_eq!(live.cpu_max, Some(("50000".to_string(), 200_000)));
+        assert_eq!(live.cpu_weight, None);
+    }
+
+    #[test]
+    fn given_an_unlimited_quota_when_live_settings_built_then_cpu_max_is_removed() {
+        let update = CgroupUpdate {
+            cpu_quota: Some(-1),
+            ..Default::default()
+        };
+
+        let live = live_settings(&update, &CgroupLimits::default());
+
+        assert_eq!(live.cpu_max, Some(("max".to_string(), 100_000)));
+    }
+
+    #[test]
+    fn given_shares_reservation_and_cpuset_when_live_settings_built_then_each_maps_to_its_file() {
+        let update = CgroupUpdate {
+            cpu_shares: Some(1024),
+            memory_reservation_bytes: Some(0),
+            cpuset_cpus: Some("0".into()),
+            ..Default::default()
+        };
+        let merged = CgroupLimits {
+            cpu_shares: 1024,
+            cpuset_cpus: "0".into(),
+            ..Default::default()
+        };
+
+        let live = live_settings(&update, &merged);
+
+        assert_eq!(live.cpu_weight, Some(39));
+        assert_eq!(live.memory_low_bytes, Some(0));
+        assert_eq!(live.cpuset_cpus.as_deref(), Some("0"));
+        assert!(!live.is_empty());
+    }
+
+    #[test]
+    fn given_only_a_swap_update_when_live_settings_built_then_nothing_runs() {
+        let update = CgroupUpdate {
+            memory_swap_bytes: Some(1),
+            ..Default::default()
+        };
+
+        assert!(live_settings(&update, &CgroupLimits::default()).is_empty());
     }
 }

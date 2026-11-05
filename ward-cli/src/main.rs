@@ -43,6 +43,7 @@ mod secrets;
 mod socket;
 mod start_attach;
 mod stats;
+mod stop_options;
 mod system;
 mod tag;
 mod template;
@@ -82,9 +83,8 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Force tab-separated output for list commands even when stdout is
-    /// a TTY. Useful when the operator wants to copy the table cleanly
-    /// or pipe through an external pretty-printer. Also honoured via
+    /// Print list commands as tab-separated columns instead of Docker's
+    /// aligned table. Ward only; handy for `cut -f`. Also honoured via
     /// `WARD_NO_PRETTY=1`.
     #[arg(long, global = true)]
     no_pretty: bool,
@@ -96,8 +96,9 @@ struct Cli {
 /// Footer for commands whose behavior differs from Docker's.
 const DOCKER_DIFFERENCES: &str = "See docs/docker-differences.md or https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
 
-const DEFAULT_MEMORY: &str = "512m";
-const DEFAULT_CPUS: &str = "1";
+/// Value sent for `--memory` and `--cpus` when the flag is absent: the daemon
+/// applies its own default, which is no limit unless the operator sets one.
+const DAEMON_DEFAULT_LIMIT: &str = "0";
 
 /// Help for `--time` on `stop` and `restart`.
 fn stop_time_help() -> String {
@@ -116,9 +117,16 @@ struct SandboxOpts {
     /// Environment variables in KEY=VALUE form.
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
-    /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
-    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    /// Mount a host directory or a named volume: SOURCE:TARGET[:OPTIONS]. A
+    /// SOURCE that is not an absolute path names a volume, created on first
+    /// use. A bare /TARGET makes an anonymous volume. OPTIONS is a comma list
+    /// of ro, rw, z, Z, cached, delegated, consistent and nocopy; z, Z, cached,
+    /// delegated, consistent and nocopy are accepted and ignored. Repeatable.
+    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:OPTIONS]")]
     volume: Vec<String>,
+    /// Mount the volumes of another sandbox: SANDBOX[:ro|rw]. Repeatable.
+    #[arg(long = "volumes-from", value_name = "SANDBOX[:ro|rw]")]
+    volumes_from: Vec<String>,
     /// Outbound network policy: "deny" (default), "allowlist" or "open".
     #[arg(long, default_value = "deny")]
     egress: String,
@@ -126,12 +134,14 @@ struct SandboxOpts {
     #[arg(long = "allow-domain", value_name = "DOMAIN")]
     allow_domain: Vec<String>,
     /// Memory limit: bytes, or a number with a k, m, g or t suffix (512m,
-    /// 1.5g). 0 uses the daemon default.
-    #[arg(short = 'm', long, default_value = DEFAULT_MEMORY, value_name = "SIZE")]
-    memory: String,
-    /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
-    #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
-    cpus: String,
+    /// 1.5g). Unset or 0 uses the daemon default, which is no limit unless the
+    /// operator sets one.
+    #[arg(short = 'm', long, value_name = "SIZE")]
+    memory: Option<String>,
+    /// CPU limit. Fractions round up to a whole CPU. Unset or 0 uses the
+    /// daemon default, which is no limit unless the operator sets one.
+    #[arg(long, value_name = "NUMBER")]
+    cpus: Option<String>,
     /// Process limit, as in Docker: 0 or -1 for unlimited. 0 uses the daemon
     /// default, which is unlimited unless the operator sets one.
     #[arg(
@@ -150,14 +160,16 @@ struct SandboxOpts {
     /// Working directory.
     #[arg(short = 'w', long)]
     workdir: Option<String>,
-    /// Publish a TCP port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp]. Without
-    /// HOST_PORT, or with 0, the daemon picks a free one. Repeatable.
-    /// Unlike Docker, HOST_IP defaults to 127.0.0.1, not 0.0.0.0; the port
-    /// stays open while the sandbox is exited and closes on stop or rm; TCP only.
+    /// Publish a port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp|/udp]. Without
+    /// HOST_PORT, or with 0, the daemon picks a free one. Either side can be a
+    /// range such as 8000-8010:80 (the first free host port) or
+    /// 8000-8002:80-82 (pairwise). Repeatable. Unlike Docker, HOST_IP defaults
+    /// to 127.0.0.1, not 0.0.0.0; the port stays open while the sandbox is
+    /// exited and closes on stop or rm.
     #[arg(
         short = 'p',
         long = "publish",
-        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
+        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp|/udp]"
     )]
     publish: Vec<String>,
     /// When to pull the image: "always", "missing" (default), "never", or
@@ -282,8 +294,10 @@ enum Commands {
         #[arg(short = 'l', long)]
         latest: bool,
         /// Only sandboxes matching name=, id= (a prefix), status=
-        /// (created, running, stopping, stopped, exited, failed), label= or
-        /// health= (starting, healthy, unhealthy, none). Repeatable.
+        /// (created, running, stopping, stopped, exited, failed), label=,
+        /// health= (starting, healthy, unhealthy, none), ancestor=IMAGE,
+        /// before=SANDBOX, since=SANDBOX, exited=CODE, publish=PORT[/tcp],
+        /// expose=PORT[/tcp] (ports may be ranges) or volume=PATH. Repeatable.
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
@@ -300,14 +314,14 @@ enum Commands {
     #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print the host address each published port is reachable on.
     ///
-    /// With PORT (80 or 80/tcp), prints only the host address for it.
+    /// With PORT (80, 80/tcp or 53/udp), prints only the host address for it.
     ///
     /// Unlike Docker, a port without HOST_IP binds 127.0.0.1, not 0.0.0.0. It
-    /// stays open while the sandbox is exited and closes on stop or rm. TCP only.
+    /// stays open while the sandbox is exited and closes on stop or rm.
     Port {
         /// Sandbox name, ID or ID prefix.
         reference: String,
-        /// Container port, optionally with /tcp.
+        /// Container port, optionally with /tcp or /udp.
         port: Option<String>,
     },
 
@@ -320,6 +334,10 @@ enum Commands {
         /// Go template for each sandbox.
         #[arg(short, long)]
         format: Option<String>,
+        /// Add SizeRootFs, the size of the sandbox's image. SizeRw is not
+        /// measured, so it is left out.
+        #[arg(short, long)]
+        size: bool,
         /// Kind of object to inspect: container. Ward cannot inspect images yet.
         #[arg(long = "type", value_name = "TYPE")]
         kind: Option<String>,
@@ -475,6 +493,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Start one or more stopped sandboxes.
@@ -496,6 +518,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Remove one or more sandboxes.
@@ -507,9 +533,9 @@ enum Commands {
         /// Remove a running sandbox too.
         #[arg(short, long)]
         force: bool,
-        /// Accepted for Docker scripts. Sandboxes have no anonymous volumes,
-        /// so there is nothing more to remove.
-        #[arg(short = 'v', long)]
+        /// Also remove the anonymous volumes of the sandbox, unless another
+        /// sandbox mounts them.
+        #[arg(short = 'v', long = "volumes")]
         volumes: bool,
         /// Not supported: sandboxes have no links to remove. Docker's short
         /// -l is `--latest` here, as in Podman.
@@ -625,10 +651,12 @@ enum Commands {
     ///
     /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
     /// SIZE. Every cached image is a final image, so -a adds nothing.
-    /// --filter takes reference=<pattern> (`*` matches any run of characters)
-    /// and dangling=true|false; no cached image is dangling. --format takes a
-    /// Go template over .Repository .Tag .ID .Digest .CreatedAt .CreatedSince
-    /// .Size, the `table ` prefix, and `{{json .}}`.
+    /// --filter takes reference=<pattern> (`*` matches any run of characters),
+    /// dangling=true|false (no cached image is dangling), before=IMAGE,
+    /// since=IMAGE and label=KEY (images carry no labels, so it matches none).
+    /// --digests adds a DIGEST column. --format takes a Go template over
+    /// .Repository .Tag .ID .Digest .CreatedAt .CreatedSince .Size, the
+    /// `table ` prefix, and `{{json .}}`.
     Images {
         /// Show all images. Ward keeps no intermediate images.
         #[arg(short, long)]
@@ -647,6 +675,9 @@ enum Commands {
         filter: Vec<String>,
         /// Only images of this REPOSITORY[:TAG].
         reference: Option<String>,
+        /// Show the digest column.
+        #[arg(long)]
+        digests: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -873,11 +904,14 @@ enum SystemCommands {
         #[arg(short, long)]
         format: Option<String>,
     },
-    /// Count sandboxes and cached images.
+    /// Show disk usage of images, containers and volumes.
     Df {
         /// Show a table per sandbox, image and volume.
         #[arg(short, long)]
         verbose: bool,
+        /// Go template per row: .Type .TotalCount .Active .Size .Reclaimable.
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Remove stopped sandboxes, and with -a unused images and with
     /// --volumes volumes, asking first unless -f is given.
@@ -951,22 +985,6 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `--volume`.
-fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (source, target, readonly) = match parts.as_slice() {
-        [source, target] => (*source, *target, false),
-        [source, target, "ro"] => (*source, *target, true),
-        [source, target, "rw"] => (*source, *target, false),
-        _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
-    };
-    Ok(ward_core::pb::Mount {
-        source: source.to_string(),
-        target: target.to_string(),
-        readonly,
-    })
-}
-
 /// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
 /// themselves contain '=', which matters for tokens, URLs and serialised JSON.
 /// A bare `KEY` takes its value from the host and is dropped when unset,
@@ -1006,8 +1024,10 @@ fn create_request(
         other => anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'"),
     };
     let resources = ward_core::pb::ResourceLimits {
-        cpus: resources::parse_cpus(&opts.cpus)?,
-        memory_mb: resources::parse_memory_mib(&opts.memory)?,
+        cpus: resources::parse_cpus(opts.cpus.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT))?,
+        memory_mb: resources::parse_memory_mib(
+            opts.memory.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT),
+        )?,
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
@@ -1017,14 +1037,16 @@ fn create_request(
     let mounts = opts
         .volume
         .iter()
-        .map(|spec| parse_mount_spec(spec))
+        .map(|spec| volume::parse_flag(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let volumes_from = opts.volumes_from.clone();
     let published_ports = ports::parse_all(&opts.publish)?;
     ports::warn_if_exposed(&published_ports);
     let mut request = ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
         published_ports,
+        volumes_from,
         egress: Some(ward_core::pb::EgressPolicy {
             mode: egress_mode as i32,
             domains: opts.allow_domain,
@@ -1131,6 +1153,9 @@ const IMAGE_COMMANDS: [(&str, &str); 12] = [
     ("import", "import"),
 ];
 
+/// Docker's `system` subcommands that are top-level commands in Ward.
+const SYSTEM_COMMANDS: [(&str, &str); 1] = [("events", "events")];
+
 /// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
 /// same way, so both spellings share one definition and one help text.
 fn expand_groups(mut args: Vec<String>) -> Vec<String> {
@@ -1140,6 +1165,7 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     let table: &[(&str, &str)] = match args[group].as_str() {
         "container" => &CONTAINER_COMMANDS,
         "image" => &IMAGE_COMMANDS,
+        "system" => &SYSTEM_COMMANDS,
         _ => return args,
     };
     let target = args
@@ -1369,12 +1395,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Inspect {
             format,
+            size,
             kind,
             references,
         } => {
             inspect::check_type(kind.as_deref())?;
             let mut c = client::connect(&socket_path).await?;
-            inspect::inspect(&mut c, &token_store, &references, format.as_deref()).await?;
+            inspect::inspect(&mut c, &token_store, &references, format.as_deref(), size).await?;
         }
 
         Commands::Exec {
@@ -1655,10 +1682,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         },
 
-        Commands::Stop { refs, time } => {
+        Commands::Stop { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             let action = lifecycle::Action::Stop;
-            lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
+            lifecycle::lifecycle(&mut c, &token_store, action, &refs, &stop, json).await?;
         }
 
         Commands::Start { refs, attach } if attach.wanted() => {
@@ -1678,20 +1706,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &token_store,
                 lifecycle::Action::Start,
                 &refs,
-                None,
+                &stop_options::StopOptions::default(),
                 json,
             )
             .await?;
         }
 
-        Commands::Restart { refs, time } => {
+        Commands::Restart { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
                 &token_store,
                 lifecycle::Action::Restart,
                 &refs,
-                time,
+                &stop,
                 json,
             )
             .await?;
@@ -1700,12 +1729,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Remove {
             refs,
             force,
-            volumes: _,
+            volumes,
             link,
         } => {
             lifecycle::refuse_link(link)?;
             let mut c = client::connect(&socket_path).await?;
-            lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+            lifecycle::remove(&mut c, &token_store, &refs, force, volumes, json).await?;
         }
 
         Commands::Cp {
@@ -1771,9 +1800,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             format,
             filter,
             reference,
+            digests,
             ..
         } => {
             let options = images::Options {
+                digests,
                 quiet,
                 no_trunc,
                 format,
@@ -1874,12 +1905,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             system::version(&socket_path, format.as_deref(), json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: true }) => {
+        Commands::System(SystemCommands::Df {
+            verbose: true,
+            format: Some(_),
+        }) => {
+            anyhow::bail!("--format is not supported with system df -v");
+        }
+
+        Commands::System(SystemCommands::Df { verbose: true, .. }) => {
             df_verbose::run(&socket_path, json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: false }) => {
-            system::df(&socket_path, json, no_pretty).await?;
+        Commands::System(SystemCommands::Df {
+            verbose: false,
+            format,
+        }) => {
+            system::df(&socket_path, format.as_deref(), json, no_pretty).await?;
         }
 
         Commands::Container { .. } | Commands::Image { .. } => {
@@ -2046,7 +2087,7 @@ mod tests {
 
     #[test]
     fn given_source_and_target_when_parse_mount_then_read_write() {
-        let m = parse_mount_spec("/tmp/a:/data").unwrap();
+        let m = volume::parse_flag("/tmp/a:/data").unwrap();
         assert_eq!(
             (m.source.as_str(), m.target.as_str(), m.readonly),
             ("/tmp/a", "/data", false)
@@ -2074,6 +2115,8 @@ mod tests {
     #[case::container_remove(&["ward", "container", "remove", "x"], &["ward", "rm", "x"])]
     #[case::image_ls(&["ward", "image", "ls"], &["ward", "images"])]
     #[case::image_pull(&["ward", "image", "pull", "alpine"], &["ward", "pull", "alpine"])]
+    #[case::system_events(&["ward", "system", "events", "--since", "1h"], &["ward", "events", "--since", "1h"])]
+    #[case::system_info_is_left_alone(&["ward", "system", "info"], &["ward", "system", "info"])]
     #[case::unknown_sub_is_left_alone(&["ward", "container", "nope"], &["ward", "container", "nope"])]
     #[case::other_command(&["ward", "ps", "container"], &["ward", "ps", "container"])]
     fn given_group_command_when_expanded_then_it_names_the_top_level_command(
@@ -2172,6 +2215,22 @@ mod tests {
         // Assert
         let limits = request.resources.expect("resources");
         assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
+    }
+
+    #[test]
+    fn given_no_memory_or_cpus_flags_when_request_built_then_daemon_default_is_requested() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "run", "alpine", "true"]).expect("parse");
+        let Commands::Run { image, opts, .. } = cli.command else {
+            panic!("expected Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let limits = request.resources.expect("resources");
+        assert_eq!((limits.memory_mb, limits.cpus), (0, 0));
     }
 
     #[rstest::rstest]
@@ -2431,14 +2490,27 @@ mod tests {
 
     #[test]
     fn given_ro_suffix_when_parse_mount_then_readonly() {
-        assert!(parse_mount_spec("/tmp/a:/data:ro").unwrap().readonly);
+        assert!(volume::parse_flag("/tmp/a:/data:ro").unwrap().readonly);
+    }
+
+    #[rstest::rstest]
+    #[case::dot_slash("./data:/d")]
+    #[case::home("~/data:/d")]
+    #[case::relative_path("dir/data:/d")]
+    fn given_a_relative_bind_source_when_parsed_then_the_error_says_absolute(#[case] spec: &str) {
+        let error = volume::parse_flag(spec).unwrap_err();
+
+        assert!(
+            error.to_string().contains("must be an absolute path"),
+            "{error}"
+        );
     }
 
     #[test]
     fn given_malformed_spec_when_parse_mount_then_error() {
-        assert!(parse_mount_spec("/tmp/a").is_err());
-        assert!(parse_mount_spec("/tmp/a:/data:wat").is_err());
-        assert!(parse_mount_spec("a:b:ro:extra").is_err());
+        assert!(volume::parse_flag("tmp/a").is_err());
+        assert!(volume::parse_flag("/tmp/a:/data:wat").is_err());
+        assert!(volume::parse_flag("a:b:ro:extra").is_err());
     }
 
     #[test]
@@ -2686,6 +2758,23 @@ mod tests {
         match cli.command {
             Commands::Restart { time, .. } => assert_eq!(time, Some(5)),
             other => panic!("expected Restart, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::stop_short(&["ward", "stop", "-s", "SIGINT", "web1"])]
+    #[case::stop_long(&["ward", "stop", "--signal", "SIGINT", "web1"])]
+    #[case::restart_short(&["ward", "restart", "-s", "SIGINT", "web1"])]
+    fn given_a_signal_flag_when_parsed_then_it_is_kept(#[case] args: &[&str]) {
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Stop { signal, .. } | Commands::Restart { signal, .. } => {
+                assert_eq!(signal.as_deref(), Some("SIGINT"));
+            }
+            other => panic!("expected Stop or Restart, got {other:?}"),
         }
     }
 

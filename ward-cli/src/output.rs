@@ -7,42 +7,29 @@
 //! 1. `--json` (or `WARD_JSON=1`): every command emits a single JSON
 //!    object per result; list commands emit a JSON array. Stable for
 //!    `jq` pipelines.
-//! 2. Default + TTY + not piped: list commands use aligned tables
-//!    (via `tabled`). Single-record commands keep `key: value` lines.
-//! 3. Default + piped (or `--no-pretty`): tab-separated columns for
-//!    list commands; key/value lines for single-record. Stable for
-//!    `awk` / `cut` / `grep` in shell pipelines.
+//! 2. Default: list commands print Docker's space-aligned table with a
+//!    header row, whether or not stdout is a TTY.
+//! 3. `--no-pretty` (or `WARD_NO_PRETTY=1`): tab-separated columns for
+//!    list commands, for `cut -f` pipelines. This one is Ward only.
 //!
 //! The functions here are intentionally tiny so call sites stay
 //! readable; per-command output stays in `main.rs`.
 
-use std::io::IsTerminal;
-
 use serde_json::Value;
 
-/// True when stdout is an interactive TTY AND the user has not asked
-/// for `--no-pretty`. List commands gate aligned-table rendering on
-/// this; everything else stays unchanged.
-pub fn pretty_tables_enabled(no_pretty: bool) -> bool {
-    !no_pretty && std::io::stdout().is_terminal()
-}
-
-/// Header line for tab-separated output. Docker prints it even when piped.
-/// Aligned tables carry their own header, so they return `None`.
+/// Header line for tab-separated output. Aligned tables carry their own
+/// header, so they return `None`.
 pub fn tsv_header(no_pretty: bool, headers: &[&str]) -> Option<String> {
-    (!pretty_tables_enabled(no_pretty)).then(|| headers.join("\t"))
+    no_pretty.then(|| headers.join("\t"))
 }
 
 /// Emit a list result. `headers` names each column; `rows` carries the
 /// values (one inner Vec per row, length must equal `headers.len()`).
 /// In JSON mode: writes one array of `{header: value, ...}` objects.
-/// In TTY mode (and `pretty_tables_enabled`): aligned table.
-/// Otherwise: tab-separated lines (the historical default).
+/// Otherwise: Docker's aligned table, or tab-separated lines with `no_pretty`.
 ///
-/// `json_values` lets callers pass typed values (numbers, bools, nulls)
-/// rather than coercing everything to strings; the TTY / TSV paths
-/// stringify via `Value::to_string` which preserves the natural
-/// representation.
+/// Table and TSV paths stringify values via `Value::to_string`, which keeps
+/// the natural representation.
 pub fn emit_rows(
     json: bool,
     no_pretty: bool,
@@ -64,26 +51,24 @@ pub fn emit_rows(
         return Ok(());
     }
 
-    if pretty_tables_enabled(no_pretty) {
-        use tabled::{builder::Builder, settings::Style};
-        let mut b = Builder::new();
-        b.push_record(headers.iter().map(|h| h.to_string()));
-        for row in rows {
-            b.push_record(row.iter().map(stringify));
-        }
-        let mut t = b.build();
-        t.with(Style::psql());
-        println!("{t}");
+    if !no_pretty {
+        print!("{}", table_text(headers, rows));
         return Ok(());
     }
 
-    // Tab-separated default. Empty output means "list found nothing"
-    // (same convention as `grep`); scripts distinguish via exit code.
+    // Rows only: with `--no-pretty` a list that found nothing prints nothing.
     for row in rows {
         let cols: Vec<String> = row.iter().map(stringify).collect();
         println!("{}", cols.join("\t"));
     }
     Ok(())
+}
+
+/// Docker's aligned table: upper case headers, then one line per row.
+fn table_text(headers: &[&str], rows: &[Vec<Value>]) -> String {
+    let mut lines = vec![headers.iter().map(|h| h.to_uppercase()).collect()];
+    lines.extend(rows.iter().map(|row| row.iter().map(stringify).collect()));
+    crate::template::align(&lines)
 }
 
 /// Stringify a `serde_json::Value` for human / TSV display. Strings
@@ -104,8 +89,30 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn given_default_mode_when_header_built_then_none_because_the_table_has_one() {
+        assert_eq!(tsv_header(false, &["A", "B"]), None);
+    }
+
+    #[test]
     fn given_no_pretty_when_header_built_then_columns_are_tab_separated() {
         assert_eq!(tsv_header(true, &["A", "B"]).as_deref(), Some("A\tB"));
+    }
+
+    #[test]
+    fn given_rows_when_tabled_then_headers_are_upper_case_and_columns_align() {
+        let rows = vec![
+            vec![json!("a"), json!(7)],
+            vec![json!("longer"), Value::Null],
+        ];
+
+        let text = table_text(&["id", "size"], &rows);
+
+        assert_eq!(text, "ID       SIZE\na        7\nlonger   \n");
+    }
+
+    #[test]
+    fn given_no_rows_when_tabled_then_only_the_header_prints() {
+        assert_eq!(table_text(&["id", "name"], &[]), "ID   NAME\n");
     }
 
     #[test]

@@ -347,7 +347,10 @@ impl WardClient {
     }
 
     pub async fn remove_sandbox(&mut self, id: &str, token: &str) -> Result<(), WardError> {
-        let req = pb::RemoveSandboxRequest { id: id.into() };
+        let req = pb::RemoveSandboxRequest {
+            id: id.into(),
+            ..Default::default()
+        };
         self.inner.remove_sandbox(attach_token(req, token)?).await?;
         Ok(())
     }

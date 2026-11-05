@@ -65,7 +65,7 @@ fn code_of(answer: anyhow::Result<i32>) -> i32 {
 
 /// Whether `reference` is one of the image's tags, with `:latest` implied, or
 /// a prefix of its ID.
-fn names_image(image: &ImageInfo, reference: &str) -> bool {
+pub(crate) fn names_image(image: &ImageInfo, reference: &str) -> bool {
     let wanted = reference.trim_start_matches(DIGEST_PREFIX);
     if wanted.is_empty() {
         return false;

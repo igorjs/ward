@@ -386,6 +386,7 @@ mod tests {
             source: "/tmp/x".into(),
             target: "/data/".into(),
             readonly: false,
+            ..Default::default()
         };
 
         // Act
