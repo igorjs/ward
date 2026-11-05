@@ -1368,11 +1368,12 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         } => {
             let secrets = secrets::load_all(&secret)?;
             let env = create_opts::host_environment(&env_file, &env)?;
+            let options = detach_keys.options(true)?;
             if !detach {
                 let spec = docker::ExecSpec {
                     secrets,
                     command,
-                    options: detach_keys.options(true)?,
+                    options,
                     env,
                     workdir: workdir.unwrap_or_default(),
                     user: user.unwrap_or_default(),

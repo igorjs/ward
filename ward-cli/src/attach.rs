@@ -120,7 +120,8 @@ fn write_flushed(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Like [`attach_opts`] with default settings, handing every output chunk and the replay end to `sink`.
+/// Like [`attach_opts`] with default settings, handing every output chunk and
+/// the replay end to `sink`.
 pub async fn attach_with(
     client: &mut WardClient<Channel>,
     target: &Resolved,

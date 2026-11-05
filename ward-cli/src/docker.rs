@@ -90,6 +90,12 @@ pub async fn run(
         None => attach::attach_opts(&mut c, &target, start, forward_stdin, options, sink).await,
     };
     // A detached sandbox keeps running, so --rm has nothing to remove yet.
+    if flags.rm && options.was_detached() {
+        eprintln!(
+            "warning: --rm did not remove {}: remove it with `ward rm`",
+            created.id
+        );
+    }
     if flags.rm && !options.was_detached() {
         let removal = lifecycle::remove_resolved(&mut c, token_store, &target);
         let interrupt = async {

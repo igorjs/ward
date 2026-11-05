@@ -9,9 +9,11 @@
 use anyhow::{Result, bail};
 use clap::Args;
 
-const DOCS: &str = "docs/docker-differences.md";
+const DOCS: &str = "https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
 /// The drivers whose behavior Ward already has: the output is kept and
 /// `ward logs` reads it.
+const IGNORED_OPTS_WARNING: &str =
+    "warning: --log-opt is ignored: Ward does not rotate or tag sandbox output";
 const ACCEPTED_DRIVERS: [&str; 2] = ["json-file", "local"];
 
 #[derive(Debug, Args, Default)]
@@ -41,10 +43,15 @@ impl LogFlags {
                 "--log-driver {driver} is not supported: Ward keeps sandbox output itself and only accepts json-file or local. See {DOCS}"
             );
         }
-        if !self.log_opt.is_empty() {
-            eprintln!("warning: --log-opt is ignored: Ward does not rotate or tag sandbox output");
+        if let Some(warning) = self.ignored_opts_warning() {
+            eprintln!("{warning}");
         }
         Ok(())
+    }
+
+    /// What to tell the user when `--log-opt` was given.
+    fn ignored_opts_warning(&self) -> Option<&'static str> {
+        (!self.log_opt.is_empty()).then_some(IGNORED_OPTS_WARNING)
     }
 }
 
@@ -81,6 +88,17 @@ mod tests {
         assert!(error.starts_with(&format!("--log-driver {name} is not supported")));
         assert!(error.ends_with(DOCS), "{error}");
         assert_eq!(error.lines().count(), 1);
+    }
+
+    #[test]
+    fn given_log_opts_when_checked_then_a_warning_is_due_and_without_them_none() {
+        let with = LogFlags {
+            log_opt: vec!["max-size=10m".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(with.ignored_opts_warning(), Some(IGNORED_OPTS_WARNING));
+        assert_eq!(LogFlags::default().ignored_opts_warning(), None);
     }
 
     #[test]

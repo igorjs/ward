@@ -14,7 +14,7 @@ use crate::ports::parse_publish;
 const HOST_PORT_SEPARATOR: char = ':';
 
 /// Why `-P` has nothing to publish. Ward does not read the image's EXPOSE.
-const NOTHING_TO_PUBLISH: &str = "-P has no ports to publish: Ward does not read the image's EXPOSE yet, so name them with --expose PORT or use -p";
+const NOTHING_TO_PUBLISH: &str = "-P has no ports to publish: Ward does not read the image's EXPOSE, so name them with --expose PORT or use -p";
 
 #[derive(Debug, Args, Default)]
 pub struct PublishAllFlags {
