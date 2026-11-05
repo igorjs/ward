@@ -22,4 +22,9 @@ async fn server_responds_to_get_info() {
     assert!(!info.version.is_empty(), "version must be populated");
     assert!(!info.platform.is_empty(), "platform must be populated");
     assert_eq!(info.backend, "krunvm");
+    assert!(info.ncpu > 0, "ncpu must be populated");
+    assert!(
+        info.root_dir.is_empty(),
+        "an embedded server has no data dir"
+    );
 }

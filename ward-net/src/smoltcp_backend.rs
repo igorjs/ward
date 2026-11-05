@@ -55,6 +55,10 @@ use crate::inbound::{
     InboundFlow, InboundHandle, InboundTuning, LocalPorts, MAX_INBOUND_TOTAL, NewInbound,
     start_listener,
 };
+use crate::inbound_udp::{
+    MAX_UDP_FLOWS, MAX_UDP_FLOWS_PER_HOST, MAX_UDP_PAYLOAD_BYTES, NewDatagram, UdpFlow, new_socket,
+    start_udp_listener,
+};
 use crate::{AttachId, AttachOptions, Error, NetworkBackend};
 
 /// Resolves a domain name to zero or more addresses on the guest's behalf.
@@ -777,6 +781,8 @@ pub struct Stack {
     resolved_order: VecDeque<IpAddr>,
     /// Host connections being relayed to the guest, see `crate::inbound`.
     inbound: Vec<InboundFlow>,
+    /// Host UDP peers being relayed to the guest, see `crate::inbound_udp`.
+    udp_flows: Vec<UdpFlow>,
     inbound_tuning: InboundTuning,
     inbound_ports: LocalPorts,
     /// Signalled by host I/O tasks when they have bytes for the stack.
@@ -861,6 +867,7 @@ impl Stack {
             resolved: HashMap::new(),
             resolved_order: VecDeque::new(),
             inbound: Vec::new(),
+            udp_flows: Vec::new(),
             inbound_tuning: InboundTuning::default(),
             inbound_ports: LocalPorts::new(),
             inbound_wake: Arc::new(Notify::new()),
@@ -992,6 +999,7 @@ impl Stack {
 
         self.pump_flows();
         self.pump_inbound();
+        self.pump_udp_flows();
         self.relay_dns_queries();
         self.deliver_dns_answers();
         self.serve_dhcp();
@@ -1272,7 +1280,7 @@ impl Stack {
     /// the loop through `inbound_wake` regardless, and an idle flow costs
     /// one slow tick per `POLL_INTERVAL`.
     fn inbound_is_active(&self) -> bool {
-        !self.inbound.is_empty()
+        !(self.inbound.is_empty() && self.udp_flows.is_empty())
             && self
                 .inbound_active_at
                 .is_some_and(|at| at.elapsed() < INBOUND_ACTIVE_WINDOW)
@@ -1315,6 +1323,81 @@ impl Stack {
             local_port,
             Arc::clone(&self.inbound_wake),
         ));
+    }
+
+    /// Passes a host datagram to the guest, opening a flow for a new peer.
+    fn accept_udp(&mut self, datagram: NewDatagram) {
+        let Some(guest_addr) = self.guest_addr.get().copied() else {
+            tracing::warn!("dropping inbound datagram: the guest has no DHCP lease yet");
+            return;
+        };
+        if datagram.payload_len() > MAX_UDP_PAYLOAD_BYTES {
+            tracing::warn!(
+                bytes = datagram.payload_len(),
+                limit = MAX_UDP_PAYLOAD_BYTES,
+                "dropping an inbound datagram larger than the guest MTU allows"
+            );
+            return;
+        }
+        let guest = IpAddress::Ipv4(guest_addr);
+        let known = self.udp_flows.iter().position(|f| f.serves(&datagram));
+        let index = match known {
+            Some(index) => index,
+            None => {
+                if self.udp_flows.len() >= MAX_UDP_FLOWS {
+                    tracing::warn!("inbound UDP flow limit reached, dropping datagram");
+                    return;
+                }
+                let from_host = self
+                    .udp_flows
+                    .iter()
+                    .filter(|f| f.peer_ip() == datagram.peer_ip())
+                    .count();
+                if from_host >= MAX_UDP_FLOWS_PER_HOST {
+                    tracing::warn!(host = %datagram.peer_ip(), "too many UDP flows from one host, dropping datagram");
+                    return;
+                }
+                let local_port = self
+                    .inbound_ports
+                    .allocate(|port| self.udp_flows.iter().any(|flow| flow.local_port() == port));
+                let mut socket = new_socket();
+                if socket.bind(local_port).is_err() {
+                    self.inbound_ports.retire(local_port);
+                    return;
+                }
+                let handle = self.sockets.add(socket);
+                self.udp_flows
+                    .push(UdpFlow::new(handle, local_port, &datagram));
+                self.udp_flows.len() - 1
+            }
+        };
+        let payload = datagram.into_payload();
+        let flow = &mut self.udp_flows[index];
+        let socket = self.sockets.get_mut::<udp::Socket>(flow.handle());
+        if !flow.send_to_guest(socket, guest, &payload) {
+            tracing::debug!("dropping an inbound datagram the guest socket cannot take");
+        }
+        self.inbound_active_at = Some(std::time::Instant::now());
+    }
+
+    /// Returns guest replies to their peers and frees idle flows.
+    fn pump_udp_flows(&mut self) {
+        let mut moved = false;
+        self.udp_flows.retain_mut(|flow| {
+            let socket = self.sockets.get_mut::<udp::Socket>(flow.handle());
+            let queued = socket.can_recv();
+            let done = flow.pump(socket);
+            moved |= queued;
+            if !done {
+                return true;
+            }
+            self.sockets.remove(flow.handle());
+            self.inbound_ports.retire(flow.local_port());
+            false
+        });
+        if moved {
+            self.inbound_active_at = Some(std::time::Instant::now());
+        }
     }
 
     /// Advances every inbound flow and retires finished ones. Sockets are
@@ -1624,6 +1707,8 @@ pub enum StackCommand {
     Shutdown,
     /// A host connection to relay to the guest.
     Inbound(NewInbound),
+    /// A host datagram to relay to the guest.
+    InboundUdp(NewDatagram),
 }
 
 /// Returned by [`spawn_for_sandbox`]. Holds the guest-side fd to hand to
@@ -1671,6 +1756,21 @@ impl SmoltcpHandle {
             Arc::clone(&self.inbound_total),
         )
         .await
+    }
+
+    /// Like [`SmoltcpHandle::add_inbound`] for UDP: each datagram that
+    /// reaches `host_addr` goes to `guest_port` of the guest, and the guest's
+    /// replies go back to the sender.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Listen`] if the host address cannot be bound.
+    pub async fn add_inbound_udp(
+        &self,
+        host_addr: SocketAddr,
+        guest_port: u16,
+    ) -> Result<InboundHandle, Error> {
+        start_udp_listener(host_addr, guest_port, self.cmd_tx.clone()).await
     }
 
     /// Address of the guest's first DHCP lease, once granted.
@@ -1872,6 +1972,7 @@ pub async fn spawn_for_sandbox_with_tuning(
                 cmd = cmd_rx.recv() => match cmd {
                     Some(StackCommand::Shutdown) | None => break,
                     Some(StackCommand::Inbound(new)) => stack.accept_inbound(new),
+                    Some(StackCommand::InboundUdp(datagram)) => stack.accept_udp(datagram),
                 },
                 () = wake.notified() => {}
                 () = tokio::time::sleep(interval) => {}

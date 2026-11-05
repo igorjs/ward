@@ -199,7 +199,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::protocol::{PublishedPort, SandboxSpec};
+    use crate::protocol::{PortProtocol, PublishedPort, SandboxSpec};
 
     const TOKEN: &str = "11111111-2222-3333-4444-555555555555";
     const IMAGE_DIGEST: &str = "sha256:abc123";
@@ -231,7 +231,9 @@ mod tests {
                     published_ports: vec![PublishedPort {
                         host_ip: std::net::Ipv4Addr::LOCALHOST.into(),
                         host_port: 49153,
+                        host_port_end: 0,
                         container_port: 80,
+                        protocol: PortProtocol::Udp,
                     }],
                     image_digest: IMAGE_DIGEST.into(),
                     labels: [(LABEL_KEY.to_string(), LABEL_VALUE.to_string())].into(),
@@ -327,6 +329,7 @@ mod tests {
         // Assert
         let ports = &loaded[0].options.spec.published_ports;
         assert_eq!((ports[0].host_port, ports[0].container_port), (49153, 80));
+        assert_eq!(ports[0].protocol, PortProtocol::Udp);
     }
 
     #[test]

@@ -82,9 +82,8 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Force tab-separated output for list commands even when stdout is
-    /// a TTY. Useful when the operator wants to copy the table cleanly
-    /// or pipe through an external pretty-printer. Also honoured via
+    /// Print list commands as tab-separated columns instead of Docker's
+    /// aligned table. Ward only; handy for `cut -f`. Also honoured via
     /// `WARD_NO_PRETTY=1`.
     #[arg(long, global = true)]
     no_pretty: bool,
@@ -96,8 +95,9 @@ struct Cli {
 /// Footer for commands whose behavior differs from Docker's.
 const DOCKER_DIFFERENCES: &str = "See docs/docker-differences.md or https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
 
-const DEFAULT_MEMORY: &str = "512m";
-const DEFAULT_CPUS: &str = "1";
+/// Value sent for `--memory` and `--cpus` when the flag is absent: the daemon
+/// applies its own default, which is no limit unless the operator sets one.
+const DAEMON_DEFAULT_LIMIT: &str = "0";
 
 /// Help for `--time` on `stop` and `restart`.
 fn stop_time_help() -> String {
@@ -133,12 +133,14 @@ struct SandboxOpts {
     #[arg(long = "allow-domain", value_name = "DOMAIN")]
     allow_domain: Vec<String>,
     /// Memory limit: bytes, or a number with a k, m, g or t suffix (512m,
-    /// 1.5g). 0 uses the daemon default.
-    #[arg(short = 'm', long, default_value = DEFAULT_MEMORY, value_name = "SIZE")]
-    memory: String,
-    /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
-    #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
-    cpus: String,
+    /// 1.5g). Unset or 0 uses the daemon default, which is no limit unless the
+    /// operator sets one.
+    #[arg(short = 'm', long, value_name = "SIZE")]
+    memory: Option<String>,
+    /// CPU limit. Fractions round up to a whole CPU. Unset or 0 uses the
+    /// daemon default, which is no limit unless the operator sets one.
+    #[arg(long, value_name = "NUMBER")]
+    cpus: Option<String>,
     /// Process limit, as in Docker: 0 or -1 for unlimited. 0 uses the daemon
     /// default, which is unlimited unless the operator sets one.
     #[arg(
@@ -151,14 +153,16 @@ struct SandboxOpts {
     /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
     #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
     user: Option<String>,
-    /// Publish a TCP port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp]. Without
-    /// HOST_PORT, or with 0, the daemon picks a free one. Repeatable.
-    /// Unlike Docker, HOST_IP defaults to 127.0.0.1, not 0.0.0.0; the port
-    /// stays open while the sandbox is exited and closes on stop or rm; TCP only.
+    /// Publish a port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp|/udp]. Without
+    /// HOST_PORT, or with 0, the daemon picks a free one. Either side can be a
+    /// range such as 8000-8010:80 (the first free host port) or
+    /// 8000-8002:80-82 (pairwise). Repeatable. Unlike Docker, HOST_IP defaults
+    /// to 127.0.0.1, not 0.0.0.0; the port stays open while the sandbox is
+    /// exited and closes on stop or rm.
     #[arg(
         short = 'p',
         long = "publish",
-        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
+        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp|/udp]"
     )]
     publish: Vec<String>,
     /// When to pull the image: "always", "missing" (default), "never", or
@@ -294,14 +298,14 @@ enum Commands {
     #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print the host address each published port is reachable on.
     ///
-    /// With PORT (80 or 80/tcp), prints only the host address for it.
+    /// With PORT (80, 80/tcp or 53/udp), prints only the host address for it.
     ///
     /// Unlike Docker, a port without HOST_IP binds 127.0.0.1, not 0.0.0.0. It
-    /// stays open while the sandbox is exited and closes on stop or rm. TCP only.
+    /// stays open while the sandbox is exited and closes on stop or rm.
     Port {
         /// Sandbox name, ID or ID prefix.
         reference: String,
-        /// Container port, optionally with /tcp.
+        /// Container port, optionally with /tcp or /udp.
         port: Option<String>,
     },
 
@@ -868,11 +872,14 @@ enum SystemCommands {
         #[arg(short, long)]
         format: Option<String>,
     },
-    /// Count sandboxes and cached images.
+    /// Show disk usage of images, containers and volumes.
     Df {
         /// Show a table per sandbox, image and volume.
         #[arg(short, long)]
         verbose: bool,
+        /// Go template per row: .Type .TotalCount .Active .Size .Reclaimable.
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Remove stopped sandboxes, and with -a unused images and with
     /// --volumes volumes, asking first unless -f is given.
@@ -985,8 +992,10 @@ fn create_request(
         other => anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'"),
     };
     let resources = ward_core::pb::ResourceLimits {
-        cpus: resources::parse_cpus(&opts.cpus)?,
-        memory_mb: resources::parse_memory_mib(&opts.memory)?,
+        cpus: resources::parse_cpus(opts.cpus.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT))?,
+        memory_mb: resources::parse_memory_mib(
+            opts.memory.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT),
+        )?,
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
@@ -1108,6 +1117,9 @@ const IMAGE_COMMANDS: [(&str, &str); 12] = [
     ("import", "import"),
 ];
 
+/// Docker's `system` subcommands that are top-level commands in Ward.
+const SYSTEM_COMMANDS: [(&str, &str); 1] = [("events", "events")];
+
 /// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
 /// same way, so both spellings share one definition and one help text.
 fn expand_groups(mut args: Vec<String>) -> Vec<String> {
@@ -1117,6 +1129,7 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     let table: &[(&str, &str)] = match args[group].as_str() {
         "container" => &CONTAINER_COMMANDS,
         "image" => &IMAGE_COMMANDS,
+        "system" => &SYSTEM_COMMANDS,
         _ => return args,
     };
     let target = args
@@ -1827,12 +1840,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             system::version(&socket_path, format.as_deref(), json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: true }) => {
+        Commands::System(SystemCommands::Df {
+            verbose: true,
+            format: Some(_),
+        }) => {
+            anyhow::bail!("--format is not supported with system df -v");
+        }
+
+        Commands::System(SystemCommands::Df { verbose: true, .. }) => {
             df_verbose::run(&socket_path, json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: false }) => {
-            system::df(&socket_path, json, no_pretty).await?;
+        Commands::System(SystemCommands::Df {
+            verbose: false,
+            format,
+        }) => {
+            system::df(&socket_path, format.as_deref(), json, no_pretty).await?;
         }
 
         Commands::Container { .. } | Commands::Image { .. } => {
@@ -2027,6 +2050,8 @@ mod tests {
     #[case::container_remove(&["ward", "container", "remove", "x"], &["ward", "rm", "x"])]
     #[case::image_ls(&["ward", "image", "ls"], &["ward", "images"])]
     #[case::image_pull(&["ward", "image", "pull", "alpine"], &["ward", "pull", "alpine"])]
+    #[case::system_events(&["ward", "system", "events", "--since", "1h"], &["ward", "events", "--since", "1h"])]
+    #[case::system_info_is_left_alone(&["ward", "system", "info"], &["ward", "system", "info"])]
     #[case::unknown_sub_is_left_alone(&["ward", "container", "nope"], &["ward", "container", "nope"])]
     #[case::other_command(&["ward", "ps", "container"], &["ward", "ps", "container"])]
     fn given_group_command_when_expanded_then_it_names_the_top_level_command(
@@ -2125,6 +2150,22 @@ mod tests {
         // Assert
         let limits = request.resources.expect("resources");
         assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
+    }
+
+    #[test]
+    fn given_no_memory_or_cpus_flags_when_request_built_then_daemon_default_is_requested() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "run", "alpine", "true"]).expect("parse");
+        let Commands::Run { image, opts, .. } = cli.command else {
+            panic!("expected Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let limits = request.resources.expect("resources");
+        assert_eq!((limits.memory_mb, limits.cpus), (0, 0));
     }
 
     #[rstest::rstest]

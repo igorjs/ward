@@ -2550,15 +2550,16 @@ impl SandboxManager {
         ports: &mut [crate::protocol::PublishedPort],
     ) -> Result<Vec<PortListener>> {
         let mut listeners = Vec::with_capacity(ports.len());
-        for port in ports.iter_mut() {
+        // Fixed host ports go first, so a range cannot take one a later
+        // mapping asked for by number.
+        let mut order: Vec<usize> = (0..ports.len()).collect();
+        order.sort_by_key(|&index| ports[index].host_port_end != 0);
+        for index in order {
+            let port = &mut ports[index];
             if port.host_ip.is_unspecified() {
                 tracing::warn!(sandbox_id = %id, host_port = port.host_port, "publishing on all host interfaces");
             }
-            let listener = match self
-                .forwarder
-                .open(id, port.host_addr(), port.container_port)
-                .await
-            {
+            let listener = match self.open_in_range(id, port).await {
                 Ok(listener) => listener,
                 Err(e) => {
                     close_all(listeners).await;
@@ -2566,10 +2567,38 @@ impl SandboxManager {
                 }
             };
             port.host_port = listener.local_addr().port();
+            port.host_port_end = 0;
             tracing::info!(sandbox_id = %id, host_port = port.host_port, container_port = port.container_port, "published port");
             listeners.push(listener);
         }
         Ok(listeners)
+    }
+
+    /// Open `port`, trying each host port of its range until one is free.
+    async fn open_in_range(
+        &self,
+        id: &str,
+        port: &crate::protocol::PublishedPort,
+    ) -> crate::backend::Result<PortListener> {
+        let last = port.host_port_end.max(port.host_port);
+        let mut attempt = *port;
+        loop {
+            match self
+                .forwarder
+                .open(
+                    id,
+                    attempt.host_addr(),
+                    attempt.container_port,
+                    attempt.protocol,
+                )
+                .await
+            {
+                Err(BackendError::AddressInUse(_)) if attempt.host_port < last => {
+                    attempt.host_port += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Close the sandbox's ports and wait until the host frees them.
@@ -3675,7 +3704,8 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 host_ip: port.host_ip.to_string(),
                 host_port: u32::from(port.host_port),
                 container_port: u32::from(port.container_port),
-                protocol: crate::validate::PUBLISH_PROTOCOL.to_string(),
+                protocol: port.protocol.as_str().to_string(),
+                host_port_end: 0,
             })
             .collect(),
         entrypoint: match view {

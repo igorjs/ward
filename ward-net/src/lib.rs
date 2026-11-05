@@ -21,6 +21,7 @@ use std::path::PathBuf;
 
 pub mod counters;
 pub mod inbound;
+pub mod inbound_udp;
 pub mod null;
 pub mod smoltcp_backend;
 

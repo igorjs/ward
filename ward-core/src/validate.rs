@@ -555,8 +555,6 @@ pub fn secrets(files: &[crate::pb::SecretFile]) -> Result<(), ApiError> {
 
 /// Most ports one sandbox may publish.
 const MAX_PUBLISHED_PORTS: usize = 64;
-/// The only protocol a port may be published with.
-pub const PUBLISH_PROTOCOL: &str = "tcp";
 
 /// Validate `-p` mappings and fill in the defaults: 127.0.0.1 for an empty
 /// host address (Docker would use 0.0.0.0, but exposing a guest to the
@@ -574,11 +572,15 @@ pub fn published_ports(
         .map(published_port)
         .collect::<Result<Vec<_>, _>>()?;
     let mut claimed = std::collections::HashSet::new();
-    for port in ports.iter().filter(|port| port.host_port != 0) {
-        if !claimed.insert((port.host_ip, port.host_port)) {
+    let fixed =
+        |port: &&crate::protocol::PublishedPort| port.host_port != 0 && port.host_port_end == 0;
+    for port in ports.iter().filter(fixed) {
+        if !claimed.insert((port.host_ip, port.host_port, port.protocol)) {
             return Err(ApiError::InvalidRequest(format!(
-                "host port {}:{} is published more than once",
-                port.host_ip, port.host_port
+                "host port {}:{}/{} is published more than once",
+                port.host_ip,
+                port.host_port,
+                port.protocol.as_str()
             )));
         }
     }
@@ -586,12 +588,15 @@ pub fn published_ports(
 }
 
 fn published_port(m: &crate::pb::PortMapping) -> Result<crate::protocol::PublishedPort, ApiError> {
-    if !m.protocol.is_empty() && m.protocol != PUBLISH_PROTOCOL {
-        return Err(ApiError::InvalidRequest(format!(
-            "unsupported protocol \"{}\": only tcp ports can be published",
-            m.protocol
-        )));
-    }
+    let protocol = match m.protocol.as_str() {
+        "" | "tcp" => crate::protocol::PortProtocol::Tcp,
+        "udp" => crate::protocol::PortProtocol::Udp,
+        other => {
+            return Err(ApiError::InvalidRequest(format!(
+                "unsupported protocol \"{other}\": only tcp and udp ports can be published"
+            )));
+        }
+    };
     let host_ip = if m.host_ip.is_empty() {
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     } else {
@@ -611,10 +616,20 @@ fn published_port(m: &crate::pb::PortMapping) -> Result<crate::protocol::Publish
                 m.container_port
             ))
         })?;
+    let host_port_end = u16::try_from(m.host_port_end).map_err(|_| {
+        ApiError::InvalidRequest(format!("host port {} is out of range", m.host_port_end))
+    })?;
+    if host_port_end != 0 && (host_port == 0 || host_port_end < host_port) {
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid host port range {host_port}-{host_port_end}"
+        )));
+    }
     Ok(crate::protocol::PublishedPort {
         host_ip,
         host_port,
+        host_port_end,
         container_port,
+        protocol,
     })
 }
 
@@ -841,7 +856,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::udp("", 8080, 53, "udp", false)]
+    #[case::udp("", 8080, 53, "udp", true)]
+    #[case::sctp("", 8080, 53, "sctp", false)]
     #[case::zero_container("", 8080, 0, "", false)]
     #[case::container_too_big("", 8080, 65_536, "", false)]
     #[case::host_too_big("", 65_536, 80, "", false)]
@@ -849,7 +865,7 @@ mod tests {
     #[case::tcp("", 8080, 80, "tcp", true)]
     #[case::any_host_port("127.0.0.1", 0, 80, "", true)]
     #[case::ipv6("::1", 8080, 80, "", true)]
-    fn given_a_port_mapping_when_validated_then_only_a_sound_tcp_mapping_passes(
+    fn given_a_port_mapping_when_validated_then_only_a_sound_mapping_passes(
         #[case] host_ip: &str,
         #[case] host_port: u32,
         #[case] container_port: u32,
@@ -862,6 +878,7 @@ mod tests {
             host_port,
             container_port,
             protocol: protocol.into(),
+            ..Default::default()
         };
 
         // Act
@@ -869,6 +886,49 @@ mod tests {
 
         // Assert
         assert_eq!(result.is_ok(), valid, "{result:?}");
+    }
+
+    #[rstest]
+    #[case::range(8000, 8010, true)]
+    #[case::single_port_range(8000, 8000, true)]
+    #[case::backwards(8010, 8000, false)]
+    #[case::any_start(0, 8010, false)]
+    #[case::end_too_big(8000, 70_000, false)]
+    fn given_a_host_port_range_when_validated_then_only_an_ordered_range_passes(
+        #[case] host_port: u32,
+        #[case] host_port_end: u32,
+        #[case] valid: bool,
+    ) {
+        // Arrange
+        let mapping = crate::pb::PortMapping {
+            host_port,
+            host_port_end,
+            container_port: 80,
+            ..Default::default()
+        };
+
+        // Act
+        let result = published_ports(&[mapping]);
+
+        // Assert
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+    }
+
+    #[test]
+    fn given_the_same_host_port_over_tcp_and_udp_when_validated_then_both_are_accepted() {
+        // Arrange
+        let mapping = |protocol: &str| crate::pb::PortMapping {
+            host_port: 5353,
+            container_port: 53,
+            protocol: protocol.into(),
+            ..Default::default()
+        };
+
+        // Act
+        let result = published_ports(&[mapping("tcp"), mapping("udp")]);
+
+        // Assert
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -901,7 +961,7 @@ mod tests {
                 host_ip: host_ip.into(),
                 host_port,
                 container_port,
-                protocol: String::new(),
+                ..Default::default()
             };
 
         // Act

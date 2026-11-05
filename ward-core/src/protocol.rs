@@ -160,6 +160,57 @@ pub struct CgroupLimits {
     pub cpu_quota: i64,
 }
 
+/// Changes to Docker's cgroup options. A field left `None` is kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupUpdate {
+    pub memory_swap_bytes: Option<i64>,
+    pub memory_reservation_bytes: Option<u64>,
+    pub cpu_shares: Option<u32>,
+    pub cpuset_cpus: Option<String>,
+    pub cpu_period: Option<u64>,
+    pub cpu_quota: Option<i64>,
+}
+
+impl CgroupLimits {
+    /// These options with `update` applied.
+    #[must_use]
+    pub fn updated(&self, update: &CgroupUpdate) -> Self {
+        Self {
+            memory_swap_bytes: update.memory_swap_bytes.unwrap_or(self.memory_swap_bytes),
+            memory_reservation_bytes: update
+                .memory_reservation_bytes
+                .unwrap_or(self.memory_reservation_bytes),
+            cpu_shares: update.cpu_shares.unwrap_or(self.cpu_shares),
+            cpuset_cpus: update
+                .cpuset_cpus
+                .clone()
+                .unwrap_or_else(|| self.cpuset_cpus.clone()),
+            cpu_period: update.cpu_period.unwrap_or(self.cpu_period),
+            cpu_quota: update.cpu_quota.unwrap_or(self.cpu_quota),
+        }
+    }
+}
+
+impl CgroupUpdate {
+    /// The update that puts back `previous` for every field this one changes.
+    #[must_use]
+    pub fn undoing(&self, previous: &CgroupLimits) -> Self {
+        Self {
+            memory_swap_bytes: self.memory_swap_bytes.map(|_| previous.memory_swap_bytes),
+            memory_reservation_bytes: self
+                .memory_reservation_bytes
+                .map(|_| previous.memory_reservation_bytes),
+            cpu_shares: self.cpu_shares.map(|_| previous.cpu_shares),
+            cpuset_cpus: self
+                .cpuset_cpus
+                .as_ref()
+                .map(|_| previous.cpuset_cpus.clone()),
+            cpu_period: self.cpu_period.map(|_| previous.cpu_period),
+            cpu_quota: self.cpu_quota.map(|_| previous.cpu_quota),
+        }
+    }
+}
+
 /// Docker's default size for `/dev/shm`: 64 MiB.
 pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -272,13 +323,44 @@ impl SandboxSpec {
     }
 }
 
-/// A host TCP port forwarded to a guest port.
+/// Transport of a published port.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// A host port forwarded to a guest port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedPort {
     pub host_ip: std::net::IpAddr,
     /// 0 asks for any free port when the sandbox is created.
     pub host_port: u16,
+    /// Last port of a host range to try, or 0 for the single `host_port`.
+    /// Cleared once a port is bound.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub host_port_end: u16,
     pub container_port: u16,
+    #[serde(default)]
+    pub protocol: PortProtocol,
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
 }
 
 impl PublishedPort {
@@ -372,11 +454,12 @@ pub const NANOS_PER_CPU: u64 = 1_000_000_000;
 
 /// Limits `update` changes. A field left `None` is kept, and 0 removes that
 /// limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LimitsUpdate {
     pub memory_mb: Option<u32>,
     pub nano_cpus: Option<u64>,
     pub pids_max: Option<u32>,
+    pub cgroup: CgroupUpdate,
 }
 
 impl LimitsUpdate {
@@ -926,6 +1009,45 @@ mod tests {
 
         // Assert
         assert!(error.contains(said), "{error}");
+    }
+
+    #[test]
+    fn given_a_cgroup_update_when_applied_then_only_the_named_fields_change() {
+        let base = CgroupLimits {
+            cpu_shares: 512,
+            cpuset_cpus: "0".into(),
+            cpu_quota: 1000,
+            ..Default::default()
+        };
+        let update = CgroupUpdate {
+            cpu_shares: Some(1024),
+            cpuset_cpus: Some(String::new()),
+            ..Default::default()
+        };
+
+        let next = base.updated(&update);
+
+        assert_eq!(next.cpu_shares, 1024);
+        assert_eq!(next.cpuset_cpus, "");
+        assert_eq!(next.cpu_quota, 1000);
+    }
+
+    #[test]
+    fn given_a_cgroup_update_when_undone_then_the_previous_values_come_back_for_its_fields() {
+        let previous = CgroupLimits {
+            cpu_shares: 512,
+            cpu_period: 200_000,
+            ..Default::default()
+        };
+        let update = CgroupUpdate {
+            cpu_shares: Some(1024),
+            ..Default::default()
+        };
+
+        let undo = update.undoing(&previous);
+
+        assert_eq!(undo.cpu_shares, Some(512));
+        assert_eq!(undo.cpu_period, None);
     }
 }
 

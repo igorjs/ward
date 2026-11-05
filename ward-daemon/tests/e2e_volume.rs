@@ -78,7 +78,7 @@ fn given_running_daemon_when_user_creates_volume_with_invalid_name_then_fails_wi
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_no_volumes_when_user_runs_list_then_output_is_empty() {
+fn given_no_volumes_when_user_runs_list_then_only_the_header_prints() {
     // Arrange: a daemon with zero volumes (fresh state).
     let daemon = common::Daemon::spawn();
 
@@ -86,9 +86,11 @@ fn given_no_volumes_when_user_runs_list_then_output_is_empty() {
     let mut cmd = daemon.cli();
     let output = cmd.args(["volume", "list"]).assert();
 
-    // Assert: command exits 0 and prints nothing. Empty output is the
-    // contract for "no matches" — distinct from error (non-zero exit).
-    output.success().stdout(predicate::str::is_empty());
+    // Assert: exits 0 and prints only the header row, as Docker does.
+    output.success().stdout(
+        predicate::str::starts_with("ID ")
+            .and(predicate::function(|s: &str| s.lines().count() == 1)),
+    );
 }
 
 #[test]
