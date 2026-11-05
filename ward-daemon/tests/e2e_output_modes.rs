@@ -134,13 +134,6 @@ fn given_empty_list_with_json_when_run_then_emits_empty_array() {
     assertion.success().stdout("[]\n");
 }
 
-// NOTE: an analogous `ward volume list --json` test would belong here but
-// `ward volume create` shells out to `mkfs.ext4` which is Linux-only;
-// macOS dev hosts cannot drive this path. The same shape is already
-// covered for sandboxes by `given_list_with_json_flag_when_run_then_emits_array`
-// above (same emit_rows helper, same JSON-array path), so coverage of
-// the list-JSON code path is not gated on the unfixable platform skew.
-
 #[test]
 fn given_remove_with_json_when_run_then_emits_removed_key() {
     // Arrange

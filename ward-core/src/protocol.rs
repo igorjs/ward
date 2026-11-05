@@ -294,6 +294,9 @@ pub struct Mount {
     pub source: String,
     pub target: String,
     pub readonly: bool,
+    /// Name of the daemon-managed volume behind `source`, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +661,9 @@ pub enum ApiError {
     SandboxNotFound(String),
     #[error("volume not found: {0}")]
     VolumeNotFound(String),
+    /// A sandbox still mounts the volume; the text is Docker's wording.
+    #[error("{0}")]
+    VolumeInUse(String),
     #[error("snapshot not found: {0}")]
     SnapshotNotFound(String),
     #[error("process not found: {0}")]

@@ -213,7 +213,8 @@ pub fn restart_policy(
 }
 
 /// Validate a volume name.
-/// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
+/// Docker's rule: starts with an alphanumeric, then alphanumerics, dash,
+/// underscore or dot, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::InvalidRequest(
@@ -225,13 +226,15 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
             "volume name exceeds 64 characters".into(),
         ));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    let starts_ok = name.starts_with(|c: char| c.is_ascii_alphanumeric());
+    if !starts_ok
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(ApiError::InvalidRequest(
-            "volume name must contain only alphanumeric characters, dashes, and underscores".into(),
-        ));
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid volume name \"{name}\": it must start with a letter or digit and contain only letters, digits, '-', '_' and '.'"
+        )));
     }
     Ok(())
 }
@@ -254,22 +257,18 @@ pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Validate a bind mount's source (host) and target (guest) paths.
-///
-/// Both must be absolute, and neither may contain a `..` component — a guest
-/// `..` could escape its mount point, and a host `..` could widen what the
-/// caller intended to share.
-///
-/// SEC-020: when `allow_host` is false (the safe default), source paths
-/// must fall under one of the allowed roots: `/home/<user>/`, `/tmp/`,
-/// `/var/lib/ward/`. Set `WARD_ALLOW_HOST_MOUNTS=1` at the daemon to
-/// pass `allow_host=true` and lift the restriction (useful for
-/// trusted operator workflows like CI runners with explicit host-FS
-/// access). Even with the opt-in, system-critical roots (`/proc`,
-/// `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/usr`, `/run`, `/var/run`,
-/// `/lib`, `/bin`, `/sbin`) still require `readonly: true` so a sandbox
-/// can't overwrite host system files.
-pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
+/// A volume mount's guest path follows the bind mount rules; its host path
+/// is the daemon's own, so only the volume name is checked.
+pub fn volume_mount(name: &str, target: &str) -> Result<(), ApiError> {
+    volume_name(name)?;
+    mount_path_shape(MOUNT_PATH_ANCHOR, target)
+}
+
+/// Any absolute path stands in for the host side of a volume mount.
+const MOUNT_PATH_ANCHOR: &str = "/";
+
+/// Both paths must be absolute and free of `..`.
+fn mount_path_shape(source: &str, target: &str) -> Result<(), ApiError> {
     for (label, path) in [("source", source), ("target", target)] {
         if path.is_empty() {
             return Err(ApiError::InvalidRequest(format!(
@@ -287,6 +286,26 @@ pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Re
             )));
         }
     }
+    Ok(())
+}
+
+/// Validate a bind mount's source (host) and target (guest) paths.
+///
+/// Both must be absolute, and neither may contain a `..` component — a guest
+/// `..` could escape its mount point, and a host `..` could widen what the
+/// caller intended to share.
+///
+/// SEC-020: when `allow_host` is false (the safe default), source paths
+/// must fall under one of the allowed roots: `/home/<user>/`, `/tmp/`,
+/// `/var/lib/ward/`. Set `WARD_ALLOW_HOST_MOUNTS=1` at the daemon to
+/// pass `allow_host=true` and lift the restriction (useful for
+/// trusted operator workflows like CI runners with explicit host-FS
+/// access). Even with the opt-in, system-critical roots (`/proc`,
+/// `/sys`, `/dev`, `/etc`, `/root`, `/boot`, `/usr`, `/run`, `/var/run`,
+/// `/lib`, `/bin`, `/sbin`) still require `readonly: true` so a sandbox
+/// can't overwrite host system files.
+pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
+    mount_path_shape(source, target)?;
 
     // SEC-020: source allowlist (host-side path the sandbox can see).
     if !allow_host && !is_default_allowed_source(source) {
@@ -1032,7 +1051,8 @@ mod tests {
     #[case::empty("")]
     #[case::slash("../escape")]
     #[case::space("my volume")]
-    #[case::dot("my.volume")]
+    #[case::leading_dot(".volume")]
+    #[case::leading_dash("-volume")]
     #[case::null("vol\0name")]
     fn volume_name_rejects_invalid(#[case] input: &str) {
         assert!(volume_name(input).is_err());
@@ -1368,11 +1388,11 @@ mod proptests {
     // ----- volume_name ----------------------------------------------------
 
     proptest! {
-        /// Any non-empty alphanumeric+dash+underscore string up to 64 chars
-        /// is accepted.
+        /// Any name that starts alphanumeric and continues with letters,
+        /// digits, dash, underscore or dot, up to 64 chars, is accepted.
         #[test]
         fn property_volume_name_accepts_valid_alphabet(
-            name in "[a-zA-Z0-9_-]{1,64}"
+            name in "[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}"
         ) {
             prop_assert!(volume_name(&name).is_ok(), "rejected: {name:?}");
         }

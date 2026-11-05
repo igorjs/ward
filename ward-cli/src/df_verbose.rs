@@ -10,11 +10,10 @@ use crate::client;
 use crate::images::{BYTES_PER_MIB, record as image_record, size_text};
 use crate::inspect::ps_json_object;
 use crate::ps_columns::uses_image;
+use crate::volume::link_counts;
 
 const COLUMN_PADDING: usize = 3;
 /// A sandbox cannot mount a volume yet, and no volume has a sandbox using it.
-const NO_VOLUMES: &str = "0";
-const NO_LINKS: &str = "0";
 /// Shown for a figure Ward does not measure.
 const UNMEASURED: &str = "--";
 /// What `docker system df -v` prints for the build cache; Ward has none.
@@ -108,7 +107,11 @@ fn container_rows(sandboxes: &[SandboxInfo]) -> Vec<Row> {
                 field("ID"),
                 field("Image"),
                 field("Command"),
-                NO_VOLUMES.to_string(),
+                info.mounts
+                    .iter()
+                    .filter(|m| !m.volume.is_empty())
+                    .count()
+                    .to_string(),
                 UNMEASURED.to_string(),
                 field("RunningFor"),
                 field("Status"),
@@ -118,13 +121,18 @@ fn container_rows(sandboxes: &[SandboxInfo]) -> Vec<Row> {
         .collect()
 }
 
-fn volume_rows(volumes: &[VolumeInfo]) -> Vec<Row> {
+fn volume_rows(volumes: &[VolumeInfo], sandboxes: &[SandboxInfo]) -> Vec<Row> {
+    let links = link_counts(sandboxes);
     volumes
         .iter()
         .map(|volume| {
             vec![
                 volume.name.clone(),
-                NO_LINKS.to_string(),
+                links
+                    .get(&volume.name)
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
                 size_text(u64::from(volume.size_mb) * BYTES_PER_MIB),
             ]
         })
@@ -137,7 +145,7 @@ fn report(images: &[ImageInfo], sandboxes: &[SandboxInfo], volumes: &[VolumeInfo
         "Images space usage:\n\n{}\nContainers space usage:\n\n{}\nLocal Volumes space usage:\n\n{}\n{NO_BUILD_CACHE}\n",
         table(&IMAGE_HEADERS, &image_rows(images, sandboxes)),
         table(&CONTAINER_HEADERS, &container_rows(sandboxes)),
-        table(&VOLUME_HEADERS, &volume_rows(volumes)),
+        table(&VOLUME_HEADERS, &volume_rows(volumes, sandboxes)),
     )
 }
 

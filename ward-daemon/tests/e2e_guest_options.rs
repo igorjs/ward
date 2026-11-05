@@ -89,7 +89,7 @@ fn given_bad_guest_flags_when_created_then_each_fails_with_a_clear_error() {
             &["--tmpfs", "/data", "--mount", "type=tmpfs,dst=/data"],
             "Duplicate mount point: /data",
         ),
-        (&["--mount", "type=volume,src=v,dst=/v"], "named volumes"),
+        (&["--mount", "type=volume,dst=/v"], "needs src"),
         (&["--shm-size", "lots"], "invalid size"),
     ];
 

@@ -935,7 +935,8 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `--volume`.
+/// Parse `SOURCE:TARGET[:ro]` from `--volume`. A source that is not an
+/// absolute path names a volume.
 fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (source, target, readonly) = match parts.as_slice() {
@@ -944,11 +945,7 @@ fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
         [source, target, "rw"] => (*source, *target, false),
         _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
     };
-    Ok(ward_core::pb::Mount {
-        source: source.to_string(),
-        target: target.to_string(),
-        readonly,
-    })
+    Ok(volume::mount_for(source, target, readonly))
 }
 
 /// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
