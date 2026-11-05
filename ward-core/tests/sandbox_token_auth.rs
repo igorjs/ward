@@ -132,7 +132,10 @@ async fn given_wrong_token_when_remove_sandbox_then_permission_denied() {
 
     // Act
     let request = common::with_token(
-        RemoveSandboxRequest { id: sandbox_id },
+        RemoveSandboxRequest {
+            id: sandbox_id,
+            ..Default::default()
+        },
         "not-the-real-token",
     );
     let status = client
@@ -233,7 +236,13 @@ async fn given_token_for_sandbox_a_when_used_against_sandbox_b_then_permission_d
         .into_inner();
 
     // Act: sandbox A's real token, presented against sandbox B's id.
-    let request = common::with_token(RemoveSandboxRequest { id: sandbox_b.id }, &sandbox_a.token);
+    let request = common::with_token(
+        RemoveSandboxRequest {
+            id: sandbox_b.id,
+            ..Default::default()
+        },
+        &sandbox_a.token,
+    );
     let status = client
         .remove_sandbox(request)
         .await

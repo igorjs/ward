@@ -379,6 +379,9 @@ pub struct Mount {
     /// Name of the daemon-managed volume behind `source`, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
+    /// The volume exists for this mount alone and goes with the sandbox.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anonymous: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,5 +1048,41 @@ mod tests {
 
         assert_eq!(undo.cpu_shares, Some(512));
         assert_eq!(undo.cpu_period, None);
+    }
+}
+
+#[cfg(test)]
+mod mount_serde_tests {
+    use super::Mount;
+
+    #[test]
+    fn given_a_stored_mount_without_anonymous_when_loaded_then_it_is_not_anonymous() {
+        // Arrange
+        let stored = r#"{"source":"/tmp/a","target":"/a","readonly":false}"#;
+
+        // Act
+        let mount: Mount = serde_json::from_str(stored).unwrap();
+
+        // Assert
+        assert!(!mount.anonymous);
+        assert_eq!(mount.volume, None);
+    }
+
+    #[test]
+    fn given_an_anonymous_mount_when_stored_and_loaded_then_the_flag_survives() {
+        // Arrange
+        let mount = Mount {
+            source: "/v".into(),
+            target: "/a".into(),
+            readonly: false,
+            volume: Some("v".into()),
+            anonymous: true,
+        };
+
+        // Act
+        let back: Mount = serde_json::from_str(&serde_json::to_string(&mount).unwrap()).unwrap();
+
+        // Assert
+        assert_eq!(back, mount);
     }
 }

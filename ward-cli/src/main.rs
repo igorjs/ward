@@ -44,6 +44,7 @@ mod secrets;
 mod socket;
 mod start_attach;
 mod stats;
+mod stop_options;
 mod system;
 mod tag;
 mod template;
@@ -117,9 +118,16 @@ struct SandboxOpts {
     /// Environment variables in KEY=VALUE form.
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
-    /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
-    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    /// Mount a host directory or a named volume: SOURCE:TARGET[:OPTIONS]. A
+    /// SOURCE that is not an absolute path names a volume, created on first
+    /// use. A bare /TARGET makes an anonymous volume. OPTIONS is a comma list
+    /// of ro, rw, z, Z, cached, delegated, consistent and nocopy; z, Z, cached,
+    /// delegated, consistent and nocopy are accepted and ignored. Repeatable.
+    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:OPTIONS]")]
     volume: Vec<String>,
+    /// Mount the volumes of another sandbox: SANDBOX[:ro|rw]. Repeatable.
+    #[arg(long = "volumes-from", value_name = "SANDBOX[:ro|rw]")]
+    volumes_from: Vec<String>,
     /// Outbound network policy: "deny" (default), "allowlist" or "open".
     #[arg(long, default_value = "deny")]
     egress: String,
@@ -479,6 +487,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Start one or more stopped sandboxes.
@@ -500,6 +512,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Remove one or more sandboxes.
@@ -511,6 +527,10 @@ enum Commands {
         /// Remove a running sandbox too.
         #[arg(short, long)]
         force: bool,
+        /// Also remove the anonymous volumes of the sandbox, unless another
+        /// sandbox mounts them.
+        #[arg(short = 'v', long = "volumes")]
+        volumes: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -965,19 +985,6 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `--volume`. A source that is not an
-/// absolute path names a volume.
-fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (source, target, readonly) = match parts.as_slice() {
-        [source, target] => (*source, *target, false),
-        [source, target, "ro"] => (*source, *target, true),
-        [source, target, "rw"] => (*source, *target, false),
-        _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
-    };
-    volume::mount_for(source, target, readonly)
-}
-
 /// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
 /// themselves contain '=', which matters for tokens, URLs and serialised JSON.
 /// A bare `KEY` takes its value from the host and is dropped when unset,
@@ -1030,14 +1037,16 @@ fn create_request(
     let mounts = opts
         .volume
         .iter()
-        .map(|spec| parse_mount_spec(spec))
+        .map(|spec| volume::parse_flag(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let volumes_from = opts.volumes_from.clone();
     let published_ports = ports::parse_all(&opts.publish)?;
     ports::warn_if_exposed(&published_ports);
     let mut request = ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
         published_ports,
+        volumes_from,
         egress: Some(ward_core::pb::EgressPolicy {
             mode: egress_mode as i32,
             domains: opts.allow_domain,
@@ -1669,10 +1678,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         },
 
-        Commands::Stop { refs, time } => {
+        Commands::Stop { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             let action = lifecycle::Action::Stop;
-            lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
+            lifecycle::lifecycle(&mut c, &token_store, action, &refs, &stop, json).await?;
         }
 
         Commands::Start { refs, attach } if attach.wanted() => {
@@ -1692,28 +1702,33 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &token_store,
                 lifecycle::Action::Start,
                 &refs,
-                None,
+                &stop_options::StopOptions::default(),
                 json,
             )
             .await?;
         }
 
-        Commands::Restart { refs, time } => {
+        Commands::Restart { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
                 &token_store,
                 lifecycle::Action::Restart,
                 &refs,
-                time,
+                &stop,
                 json,
             )
             .await?;
         }
 
-        Commands::Remove { refs, force } => {
+        Commands::Remove {
+            refs,
+            force,
+            volumes,
+        } => {
             let mut c = client::connect(&socket_path).await?;
-            lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+            lifecycle::remove(&mut c, &token_store, &refs, force, volumes, json).await?;
         }
 
         Commands::Cp {
@@ -2065,7 +2080,7 @@ mod tests {
 
     #[test]
     fn given_source_and_target_when_parse_mount_then_read_write() {
-        let m = parse_mount_spec("/tmp/a:/data").unwrap();
+        let m = volume::parse_flag("/tmp/a:/data").unwrap();
         assert_eq!(
             (m.source.as_str(), m.target.as_str(), m.readonly),
             ("/tmp/a", "/data", false)
@@ -2398,7 +2413,7 @@ mod tests {
 
     #[test]
     fn given_ro_suffix_when_parse_mount_then_readonly() {
-        assert!(parse_mount_spec("/tmp/a:/data:ro").unwrap().readonly);
+        assert!(volume::parse_flag("/tmp/a:/data:ro").unwrap().readonly);
     }
 
     #[rstest::rstest]
@@ -2406,7 +2421,7 @@ mod tests {
     #[case::home("~/data:/d")]
     #[case::relative_path("dir/data:/d")]
     fn given_a_relative_bind_source_when_parsed_then_the_error_says_absolute(#[case] spec: &str) {
-        let error = parse_mount_spec(spec).unwrap_err();
+        let error = volume::parse_flag(spec).unwrap_err();
 
         assert!(
             error.to_string().contains("must be an absolute path"),
@@ -2416,9 +2431,9 @@ mod tests {
 
     #[test]
     fn given_malformed_spec_when_parse_mount_then_error() {
-        assert!(parse_mount_spec("/tmp/a").is_err());
-        assert!(parse_mount_spec("/tmp/a:/data:wat").is_err());
-        assert!(parse_mount_spec("a:b:ro:extra").is_err());
+        assert!(volume::parse_flag("tmp/a").is_err());
+        assert!(volume::parse_flag("/tmp/a:/data:wat").is_err());
+        assert!(volume::parse_flag("a:b:ro:extra").is_err());
     }
 
     #[test]
@@ -2669,6 +2684,23 @@ mod tests {
         }
     }
 
+    #[rstest::rstest]
+    #[case::stop_short(&["ward", "stop", "-s", "SIGINT", "web1"])]
+    #[case::stop_long(&["ward", "stop", "--signal", "SIGINT", "web1"])]
+    #[case::restart_short(&["ward", "restart", "-s", "SIGINT", "web1"])]
+    fn given_a_signal_flag_when_parsed_then_it_is_kept(#[case] args: &[&str]) {
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Stop { signal, .. } | Commands::Restart { signal, .. } => {
+                assert_eq!(signal.as_deref(), Some("SIGINT"));
+            }
+            other => panic!("expected Stop or Restart, got {other:?}"),
+        }
+    }
+
     #[test]
     fn given_stop_time_help_when_built_then_it_names_the_core_default_grace() {
         // Act
@@ -2698,7 +2730,7 @@ mod tests {
 
         // Assert
         match cli.command {
-            Commands::Remove { refs, force } => {
+            Commands::Remove { refs, force, .. } => {
                 assert_eq!(refs, ["web1", "web2"]);
                 assert!(force);
             }

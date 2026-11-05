@@ -29,6 +29,8 @@ tonic = "0.14"
 # Staging directory for a downloaded file, so a rename lands it atomically.
 tempfile = "3"
 tower = "0.5"
+# Names the anonymous volume of a bare `-v /path`.
+uuid = { version = "1", features = ["v4"] }
 ward-core = { path = "../ward-core" }
 
 [dev-dependencies]

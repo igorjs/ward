@@ -19,6 +19,7 @@ use ward_core::pb::{
 };
 
 use crate::client::{self, Resolved};
+use crate::stop_options::StopOptions;
 use crate::tokens;
 
 /// The state change a lifecycle command asks for.
@@ -43,19 +44,27 @@ impl Action {
         self,
         c: &mut WardClient<Channel>,
         target: &Resolved,
-        grace_seconds: Option<i32>,
+        stop: &StopOptions,
     ) -> Result<()> {
         let id = target.id.clone();
         match self {
             Self::Stop => {
-                let request = StopRequest { id, grace_seconds };
+                let request = StopRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.stop(target.request(request)?).await?;
             }
             Self::Start => {
                 c.start(target.request(StartRequest { id })?).await?;
             }
             Self::Restart => {
-                let request = RestartRequest { id, grace_seconds };
+                let request = RestartRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.restart(target.request(request)?).await?;
             }
         }
@@ -97,14 +106,14 @@ pub async fn lifecycle(
     token_store: &Path,
     action: Action,
     refs: &[String],
-    grace_seconds: Option<i32>,
+    stop: &StopOptions,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
     for reference in refs {
         let result = async {
             let target = client::resolve(c, token_store, reference).await?;
-            action.call(c, &target, grace_seconds).await
+            action.call(c, &target, stop).await
         }
         .await;
         match result {
@@ -121,6 +130,7 @@ pub async fn remove(
     token_store: &Path,
     refs: &[String],
     force: bool,
+    remove_volumes: bool,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
@@ -132,7 +142,7 @@ pub async fn remove(
             if !force && target.status == SandboxStatus::Running {
                 anyhow::bail!("cannot remove a running sandbox: stop it first or use -f");
             }
-            remove_resolved(c, token_store, &target).await
+            remove_with_volumes(c, token_store, &target, remove_volumes).await
         }
         .await;
         match result {
@@ -211,8 +221,20 @@ pub async fn remove_resolved(
     token_store: &Path,
     target: &Resolved,
 ) -> Result<()> {
+    remove_with_volumes(c, token_store, target, false).await
+}
+
+/// [`remove_resolved`] that also removes the sandbox's anonymous volumes
+/// when `remove_volumes` is set.
+pub async fn remove_with_volumes(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    target: &Resolved,
+    remove_volumes: bool,
+) -> Result<()> {
     let request = RemoveSandboxRequest {
         id: target.id.clone(),
+        remove_volumes,
     };
     c.remove_sandbox(target.request(request)?).await?;
     // The daemon already removed the sandbox, so a store failure is only a

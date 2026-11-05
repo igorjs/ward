@@ -88,7 +88,7 @@ pub async fn run(
         None => attach::attach_with(&mut c, &target, start, forward_stdin, sink).await,
     };
     if flags.rm {
-        let removal = lifecycle::remove_resolved(&mut c, token_store, &target);
+        let removal = lifecycle::remove_with_volumes(&mut c, token_store, &target, true);
         let interrupt = async {
             match exits.as_mut() {
                 Some(exits) => exits.recv_exit_code().await,

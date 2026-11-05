@@ -155,16 +155,38 @@ impl VolumeManager {
             .await
     }
 
+    /// Create the volume called `name`, which must not exist yet.
+    pub async fn create_new(&self, name: &str) -> Result<PbVolumeInfo> {
+        crate::validate::volume_name(name)?;
+        self.insert_volume(name, IMPLICIT_VOLUME_SIZE_MB, HashMap::new(), true)
+            .await
+    }
+
     async fn create_if_missing(
         &self,
         name: &str,
         size_mb: u32,
         labels: HashMap<String, String>,
     ) -> Result<PbVolumeInfo> {
+        self.insert_volume(name, size_mb, labels, false).await
+    }
+
+    async fn insert_volume(
+        &self,
+        name: &str,
+        size_mb: u32,
+        labels: HashMap<String, String>,
+        must_be_new: bool,
+    ) -> Result<PbVolumeInfo> {
         // The write lock spans the check and the insert, so two sandboxes
         // that name a new volume at once get the same one.
         let mut volumes = self.volumes.write().await;
         if let Some(existing) = volumes.values().find(|v| v.name == name) {
+            if must_be_new {
+                return Err(ApiError::InvalidRequest(format!(
+                    "volume {name} already exists"
+                )));
+            }
             return Ok(entry_to_pb(existing.clone()));
         }
         // Enforce volume cap to prevent resource exhaustion.
@@ -707,6 +729,19 @@ mod tests {
         assert_eq!(listed[0].id, v.id);
         assert_eq!(listed[0].name, "keep");
         assert!(Path::new(&listed[0].mount_path).join("f").exists());
+    }
+
+    #[tokio::test]
+    async fn given_an_existing_name_when_create_new_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        mgr.ensure("taken").await.unwrap();
+
+        // Act
+        let err = mgr.create_new("taken").await.unwrap_err();
+
+        // Assert
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
     }
 
     #[tokio::test]
