@@ -1623,9 +1623,9 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         },
 
         Commands::Stop { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             let action = lifecycle::Action::Stop;
-            let stop = stop_options::StopOptions::new(time, signal)?;
             lifecycle::lifecycle(&mut c, &token_store, action, &refs, &stop, json).await?;
         }
 

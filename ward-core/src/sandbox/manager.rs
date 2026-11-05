@@ -2350,7 +2350,9 @@ impl SandboxManager {
                 Some(signal) => signal,
                 None => self.stop_signal_of(id).await,
             };
-            let _ = control.send(ProcessControl::Signal(signal)).await;
+            if control.send(ProcessControl::Signal(signal)).await.is_err() {
+                tracing::warn!(sandbox_id = %id, signal, "cannot deliver the stop signal");
+            }
         }
         if !ended_within(&mut exit, grace).await {
             tracing::warn!(sandbox_id = %id, "main process ignored the stop signal, forcing it");
@@ -8047,6 +8049,9 @@ pub(crate) mod tests {
     const SIGKILL_EXIT_CODE: i32 = 137;
     #[cfg(not(feature = "krunvm"))]
     const STOP_SIGNAL_EXIT_CODE: i32 = 42;
+    /// A stop grace of -1 waits as long as it takes.
+    const WAIT_FOREVER: i32 = -1;
+    const RESTART_SIGNAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const DEFAULT_HOSTNAME_LEN: usize = 12;
     #[cfg(not(feature = "krunvm"))]
     const SIGTERM_EXIT_CODE: i32 = 143;
@@ -8462,6 +8467,38 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_signal_override_when_restarted_then_the_old_process_gets_it() {
+        // Arrange: only SIGHUP ends the process, and the stop waits forever.
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        let restarted = tokio::time::timeout(
+            RESTART_SIGNAL_DEADLINE,
+            mgr.restart_with_signal(&id, Some(WAIT_FOREVER), Some("SIGHUP")),
+        )
+        .await;
+
+        // Assert
+        assert!(
+            restarted
+                .expect("restart must not wait out the grace")
+                .is_ok()
+        );
     }
 
     #[tokio::test]

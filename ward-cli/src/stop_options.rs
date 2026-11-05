@@ -22,7 +22,7 @@ impl StopOptions {
     pub fn new(grace_seconds: Option<i32>, signal: Option<String>) -> Result<Self> {
         if let Some(signal) = &signal {
             crate::inspect::parse_signal(signal)
-                .map_err(|_| anyhow::anyhow!("invalid signal: {signal}"))?;
+                .map_err(|_| anyhow::anyhow!("invalid stop signal: {signal}"))?;
         }
         Ok(Self {
             grace_seconds,
@@ -54,6 +54,6 @@ mod tests {
     fn given_an_unknown_signal_when_options_built_then_it_fails_before_any_stop() {
         let error = StopOptions::new(None, Some("SIGNOPE".into())).unwrap_err();
 
-        assert_eq!(error.to_string(), "invalid signal: SIGNOPE");
+        assert_eq!(error.to_string(), "invalid stop signal: SIGNOPE");
     }
 }

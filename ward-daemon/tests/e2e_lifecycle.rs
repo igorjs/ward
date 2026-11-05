@@ -311,7 +311,7 @@ fn given_only_unknown_references_when_inspect_then_empty_array_and_nonzero_exit(
 }
 
 #[test]
-fn given_a_signal_flag_when_stop_and_restart_then_the_sandbox_follows_as_without_it() {
+fn given_a_signal_flag_when_stop_and_restart_then_both_succeed_and_print_the_name() {
     // Arrange
     let d = Daemon::spawn();
     let id = create(&d, &["--name", "sig1"]);
@@ -323,7 +323,7 @@ fn given_a_signal_flag_when_stop_and_restart_then_the_sandbox_follows_as_without
     // Assert
     assert_eq!(stopped.trim(), "sig1");
     assert_eq!(restarted.trim(), "sig1");
-    assert!(status_of(&d, &id).is_some());
+    assert_eq!(status_of(&d, &id).as_deref(), Some("running"));
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn given_an_unknown_signal_when_stop_then_it_fails_and_the_sandbox_is_untouched(
     // Assert
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("invalid signal: SIGNOPE"),
+        stderr(&out).contains("invalid stop signal: SIGNOPE"),
         "{}",
         stderr(&out)
     );
