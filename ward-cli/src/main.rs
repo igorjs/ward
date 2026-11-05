@@ -1833,6 +1833,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             system::version(&socket_path, format.as_deref(), json).await?;
         }
 
+        Commands::System(SystemCommands::Df {
+            verbose: true,
+            format: Some(_),
+        }) => {
+            anyhow::bail!("--format is not supported with system df -v");
+        }
+
         Commands::System(SystemCommands::Df { verbose: true, .. }) => {
             df_verbose::run(&socket_path, json).await?;
         }

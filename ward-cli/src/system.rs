@@ -27,6 +27,12 @@ const DF_FIELDS: [(&str, &str); 5] = [
     ("Reclaimable", "RECLAIMABLE"),
 ];
 const PERCENT: u64 = 100;
+const KIND_IMAGES: &str = "Images";
+const KIND_CONTAINERS: &str = "Containers";
+const KIND_VOLUMES: &str = "Local Volumes";
+const KIND_BUILD_CACHE: &str = "Build Cache";
+/// How `info` names the isolation, in place of Docker's storage driver.
+const ISOLATION: &str = "microVM";
 
 /// The `docker version` record: `.Client.Version`, `.Server.Version`, and so on.
 fn version_record(server: Option<&ward_core::pb::DaemonInfo>) -> Value {
@@ -141,11 +147,12 @@ fn info_record(
 
 /// The sectioned text of `docker info`.
 fn info_text(record: &serde_json::Map<String, Value>) -> String {
-    let text = |key: &str| match &record[key] {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+    let text = |key: &str| match record.get(key) {
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
     };
-    let memory = size_text(record["MemTotal"].as_u64().unwrap_or(0));
+    let memory = size_text(record.get("MemTotal").and_then(Value::as_u64).unwrap_or(0));
     format!(
         "Server:\n\
          {INDENT}Containers: {}\n\
@@ -154,7 +161,7 @@ fn info_text(record: &serde_json::Map<String, Value>) -> String {
          {INDENT}{INDENT}Stopped: {}\n\
          {INDENT}Images: {}\n\
          {INDENT}Server Version: {}\n\
-         {INDENT}Isolation: microVM ({})\n\
+         {INDENT}Isolation: {ISOLATION} ({})\n\
          {INDENT}Kernel Version: {}\n\
          {INDENT}Operating System: {}\n\
          {INDENT}OSType: {}\n\
@@ -218,6 +225,9 @@ impl DfRow {
 
 /// `1.2GB (66%)`: the reclaimable bytes and their share of the total.
 fn reclaimable_text(reclaimable: u64, total: u64) -> String {
+    if total == 0 {
+        return size_text(0);
+    }
     let percent = reclaimable
         .saturating_mul(PERCENT)
         .checked_div(total)
@@ -231,9 +241,10 @@ fn df_rows(
     images: &[ward_core::pb::ImageInfo],
     volumes: &[ward_core::pb::VolumeInfo],
 ) -> Vec<DfRow> {
+    // A paused sandbox is not counted as running, as in `info`.
     let running = sandboxes
         .iter()
-        .filter(|s| s.status == SandboxStatus::Running as i32)
+        .filter(|s| s.status == SandboxStatus::Running as i32 && !s.paused)
         .count();
     let used = |image: &&ward_core::pb::ImageInfo| sandboxes.iter().any(|s| uses_image(s, image));
     let image_bytes: u64 = images.iter().map(|i| i.size_bytes).sum();
@@ -249,28 +260,28 @@ fn df_rows(
         .sum();
     vec![
         DfRow {
-            kind: "Images",
+            kind: KIND_IMAGES,
             total: images.len(),
             active: images.iter().filter(used).count(),
             size: size_text(image_bytes),
             reclaimable: reclaimable_text(unused_bytes, image_bytes),
         },
         DfRow {
-            kind: "Containers",
+            kind: KIND_CONTAINERS,
             total: sandboxes.len(),
             active: running,
             size: UNMEASURED.into(),
             reclaimable: UNMEASURED.into(),
         },
         DfRow {
-            kind: "Local Volumes",
+            kind: KIND_VOLUMES,
             total: volumes.len(),
             active: 0,
             size: size_text(volume_bytes),
             reclaimable: reclaimable_text(volume_bytes, volume_bytes),
         },
         DfRow {
-            kind: "Build Cache",
+            kind: KIND_BUILD_CACHE,
             total: 0,
             active: 0,
             size: size_text(0),
@@ -407,12 +418,12 @@ mod tests {
 
         let rows = df_rows(&sandboxes, &[used, idle], &[]);
 
-        assert_eq!(rows[0].kind, "Images");
+        assert_eq!(rows[0].kind, KIND_IMAGES);
         assert_eq!((rows[0].total, rows[0].active), (2, 1));
         assert_eq!(rows[0].size, "4MB");
         assert_eq!(rows[0].reclaimable, "1MB (25%)");
         assert_eq!((rows[1].total, rows[1].active), (1, 1));
-        assert_eq!(rows[3].kind, "Build Cache");
+        assert_eq!(rows[3].kind, KIND_BUILD_CACHE);
     }
 
     #[test]
@@ -424,7 +435,7 @@ mod tests {
 
         let rows = df_rows(&[], &[], &[volume]);
 
-        assert_eq!(rows[2].kind, "Local Volumes");
+        assert_eq!(rows[2].kind, KIND_VOLUMES);
         assert!(
             rows[2].reclaimable.ends_with("(100%)"),
             "{}",
@@ -443,5 +454,56 @@ mod tests {
             text.starts_with("TYPE            TOTAL   ACTIVE   SIZE   RECLAIMABLE\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn given_a_paused_sandbox_when_df_rows_built_then_it_is_not_active() {
+        let sandboxes = [
+            sandbox(SandboxStatus::Running, true, "a"),
+            sandbox(SandboxStatus::Running, false, "a"),
+        ];
+
+        let rows = df_rows(&sandboxes, &[], &[]);
+
+        assert_eq!((rows[1].total, rows[1].active), (2, 1));
+    }
+
+    #[test]
+    fn given_no_images_when_df_rows_built_then_the_row_has_no_percentage() {
+        let rows = df_rows(&[], &[], &[]);
+
+        assert_eq!(rows[0].reclaimable, "0B");
+        assert_eq!(rows[2].reclaimable, "0B");
+    }
+
+    #[test]
+    fn given_a_df_row_when_cells_built_then_they_follow_the_header_order() {
+        let row = DfRow {
+            kind: KIND_IMAGES,
+            total: 3,
+            active: 1,
+            size: "1MB".into(),
+            reclaimable: "0B".into(),
+        };
+
+        assert_eq!(
+            row.cells(),
+            [
+                json!("Images"),
+                json!(3),
+                json!(1),
+                json!("1MB"),
+                json!("0B")
+            ]
+        );
+        assert_eq!(row.cells().len(), DF_HEADERS.len());
+    }
+
+    #[test]
+    fn given_an_empty_record_when_info_text_built_then_it_prints_blanks_without_panicking() {
+        let text = info_text(&serde_json::Map::new());
+
+        assert!(text.contains(" Name: \n"), "{text}");
+        assert!(text.contains(" Total Memory: 0B\n"), "{text}");
     }
 }

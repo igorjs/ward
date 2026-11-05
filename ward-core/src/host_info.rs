@@ -48,7 +48,7 @@ fn parse_meminfo(text: &str) -> Option<u64> {
         .next()?
         .parse()
         .ok()?;
-    Some(kib * BYTES_PER_KIB)
+    kib.checked_mul(BYTES_PER_KIB)
 }
 
 /// The quoted `PRETTY_NAME` of an `os-release` text.
@@ -56,7 +56,7 @@ fn parse_os_release(text: &str) -> Option<String> {
     let value = text
         .lines()
         .find_map(|l| l.strip_prefix(OS_RELEASE_NAME_KEY))?;
-    Some(value.trim_matches('"').to_string())
+    Some(value.trim_matches(['"', '\'']).to_string())
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
@@ -89,20 +89,35 @@ fn operating_system(sysname: &str) -> String {
     }
 }
 
-/// The id stored in `data_dir`, created on first use. Empty when the
-/// directory cannot be written.
+/// The id stored in `data_dir`, created on first use. Empty, with a
+/// warning in the log, when the directory cannot be written.
 pub fn daemon_id(data_dir: &Path) -> String {
+    use std::io::Write;
+
     let path = data_dir.join(DAEMON_ID_FILE);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim();
-        if !existing.is_empty() {
-            return existing.to_string();
-        }
+    let read = || {
+        std::fs::read_to_string(&path)
+            .map(|text| text.trim().to_string())
+            .ok()
+            .filter(|id| !id.is_empty())
+    };
+    if let Some(existing) = read() {
+        return existing;
     }
     let id = uuid::Uuid::new_v4().to_string();
-    match std::fs::write(&path, &id) {
+    // create_new makes two first callers agree: the loser reads the winner's id.
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(id.as_bytes()));
+    match written {
         Ok(()) => id,
-        Err(_) => String::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read().unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "cannot store the daemon id");
+            String::new()
+        }
     }
 }
 
@@ -141,10 +156,41 @@ mod tests {
     }
 
     #[test]
-    fn given_this_host_when_detected_then_it_has_cpus_and_a_hostname() {
+    fn given_this_host_when_detected_then_it_has_cpus_and_an_operating_system() {
         let host = HostInfo::detect();
 
         assert!(host.ncpu > 0);
-        assert!(!host.hostname.is_empty());
+        assert!(!host.operating_system.is_empty());
+    }
+
+    #[test]
+    fn given_a_missing_data_dir_when_id_asked_then_it_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(daemon_id(&dir.path().join("absent")), "");
+    }
+
+    #[test]
+    fn given_an_id_file_when_id_asked_then_the_stored_id_is_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(DAEMON_ID_FILE), "fixed-id\n").expect("write");
+
+        assert_eq!(daemon_id(dir.path()), "fixed-id");
+    }
+
+    #[rstest::rstest]
+    #[case::single_quotes("PRETTY_NAME='Alpine Linux'\n", Some("Alpine Linux"))]
+    #[case::unquoted("PRETTY_NAME=Arch\n", Some("Arch"))]
+    #[case::missing("NAME=Debian\n", None)]
+    fn given_os_release_variants_when_parsed_then_quotes_are_dropped_and_absence_is_none(
+        #[case] text: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(parse_os_release(text).as_deref(), expected);
+    }
+
+    #[test]
+    fn given_an_overflowing_meminfo_when_parsed_then_none() {
+        assert_eq!(parse_meminfo("MemTotal: 18446744073709551615 kB\n"), None);
     }
 }

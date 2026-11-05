@@ -208,8 +208,11 @@ pub struct WardGrpcServer {
     pub sandbox: Arc<SandboxManager>,
     pub volume: Arc<VolumeManager>,
     pub started_at: Instant,
-    /// Reported by `GetInfo` as the root directory; unset in embedded use.
-    pub data_dir: Option<std::path::PathBuf>,
+    /// Host facts `GetInfo` reports, read once at startup.
+    host: crate::host_info::HostInfo,
+    /// Data directory and daemon id `GetInfo` reports; empty in embedded use.
+    root_dir: String,
+    daemon_id: String,
 }
 
 impl WardGrpcServer {
@@ -218,14 +221,17 @@ impl WardGrpcServer {
             sandbox,
             volume,
             started_at: Instant::now(),
-            data_dir: None,
+            host: crate::host_info::HostInfo::detect(),
+            root_dir: String::new(),
+            daemon_id: String::new(),
         }
     }
 
     /// Names the data directory `GetInfo` reports and keeps the daemon id in.
     #[must_use]
     pub fn with_data_dir(mut self, data_dir: std::path::PathBuf) -> Self {
-        self.data_dir = Some(data_dir);
+        self.root_dir = data_dir.display().to_string();
+        self.daemon_id = crate::host_info::daemon_id(&data_dir);
         self
     }
 }
@@ -1422,23 +1428,18 @@ impl Ward for WardGrpcServer {
         fields(request_id = %uuid::Uuid::new_v4())
     )]
     async fn get_info(&self, _request: Request<()>) -> Result<Response<DaemonInfo>, Status> {
-        let host = crate::host_info::HostInfo::detect();
-        let (root_dir, id) = match &self.data_dir {
-            Some(dir) => (dir.display().to_string(), crate::host_info::daemon_id(dir)),
-            None => Default::default(),
-        };
         Ok(Response::new(DaemonInfo {
             version: super::VERSION.to_string(),
             platform: std::env::consts::OS.to_string(),
             backend: "krunvm".to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            hostname: host.hostname,
-            kernel_version: host.kernel_version,
-            operating_system: host.operating_system,
-            ncpu: host.ncpu,
-            mem_total_bytes: host.mem_total_bytes,
-            root_dir,
-            id,
+            hostname: self.host.hostname.clone(),
+            kernel_version: self.host.kernel_version.clone(),
+            operating_system: self.host.operating_system.clone(),
+            ncpu: self.host.ncpu,
+            mem_total_bytes: self.host.mem_total_bytes,
+            root_dir: self.root_dir.clone(),
+            id: self.daemon_id.clone(),
         }))
     }
 }
