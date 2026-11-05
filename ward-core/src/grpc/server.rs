@@ -708,17 +708,10 @@ impl Ward for WardGrpcServer {
         request: Request<RemoveVolumeRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let volume = self.volume.get(&req.id).await.map_err(api_err_to_status)?;
-        let users = self.sandbox.volume_users(&volume.name).await;
-        if !users.is_empty() {
-            return Err(api_err_to_status(ApiError::VolumeInUse(format!(
-                "remove {}: volume is in use - [{}]",
-                volume.name,
-                users.join(", ")
-            ))));
-        }
         self.volume
-            .remove(&req.id)
+            .remove_if_unused(&req.id, |name| async move {
+                self.sandbox.volume_users(&name).await
+            })
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))

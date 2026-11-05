@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncWriteExt as _;
 use tokio::sync::RwLock;
+
+use crate::sync::LockUnpoisoned;
 
 use crate::pb::{CreateVolumeRequest, VolumeInfo as PbVolumeInfo};
 use crate::protocol::ApiError;
@@ -21,8 +24,14 @@ type Result<T> = std::result::Result<T, ApiError>;
 const VOLUMES_DIR: &str = "volumes";
 /// Directory inside a volume's own directory that a sandbox sees.
 const DATA_DIR: &str = "data";
+/// Stands for a sandbox that is still being created in an in-use message.
+const CREATING_HOLDER: &str = "a sandbox being created";
+/// Owner-only modes: another local user must not read a volume.
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
 /// File inside a volume's directory that records its identity.
 const META_FILE: &str = "volume.json";
+const META_TEMP_FILE: &str = "volume.json.tmp";
 /// Size recorded for a volume that a sandbox creates on first use.
 pub const IMPLICIT_VOLUME_SIZE_MB: u32 = 1024;
 
@@ -65,6 +74,30 @@ pub struct VolumeManager {
     volumes: Arc<RwLock<HashMap<String, VolumeEntry>>>,
     /// Maximum number of volumes. Prevents metadata and inode exhaustion.
     max_volumes: usize,
+    /// Volumes that a sandbox being created has named, with how many such
+    /// sandboxes. They cannot be removed until the sandbox is recorded.
+    claims: Claims,
+}
+
+type Claims = Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+/// Holds a volume against removal while a sandbox that names it is being
+/// created. Dropping it releases the hold.
+pub struct VolumeClaim {
+    claims: Claims,
+    name: String,
+}
+
+impl Drop for VolumeClaim {
+    fn drop(&mut self) {
+        let mut claims = self.claims.lock_unpoisoned();
+        if let Some(count) = claims.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                claims.remove(&self.name);
+            }
+        }
+    }
 }
 
 impl VolumeManager {
@@ -76,7 +109,26 @@ impl VolumeManager {
             data_dir,
             volumes: Arc::new(RwLock::new(volumes)),
             max_volumes,
+            claims: Claims::default(),
         }
+    }
+
+    /// Hold the volume called `name` against removal, whether or not it
+    /// exists yet.
+    pub fn claim(&self, name: &str) -> VolumeClaim {
+        *self
+            .claims
+            .lock_unpoisoned()
+            .entry(name.to_string())
+            .or_default() += 1;
+        VolumeClaim {
+            claims: Arc::clone(&self.claims),
+            name: name.to_string(),
+        }
+    }
+
+    fn is_claimed(&self, name: &str) -> bool {
+        self.claims.lock_unpoisoned().contains_key(name)
     }
 
     // -----------------------------------------------------------------------
@@ -150,29 +202,82 @@ impl VolumeManager {
             .collect())
     }
 
+    /// Remove a volume that nothing uses. `users` lists the sandboxes that
+    /// mount the volume; it runs under the manager's lock, so a sandbox
+    /// cannot claim the volume between the check and the removal.
+    pub async fn remove_if_unused<F, Fut>(&self, id: &str, users: F) -> Result<()>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
+        crate::validate::entity_id(id, "volume")?;
+        let mut volumes = self.volumes.write().await;
+        let entry = volumes
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ApiError::VolumeNotFound(id.to_string()))?;
+        let mut holders = users(entry.name.clone()).await;
+        if self.is_claimed(&entry.name) {
+            holders.push(CREATING_HOLDER.to_string());
+        }
+        if !holders.is_empty() {
+            return Err(ApiError::VolumeInUse(format!(
+                "remove {}: volume is in use - [{}]",
+                entry.name,
+                holders.join(", ")
+            )));
+        }
+        // Without its metadata the volume no longer loads, so a failed
+        // delete below cannot bring back a half-removed volume on restart.
+        match tokio::fs::remove_file(entry.dir.join(META_FILE)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ApiError::from_io("remove volume metadata", &e)),
+        }
+        volumes.remove(id);
+        drop(volumes);
+        tokio::fs::remove_dir_all(&entry.dir)
+            .await
+            .map_err(|e| ApiError::from_io("remove volume directory", &e))
+    }
+
     /// Remove a volume, deleting its data.
     pub async fn remove(&self, id: &str) -> Result<()> {
-        crate::validate::entity_id(id, "volume")?;
-        let entry = self
+        self.remove_if_unused(id, |_| async { Vec::new() }).await
+    }
+
+    /// Remove the volume called `name` if nothing uses it. Returns whether
+    /// it was removed.
+    pub async fn remove_unused_by_name<F, Fut>(&self, name: &str, users: F) -> Result<bool>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Vec<String>>,
+    {
+        let id = self
             .volumes
-            .write()
+            .read()
             .await
-            .remove(id)
-            .ok_or_else(|| ApiError::VolumeNotFound(id.to_string()))?;
-
-        if entry.dir.exists() {
-            tokio::fs::remove_dir_all(&entry.dir)
-                .await
-                .map_err(|e| ApiError::from_io("remove volume directory", &e))?;
+            .values()
+            .find(|v| v.name == name)
+            .map(|v| v.id.clone());
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        match self.remove_if_unused(&id, users).await {
+            Ok(()) => Ok(true),
+            Err(ApiError::VolumeInUse(_) | ApiError::VolumeNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
         }
-
-        Ok(())
     }
 }
 
-/// Create the volume's directories and record its identity.
+/// Create the volume's directories and record its identity. The record is
+/// written to a temporary file first, so a crash leaves no truncated one.
 async fn write_volume(entry: &VolumeEntry) -> Result<()> {
-    tokio::fs::create_dir_all(entry.data_path())
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIR_MODE)
+        .create(entry.data_path())
         .await
         .map_err(|e| ApiError::from_io("create volume directory", &e))?;
     let meta = VolumeMeta {
@@ -187,31 +292,66 @@ async fn write_volume(entry: &VolumeEntry) -> Result<()> {
     };
     let json = serde_json::to_vec(&meta)
         .map_err(|e| ApiError::Internal(format!("encode volume metadata: {e}")))?;
-    tokio::fs::write(entry.dir.join(META_FILE), json)
+    let write_err = |e: std::io::Error| ApiError::from_io("write volume metadata", &e);
+    let temp = entry.dir.join(META_TEMP_FILE);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(FILE_MODE)
+        .open(&temp)
         .await
-        .map_err(|e| ApiError::from_io("write volume metadata", &e))
+        .map_err(write_err)?;
+    file.write_all(&json).await.map_err(write_err)?;
+    file.sync_all().await.map_err(write_err)?;
+    tokio::fs::rename(&temp, entry.dir.join(META_FILE))
+        .await
+        .map_err(write_err)
 }
 
-/// Read every volume directory under `root`. A directory without readable
-/// metadata is skipped.
+/// Read every volume directory under `root`. A directory whose metadata is
+/// missing, unreadable, inconsistent with its directory name, or a duplicate
+/// of an earlier name is skipped, with a warning.
 fn load_volumes(root: &Path) -> HashMap<String, VolumeEntry> {
     let Ok(dirs) = std::fs::read_dir(root) else {
         return HashMap::new();
     };
-    dirs.flatten()
-        .filter_map(|dir| {
-            let bytes = std::fs::read(dir.path().join(META_FILE)).ok()?;
-            let meta: VolumeMeta = serde_json::from_slice(&bytes).ok()?;
-            let entry = VolumeEntry {
-                id: meta.id,
-                name: meta.name,
-                size_mb: meta.size_mb,
-                created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(meta.created_at_secs),
-                dir: dir.path(),
-            };
-            Some((entry.id.clone(), entry))
-        })
-        .collect()
+    let mut loaded: HashMap<String, VolumeEntry> = HashMap::new();
+    let mut paths: Vec<PathBuf> = dirs.flatten().map(|d| d.path()).collect();
+    paths.sort();
+    for dir in paths {
+        let entry = match read_entry(&dir) {
+            Ok(entry) => entry,
+            Err(reason) => {
+                tracing::warn!(dir = %dir.display(), %reason, "skipping a volume directory");
+                continue;
+            }
+        };
+        if loaded.values().any(|v| v.name == entry.name) {
+            tracing::warn!(dir = %dir.display(), name = %entry.name, "skipping a duplicate volume name");
+            continue;
+        }
+        loaded.insert(entry.id.clone(), entry);
+    }
+    loaded
+}
+
+fn read_entry(dir: &Path) -> std::result::Result<VolumeEntry, String> {
+    let bytes = std::fs::read(dir.join(META_FILE)).map_err(|e| format!("no metadata: {e}"))?;
+    let meta: VolumeMeta =
+        serde_json::from_slice(&bytes).map_err(|e| format!("unreadable metadata: {e}"))?;
+    let dir_name = dir.file_name().and_then(|n| n.to_str());
+    if dir_name != Some(meta.id.as_str()) {
+        return Err("the id does not match the directory name".to_string());
+    }
+    crate::validate::volume_name(&meta.name).map_err(|e| e.to_string())?;
+    Ok(VolumeEntry {
+        id: meta.id,
+        name: meta.name,
+        size_mb: meta.size_mb,
+        created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(meta.created_at_secs),
+        dir: dir.to_path_buf(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -551,5 +691,75 @@ mod tests {
         assert_eq!(listed[0].id, v.id);
         assert_eq!(listed[0].name, "keep");
         assert!(Path::new(&listed[0].mount_path).join("f").exists());
+    }
+
+    #[tokio::test]
+    async fn given_a_claimed_volume_when_removed_then_it_is_in_use_until_the_claim_drops() {
+        // Arrange
+        let mgr = build_manager(4);
+        let v = mgr.ensure("busy").await.unwrap();
+        let claim = mgr.claim("busy");
+
+        // Act
+        let while_claimed = mgr.remove(&v.id).await;
+        drop(claim);
+        let after = mgr.remove(&v.id).await;
+
+        // Assert
+        assert!(matches!(while_claimed, Err(ApiError::VolumeInUse(_))));
+        assert!(after.is_ok());
+    }
+
+    #[tokio::test]
+    async fn given_a_sandbox_using_the_volume_when_removed_then_the_error_lists_it() {
+        // Arrange
+        let mgr = build_manager(4);
+        let v = mgr.ensure("busy").await.unwrap();
+
+        // Act
+        let err = mgr
+            .remove_if_unused(&v.id, |_| async { vec!["sandbox-1".to_string()] })
+            .await
+            .unwrap_err();
+
+        // Assert
+        assert_eq!(
+            err.to_string(),
+            "remove busy: volume is in use - [sandbox-1]"
+        );
+        assert!(mgr.get(&v.id).await.is_ok());
+    }
+
+    #[test]
+    fn given_a_volume_directory_with_a_mismatched_id_when_loaded_then_it_is_skipped() {
+        // Arrange
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(VOLUMES_DIR).join("not-the-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = r#"{"id":"other","name":"x","size_mb":1,"created_at_secs":0}"#;
+        std::fs::write(dir.join(META_FILE), meta).unwrap();
+
+        // Act
+        let loaded = load_volumes(&root.path().join(VOLUMES_DIR));
+
+        // Assert
+        assert!(loaded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_a_new_volume_when_created_then_its_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        // Arrange
+        let mgr = build_manager(4);
+
+        // Act
+        let v = mgr.ensure("private").await.unwrap();
+
+        // Assert
+        let data_mode = std::fs::metadata(&v.mount_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(data_mode & 0o777, DIR_MODE);
     }
 }

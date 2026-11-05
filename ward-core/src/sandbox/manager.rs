@@ -1023,12 +1023,15 @@ impl SandboxManager {
         self
     }
 
-    /// Host path of the volume called `name`, which is created when missing.
-    async fn volume_path(&self, name: &str) -> Result<String> {
+    /// Claim the volume called `name`, creating it when missing, and return
+    /// its host path.
+    async fn claim_volume(&self, name: &str) -> Result<(crate::volume::VolumeClaim, String)> {
         let volumes = self.volumes.as_ref().ok_or_else(|| {
             ApiError::InvalidRequest("this daemon cannot mount named volumes".into())
         })?;
-        Ok(volumes.ensure(name).await?.mount_path)
+        let claim = volumes.claim(name);
+        let path = volumes.ensure(name).await?.mount_path;
+        Ok((claim, path))
     }
 
     /// IDs of the sandboxes, stopped ones included, that mount the volume
@@ -1482,6 +1485,9 @@ impl SandboxManager {
         // mount allowlist, because the validator reads the snapshot,
         // not the live env.
         let mut mounts = Vec::with_capacity(req.mounts.len());
+        // Held until the sandbox is recorded, so a volume it names cannot be
+        // removed while the image is still being pulled.
+        let mut volume_claims = Vec::new();
         for m in &req.mounts {
             if m.volume.is_empty() {
                 crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
@@ -1495,8 +1501,10 @@ impl SandboxManager {
                 // The host path is the daemon's own, so the client's source
                 // is ignored and the host allowlist does not apply.
                 crate::validate::volume_mount(&m.volume, &m.target)?;
+                let (claim, source) = self.claim_volume(&m.volume).await?;
+                volume_claims.push(claim);
                 mounts.push(crate::protocol::Mount {
-                    source: self.volume_path(&m.volume).await?,
+                    source,
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: Some(m.volume.clone()),

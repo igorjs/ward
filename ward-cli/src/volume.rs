@@ -55,17 +55,21 @@ pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::M
 
 /// The mount for `SOURCE:TARGET`: a bind mount when `source` is an absolute
 /// host path, otherwise the volume it names.
-pub fn mount_for(source: &str, target: &str, readonly: bool) -> ward_core::pb::Mount {
+pub fn mount_for(source: &str, target: &str, readonly: bool) -> Result<ward_core::pb::Mount> {
     if source.starts_with('/') {
-        ward_core::pb::Mount {
+        return Ok(ward_core::pb::Mount {
             source: source.to_string(),
             target: target.to_string(),
             readonly,
             volume: String::new(),
-        }
-    } else {
-        named_mount(source, target, readonly)
+        });
     }
+    if source.contains('/') || source.starts_with(['~', '.']) {
+        bail!(
+            "invalid volume specification: bind mount source '{source}' must be an absolute path"
+        );
+    }
+    Ok(named_mount(source, target, readonly))
 }
 
 #[derive(clap::Args, Debug)]

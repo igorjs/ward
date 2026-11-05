@@ -68,7 +68,12 @@ fn given_a_read_only_volume_mount_when_written_then_the_write_fails() {
     require_vm!();
     // Arrange
     let d = Daemon::spawn_vm();
-    run_script(&d, &["-v", "ro-data:/data"], "echo x > /data/f");
+    let seeded = run_script(
+        &d,
+        &["-v", "ro-data:/data"],
+        "echo x > /data/f && echo seeded",
+    );
+    assert_eq!(seeded.trim(), "seeded");
 
     // Act
     let out = run_script(
