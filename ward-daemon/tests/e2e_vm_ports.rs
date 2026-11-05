@@ -20,8 +20,9 @@ const DEFAULT_IMAGE: &str = "alpine:3.20";
 const GUEST_REPLY: &str = "ward-guest-reply";
 const GUEST_UDP_PORT: u16 = 5300;
 const GUEST_TCP_PORT: u16 = 80;
-const RANGE_FIRST: u16 = 38200;
-const RANGE_LAST: u16 = 38209;
+const RANGE_SPAN: u16 = 9;
+/// Highest start for the host range, so its end is a valid port.
+const RANGE_START_CEILING: u16 = 65_000;
 const DIAL_DEADLINE: Duration = Duration::from_secs(30);
 const RETRY_STEP: Duration = Duration::from_millis(200);
 const READ_TIMEOUT: Duration = Duration::from_millis(500);
@@ -81,6 +82,20 @@ fn udp_reply(port: u16) -> String {
     }
 }
 
+/// A port the OS just handed out, low enough to start a range from.
+fn free_port() -> u16 {
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        if port <= RANGE_START_CEILING {
+            return port;
+        }
+    }
+}
+
 fn tcp_reply(port: u16) -> String {
     use std::io::Read;
     let deadline = Instant::now() + DIAL_DEADLINE;
@@ -121,7 +136,9 @@ fn given_a_host_port_range_when_published_then_a_port_in_the_range_serves_the_gu
     require_vm!();
     // Arrange
     let d = Daemon::spawn_vm();
-    let publish = format!("{RANGE_FIRST}-{RANGE_LAST}:{GUEST_TCP_PORT}");
+    let range_first = free_port();
+    let range_last = range_first + RANGE_SPAN;
+    let publish = format!("{range_first}-{range_last}:{GUEST_TCP_PORT}");
     let script = format!("while true; do printf '{GUEST_REPLY}' | nc -l -p {GUEST_TCP_PORT}; done");
     let id = serve(&d, &["-p", &publish], &script);
 
@@ -130,6 +147,6 @@ fn given_a_host_port_range_when_published_then_a_port_in_the_range_serves_the_gu
     let host_port: u16 = listed.trim().rsplit(':').next().unwrap().parse().unwrap();
 
     // Assert
-    assert!((RANGE_FIRST..=RANGE_LAST).contains(&host_port), "{listed}");
+    assert!((range_first..=range_last).contains(&host_port), "{listed}");
     assert_eq!(tcp_reply(host_port), GUEST_REPLY);
 }

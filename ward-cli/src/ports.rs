@@ -18,6 +18,8 @@ use crate::client;
 const PROTOCOL: &str = "tcp";
 const UDP: &str = "udp";
 const RANGE_SEPARATOR: char = '-';
+/// Most ports one sandbox can publish; the daemon enforces the same limit.
+const MAX_PUBLISHED_PORTS: usize = 64;
 
 /// An inclusive run of ports; one port is a run of length 1.
 #[derive(Clone, Copy)]
@@ -49,6 +51,12 @@ pub fn parse_publish(spec: &str) -> Result<Vec<PortMapping>> {
             bail!("invalid publish value \"{spec}\": expected [HOST_IP:][HOST_PORT:]CONTAINER_PORT")
         }
     };
+    if container.len() > MAX_PUBLISHED_PORTS {
+        bail!(
+            "invalid publish value \"{spec}\": a range holds {} ports and at most {MAX_PUBLISHED_PORTS} can be published",
+            container.len()
+        );
+    }
     let mapping = |host_port: u16, host_port_end: u16, container_port: u16| PortMapping {
         host_ip: host_ip.clone(),
         host_port: u32::from(host_port),
@@ -439,6 +447,15 @@ mod tests {
             (mappings[0].host_port, mappings[0].host_port_end),
             (8000, 8010)
         );
+    }
+
+    #[test]
+    fn given_a_range_past_the_publish_limit_when_parsed_then_it_is_refused_before_expanding() {
+        // Act
+        let error = parse_publish("1-65535").unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains("at most 64"), "{error}");
     }
 
     #[test]

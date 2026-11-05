@@ -2364,7 +2364,12 @@ impl SandboxManager {
         ports: &mut [crate::protocol::PublishedPort],
     ) -> Result<Vec<PortListener>> {
         let mut listeners = Vec::with_capacity(ports.len());
-        for port in ports.iter_mut() {
+        // Fixed host ports go first, so a range cannot take one a later
+        // mapping asked for by number.
+        let mut order: Vec<usize> = (0..ports.len()).collect();
+        order.sort_by_key(|&index| ports[index].host_port_end != 0);
+        for index in order {
+            let port = &mut ports[index];
             if port.host_ip.is_unspecified() {
                 tracing::warn!(sandbox_id = %id, host_port = port.host_port, "publishing on all host interfaces");
             }

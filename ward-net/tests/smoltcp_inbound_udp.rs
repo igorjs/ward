@@ -163,3 +163,51 @@ async fn given_a_dropped_handle_when_a_datagram_is_sent_then_nothing_comes_back(
     assert!(reply.is_err(), "a closed port must stay silent");
     guest.abort();
 }
+
+#[tokio::test]
+async fn given_a_datagram_over_the_mtu_when_sent_then_it_is_dropped_and_small_ones_still_work() {
+    // Arrange
+    let (_handle, target, guest, _forward) = published().await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let oversized = vec![7u8; 1473];
+
+    // Act
+    client.send_to(&oversized, target).await.unwrap();
+    let mut buf = [0u8; PACKET_BYTES];
+    let silent = tokio::time::timeout(SILENCE, client.recv_from(&mut buf)).await;
+    let reply = ask(&client, target, b"ping").await;
+
+    // Assert
+    assert!(silent.is_err(), "an oversized datagram must get no reply");
+    assert_eq!(reply, b"echo:ping");
+    guest.abort();
+}
+
+#[tokio::test]
+async fn given_one_host_with_many_source_ports_when_it_sends_then_only_the_per_host_cap_is_served()
+{
+    // Arrange
+    let (_handle, target, guest, _forward) = published().await;
+    let over_cap = ward_net::inbound_udp::MAX_UDP_FLOWS_PER_HOST + 1;
+    let mut clients = Vec::new();
+    for _ in 0..over_cap {
+        clients.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    }
+
+    // Act
+    let mut answered = 0;
+    for client in &clients {
+        client.send_to(b"ping", target).await.unwrap();
+        let mut buf = [0u8; PACKET_BYTES];
+        if tokio::time::timeout(SILENCE, client.recv_from(&mut buf))
+            .await
+            .is_ok()
+        {
+            answered += 1;
+        }
+    }
+
+    // Assert
+    assert_eq!(answered, ward_net::inbound_udp::MAX_UDP_FLOWS_PER_HOST);
+    guest.abort();
+}

@@ -25,11 +25,19 @@ use crate::smoltcp_backend::StackCommand;
 /// new peer past this is dropped, so a flood cannot grow the flow table.
 pub const MAX_UDP_FLOWS: usize = 256;
 
+/// Concurrent flows one remote host may hold, so a single host cannot use
+/// up the table. The host is the source IP address.
+pub const MAX_UDP_FLOWS_PER_HOST: usize = 16;
+
+/// Largest UDP payload that fits the 1500 byte MTU after the 20 byte IP and
+/// 8 byte UDP headers. The stack does not fragment, so larger ones are dropped.
+pub const MAX_UDP_PAYLOAD_BYTES: usize = 1472;
+
 /// How long a flow may sit idle before its socket is freed.
 pub const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Largest datagram the host socket reads.
-const MAX_DATAGRAM_BYTES: usize = 65535;
+const MAX_DATAGRAM_BYTES: usize = u16::MAX as usize;
 
 /// Datagrams a flow queues in each direction.
 const FLOW_PACKETS: usize = 16;
@@ -110,6 +118,14 @@ pub(crate) async fn start_udp_listener(
 }
 
 impl NewDatagram {
+    pub(crate) fn peer_ip(&self) -> std::net::IpAddr {
+        self.peer.ip()
+    }
+
+    pub(crate) fn payload_len(&self) -> usize {
+        self.payload.len()
+    }
+
     pub(crate) fn into_payload(self) -> Vec<u8> {
         self.payload
     }
@@ -145,6 +161,10 @@ impl UdpFlow {
 
     pub(crate) fn local_port(&self) -> u16 {
         self.local_port
+    }
+
+    pub(crate) fn peer_ip(&self) -> std::net::IpAddr {
+        self.peer.ip()
     }
 
     /// Whether `datagram` belongs to this flow.

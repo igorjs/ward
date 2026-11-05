@@ -55,7 +55,10 @@ use crate::inbound::{
     InboundFlow, InboundHandle, InboundTuning, LocalPorts, MAX_INBOUND_TOTAL, NewInbound,
     start_listener,
 };
-use crate::inbound_udp::{MAX_UDP_FLOWS, NewDatagram, UdpFlow, new_socket, start_udp_listener};
+use crate::inbound_udp::{
+    MAX_UDP_FLOWS, MAX_UDP_FLOWS_PER_HOST, MAX_UDP_PAYLOAD_BYTES, NewDatagram, UdpFlow, new_socket,
+    start_udp_listener,
+};
 use crate::{AttachId, AttachOptions, Error, NetworkBackend};
 
 /// Resolves a domain name to zero or more addresses on the guest's behalf.
@@ -1328,6 +1331,14 @@ impl Stack {
             tracing::warn!("dropping inbound datagram: the guest has no DHCP lease yet");
             return;
         };
+        if datagram.payload_len() > MAX_UDP_PAYLOAD_BYTES {
+            tracing::warn!(
+                bytes = datagram.payload_len(),
+                limit = MAX_UDP_PAYLOAD_BYTES,
+                "dropping an inbound datagram larger than the guest MTU allows"
+            );
+            return;
+        }
         let guest = IpAddress::Ipv4(guest_addr);
         let known = self.udp_flows.iter().position(|f| f.serves(&datagram));
         let index = match known {
@@ -1335,6 +1346,15 @@ impl Stack {
             None => {
                 if self.udp_flows.len() >= MAX_UDP_FLOWS {
                     tracing::warn!("inbound UDP flow limit reached, dropping datagram");
+                    return;
+                }
+                let from_host = self
+                    .udp_flows
+                    .iter()
+                    .filter(|f| f.peer_ip() == datagram.peer_ip())
+                    .count();
+                if from_host >= MAX_UDP_FLOWS_PER_HOST {
+                    tracing::warn!(host = %datagram.peer_ip(), "too many UDP flows from one host, dropping datagram");
                     return;
                 }
                 let local_port = self
