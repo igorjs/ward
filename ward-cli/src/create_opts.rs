@@ -164,6 +164,16 @@ fn check_platform(platform: Option<&str>, host_arch: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment of one command: every env file in order, then each `-e`,
+/// with a bare key taking its value from this host.
+///
+/// # Errors
+///
+/// Fails on an unreadable or malformed file.
+pub fn host_environment(files: &[PathBuf], flags: &[String]) -> Result<HashMap<String, String>> {
+    environment(files, flags, host_env)
+}
+
 /// The sandbox environment: every env file in order, then each `-e`.
 fn environment(
     files: &[PathBuf],
@@ -314,6 +324,21 @@ async fn remove_named(c: &mut WardClient<Channel>, token_store: &Path, name: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn given_env_file_and_flags_when_merged_for_exec_then_flags_win() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("a.env");
+        std::fs::write(&file, "A=file\nB=file\n").expect("write");
+
+        // Act
+        let env = host_environment(&[file], &["B=flag".to_string()]).expect("env");
+
+        // Assert
+        assert_eq!(env["A"], "file");
+        assert_eq!(env["B"], "flag");
+    }
 
     const HOST_VALUE: &str = "from-host";
 

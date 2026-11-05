@@ -31,6 +31,8 @@ pub struct RunFlags {
     /// The streams `-a` asked for; all of them without it.
     pub streams: Streams,
     pub hooks: crate::create_opts::Hooks,
+    /// Detach keys and signal proxying.
+    pub options: Options,
 }
 
 /// Creates a sandbox, runs its main command and returns the exit code.
@@ -79,15 +81,22 @@ pub async fn run(
         }
         Output::Data(_) | Output::ReplayEnd => Ok(()),
     };
+    let options = &flags.options;
     let outcome = match exits.as_mut() {
         Some(exits) => {
-            let options = Options::default();
-            attach::attach_with_exits(&mut c, &target, start, forward_stdin, &options, exits, sink)
+            attach::attach_with_exits(&mut c, &target, start, forward_stdin, options, exits, sink)
                 .await
         }
-        None => attach::attach_with(&mut c, &target, start, forward_stdin, sink).await,
+        None => attach::attach_opts(&mut c, &target, start, forward_stdin, options, sink).await,
     };
-    if flags.rm {
+    // A detached sandbox keeps running, so --rm has nothing to remove yet.
+    if flags.rm && options.was_detached() {
+        eprintln!(
+            "warning: --rm did not remove {}: remove it with `ward rm`",
+            created.id
+        );
+    }
+    if flags.rm && !options.was_detached() {
         let removal = lifecycle::remove_with_volumes(&mut c, token_store, &target, true);
         let interrupt = async {
             match exits.as_mut() {
@@ -135,6 +144,8 @@ pub struct ExecSpec {
     pub interactive: bool,
     pub tty: bool,
     pub secrets: Vec<SecretFile>,
+    /// Detach keys.
+    pub options: Options,
 }
 
 /// Runs a command in a sandbox and returns its exit code.
@@ -158,7 +169,20 @@ pub async fn exec(
         secrets: spec.secrets,
         ..Default::default()
     };
-    require_exit(attach::attach(&mut c, &target, start, spec.interactive).await?)
+    let sink = |output: Output| match output {
+        Output::Data(chunk) => attach::write_to_terminal(chunk.stream, chunk.bytes),
+        Output::ReplayEnd => Ok(()),
+    };
+    let outcome = attach::attach_opts(
+        &mut c,
+        &target,
+        start,
+        spec.interactive,
+        &spec.options,
+        sink,
+    )
+    .await?;
+    require_exit(outcome)
 }
 
 /// Prints the buffered output of a sandbox's main process, then keeps

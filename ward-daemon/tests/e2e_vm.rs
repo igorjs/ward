@@ -1076,6 +1076,20 @@ fn given_any_host_port_and_a_guest_server_when_the_host_port_is_dialed_then_the_
 }
 
 #[test]
+fn given_publish_all_and_expose_when_a_guest_server_runs_then_a_free_host_port_serves_it() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &["-P", "--expose", "80"]);
+    start(&d, &id, None, &["sh", "-c", &reply_server(HTTP_PORT)]);
+
+    let mappings = published(&d, &id);
+
+    assert_eq!(mappings.len(), 1);
+    assert_eq!(mappings[0].0, HTTP_PORT);
+    assert_eq!(dial_reply(mappings[0].1), GUEST_REPLY);
+}
+
+#[test]
 fn given_a_published_port_when_stopped_and_started_then_it_is_refused_then_serves_on_the_same_port()
 {
     require_vm!();
