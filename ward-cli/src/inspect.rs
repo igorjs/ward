@@ -2,6 +2,7 @@
 
 //! `ward ps`, `ward inspect`, `ward kill` and the signal names `-s` accepts.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -12,7 +13,7 @@ use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInf
 use ward_core::protocol::RestartKind;
 
 use crate::lifecycle::Failures;
-use crate::ps_columns::{image_sizes, ports_text, size_column};
+use crate::ps_columns::{image_size, image_sizes, ports_text, size_column};
 use crate::ps_filter::{self, Filters};
 use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
@@ -30,6 +31,8 @@ pub const PS_HEADERS: [&str; 7] = [
 /// The column `ps -s` adds.
 const PS_SIZE_HEADER: &str = "SIZE";
 
+/// The `inspect -s` field for the size of the image.
+const SIZE_ROOT_FS_KEY: &str = "SizeRootFs";
 /// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
@@ -264,7 +267,14 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let mut shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    let mut filters = options.filters;
+    let cached = if filters.needs_images() {
+        c.list_images(()).await?.into_inner().images
+    } else {
+        Vec::new()
+    };
+    filters.resolve(&listed, &cached)?;
+    let mut shown = ps_filter::select(&listed, options.all, &filters, options.limit);
     if let Some(field) = options.sort {
         ps_filter::sort(&mut shown, field);
     }
@@ -672,6 +682,14 @@ pub fn check_type(kind: Option<&str>) -> Result<()> {
     }
 }
 
+/// Adds `SizeRootFs`, the size of the image the sandbox runs. `SizeRw`, what
+/// the sandbox wrote on top of it, is left out because Ward does not measure it.
+fn add_sizes(value: &mut Value, info: &SandboxInfo, sizes: &HashMap<String, u64>) {
+    if let Some(bytes) = image_size(info, sizes) {
+        value[SIZE_ROOT_FS_KEY] = json!(bytes);
+    }
+}
+
 /// Print one array element per found reference, or one rendering of `format`
 /// each. Missing ones go to stderr and make the command fail, like Docker.
 pub async fn inspect(
@@ -679,10 +697,16 @@ pub async fn inspect(
     token_store: &Path,
     references: &[String],
     format: Option<&str>,
+    size: bool,
 ) -> Result<()> {
     let template = format
         .map(|format| Template::parse(format, &[(ANY_FIELD, "")]))
         .transpose()?;
+    let sizes = if size {
+        image_sizes(&c.list_images(()).await?.into_inner().images)
+    } else {
+        HashMap::new()
+    };
     let mut found = Vec::new();
     let mut failures = Failures::new();
     for reference in references {
@@ -695,7 +719,13 @@ pub async fn inspect(
         }
         .await;
         match result {
-            Ok(info) => found.push(inspect_value(&info)),
+            Ok(info) => {
+                let mut value = inspect_value(&info);
+                if size {
+                    add_sizes(&mut value, &info, &sizes);
+                }
+                found.push(value);
+            }
             Err(e) => failures.record(reference, &e),
         }
     }
@@ -763,6 +793,32 @@ mod tests {
     }
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn given_a_cached_image_when_sizes_added_then_size_root_fs_is_the_image_size() {
+        let mut value = json!({"Id": "x"});
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.image = "alpine:latest".into();
+        let sizes = HashMap::from([("alpine:latest".to_string(), 7_800_000)]);
+
+        add_sizes(&mut value, &sandbox, &sizes);
+
+        assert_eq!(value["SizeRootFs"], 7_800_000);
+        assert!(value.get("SizeRw").is_none());
+    }
+
+    #[test]
+    fn given_an_uncached_image_when_sizes_added_then_nothing_is_added() {
+        let mut value = json!({"Id": "x"});
+
+        add_sizes(
+            &mut value,
+            &info(SandboxStatus::Running, None),
+            &HashMap::new(),
+        );
+
+        assert!(value.get("SizeRootFs").is_none());
+    }
 
     fn info(status: SandboxStatus, exit_code: Option<i32>) -> SandboxInfo {
         SandboxInfo {

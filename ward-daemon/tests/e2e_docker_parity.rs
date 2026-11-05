@@ -11,6 +11,8 @@ use std::process::Output;
 use common::Daemon;
 
 const ALPINE: &str = "alpine:latest";
+/// Long enough for two creations to get different timestamps.
+const CREATION_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
 
 fn run(d: &Daemon, args: &[&str]) -> Output {
     d.cli().args(args).output().expect("run ward")
@@ -216,7 +218,7 @@ fn given_three_sandboxes_when_ps_last_and_latest_then_newest_come_first() {
     let d = Daemon::spawn();
     for name in ["one", "two", "three"] {
         create(&d, name);
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::thread::sleep(CREATION_GAP);
     }
 
     // Act
@@ -272,6 +274,41 @@ fn given_unknown_signal_when_kill_then_it_is_refused_before_any_call() {
     // Assert
     assert!(!bad.status.success());
     assert!(stderr(&bad).contains("invalid signal"), "{}", stderr(&bad));
+}
+
+#[test]
+fn given_sandboxes_when_ps_filtered_by_ancestor_before_since_and_volume_then_they_narrow() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &["create", "--name", "first", "-v", "/tmp:/data", ALPINE],
+    );
+    std::thread::sleep(CREATION_GAP);
+    ok(&d, &["create", "--name", "second", "busybox:latest"]);
+    let names = |filter: &str| {
+        ok(
+            &d,
+            &["ps", "-a", "--format", "{{.Names}}", "--filter", filter],
+        )
+    };
+
+    // Act
+    let by_ancestor = names("ancestor=busybox");
+    let before = names("before=second");
+    let since = names("since=first");
+    let by_volume = names("volume=/data");
+    let by_exit = names("exited=0");
+    let missing = run(&d, &["ps", "-a", "--filter", "before=ghost"]);
+
+    // Assert
+    assert_eq!(by_ancestor, "second\n");
+    assert_eq!(before, "first\n");
+    assert_eq!(since, "second\n");
+    assert_eq!(by_volume, "first\n");
+    assert_eq!(by_exit, "");
+    assert!(!missing.status.success());
+    assert!(stderr(&missing).contains("No such container: ghost"));
 }
 
 #[test]

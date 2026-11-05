@@ -273,8 +273,10 @@ enum Commands {
         #[arg(short = 'l', long)]
         latest: bool,
         /// Only sandboxes matching name=, id= (a prefix), status=
-        /// (created, running, stopping, stopped, exited, failed), label= or
-        /// health= (starting, healthy, unhealthy, none). Repeatable.
+        /// (created, running, stopping, stopped, exited, failed), label=,
+        /// health= (starting, healthy, unhealthy, none), ancestor=IMAGE,
+        /// before=SANDBOX, since=SANDBOX, exited=CODE, publish=PORT[/tcp],
+        /// expose=PORT[/tcp] (ports may be ranges) or volume=PATH. Repeatable.
         /// A status filter looks at every state.
         #[arg(short, long)]
         filter: Vec<String>,
@@ -311,6 +313,10 @@ enum Commands {
         /// Go template for each sandbox.
         #[arg(short, long)]
         format: Option<String>,
+        /// Add SizeRootFs, the size of the sandbox's image. SizeRw is not
+        /// measured, so it is left out.
+        #[arg(short, long)]
+        size: bool,
         /// Kind of object to inspect: container. Ward cannot inspect images yet.
         #[arg(long = "type", value_name = "TYPE")]
         kind: Option<String>,
@@ -613,10 +619,12 @@ enum Commands {
     ///
     /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
     /// SIZE. Every cached image is a final image, so -a adds nothing.
-    /// --filter takes reference=<pattern> (`*` matches any run of characters)
-    /// and dangling=true|false; no cached image is dangling. --format takes a
-    /// Go template over .Repository .Tag .ID .Digest .CreatedAt .CreatedSince
-    /// .Size, the `table ` prefix, and `{{json .}}`.
+    /// --filter takes reference=<pattern> (`*` matches any run of characters),
+    /// dangling=true|false (no cached image is dangling), before=IMAGE,
+    /// since=IMAGE and label=KEY (images carry no labels, so it matches none).
+    /// --digests adds a DIGEST column. --format takes a Go template over
+    /// .Repository .Tag .ID .Digest .CreatedAt .CreatedSince .Size, the
+    /// `table ` prefix, and `{{json .}}`.
     Images {
         /// Show all images. Ward keeps no intermediate images.
         #[arg(short, long)]
@@ -635,6 +643,9 @@ enum Commands {
         filter: Vec<String>,
         /// Only images of this REPOSITORY[:TAG].
         reference: Option<String>,
+        /// Show the digest column.
+        #[arg(long)]
+        digests: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -1331,12 +1342,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
         Commands::Inspect {
             format,
+            size,
             kind,
             references,
         } => {
             inspect::check_type(kind.as_deref())?;
             let mut c = client::connect(&socket_path).await?;
-            inspect::inspect(&mut c, &token_store, &references, format.as_deref()).await?;
+            inspect::inspect(&mut c, &token_store, &references, format.as_deref(), size).await?;
         }
 
         Commands::Exec {
@@ -1733,9 +1745,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             format,
             filter,
             reference,
+            digests,
             ..
         } => {
             let options = images::Options {
+                digests,
                 quiet,
                 no_trunc,
                 format,
