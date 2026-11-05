@@ -137,3 +137,42 @@ fn given_a_missing_source_when_tagged_then_it_fails() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("No such image: nope:1"));
 }
+
+#[test]
+fn given_cached_images_when_listed_with_digests_and_relative_filters_then_they_narrow() {
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["pull", "busybox:1"]);
+
+    // Act
+    let digests = run_ok(&d, &["images", "--digests"]);
+    let labelled = run_ok(&d, &["images", "-q", "--filter", "label=env=dev"]);
+    let not_labelled = run_ok(&d, &["images", "-q", "--filter", "label!=env=dev"]);
+    let missing = run(&d, &["images", "--filter", "before=ghost:1"]);
+
+    // Assert
+    let header: Vec<&str> = digests.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(&header[..3], ["REPOSITORY", "TAG", "DIGEST"]);
+    assert_eq!(labelled, "");
+    assert_eq!(not_labelled.lines().count(), 2);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No such image: ghost:1"));
+}
+
+#[test]
+fn given_a_sandbox_and_a_cached_image_when_inspected_with_size_then_size_root_fs_is_the_image_size()
+{
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["create", "--name", "web1", IMAGE]);
+
+    // Act
+    let plain = run_ok(&d, &["inspect", "-f", "{{json .}}", "web1"]);
+    let sized = run_ok(&d, &["inspect", "-s", "-f", "{{.SizeRootFs}}", "web1"]);
+
+    // Assert
+    assert!(!plain.contains("SizeRootFs"));
+    assert!(sized.trim().parse::<u64>().is_ok(), "{sized}");
+}

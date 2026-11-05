@@ -134,6 +134,9 @@ impl Filters {
                     parsed.since = Some(value.to_string());
                 }
                 Some((FILTER_LABEL, value)) if !value.is_empty() => parsed.label_wanted = true,
+                Some((key @ (FILTER_BEFORE | FILTER_SINCE | FILTER_LABEL), "")) => {
+                    bail!("invalid filter '{key}=': a value is required")
+                }
                 Some((key, _)) if key.strip_suffix(NEGATION_MARK) == Some(FILTER_LABEL) => {}
                 Some((key, _)) => bail!("Invalid filter '{key}'"),
                 None => bail!("Bad format of filter (expected name=value)"),
@@ -355,6 +358,18 @@ mod tests {
         #[case] expected: &[&str],
     ) {
         assert_eq!(listed_after(filter), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::before("before=")]
+    #[case::since("since=")]
+    #[case::label("label=")]
+    fn given_an_empty_value_when_parsed_then_the_error_names_the_filter(#[case] spec: &str) {
+        let error = Filters::parse(&[spec.to_string()], None)
+            .err()
+            .expect("refused");
+
+        assert!(error.to_string().contains("a value is required"), "{error}");
     }
 
     #[test]

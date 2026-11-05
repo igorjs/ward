@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use ward_core::pb::{ImageInfo, PortMapping, SandboxInfo, SandboxStatus};
 
 use crate::exists::names_image;
-use crate::ps_columns::uses_image;
+use crate::ps_columns::{DEFAULT_TAG, uses_image};
 
 const FILTER_NAME: &str = "name";
 const FILTER_ID: &str = "id";
@@ -24,7 +24,9 @@ const PORT_RANGE_SEPARATOR: char = '-';
 const PROTOCOL_SEPARATOR: char = '/';
 /// The only protocol a published port can have.
 const PROTOCOL_TCP: &str = "tcp";
-const DEFAULT_TAG_SUFFIX: &str = ":latest";
+/// Protocols Docker names in a port filter. Ward publishes only tcp, so the
+/// others match nothing.
+const OTHER_PROTOCOLS: [&str; 2] = ["udp", "sctp"];
 /// Docker's word for a sandbox with no health check.
 const HEALTH_NONE: &str = "none";
 const HEALTHS: [&str; 4] = ["starting", "healthy", "unhealthy", HEALTH_NONE];
@@ -87,7 +89,7 @@ impl Ancestor {
 fn with_tag(reference: &str) -> String {
     match reference.rsplit_once(':') {
         Some((_, tag)) if !tag.contains('/') => reference.to_string(),
-        _ => format!("{reference}{DEFAULT_TAG_SUFFIX}"),
+        _ => format!("{reference}:{DEFAULT_TAG}"),
     }
 }
 
@@ -95,8 +97,10 @@ fn with_tag(reference: &str) -> String {
 /// `8000-8010/tcp`.
 #[derive(Debug)]
 struct PortSpec {
-    first: u32,
-    last: u32,
+    first: u16,
+    last: u16,
+    /// False for a protocol Ward never publishes: the filter matches nothing.
+    tcp: bool,
 }
 
 impl PortSpec {
@@ -114,14 +118,16 @@ impl PortSpec {
             first.parse().map_err(|_| bad())?,
             last.parse().map_err(|_| bad())?,
         );
-        if first > last || protocol != PROTOCOL_TCP {
+        let protocol = protocol.to_ascii_lowercase();
+        let tcp = protocol == PROTOCOL_TCP;
+        if first > last || !(tcp || OTHER_PROTOCOLS.contains(&protocol.as_str())) {
             return Err(bad());
         }
-        Ok(Self { first, last })
+        Ok(Self { first, last, tcp })
     }
 
     fn matches(&self, mapping: &PortMapping) -> bool {
-        (self.first..=self.last).contains(&mapping.container_port)
+        self.tcp && (u32::from(self.first)..=u32::from(self.last)).contains(&mapping.container_port)
     }
 }
 
@@ -191,12 +197,14 @@ impl Filters {
         }
         let created_of = |name: &Option<String>| -> Result<Option<(i64, i32)>> {
             let Some(name) = name else { return Ok(None) };
-            match listed
-                .iter()
-                .find(|s| s.name == *name || s.id.starts_with(name.as_str()))
-            {
-                Some(found) => Ok(created(found)),
-                None => bail!("No such container: {name}"),
+            if let Some(found) = listed.iter().find(|s| s.name == *name) {
+                return Ok(created(found));
+            }
+            let mut prefixed = listed.iter().filter(|s| s.id.starts_with(name.as_str()));
+            match (prefixed.next(), prefixed.next()) {
+                (Some(found), None) => Ok(created(found)),
+                (Some(_), Some(_)) => bail!("multiple IDs found with provided prefix: {name}"),
+                _ => bail!("No such container: {name}"),
             }
         };
         self.before_at = created_of(&self.before)?;
@@ -219,15 +227,16 @@ impl Filters {
             })
             && (self.ancestors.is_empty() || self.ancestors.iter().any(|a| a.matches(info)))
             && (self.exit_codes.is_empty()
-                || info
-                    .exit_code
-                    .is_some_and(|code| self.exit_codes.contains(&code)))
+                || (info.status != SandboxStatus::Running as i32
+                    && info
+                        .exit_code
+                        .is_some_and(|code| self.exit_codes.contains(&code))))
             && self
                 .before_at
-                .is_none_or(|cutoff| created(info) < Some(cutoff))
+                .is_none_or(|cutoff| created(info).is_some_and(|at| at < cutoff))
             && self
                 .since_at
-                .is_none_or(|cutoff| created(info) > Some(cutoff))
+                .is_none_or(|cutoff| created(info).is_some_and(|at| at > cutoff))
             && (self.publishes.is_empty() || self.publishes.iter().any(|p| publishes(info, p)))
             && (self.exposes.is_empty() || self.exposes.iter().any(|p| publishes(info, p)))
             && (self.volumes.is_empty()
@@ -526,6 +535,60 @@ mod tests {
     }
 
     #[test]
+    fn given_an_ambiguous_id_prefix_when_before_resolved_then_it_is_refused() {
+        let mut filters = parse(&["before=ccc"]);
+        let mut listed = fleet();
+        listed.push(sandbox("ccc4", "other", SandboxStatus::Running, 40));
+
+        let error = filters.resolve(&listed, &[]).expect_err("refused");
+
+        assert!(error.to_string().contains("multiple IDs found"), "{error}");
+    }
+
+    #[test]
+    fn given_a_sandbox_without_a_creation_time_when_filtered_then_before_and_since_leave_it_out() {
+        let mut listed = fleet();
+        listed.push(SandboxInfo {
+            id: "ddd5".into(),
+            name: "undated".into(),
+            ..Default::default()
+        });
+        let filters = resolved(&["before=web2"], &[]);
+        let after = resolved(&["since=web1"], &[]);
+
+        let older = select(&listed, true, &filters, None);
+        let newer = select(&listed, true, &after, None);
+
+        assert!(!names(&older).contains(&"undated".to_string()));
+        assert!(!names(&newer).contains(&"undated".to_string()));
+    }
+
+    #[rstest::rstest]
+    #[case::udp("publish=80/udp")]
+    #[case::upper_tcp("publish=80/TCP")]
+    fn given_a_protocol_filter_when_selected_then_udp_matches_nothing_and_tcp_any_case_matches(
+        #[case] spec: &str,
+    ) {
+        let mut listed = fleet();
+        listed[0] = with_ports(listed[0].clone(), &[80]);
+
+        let shown = select(&listed, true, &parse(&[spec]), None);
+
+        assert_eq!(shown.len(), usize::from(spec.ends_with("TCP")));
+    }
+
+    #[test]
+    fn given_a_running_sandbox_with_a_stale_exit_code_when_filtered_by_exited_then_it_is_left_out()
+    {
+        let mut listed = fleet();
+        listed[0].exit_code = Some(0);
+
+        let shown = select(&listed, true, &parse(&["exited=0"]), None);
+
+        assert!(shown.is_empty());
+    }
+
+    #[test]
     fn given_before_naming_nothing_when_resolved_then_it_is_refused() {
         let mut filters = parse(&["before=ghost"]);
 
@@ -619,7 +682,8 @@ mod tests {
     #[case::unknown_key("color=red", "invalid filter 'color'")]
     #[case::bad_exit("exited=x", "exited=x")]
     #[case::bad_port("publish=http", "publish=http")]
-    #[case::udp("expose=53/udp", "expose=53/udp")]
+    #[case::unknown_protocol("expose=53/icmp", "expose=53/icmp")]
+    #[case::too_big_port("publish=70000", "publish=70000")]
     #[case::backwards_range("publish=90-80", "publish=90-80")]
     #[case::empty_ancestor("ancestor=", "ancestor=")]
     #[case::bad_status("status=sleeping", "status=sleeping")]

@@ -31,9 +31,9 @@ pub const PS_HEADERS: [&str; 7] = [
 /// The column `ps -s` adds.
 const PS_SIZE_HEADER: &str = "SIZE";
 
-/// Docker shows the first 12 characters of an id.
 /// The `inspect -s` field for the size of the image.
 const SIZE_ROOT_FS_KEY: &str = "SizeRootFs";
+/// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
 const UNKNOWN_EXIT_CODE: i32 = 255;
@@ -674,7 +674,7 @@ pub async fn inspect(
     let sizes = if size {
         image_sizes(&c.list_images(()).await?.into_inner().images)
     } else {
-        Default::default()
+        HashMap::new()
     };
     let mut found = Vec::new();
     let mut failures = Failures::new();

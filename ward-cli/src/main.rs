@@ -615,12 +615,12 @@ enum Commands {
     ///
     /// Like `docker images`, it shows REPOSITORY, TAG, IMAGE ID, CREATED and
     /// SIZE. Every cached image is a final image, so -a adds nothing.
-    /// --filter takes reference=<pattern> (`*` matches any run of characters)
+    /// --filter takes reference=<pattern> (`*` matches any run of characters),
     /// dangling=true|false (no cached image is dangling), before=IMAGE,
     /// since=IMAGE and label=KEY (images carry no labels, so it matches none).
-    /// --digests adds a DIGEST column. --format takes a
-    /// Go template over .Repository .Tag .ID .Digest .CreatedAt .CreatedSince
-    /// .Size, the `table ` prefix, and `{{json .}}`.
+    /// --digests adds a DIGEST column. --format takes a Go template over
+    /// .Repository .Tag .ID .Digest .CreatedAt .CreatedSince .Size, the
+    /// `table ` prefix, and `{{json .}}`.
     Images {
         /// Show all images. Ward keeps no intermediate images.
         #[arg(short, long)]
