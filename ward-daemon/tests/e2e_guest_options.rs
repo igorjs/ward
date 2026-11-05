@@ -259,12 +259,13 @@ fn given_limit_flags_when_inspected_then_host_config_shows_them() {
 fn given_bad_limit_flags_when_created_then_each_fails_with_a_clear_error() {
     // Arrange
     let d = Daemon::spawn();
-    let cases: [(&[&str], &str); 6] = [
+    let cases: [(&[&str], &str); 7] = [
         (&["--ulimit", "files=1"], "invalid ulimit type"),
         (&["--ulimit", "nofile=10:5"], "soft limit"),
         (&["--group-add", "bad group"], "invalid --group-add"),
         (&["-m", "64m", "--memory-swap", "128m"], "no swap"),
         (&["--memory-swap", "-1"], "no swap"),
+        (&["--memory-swap", "512m"], "no swap"),
         (&["--cpuset-cpus", "x"], "--cpuset-cpus"),
     ];
 
@@ -361,4 +362,18 @@ fn given_conflicting_health_flags_when_created_then_each_fails_with_a_clear_erro
         assert!(!out.status.success(), "{flags:?}");
         assert!(stderr(&out).contains(reason), "{flags:?}: {}", stderr(&out));
     }
+}
+
+#[test]
+fn given_no_memory_or_cpu_flags_when_created_then_the_limits_are_unset() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["create", "--name", "free1", ALPINE]);
+
+    // Act
+    let memory = inspect(&d, "{{.HostConfig.Memory}}", "free1");
+    let nano_cpus = inspect(&d, "{{.HostConfig.NanoCpus}}", "free1");
+
+    // Assert
+    assert_eq!((memory.as_str(), nano_cpus.as_str()), ("0", "0"));
 }
