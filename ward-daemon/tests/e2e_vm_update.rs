@@ -119,6 +119,16 @@ fn given_running_sandbox_when_cgroup_options_updated_then_the_guest_cgroup_holds
     assert_eq!(cgroup_file(&d, "box", "cpu.weight"), "39");
     assert_eq!(cgroup_file(&d, "box", "cpu.max"), "50000 100000");
     assert_eq!(cgroup_file(&d, "box", "memory.low"), (64 * MIB).to_string());
+
+    // Act again: pin the CPU list and lift the quota.
+    run_ok(
+        &d,
+        &["update", "--cpuset-cpus", "0", "--cpu-quota", "-1", "box"],
+    );
+
+    // Assert again
+    assert_eq!(cgroup_file(&d, "box", "cpuset.cpus"), "0");
+    assert_eq!(cgroup_file(&d, "box", "cpu.max"), "max 100000");
 }
 
 #[test]
