@@ -159,9 +159,9 @@ A failure midway reaches the client as an error item, and the entries already wr
 
 ## Ports and inbound forwarding
 
-`-p` publishes a guest TCP port on the host. `BackendForwarder` calls `Backend::publish_port`, which opens a host listener. `ward-net/src/inbound.rs` accepts connections and hands each one to the smoltcp task. That task opens a TCP connection from the gateway to the guest and relays both ways.
+`-p` publishes a guest TCP or UDP port on the host. `BackendForwarder` calls `Backend::publish_port`, which opens a host listener. `ward-net/src/inbound.rs` accepts connections and hands each one to the smoltcp task. That task opens a TCP connection from the gateway to the guest and relays both ways. `ward-net/src/inbound_udp.rs` does the same for datagrams.
 
-- TCP only. Egress policy doesn't apply to these flows, because they point toward the guest.
+- TCP and UDP. UDP keeps one flow per host peer and frees it after 60 idle seconds. Egress policy doesn't apply to these flows, because they point toward the guest.
 - At most 64 concurrent connections per published port. Further connections close at accept time.
 - Without a `HOST_IP` the listener binds `127.0.0.1`.
 - A port stays open while the sandbox is exited. It closes on `stop` or `remove`.

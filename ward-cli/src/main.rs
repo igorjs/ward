@@ -144,14 +144,16 @@ struct SandboxOpts {
     /// User to run as: name|uid[:group|gid]. Defaults to the image's USER.
     #[arg(short = 'u', long, value_name = "NAME|UID[:GROUP|GID]")]
     user: Option<String>,
-    /// Publish a TCP port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp]. Without
-    /// HOST_PORT, or with 0, the daemon picks a free one. Repeatable.
-    /// Unlike Docker, HOST_IP defaults to 127.0.0.1, not 0.0.0.0; the port
-    /// stays open while the sandbox is exited and closes on stop or rm; TCP only.
+    /// Publish a port: [HOST_IP:][HOST_PORT:]CONTAINER_PORT[/tcp|/udp]. Without
+    /// HOST_PORT, or with 0, the daemon picks a free one. Either side can be a
+    /// range such as 8000-8010:80 (the first free host port) or
+    /// 8000-8002:80-82 (pairwise). Repeatable. Unlike Docker, HOST_IP defaults
+    /// to 127.0.0.1, not 0.0.0.0; the port stays open while the sandbox is
+    /// exited and closes on stop or rm.
     #[arg(
         short = 'p',
         long = "publish",
-        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp]"
+        value_name = "[HOST_IP:][HOST_PORT:]PORT[/tcp|/udp]"
     )]
     publish: Vec<String>,
     /// When to pull the image: "always", "missing" (default), "never", or
@@ -287,14 +289,14 @@ enum Commands {
     #[command(after_help = DOCKER_DIFFERENCES)]
     /// Print the host address each published port is reachable on.
     ///
-    /// With PORT (80 or 80/tcp), prints only the host address for it.
+    /// With PORT (80, 80/tcp or 53/udp), prints only the host address for it.
     ///
     /// Unlike Docker, a port without HOST_IP binds 127.0.0.1, not 0.0.0.0. It
-    /// stays open while the sandbox is exited and closes on stop or rm. TCP only.
+    /// stays open while the sandbox is exited and closes on stop or rm.
     Port {
         /// Sandbox name, ID or ID prefix.
         reference: String,
-        /// Container port, optionally with /tcp.
+        /// Container port, optionally with /tcp or /udp.
         port: Option<String>,
     },
 

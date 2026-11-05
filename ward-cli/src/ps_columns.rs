@@ -177,12 +177,14 @@ mod tests {
                     host_port: 8080,
                     container_port: 80,
                     protocol: "tcp".into(),
+                    ..Default::default()
                 },
                 PortMapping {
                     host_ip: "0.0.0.0".into(),
                     host_port: 8443,
                     container_port: 443,
                     protocol: "tcp".into(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -203,6 +205,7 @@ mod tests {
             host_port,
             container_port,
             protocol: protocol.into(),
+            ..Default::default()
         }
     }
 

@@ -47,7 +47,10 @@ These flags of `ward run` and `ward create` are enforced by the guest agent when
 
 - `-p` binds `127.0.0.1` when you give no `HOST_IP`. Docker binds `0.0.0.0`. Ward keeps ports private unless you ask.
 - A published port stays open while the sandbox is exited. It closes on `stop` or `rm`.
-- Only TCP is supported.
+- `/udp` publishes a UDP port, as in `-p 5353:53/udp`. The daemon keeps one flow per host peer, frees it after 60 seconds without a datagram, and relays at most 256 peers per sandbox. Datagrams larger than the guest's 1500 byte MTU are dropped, since the stack does not fragment.
+- Ranges work as in Docker: `8000-8002:80-82` maps the ports pairwise, `8000-8010:80` binds the first free host port in the range, and `80-82` gives each container port any free host port. Ranges of different lengths are refused. A sandbox publishes at most 64 ports, so a long range counts as many. `ward port` and `ps` show the host port that was bound, not the range.
+- `-p IP::PORT` publishes on that address with any free host port.
+- SCTP is not supported. `ward port SANDBOX 53/udp` selects a UDP mapping.
 
 ## Network egress
 

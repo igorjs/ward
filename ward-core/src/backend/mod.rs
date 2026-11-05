@@ -289,13 +289,15 @@ pub trait Backend: Send + Sync + 'static {
         ))
     }
 
-    /// Forward connections on host address `bind` to TCP `guest_port` of
-    /// the running sandbox `id`. Dropping the listener closes it.
+    /// Forward connections or datagrams on host address `bind` to
+    /// `guest_port` of the running sandbox `id`. Dropping the listener
+    /// closes it.
     async fn publish_port(
         &self,
         _id: &str,
         _bind: std::net::SocketAddr,
         _guest_port: u16,
+        _protocol: crate::protocol::PortProtocol,
     ) -> Result<ports::PortListener> {
         Err(BackendError::InvalidArgument(
             ports::NEEDS_MICROVM.to_string(),

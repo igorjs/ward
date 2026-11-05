@@ -317,8 +317,11 @@ message PortMapping {
   string host_ip = 1;
   uint32 host_port = 2;
   uint32 container_port = 3;
-  // "tcp" or empty. Other protocols are rejected.
+  // "tcp", "udp" or empty, which means tcp. Other protocols are rejected.
   string protocol = 4;
+  // Last host port to try when the host port is a range. 0 means a single
+  // host_port. The daemon binds the first free port from host_port to here.
+  uint32 host_port_end = 5;
 }
 
 message GetSandboxRequest {

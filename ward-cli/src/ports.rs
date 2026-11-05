@@ -16,31 +16,76 @@ use ward_core::pb::{GetSandboxRequest, PortMapping};
 use crate::client;
 
 const PROTOCOL: &str = "tcp";
+const UDP: &str = "udp";
+const RANGE_SEPARATOR: char = '-';
 
-/// Parse one `-p` value.
-pub fn parse_publish(spec: &str) -> Result<PortMapping> {
+/// An inclusive run of ports; one port is a run of length 1.
+#[derive(Clone, Copy)]
+struct PortRange {
+    first: u16,
+    last: u16,
+}
+
+impl PortRange {
+    fn len(self) -> usize {
+        usize::from(self.last - self.first) + 1
+    }
+
+    fn is_single(self) -> bool {
+        self.first == self.last
+    }
+}
+
+/// Parse one `-p` value into the mappings it stands for: a range of equal
+/// length on both sides is one mapping per port, a host range with one
+/// container port lets the daemon pick a free host port from the range.
+pub fn parse_publish(spec: &str) -> Result<Vec<PortMapping>> {
     let (body, protocol) = split_protocol(spec)?;
     let (host_ip, ports) = split_host_ip(body, spec)?;
-    let (host_port, container_port) = match ports.split(':').collect::<Vec<_>>().as_slice() {
-        [container] => (0, parse_port(container, spec)?),
-        [host, container] => (parse_host_port(host, spec)?, parse_port(container, spec)?),
+    let (host, container) = match ports.split(':').collect::<Vec<_>>().as_slice() {
+        [container] => (None, parse_range(container, spec)?),
+        [host, container] => (parse_host_range(host, spec)?, parse_range(container, spec)?),
         _ => {
             bail!("invalid publish value \"{spec}\": expected [HOST_IP:][HOST_PORT:]CONTAINER_PORT")
         }
     };
-    if container_port == 0 {
-        bail!("invalid publish value \"{spec}\": the container port must be between 1 and 65535");
-    }
-    Ok(PortMapping {
-        host_ip,
+    let mapping = |host_port: u16, host_port_end: u16, container_port: u16| PortMapping {
+        host_ip: host_ip.clone(),
         host_port: u32::from(host_port),
         container_port: u32::from(container_port),
         protocol: protocol.to_string(),
-    })
+        host_port_end: u32::from(host_port_end),
+    };
+    let container_ports = container.first..=container.last;
+    match host {
+        None => Ok(container_ports.map(|port| mapping(0, 0, port)).collect()),
+        Some(host) if host.is_single() => {
+            if !container.is_single() {
+                bail!(
+                    "invalid publish value \"{spec}\": a container port range needs a host range of the same length"
+                );
+            }
+            Ok(vec![mapping(host.first, 0, container.first)])
+        }
+        Some(host) if container.is_single() => {
+            Ok(vec![mapping(host.first, host.last, container.first)])
+        }
+        Some(host) if host.len() == container.len() => Ok((host.first..=host.last)
+            .zip(container_ports)
+            .map(|(host_port, port)| mapping(host_port, 0, port))
+            .collect()),
+        Some(_) => bail!(
+            "invalid publish value \"{spec}\": the host and container port ranges differ in length"
+        ),
+    }
 }
 
 pub fn parse_all(specs: &[String]) -> Result<Vec<PortMapping>> {
-    specs.iter().map(|spec| parse_publish(spec)).collect()
+    let mut all = Vec::new();
+    for spec in specs {
+        all.extend(parse_publish(spec)?);
+    }
+    Ok(all)
 }
 
 /// Tell the user when a mapping opens the guest to the network.
@@ -62,13 +107,13 @@ fn binds_all_interfaces(mapping: &PortMapping) -> bool {
         .is_ok_and(|ip| ip.is_unspecified())
 }
 
-/// `80/tcp` or `80`; returns the port and the protocol.
+/// `80/tcp`, `53/udp` or `80`; returns the ports and the protocol.
 fn split_protocol(spec: &str) -> Result<(&str, &str)> {
     let Some((body, protocol)) = spec.rsplit_once('/') else {
         return Ok((spec, PROTOCOL));
     };
-    if protocol != PROTOCOL {
-        bail!("unsupported protocol \"{protocol}\" in \"{spec}\": only tcp ports can be published");
+    if protocol != PROTOCOL && protocol != UDP {
+        bail!("unsupported protocol \"{protocol}\" in \"{spec}\": use tcp or udp");
     }
     Ok((body, protocol))
 }
@@ -88,19 +133,37 @@ fn split_host_ip<'a>(body: &'a str, spec: &str) -> Result<(String, &'a str)> {
     }
 }
 
-fn parse_host_port(text: &str, spec: &str) -> Result<u16> {
-    if text.is_empty() {
-        return Ok(0);
+/// The host side of a mapping: nothing, `0` or empty mean any free port.
+fn parse_host_range(text: &str, spec: &str) -> Result<Option<PortRange>> {
+    if text.is_empty() || text == "0" {
+        return Ok(None);
     }
-    parse_port(text, spec)
+    parse_range(text, spec).map(Some)
+}
+
+fn parse_range(text: &str, spec: &str) -> Result<PortRange> {
+    let Some((first, last)) = text.split_once(RANGE_SEPARATOR) else {
+        let port = parse_port(text, spec)?;
+        return Ok(PortRange {
+            first: port,
+            last: port,
+        });
+    };
+    let (first, last) = (parse_port(first, spec)?, parse_port(last, spec)?);
+    if last < first {
+        bail!("invalid publish value \"{spec}\": the port range {text} runs backwards");
+    }
+    Ok(PortRange { first, last })
 }
 
 fn parse_port(text: &str, spec: &str) -> Result<u16> {
-    if text.contains('-') {
-        bail!("invalid publish value \"{spec}\": port ranges are not supported");
+    let port: u16 = text
+        .parse()
+        .with_context(|| format!("invalid publish value \"{spec}\": \"{text}\" is not a port"))?;
+    if port == 0 {
+        bail!("invalid publish value \"{spec}\": ports must be between 1 and 65535");
     }
-    text.parse()
-        .with_context(|| format!("invalid publish value \"{spec}\": \"{text}\" is not a port"))
+    Ok(port)
 }
 
 /// `ward port SANDBOX [PORT[/tcp]]`: print where each published port is
@@ -122,12 +185,16 @@ pub async fn run(
     let shown: Vec<&PortMapping> = info
         .published_ports
         .iter()
-        .filter(|m| wanted.is_none_or(|port| m.container_port == u32::from(port)))
+        .filter(|m| {
+            wanted
+                .as_ref()
+                .is_none_or(|(port, protocol)| matches_private(m, *port, protocol))
+        })
         .collect();
-    if let Some(port) = wanted
+    if let Some((port, protocol)) = &wanted
         && shown.is_empty()
     {
-        bail!("No public port '{port}/{PROTOCOL}' published for {reference}");
+        bail!("No public port '{port}/{protocol}' published for {reference}");
     }
     if json {
         let rows: Vec<_> = shown.iter().map(|m| mapping_json(m)).collect();
@@ -140,9 +207,27 @@ pub async fn run(
     Ok(())
 }
 
-fn parse_private_port(text: &str) -> Result<u16> {
-    let (body, _) = split_protocol(text)?;
-    parse_port(body, text)
+fn parse_private_port(text: &str) -> Result<(u16, String)> {
+    let (body, protocol) = split_protocol(text)?;
+    Ok((parse_port(body, text)?, protocol.to_string()))
+}
+
+/// An empty protocol on a mapping reads as tcp.
+fn matches_private(mapping: &PortMapping, port: u16, protocol: &str) -> bool {
+    let own = if mapping.protocol.is_empty() {
+        PROTOCOL
+    } else {
+        &mapping.protocol
+    };
+    mapping.container_port == u32::from(port) && own == protocol
+}
+
+fn protocol_of(mapping: &PortMapping) -> &str {
+    if mapping.protocol.is_empty() {
+        PROTOCOL
+    } else {
+        &mapping.protocol
+    }
 }
 
 /// `80/tcp -> 127.0.0.1:49153`, or just the address when a port was asked for.
@@ -151,7 +236,11 @@ fn mapping_line(mapping: &PortMapping, address_only: bool) -> String {
     if address_only {
         address
     } else {
-        format!("{}/{PROTOCOL} -> {address}", mapping.container_port)
+        format!(
+            "{}/{} -> {address}",
+            mapping.container_port,
+            protocol_of(mapping)
+        )
     }
 }
 
@@ -166,7 +255,7 @@ fn host_address(mapping: &PortMapping) -> String {
 fn mapping_json(mapping: &PortMapping) -> serde_json::Value {
     json!({
         "container_port": mapping.container_port,
-        "protocol": PROTOCOL,
+        "protocol": protocol_of(mapping),
         "host_ip": mapping.host_ip,
         "host_port": mapping.host_port,
     })
@@ -193,9 +282,11 @@ mod tests {
         #[case] container_port: u32,
     ) {
         // Act
-        let mapping = parse_publish(spec).unwrap();
+        let mappings = parse_publish(spec).unwrap();
 
         // Assert
+        let mapping = &mappings[0];
+        assert_eq!(mappings.len(), 1);
         assert_eq!(mapping.host_ip, host_ip);
         assert_eq!(mapping.host_port, host_port);
         assert_eq!(mapping.container_port, container_port);
@@ -203,9 +294,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case::udp("8080:53/udp", "only tcp")]
-    #[case::range("8000-8010:80", "ranges")]
-    #[case::container_range("8080:80-90", "ranges")]
+    #[case::sctp("8080:53/sctp", "use tcp or udp")]
+    #[case::mismatched_ranges("8000-8010:80-82", "differ in length")]
+    #[case::single_host_for_range("8080:80-82", "same length")]
+    #[case::backwards("8010-8000:80", "backwards")]
     #[case::zero_container("8080:0", "between 1 and 65535")]
     #[case::too_big("70000", "not a port")]
     #[case::text("web", "not a port")]
@@ -228,6 +320,7 @@ mod tests {
             host_port,
             container_port,
             protocol: PROTOCOL.into(),
+            host_port_end: 0,
         }
     }
 
@@ -241,7 +334,7 @@ mod tests {
         #[case] flagged: bool,
     ) {
         // Arrange
-        let mapping = parse_publish(spec).unwrap();
+        let mapping = parse_publish(spec).unwrap().remove(0);
 
         // Act
         let result = binds_all_interfaces(&mapping);
@@ -269,25 +362,95 @@ mod tests {
     }
 
     #[rstest]
-    #[case::port("80", 80)]
-    #[case::port_with_protocol("443/tcp", 443)]
-    fn given_a_private_port_argument_when_parsed_then_the_port_is_returned(
+    #[case::port("80", 80, "tcp")]
+    #[case::port_with_protocol("443/tcp", 443, "tcp")]
+    #[case::udp("53/udp", 53, "udp")]
+    fn given_a_private_port_argument_when_parsed_then_the_port_and_protocol_are_returned(
         #[case] text: &str,
-        #[case] expected: u16,
+        #[case] port: u16,
+        #[case] protocol: &str,
     ) {
         // Act
-        let port = parse_private_port(text).unwrap();
+        let parsed = parse_private_port(text).unwrap();
 
         // Assert
-        assert_eq!(port, expected);
+        assert_eq!(parsed, (port, protocol.to_string()));
+    }
+
+    #[rstest]
+    #[case::udp_mapping_udp_query("udp", 53, "udp", true)]
+    #[case::udp_mapping_tcp_query("udp", 53, "tcp", false)]
+    #[case::unset_protocol_is_tcp("", 80, "tcp", true)]
+    fn given_a_mapping_when_matched_against_a_private_port_then_the_protocol_counts(
+        #[case] own: &str,
+        #[case] port: u16,
+        #[case] queried: &str,
+        #[case] expected: bool,
+    ) {
+        // Arrange
+        let mapping = PortMapping {
+            protocol: own.into(),
+            container_port: u32::from(port),
+            ..mapping("127.0.0.1", 1, u32::from(port))
+        };
+
+        // Act
+        let matched = matches_private(&mapping, port, queried);
+
+        // Assert
+        assert_eq!(matched, expected);
     }
 
     #[test]
-    fn given_a_udp_private_port_when_parsed_then_it_is_rejected() {
+    fn given_a_udp_publish_value_when_parsed_then_the_protocol_is_udp() {
         // Act
-        let err = parse_private_port("53/udp").unwrap_err();
+        let mappings = parse_publish("5353:53/udp").unwrap();
 
         // Assert
-        assert!(err.to_string().contains("only tcp"), "{err}");
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(mappings[0].protocol, "udp");
+        assert_eq!(
+            (mappings[0].host_port, mappings[0].container_port),
+            (5353, 53)
+        );
+    }
+
+    #[test]
+    fn given_equal_ranges_when_parsed_then_each_host_port_maps_to_its_container_port() {
+        // Act
+        let mappings = parse_publish("127.0.0.1:8000-8002:80-82").unwrap();
+
+        // Assert
+        let pairs: Vec<_> = mappings
+            .iter()
+            .map(|m| (m.host_port, m.container_port, m.host_port_end))
+            .collect();
+        assert_eq!(pairs, [(8000, 80, 0), (8001, 81, 0), (8002, 82, 0)]);
+    }
+
+    #[test]
+    fn given_a_host_range_and_one_container_port_when_parsed_then_the_range_is_kept() {
+        // Act
+        let mappings = parse_publish("8000-8010:80").unwrap();
+
+        // Assert
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            (mappings[0].host_port, mappings[0].host_port_end),
+            (8000, 8010)
+        );
+    }
+
+    #[test]
+    fn given_a_container_range_only_when_parsed_then_each_port_gets_any_host_port() {
+        // Act
+        let mappings = parse_publish("80-82").unwrap();
+
+        // Assert
+        let ports: Vec<_> = mappings
+            .iter()
+            .map(|m| (m.host_port, m.container_port))
+            .collect();
+        assert_eq!(ports, [(0, 80), (0, 81), (0, 82)]);
     }
 }
