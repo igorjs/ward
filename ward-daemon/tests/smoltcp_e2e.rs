@@ -22,12 +22,6 @@ use std::process::{Command, Stdio};
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
-/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
-fn json_pid(stdout: &str) -> String {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
-    value["pid"].as_str().expect("pid").to_string()
-}
-
 #[test]
 #[ignore]
 fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
@@ -93,7 +87,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         "exec getent failed: {}",
         String::from_utf8_lossy(&dns_exec.stderr)
     );
-    let dns_pid = json_pid(std::str::from_utf8(&dns_exec.stdout).unwrap());
+    let dns_pid = common::json_pid(std::str::from_utf8(&dns_exec.stdout).unwrap());
 
     // Assert: the resolver returned an address and the guest process
     // exited cleanly.
@@ -126,7 +120,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         "exec wget failed: {}",
         String::from_utf8_lossy(&tcp_exec.stderr)
     );
-    let tcp_pid = json_pid(std::str::from_utf8(&tcp_exec.stdout).unwrap());
+    let tcp_pid = common::json_pid(std::str::from_utf8(&tcp_exec.stdout).unwrap());
 
     // Assert: the guest's TCP connect/handshake/transfer completed and
     // the process exited cleanly.

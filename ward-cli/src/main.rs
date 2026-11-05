@@ -513,7 +513,7 @@ enum Commands {
         volumes: bool,
         /// Not supported: sandboxes have no links to remove. Docker's short
         /// -l is `--latest` here, as in Podman.
-        #[arg(long, hide = true)]
+        #[arg(long)]
         link: bool,
     },
 
@@ -1182,6 +1182,7 @@ fn parse_failure_code(error: &clap::Error, subcommand: Option<&str>) -> i32 {
         | ErrorKind::MissingRequiredArgument
         | ErrorKind::TooManyValues
         | ErrorKind::TooFewValues
+        | ErrorKind::ArgumentConflict
         | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => GENERIC_FAILURE_EXIT_CODE,
         ErrorKind::UnknownArgument if !bad_flag() => GENERIC_FAILURE_EXIT_CODE,
         _ => CLI_FAILURE_EXIT_CODE,
@@ -2401,6 +2402,17 @@ mod tests {
     }
 
     #[test]
+    fn given_pull_with_disable_content_trust_when_parsed_then_it_is_accepted() {
+        match Cli::try_parse_from(["ward", "pull", "--disable-content-trust", "alpine"])
+            .expect("parse")
+            .command
+        {
+            Commands::Pull { flags, .. } => assert!(flags.disable_content_trust),
+            other => panic!("expected Pull, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn given_rm_with_volumes_flag_when_parsed_then_it_is_accepted() {
         // Act
         let cli = Cli::try_parse_from(["ward", "rm", "-fv", "web1"]).expect("parse");
@@ -2720,6 +2732,9 @@ mod tests {
     #[case::unknown_subcommand(&["ward", "frobnicate"], GENERIC_FAILURE_EXIT_CODE)]
     #[case::missing_argument(&["ward", "rm"], GENERIC_FAILURE_EXIT_CODE)]
     #[case::extra_argument(&["ward", "port", "web1", "80", "extra"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::conflicting_flags(&["ward", "rmi", "-a", "alpine"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::json_before_bad_subcommand(&["ward", "--json", "frobnicate"], GENERIC_FAILURE_EXIT_CODE)]
+    #[case::json_before_bad_flag(&["ward", "--json", "ps", "--nope"], CLI_FAILURE_EXIT_CODE)]
     #[case::run_unknown_flag(&["ward", "run", "--nope", "alpine"], CLI_FAILURE_EXIT_CODE)]
     #[case::run_missing_image(&["ward", "run"], CLI_FAILURE_EXIT_CODE)]
     fn given_a_bad_command_line_when_coded_then_it_follows_docker(

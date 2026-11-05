@@ -13,7 +13,9 @@ pub struct Args {
     /// An image a running sandbox uses is never deleted.
     #[arg(short, long)]
     pub force: bool,
-    /// Remove every image in the cache (Podman). Give no IMAGE with it.
+    /// Remove every image in the cache (Podman). Give no IMAGE with it. An
+    /// empty cache prints nothing and succeeds; an image a running sandbox
+    /// uses is reported as an error, the rest are still removed.
     #[arg(short, long, conflicts_with = "images")]
     pub all: bool,
     /// Tag, image ID or unique ID prefix.
@@ -30,13 +32,20 @@ fn image_name(image: &ImageInfo) -> String {
     }
 }
 
+/// The names with repeats dropped, in first-seen order, so an image listed
+/// twice is not removed twice.
+fn distinct(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    names.filter(|name| seen.insert(name.clone())).collect()
+}
+
 /// Removes each image in turn. A failure is printed and the rest still run;
 /// the command fails if any did.
 pub async fn run(socket: &str, args: Args) -> Result<()> {
     let mut c = client::connect(socket).await?;
     let images = if args.all {
         let cached = c.list_images(()).await?.into_inner().images;
-        cached.iter().map(image_name).collect()
+        distinct(cached.iter().map(image_name))
     } else {
         args.images
     };
@@ -103,6 +112,13 @@ mod tests {
     #[test]
     fn given_an_untagged_image_when_named_then_the_digest_is_used() {
         assert_eq!(image_name(&image("", "sha256:ab")), "sha256:ab");
+    }
+
+    #[test]
+    fn given_repeated_names_when_made_distinct_then_first_seen_order_is_kept() {
+        let names = ["b", "a", "b", "c", "a"].map(String::from);
+
+        assert_eq!(distinct(names.into_iter()), ["b", "a", "c"]);
     }
 
     #[test]

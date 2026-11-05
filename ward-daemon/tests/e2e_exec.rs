@@ -22,12 +22,6 @@ use predicates::prelude::*;
 // Helpers: read the PID out of `--json` output for chained commands.
 // ---------------------------------------------------------------------------
 
-/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
-fn json_pid(stdout: &str) -> String {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
-    value["pid"].as_str().expect("pid").to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Feature: exec
 // ---------------------------------------------------------------------------
@@ -208,7 +202,7 @@ fn given_exec_when_user_runs_logs_then_streams_stdout_and_exit() {
         .args(["--json", "exec", "-d", &id, "--", "echo", "hello"])
         .output()
         .expect("exec");
-    let pid = json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act
     let mut cmd = daemon.cli();
@@ -289,7 +283,7 @@ fn given_exec_when_user_writes_stdin_then_command_succeeds() {
         .args(["--json", "exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
-    let pid = json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act: literal-arg form — avoids touching the CLI's own stdin in tests.
     let mut cmd = daemon.cli();
@@ -363,7 +357,7 @@ fn given_exec_when_user_runs_kill_then_succeeds_and_subsequent_stdin_fails() {
         .args(["--json", "exec", "-d", &id, "--", "cat"])
         .output()
         .expect("exec");
-    let pid = json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
+    let pid = common::json_pid(std::str::from_utf8(&exec_out.stdout).unwrap());
 
     // Act: kill succeeds and prints the sandbox reference, like `docker kill`.
     daemon

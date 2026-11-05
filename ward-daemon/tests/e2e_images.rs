@@ -45,6 +45,35 @@ fn given_a_tagged_image_when_one_tag_is_removed_then_the_image_stays() {
 }
 
 #[test]
+fn given_two_tags_when_rmi_all_then_every_image_goes_and_the_exit_is_zero() {
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["tag", IMAGE, ALIAS]);
+
+    // Act
+    let removed = run_ok(&d, &["rmi", "-a"]);
+    let listed = run_ok(&d, &["images", "-q"]);
+
+    // Assert
+    assert!(removed.contains(&format!("Untagged: {ALIAS}")), "{removed}");
+    assert!(removed.contains("Deleted: sha256:"), "{removed}");
+    assert!(listed.is_empty(), "{listed}");
+}
+
+#[test]
+fn given_an_empty_cache_when_rmi_all_then_nothing_prints_and_the_exit_is_zero() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let removed = run_ok(&d, &["rmi", "--all"]);
+
+    // Assert
+    assert_eq!(removed, "");
+}
+
+#[test]
 fn given_the_last_tag_when_removed_then_the_image_is_deleted() {
     // Arrange
     let d = Daemon::spawn();
@@ -123,6 +152,20 @@ fn given_an_image_config_when_history_is_read_then_layers_print_newest_first() {
     assert!(rows[2].contains("7.8MB"), "{table}");
     assert_eq!(json.lines().count(), 2, "{json}");
     assert_eq!(ids.lines().last(), Some("<missing>"));
+}
+
+#[test]
+fn given_human_false_when_history_is_read_then_sizes_are_bytes() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(IMAGE_CONFIG);
+    run_ok(&d, &["pull", IMAGE]);
+
+    // Act
+    let table = run_ok(&d, &["history", "--human=false", IMAGE]);
+
+    // Assert
+    assert!(table.contains("7800000"), "{table}");
+    assert!(!table.contains("7.8MB"), "{table}");
 }
 
 #[test]

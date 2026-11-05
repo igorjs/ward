@@ -21,6 +21,9 @@ use ward_core::pb::{
 use crate::client::{self, Resolved};
 use crate::tokens;
 
+/// Why `rm --link` is refused.
+const NO_LINKS: &str = "--link is not supported: sandboxes have no links to remove";
+
 /// The state change a lifecycle command asks for.
 #[derive(Clone, Copy)]
 pub enum Action {
@@ -115,8 +118,6 @@ pub async fn lifecycle(
     }
     failures.finish(refs.len(), action.past())
 }
-
-const NO_LINKS: &str = "--link is not supported: sandboxes have no links to remove";
 
 /// Refuse `rm --link`, which Docker uses to drop a link between containers.
 ///

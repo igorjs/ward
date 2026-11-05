@@ -43,12 +43,6 @@ fn image() -> String {
     std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
 }
 
-/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
-fn json_pid(stdout: &str) -> String {
-    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
-    value["pid"].as_str().expect("pid").to_string()
-}
-
 fn field(stdout: &str, prefix: &str) -> String {
     stdout
         .lines()
@@ -92,7 +86,7 @@ fn start(d: &Daemon, id: &str, workdir: Option<&str>, argv: &[&str]) -> String {
         cmd.args(["--workdir", dir]);
     }
     cmd.arg("--").args(argv);
-    json_pid(&run_ok(cmd))
+    common::json_pid(&run_ok(cmd))
 }
 
 /// Read a process's output until it exits.

@@ -132,6 +132,7 @@ fn record(
             || NO_TIME.to_string(),
             |t| t.format(CREATED_AT_FORMAT).to_string(),
         );
+    // Docker shows the timestamp in the CREATED column without --human.
     let since = if human {
         seconds_since(&layer.created, now.timestamp()).map_or_else(
             || NO_TIME.to_string(),
