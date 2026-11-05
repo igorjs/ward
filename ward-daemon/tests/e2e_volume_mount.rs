@@ -159,3 +159,141 @@ fn given_a_volume_in_use_when_system_df_verbose_then_links_count_the_sandbox() {
         .expect("volume row");
     assert!(row.split_whitespace().nth(1) == Some("1"), "{row}");
 }
+
+fn volume_names(d: &Daemon) -> Vec<String> {
+    ok(d, &["volume", "ls", "-q"])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn given_selinux_and_consistency_options_when_mounted_then_only_ro_changes_the_mode() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    ok(
+        &d,
+        &["create", "--name", "web", "-v", "data:/data:ro,z", ALPINE],
+    );
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "store",
+            "-v",
+            "cache:/c:delegated",
+            ALPINE,
+        ],
+    );
+
+    // Assert
+    let web: serde_json::Value = serde_json::from_str(&ok(&d, &["inspect", "web"])).unwrap();
+    let db: serde_json::Value = serde_json::from_str(&ok(&d, &["inspect", "store"])).unwrap();
+    assert_eq!(web[0]["Mounts"][0]["RW"], false);
+    assert_eq!(db[0]["Mounts"][0]["RW"], true);
+}
+
+#[test]
+fn given_an_unknown_mount_option_when_created_then_it_fails_with_docker_wording() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["create", "-v", "data:/data:fast", ALPINE]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("invalid mode: fast"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn given_an_anonymous_volume_when_the_sandbox_is_removed_then_only_rm_v_removes_it() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["create", "--name", "kept", "-v", "/data", ALPINE]);
+    ok(&d, &["create", "--name", "gone", "-v", "/data", ALPINE]);
+    assert_eq!(volume_names(&d).len(), 2);
+
+    // Act
+    ok(&d, &["rm", "-f", "kept"]);
+    let after_plain_rm = volume_names(&d).len();
+    ok(&d, &["rm", "-fv", "gone"]);
+
+    // Assert
+    assert_eq!(after_plain_rm, 2);
+    let left = volume_names(&d);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].len(), 64);
+}
+
+#[test]
+fn given_a_shared_anonymous_volume_when_rm_v_then_it_goes_with_the_last_sandbox() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["create", "--name", "owner", "-v", "/data", ALPINE]);
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "user",
+            "--volumes-from",
+            "owner",
+            ALPINE,
+        ],
+    );
+
+    // Act
+    ok(&d, &["rm", "-fv", "owner"]);
+    let while_shared = volume_names(&d).len();
+    ok(&d, &["rm", "-fv", "user"]);
+
+    // Assert
+    assert_eq!(while_shared, 1);
+    assert!(volume_names(&d).is_empty());
+}
+
+#[test]
+fn given_volumes_from_with_ro_when_created_then_the_shared_mounts_are_read_only() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(&d, &["create", "--name", "src", "-v", "data:/data", ALPINE]);
+
+    // Act
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "dst",
+            "--volumes-from",
+            "src:ro",
+            ALPINE,
+        ],
+    );
+
+    // Assert
+    let dst: serde_json::Value = serde_json::from_str(&ok(&d, &["inspect", "dst"])).unwrap();
+    let mount = &dst[0]["Mounts"][0];
+    assert_eq!(mount["Name"], "data");
+    assert_eq!(mount["RW"], false);
+}
+
+#[test]
+fn given_volumes_from_an_unknown_sandbox_when_created_then_it_fails() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["create", "--volumes-from", "nope", ALPINE]);
+
+    // Assert
+    assert!(!out.status.success());
+}

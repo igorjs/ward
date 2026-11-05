@@ -116,9 +116,16 @@ struct SandboxOpts {
     /// Environment variables in KEY=VALUE form.
     #[arg(short, long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
-    /// Share a host directory into the sandbox: SOURCE:TARGET[:ro].
-    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:ro]")]
+    /// Mount a host directory or a named volume: SOURCE:TARGET[:OPTIONS]. A
+    /// SOURCE that is not an absolute path names a volume, created on first
+    /// use. A bare /TARGET makes an anonymous volume. OPTIONS is a comma list
+    /// of ro, rw, z, Z, cached, delegated, consistent and nocopy; z, Z, cached,
+    /// delegated, consistent and nocopy are accepted and ignored. Repeatable.
+    #[arg(short = 'v', long = "volume", value_name = "SOURCE:TARGET[:OPTIONS]")]
     volume: Vec<String>,
+    /// Mount the volumes of another sandbox: SANDBOX[:ro|rw]. Repeatable.
+    #[arg(long = "volumes-from", value_name = "SANDBOX[:ro|rw]")]
+    volumes_from: Vec<String>,
     /// Outbound network policy: "deny" (default), "allowlist" or "open".
     #[arg(long, default_value = "deny")]
     egress: String,
@@ -499,6 +506,10 @@ enum Commands {
         /// Remove a running sandbox too.
         #[arg(short, long)]
         force: bool,
+        /// Also remove the anonymous volumes of the sandbox, unless another
+        /// sandbox mounts them.
+        #[arg(short = 'v', long = "volumes")]
+        volumes: bool,
     },
 
     #[command(after_help = DOCKER_DIFFERENCES)]
@@ -935,19 +946,6 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `--volume`. A source that is not an
-/// absolute path names a volume.
-fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (source, target, readonly) = match parts.as_slice() {
-        [source, target] => (*source, *target, false),
-        [source, target, "ro"] => (*source, *target, true),
-        [source, target, "rw"] => (*source, *target, false),
-        _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
-    };
-    Ok(volume::mount_for(source, target, readonly))
-}
-
 /// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
 /// themselves contain '=', which matters for tokens, URLs and serialised JSON.
 /// A bare `KEY` takes its value from the host and is dropped when unset,
@@ -998,7 +996,7 @@ fn create_request(
     let mounts = opts
         .volume
         .iter()
-        .map(|spec| parse_mount_spec(spec))
+        .map(|spec| volume::parse_flag(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let published_ports = ports::parse_all(&opts.publish)?;
     ports::warn_if_exposed(&published_ports);
@@ -1210,7 +1208,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
             let hooks = opts.extras.hooks(opts.name.as_deref());
+            let volumes_from = opts.volumes_from.clone();
             let mut req = create_request(image, opts, timeout)?;
+            req.mounts
+                .extend(volume::mounts_from(&socket_path, &volumes_from).await?);
             req.command = command;
             req.comms = Some(ward_core::pb::CommunicationPolicy {
                 mode: comms_mode_pb as i32,
@@ -1390,7 +1391,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             opts.extras.check_rm(rm)?;
             let hooks = opts.extras.hooks(opts.name.as_deref());
+            let volumes_from = opts.volumes_from.clone();
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
+            request
+                .mounts
+                .extend(volume::mounts_from(&socket_path, &volumes_from).await?);
             request.secrets = secrets::load_all(&secret)?;
             request.command = command;
             request.use_image_config = true;
@@ -1652,9 +1657,13 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Remove { refs, force } => {
+        Commands::Remove {
+            refs,
+            force,
+            volumes,
+        } => {
             let mut c = client::connect(&socket_path).await?;
-            lifecycle::remove(&mut c, &token_store, &refs, force, json).await?;
+            lifecycle::remove(&mut c, &token_store, &refs, force, volumes, json).await?;
         }
 
         Commands::Cp {
@@ -1995,7 +2004,7 @@ mod tests {
 
     #[test]
     fn given_source_and_target_when_parse_mount_then_read_write() {
-        let m = parse_mount_spec("/tmp/a:/data").unwrap();
+        let m = volume::parse_flag("/tmp/a:/data").unwrap();
         assert_eq!(
             (m.source.as_str(), m.target.as_str(), m.readonly),
             ("/tmp/a", "/data", false)
@@ -2301,14 +2310,14 @@ mod tests {
 
     #[test]
     fn given_ro_suffix_when_parse_mount_then_readonly() {
-        assert!(parse_mount_spec("/tmp/a:/data:ro").unwrap().readonly);
+        assert!(volume::parse_flag("/tmp/a:/data:ro").unwrap().readonly);
     }
 
     #[test]
     fn given_malformed_spec_when_parse_mount_then_error() {
-        assert!(parse_mount_spec("/tmp/a").is_err());
-        assert!(parse_mount_spec("/tmp/a:/data:wat").is_err());
-        assert!(parse_mount_spec("a:b:ro:extra").is_err());
+        assert!(volume::parse_flag("tmp/a").is_err());
+        assert!(volume::parse_flag("/tmp/a:/data:wat").is_err());
+        assert!(volume::parse_flag("a:b:ro:extra").is_err());
     }
 
     #[test]
@@ -2588,7 +2597,7 @@ mod tests {
 
         // Assert
         match cli.command {
-            Commands::Remove { refs, force } => {
+            Commands::Remove { refs, force, .. } => {
                 assert_eq!(refs, ["web1", "web2"]);
                 assert!(force);
             }

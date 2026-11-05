@@ -43,6 +43,106 @@ const FIELDS: [(&str, &str); 8] = [
     ("Links", "LINKS"),
 ];
 
+/// Mount options Docker accepts that change nothing here: SELinux labels,
+/// macOS consistency hints and `nocopy`, since Ward never copies image files
+/// into a volume.
+const IGNORED_OPTIONS: [&str; 7] = [
+    "z",
+    "Z",
+    "cached",
+    "delegated",
+    "consistent",
+    "nocopy",
+    "rw",
+];
+const READ_ONLY_OPTION: &str = "ro";
+const READ_WRITE_OPTION: &str = "rw";
+const OPTION_SEPARATOR: char = ',';
+const FIELD_SEPARATOR: char = ':';
+
+/// A name for the volume of a bare `-v /path`: 64 hex characters, which is
+/// what Docker generates.
+fn anonymous_name() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// A mount of a new volume that goes away with the sandbox.
+pub fn anonymous_mount(target: &str, readonly: bool) -> ward_core::pb::Mount {
+    ward_core::pb::Mount {
+        anonymous: true,
+        ..named_mount(&anonymous_name(), target, readonly)
+    }
+}
+
+/// Parse `-v`: `/TARGET`, `SOURCE:TARGET` or `SOURCE:TARGET:OPTIONS`.
+pub fn parse_flag(spec: &str) -> Result<ward_core::pb::Mount> {
+    let parts: Vec<&str> = spec.split(FIELD_SEPARATOR).collect();
+    match parts.as_slice() {
+        [target] if target.starts_with('/') => Ok(anonymous_mount(target, false)),
+        [source, target] => Ok(mount_for(source, target, false)),
+        [source, target, options] => {
+            let readonly = parse_options(options, spec)?;
+            Ok(mount_for(source, target, readonly))
+        }
+        _ => bail!("--volume expects SOURCE:TARGET[:OPTIONS], got '{spec}'"),
+    }
+}
+
+/// Whether `options` ask for a read-only mount. Unknown words and a
+/// contradiction between `ro` and `rw` are errors, as in Docker.
+fn parse_options(options: &str, spec: &str) -> Result<bool> {
+    let words: Vec<&str> = options.split(OPTION_SEPARATOR).collect();
+    for word in &words {
+        if *word != READ_ONLY_OPTION && !IGNORED_OPTIONS.contains(word) {
+            bail!("invalid volume specification '{spec}': invalid mode: {word}");
+        }
+    }
+    let readonly = words.contains(&READ_ONLY_OPTION);
+    if readonly && words.contains(&READ_WRITE_OPTION) {
+        bail!("invalid volume specification '{spec}': invalid mode: {options}");
+    }
+    Ok(readonly)
+}
+
+/// The mounts `--volumes-from SANDBOX[:ro|rw]` stand for: every volume and
+/// bind mount of each named sandbox. An anonymous volume stays anonymous, and
+/// the daemon removes it with the last sandbox that mounts it.
+///
+/// # Errors
+///
+/// Fails when a sandbox is unknown, the mode is not `ro` or `rw`, or the
+/// daemon cannot be reached.
+pub async fn mounts_from(socket: &str, specs: &[String]) -> Result<Vec<ward_core::pb::Mount>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut c = client::connect(socket).await?;
+    let mut mounts = Vec::new();
+    for spec in specs {
+        let (reference, mode) = spec.split_once(FIELD_SEPARATOR).unwrap_or((spec, ""));
+        let readonly = match mode {
+            "" | READ_WRITE_OPTION => false,
+            READ_ONLY_OPTION => true,
+            other => bail!("invalid volumes-from mode '{other}' in '{spec}': use ro or rw"),
+        };
+        let source = c
+            .get_sandbox(ward_core::pb::GetSandboxRequest {
+                id: reference.to_string(),
+            })
+            .await?
+            .into_inner();
+        mounts.extend(source.mounts.into_iter().map(|mut mount| {
+            mount.readonly |= readonly;
+            mount
+        }));
+    }
+    Ok(mounts)
+}
+
 /// A mount of the volume called `name`.
 pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::Mount {
     ward_core::pb::Mount {
@@ -50,6 +150,7 @@ pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::M
         target: target.to_string(),
         readonly,
         volume: name.to_string(),
+        anonymous: false,
     }
 }
 
@@ -62,6 +163,7 @@ pub fn mount_for(source: &str, target: &str, readonly: bool) -> ward_core::pb::M
             target: target.to_string(),
             readonly,
             volume: String::new(),
+            anonymous: false,
         }
     } else {
         named_mount(source, target, readonly)
@@ -346,6 +448,64 @@ pub async fn remove(socket: &str, args: RemoveArgs, json: bool) -> Result<bool> 
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::selinux_shared("/a:/b:z", false)]
+    #[case::selinux_private("/a:/b:Z", false)]
+    #[case::cached("/a:/b:cached", false)]
+    #[case::delegated("/a:/b:delegated", false)]
+    #[case::consistent("/a:/b:consistent", false)]
+    #[case::read_only_with_label("/a:/b:ro,z", true)]
+    #[case::label_then_read_only("/a:/b:Z,ro", true)]
+    #[case::explicit_read_write("/a:/b:rw", false)]
+    #[case::named_volume("data:/b:nocopy,ro", true)]
+    fn given_mount_options_when_parsed_then_only_ro_makes_it_read_only(
+        #[case] spec: &str,
+        #[case] readonly: bool,
+    ) {
+        // Act
+        let mount = parse_flag(spec).unwrap();
+
+        // Assert
+        assert_eq!(mount.readonly, readonly);
+        assert_eq!(mount.target, "/b");
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_word("/a:/b:fast")]
+    #[case::contradiction("/a:/b:ro,rw")]
+    #[case::too_many_fields("/a:/b:ro:x")]
+    #[case::bare_name("data")]
+    fn given_a_bad_volume_flag_when_parsed_then_it_is_refused(#[case] spec: &str) {
+        // Act
+        let error = parse_flag(spec).unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains("--volume") || error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn given_a_bare_path_when_parsed_then_it_is_an_anonymous_volume() {
+        // Act
+        let first = parse_flag("/data").unwrap();
+        let second = parse_flag("/data").unwrap();
+
+        // Assert
+        assert!(first.anonymous && first.source.is_empty());
+        assert_eq!(first.volume.len(), 64);
+        assert!(first.volume.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first.volume, second.volume);
+    }
+
+    #[test]
+    fn given_a_named_volume_flag_when_parsed_then_it_is_not_anonymous() {
+        // Act
+        let mount = parse_flag("data:/data").unwrap();
+
+        // Assert
+        assert!(!mount.anonymous);
+        assert_eq!(mount.volume, "data");
+    }
+
     use super::*;
 
     fn volume(id: &str, name: &str) -> VolumeInfo {

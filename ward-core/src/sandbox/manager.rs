@@ -701,6 +701,32 @@ struct Teardown {
     exited_ttl: Option<std::time::Duration>,
     /// Where a main process that may need starting again is reported.
     restarts: mpsc::UnboundedSender<RestartRequest>,
+    volumes: Option<Arc<crate::volume::VolumeManager>>,
+}
+
+/// Remove the anonymous volumes among `mounts` that no remaining sandbox
+/// mounts. A volume that cannot be removed stays; nothing depends on it.
+async fn release_anonymous_volumes(teardown: &Teardown, mounts: &[crate::protocol::Mount]) {
+    let Some(volumes) = &teardown.volumes else {
+        return;
+    };
+    let entries = teardown.entries.read().await;
+    for name in mounts
+        .iter()
+        .filter(|m| m.anonymous)
+        .filter_map(|m| m.volume.as_deref())
+    {
+        let shared = entries.values().any(|e| {
+            e.meta
+                .options
+                .mounts
+                .iter()
+                .any(|m| m.volume.as_deref() == Some(name))
+        });
+        if !shared && let Err(e) = volumes.remove_by_name(name).await {
+            tracing::warn!(volume = name, error = %e, "cannot remove an anonymous volume");
+        }
+    }
 }
 
 fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
@@ -948,6 +974,7 @@ impl SandboxManager {
             events: self.events.clone(),
             exited_ttl: self.exited_ttl,
             restarts: self.restart_tx.clone(),
+            volumes: self.volumes.clone(),
         }
     }
 
@@ -1490,6 +1517,7 @@ impl SandboxManager {
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: None,
+                    anonymous: false,
                 });
             } else {
                 // The host path is the daemon's own, so the client's source
@@ -1500,6 +1528,7 @@ impl SandboxManager {
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: Some(m.volume.clone()),
+                    anonymous: m.anonymous,
                 });
             }
         }
@@ -2141,11 +2170,23 @@ impl SandboxManager {
 
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        self.remove_with_volumes(id, false).await
+    }
+
+    /// Remove a sandbox. With `remove_volumes`, its anonymous volumes go too,
+    /// unless another sandbox still mounts them.
+    pub async fn remove_with_volumes(&self, id: &str, remove_volumes: bool) -> Result<()> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
+        let mounts = match self.entries.read().await.get(id) {
+            Some(entry) if remove_volumes => entry.meta.options.mounts.clone(),
+            _ => Vec::new(),
+        };
         Self::cleanup_sandbox_inner(&self.teardown(), id, /* from_timeout = */ false)
             .await
-            .map_err(backend_err)
+            .map_err(backend_err)?;
+        release_anonymous_volumes(&self.teardown(), &mounts).await;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -3003,6 +3044,9 @@ impl SandboxManager {
         }
         let result = teardown.backend.remove_sandbox(id).await;
         if let Some(RemovedEntry { meta, .. }) = removed {
+            if meta.options.spec.auto_remove {
+                release_anonymous_volumes(teardown, &meta.options.mounts).await;
+            }
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
             // Removing a running sandbox kills it, as `docker rm -f` does.
@@ -3522,6 +3566,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 target: m.target.clone(),
                 readonly: m.readonly,
                 volume: m.volume.clone().unwrap_or_default(),
+                anonymous: m.anonymous,
             })
             .collect(),
         paused: info.paused,

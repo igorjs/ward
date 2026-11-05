@@ -297,6 +297,9 @@ pub struct Mount {
     /// Name of the daemon-managed volume behind `source`, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<String>,
+    /// The volume exists for this mount alone and goes with the sandbox.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anonymous: bool,
 }
 
 // ---------------------------------------------------------------------------

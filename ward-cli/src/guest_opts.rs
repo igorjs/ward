@@ -290,6 +290,7 @@ fn parse_mount(spec: &str) -> Result<MountArg> {
                 target: target.to_string(),
                 readonly,
                 volume: String::new(),
+                anonymous: false,
             }))
         }
         TYPE_TMPFS => {
@@ -313,15 +314,13 @@ fn parse_mount(spec: &str) -> Result<MountArg> {
             }))
         }
         TYPE_VOLUME => {
-            let Some(source) = source else {
-                bail!("--mount {spec}: type=volume needs src=");
-            };
             if size.is_some() || mode.is_some() {
                 bail!("--mount {spec}: tmpfs options need type=tmpfs");
             }
-            Ok(MountArg::Bind(volume::named_mount(
-                source, target, readonly,
-            )))
+            Ok(MountArg::Bind(match source {
+                Some(name) => volume::named_mount(name, target, readonly),
+                None => volume::anonymous_mount(target, readonly),
+            }))
         }
         other => bail!("--mount {spec}: unsupported type '{other}', use bind, volume or tmpfs"),
     }
@@ -383,8 +382,23 @@ mod tests {
                 target: "/data".into(),
                 readonly: true,
                 volume: String::new(),
+                anonymous: false,
             })
         );
+    }
+
+    #[rstest::rstest]
+    #[case::explicit("type=volume,dst=/data")]
+    #[case::default_type("dst=/data")]
+    fn given_volume_mount_without_source_when_parsed_then_it_is_anonymous(#[case] spec: &str) {
+        // Act
+        let MountArg::Bind(mount) = parse_mount(spec).unwrap() else {
+            panic!("expected a volume mount");
+        };
+
+        // Assert
+        assert!(mount.anonymous && mount.source.is_empty());
+        assert_eq!(mount.volume.len(), 64);
     }
 
     #[test]
@@ -400,6 +414,7 @@ mod tests {
                 target: "/data".into(),
                 readonly: true,
                 volume: "data".into(),
+                anonymous: false,
             })
         );
     }
@@ -421,8 +436,6 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::volume_without_source("type=volume,dst=/data", "needs src")]
-    #[case::default_type_is_volume_without_source("dst=/data", "needs src")]
     #[case::unknown_type("type=npipe,dst=/x", "unsupported type")]
     #[case::unknown_key(
         "type=bind,src=/a,dst=/b,bind-propagation=rshared",

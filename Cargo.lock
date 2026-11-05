@@ -3784,6 +3784,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tower",
+ "uuid",
  "ward-core",
 ]
 

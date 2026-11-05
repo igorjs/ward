@@ -150,6 +150,21 @@ impl VolumeManager {
             .collect())
     }
 
+    /// Remove the volume called `name`, if there is one.
+    pub async fn remove_by_name(&self, name: &str) -> Result<()> {
+        let id = self
+            .volumes
+            .read()
+            .await
+            .values()
+            .find(|v| v.name == name)
+            .map(|v| v.id.clone());
+        match id {
+            Some(id) => self.remove(&id).await,
+            None => Ok(()),
+        }
+    }
+
     /// Remove a volume, deleting its data.
     pub async fn remove(&self, id: &str) -> Result<()> {
         crate::validate::entity_id(id, "volume")?;

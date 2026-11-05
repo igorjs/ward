@@ -409,7 +409,10 @@ async fn given_sandbox_removed_when_restore_old_snapshot_then_not_found() {
         .into_inner();
     client
         .remove_sandbox(common::with_token(
-            ward_core::pb::RemoveSandboxRequest { id: s.id.clone() },
+            ward_core::pb::RemoveSandboxRequest {
+                id: s.id.clone(),
+                ..Default::default()
+            },
             &s.token,
         ))
         .await

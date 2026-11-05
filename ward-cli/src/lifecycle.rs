@@ -121,6 +121,7 @@ pub async fn remove(
     token_store: &Path,
     refs: &[String],
     force: bool,
+    remove_volumes: bool,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
@@ -132,7 +133,7 @@ pub async fn remove(
             if !force && target.status == SandboxStatus::Running {
                 anyhow::bail!("cannot remove a running sandbox: stop it first or use -f");
             }
-            remove_resolved(c, token_store, &target).await
+            remove_with_volumes(c, token_store, &target, remove_volumes).await
         }
         .await;
         match result {
@@ -211,8 +212,20 @@ pub async fn remove_resolved(
     token_store: &Path,
     target: &Resolved,
 ) -> Result<()> {
+    remove_with_volumes(c, token_store, target, false).await
+}
+
+/// [`remove_resolved`] that also removes the sandbox's anonymous volumes
+/// when `remove_volumes` is set.
+pub async fn remove_with_volumes(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    target: &Resolved,
+    remove_volumes: bool,
+) -> Result<()> {
     let request = RemoveSandboxRequest {
         id: target.id.clone(),
+        remove_volumes,
     };
     c.remove_sandbox(target.request(request)?).await?;
     // The daemon already removed the sandbox, so a store failure is only a
