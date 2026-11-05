@@ -18,6 +18,9 @@ There is no `ward build` and no Dockerfile support yet. Ward runs images from a 
 
 These flags of `ward run` and `ward create` follow Docker unless noted.
 
+- `--expose PORT[/tcp]` names a port the sandbox listens on and publishes nothing alone. `-P/--publish-all` publishes every `--expose` port on a free host port bound to 127.0.0.1, as `-p PORT` does. Ward does not read the image's `EXPOSE`, so `-P` with no `--expose` fails with that reason. UDP and port ranges are refused, as for `-p`.
+- `--log-driver json-file|local` is accepted and has no effect: Ward keeps each sandbox's output and `ward logs` reads it. Any other driver, `none` included, is refused with a one line reason. `--log-opt` is accepted and ignored with a warning, since Ward does not rotate or tag output.
+
 - `--env-file FILE` reads `KEY=VALUE` lines. Blank lines and lines starting with `#` are skipped, and a bare `KEY` takes the host value or is dropped when the host has none. `-e` overrides the files, and a later file overrides an earlier one. Values are not unquoted or expanded.
 - `-l/--label KEY[=VALUE]` and `--label-file FILE` set labels, shown in `inspect` as `Config.Labels`. `-l` overrides the file. A sandbox takes at most 128 labels, with keys up to 256 bytes and values up to 4096. Labels also appear as attributes of its `ward events`, so `events --filter label=KEY[=VALUE]` works.
 - `--cidfile FILE` writes the sandbox ID without a newline and fails if FILE exists. The file is removed when creation fails.
@@ -69,7 +72,9 @@ A `deny` sandbox without published ports records nothing for `suggest`. The gues
 Each attach session is separate. A client that disconnects only detaches and leaves the main process running. In raw terminal mode Ctrl-C goes to the guest as a byte, as in Docker. Outside raw mode the CLI passes SIGINT and SIGTERM to the guest process.
 
 - `ward attach SANDBOX` follows `docker attach`: it shows only the output the process writes after the attach, sends this terminal's input unless `--no-stdin`, and exits with the process's exit code. A sandbox that is not running fails with `You cannot attach to a stopped container, start it first`.
-- `--detach-keys` takes Docker's syntax and defaults to `ctrl-p,ctrl-q`. Typing it prints `read escape sequence` on stderr, ends the attach with exit code 0 and leaves the process running. Docker's `detachKeys` setting in `config.json` is not read, and `--detach-keys` is not on `run` or `exec`.
+- `--detach-keys` takes Docker's syntax and defaults to `ctrl-p,ctrl-q`. Typing it prints `read escape sequence` on stderr, ends the attach with exit code 0 and leaves the process running. Docker's `detachKeys` setting in `config.json` is not read.
+- `ward run` and `ward exec` take `--detach-keys` (and `run` takes `--sig-proxy`) like `attach`, with one difference: they have no default key sequence, so nothing detaches unless you give one. After a detach, `run --rm` does not remove the sandbox, because it keeps running; remove it yourself.
+- `ward exec --env-file FILE` reads `KEY=VALUE` lines like `run --env-file`; a bare `KEY` takes the host value, and `-e` overrides the files.
 - `--sig-proxy` (default true) passes SIGINT and SIGTERM to the process when the CLI does not own the terminal. With `--sig-proxy=false` they end the CLI (exit 130 or 143) and leave the process alone. With a terminal, Ctrl-C is a key and the flag has no effect, as in Docker.
 - `ward start -a` and `-i` start one sandbox, then attach as above and exit with the process's exit code. They show all the output of that run, and `-i` also sends input. Several references with either flag are refused, as in Docker. Docker attaches before it starts; Ward attaches right after the start call returns and replays the output of the new run, so nothing is lost.
 - `ward run -a STREAM` (STDIN, STDOUT or STDERR, repeatable) shows only those streams, and sends input only for STDIN with `-i`. Without `-a` all are attached. `-a` with `-d` fails.

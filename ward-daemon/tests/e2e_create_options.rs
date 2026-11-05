@@ -516,3 +516,66 @@ fn given_restart_policy_with_rm_when_run_then_it_is_refused() {
         stderr(&out)
     );
 }
+
+#[test]
+fn given_an_unsupported_log_driver_when_create_then_it_fails_with_one_line_and_no_sandbox() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["create", "--log-driver", "syslog", ALPINE]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--log-driver syslog is not supported"));
+    assert_eq!(ok(&d, &["list"]).lines().count(), 0);
+}
+
+#[test]
+fn given_json_file_driver_and_log_opt_when_create_then_it_succeeds() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(
+        &d,
+        &[
+            "create",
+            "--log-driver",
+            "json-file",
+            "--log-opt",
+            "max-size=1m",
+            ALPINE,
+        ],
+    );
+
+    // Assert
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
+#[test]
+fn given_publish_all_without_a_port_to_publish_when_create_then_it_fails_with_the_reason() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["create", "-P", ALPINE]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("-P has no ports to publish"));
+}
+
+#[test]
+fn given_expose_alone_when_create_then_it_succeeds_and_publishes_nothing() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = ok(&d, &["create", "--expose", "8080", ALPINE]);
+
+    // Act
+    let out = run(&d, &["port", id.trim()]);
+
+    // Assert
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "");
+}

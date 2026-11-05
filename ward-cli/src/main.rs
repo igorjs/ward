@@ -26,6 +26,7 @@ mod isolation;
 mod latest;
 mod lifecycle;
 mod load;
+mod log_opts;
 mod log_output;
 mod login;
 mod output;
@@ -35,6 +36,7 @@ mod prune;
 mod prune_filter;
 mod ps_columns;
 mod ps_filter;
+mod publish_all;
 mod pull;
 mod resources;
 mod rmi;
@@ -168,6 +170,10 @@ struct SandboxOpts {
     guest: guest_opts::GuestExtras,
     #[command(flatten)]
     isolation: isolation::IsolationFlags,
+    #[command(flatten)]
+    log: log_opts::LogFlags,
+    #[command(flatten)]
+    publish_all: publish_all::PublishAllFlags,
 }
 
 /// Parse `--exited-ttl` into whole seconds, rounding a fraction up.
@@ -335,12 +341,18 @@ enum Commands {
         /// Environment variables in KEY=VALUE form.
         #[arg(short, long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
+        /// Read environment variables from a file of KEY=VALUE lines. -e
+        /// overrides the files. Repeatable.
+        #[arg(long = "env-file", value_name = "FILE")]
+        env_file: Vec<std::path::PathBuf>,
         /// Keep stdin open and send it to the command.
         #[arg(short, long)]
         interactive: bool,
         /// Run the command on a pseudo-terminal.
         #[arg(short, long)]
         tty: bool,
+        #[command(flatten)]
+        detach_keys: attach_cmd::DetachFlag,
         /// Start the command in the background and print its PID. Ignores
         /// -i and -t, since nothing attaches to the command.
         #[arg(short, long)]
@@ -373,6 +385,19 @@ enum Commands {
         /// Run the command on a pseudo-terminal.
         #[arg(short, long)]
         tty: bool,
+        /// Pass SIGINT and SIGTERM to the command. Needs no terminal: with a
+        /// terminal, Ctrl-C is sent as a key.
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            require_equals = true,
+            default_missing_value = "true",
+            value_name = "BOOL"
+        )]
+        sig_proxy: bool,
+        #[command(flatten)]
+        detach_keys: attach_cmd::DetachFlag,
         /// Remove the sandbox when the command ends.
         #[arg(long)]
         rm: bool,
@@ -955,10 +980,6 @@ fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
 /// themselves contain '=', which matters for tokens, URLs and serialised JSON.
 /// A bare `KEY` takes its value from the host and is dropped when unset,
 /// like Docker's `-e KEY`.
-fn parse_env(pairs: &[String]) -> std::collections::HashMap<String, String> {
-    parse_env_with(pairs, |key| std::env::var(key).ok())
-}
-
 fn parse_env_with(
     pairs: &[String],
     host: impl Fn(&str) -> Option<String>,
@@ -998,12 +1019,15 @@ fn create_request(
         nano_cpus: 0,
     };
     opts.isolation.check()?;
+    opts.log.check()?;
     let mounts = opts
         .volume
         .iter()
         .map(|spec| parse_mount_spec(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let published_ports = ports::parse_all(&opts.publish)?;
+    let mut published_ports = ports::parse_all(&opts.publish)?;
+    let published_all = opts.publish_all.mappings(&published_ports)?;
+    published_ports.extend(published_all);
     ports::warn_if_exposed(&published_ports);
     let mut request = ward_core::pb::CreateSandboxRequest {
         image,
@@ -1335,17 +1359,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             workdir,
             user,
             env,
+            env_file,
             interactive,
             tty,
+            detach_keys,
             detach,
             secret,
         } => {
             let secrets = secrets::load_all(&secret)?;
+            let env = create_opts::host_environment(&env_file, &env)?;
             if !detach {
                 let spec = docker::ExecSpec {
                     secrets,
                     command,
-                    env: parse_env(&env),
+                    options: detach_keys.options(true)?,
+                    env,
                     workdir: workdir.unwrap_or_default(),
                     user: user.unwrap_or_default(),
                     interactive,
@@ -1360,7 +1388,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 sandbox_id: target.id.clone(),
                 command,
                 working_dir: workdir.unwrap_or_default(),
-                env: parse_env(&env),
+                env,
                 user: user.unwrap_or_default(),
                 secrets,
             })?;
@@ -1382,11 +1410,14 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             workdir,
             interactive,
             tty,
+            sig_proxy,
+            detach_keys,
             rm,
             detach,
             attach,
             secret,
         } => {
+            let options = detach_keys.options(sig_proxy)?;
             let streams = attach_streams::Streams::parse(&attach)?;
             if detach && !attach.is_empty() {
                 anyhow::bail!("conflicting options: -a and -d");
@@ -1410,6 +1441,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 detach,
                 streams,
                 hooks,
+                options,
             };
             let code = docker::run(&socket_path, &token_store, request, flags).await?;
             std::process::exit(code);
@@ -2597,5 +2629,135 @@ mod tests {
             }
             other => panic!("expected Remove, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn given_run_with_sig_proxy_and_detach_keys_when_parsed_then_both_are_kept() {
+        // Act
+        let cli = Cli::try_parse_from([
+            "ward",
+            "run",
+            "--sig-proxy=false",
+            "--detach-keys",
+            "ctrl-x",
+            "alpine",
+        ])
+        .expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Run {
+                sig_proxy,
+                detach_keys,
+                ..
+            } => {
+                assert!(!sig_proxy);
+                assert_eq!(detach_keys.detach_keys.as_deref(), Some("ctrl-x"));
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_run_without_sig_proxy_flag_when_parsed_then_it_defaults_to_true() {
+        let cli = Cli::try_parse_from(["ward", "run", "alpine"]).expect("parse");
+
+        match cli.command {
+            Commands::Run {
+                sig_proxy,
+                detach_keys,
+                ..
+            } => assert!(sig_proxy && detach_keys.detach_keys.is_none()),
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_exec_with_env_file_and_detach_keys_when_parsed_then_both_are_kept() {
+        // Act
+        let cli = Cli::try_parse_from([
+            "ward",
+            "exec",
+            "--env-file",
+            "a.env",
+            "--env-file",
+            "b.env",
+            "--detach-keys",
+            "ctrl-x",
+            "sb",
+            "id",
+        ])
+        .expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Exec {
+                env_file,
+                detach_keys,
+                command,
+                ..
+            } => {
+                assert_eq!(env_file.len(), 2);
+                assert_eq!(detach_keys.detach_keys.as_deref(), Some("ctrl-x"));
+                assert_eq!(command, ["id"]);
+            }
+            other => panic!("expected Exec, got {other:?}"),
+        }
+    }
+
+    fn create_request_for(args: &[&str]) -> anyhow::Result<ward_core::pb::CreateSandboxRequest> {
+        let argv = ["ward", "create"].into_iter().chain(args.iter().copied());
+        let cli = Cli::try_parse_from(argv).expect("parse");
+        let Commands::Create { image, opts, .. } = cli.command else {
+            panic!("expected Create");
+        };
+        create_request(image, opts, 0)
+    }
+
+    #[test]
+    fn given_publish_all_with_expose_when_request_built_then_each_port_is_published() {
+        // Act
+        let request =
+            create_request_for(&["-P", "--expose", "8080", "-p", "9090:90", "alpine"]).unwrap();
+
+        // Assert
+        let ports: Vec<_> = request
+            .published_ports
+            .iter()
+            .map(|m| (m.host_port, m.container_port))
+            .collect();
+        assert_eq!(ports, [(9090, 90), (0, 8080)]);
+    }
+
+    #[test]
+    fn given_expose_without_publish_all_when_request_built_then_nothing_is_published() {
+        let request = create_request_for(&["--expose", "8080", "alpine"]).unwrap();
+
+        assert!(request.published_ports.is_empty());
+    }
+
+    #[test]
+    fn given_publish_all_without_expose_when_request_built_then_it_is_refused() {
+        assert!(create_request_for(&["-P", "alpine"]).is_err());
+    }
+
+    #[test]
+    fn given_an_unsupported_log_driver_when_request_built_then_it_is_refused() {
+        let error = create_request_for(&["--log-driver", "syslog", "alpine"]).unwrap_err();
+
+        assert!(error.to_string().contains("--log-driver syslog"), "{error}");
+    }
+
+    #[test]
+    fn given_json_file_driver_with_log_opt_when_request_built_then_it_is_accepted() {
+        let request = create_request_for(&[
+            "--log-driver",
+            "json-file",
+            "--log-opt",
+            "max-size=1m",
+            "alpine",
+        ]);
+
+        assert!(request.is_ok());
     }
 }

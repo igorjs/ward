@@ -38,11 +38,39 @@ pub struct SessionFlags {
     pub sig_proxy: bool,
 }
 
+/// `--detach-keys` of `run` and `exec`. Unlike `attach`, no key sequence is
+/// active unless one is given.
+#[derive(clap::Args, Debug, Default)]
+pub struct DetachFlag {
+    /// Key sequence that detaches and leaves the process running: keys
+    /// separated by commas, each a character or ctrl- plus a letter, @, [,
+    /// \, ], ^ or _. Off unless given (Docker's default is ctrl-p,ctrl-q).
+    #[arg(long, value_name = "SEQUENCE")]
+    pub detach_keys: Option<String>,
+}
+
+impl DetachFlag {
+    /// The attach settings for `sig_proxy` and these keys.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the key sequence is not valid.
+    pub fn options(&self, sig_proxy: bool) -> Result<Options> {
+        let detach_keys = self.detach_keys.as_deref().map(DetachKeys::parse);
+        Ok(Options {
+            detach_keys: detach_keys.transpose()?,
+            sig_proxy,
+            ..Options::default()
+        })
+    }
+}
+
 impl SessionFlags {
     fn options(&self) -> Result<Options> {
         Ok(Options {
             detach_keys: Some(DetachKeys::parse(&self.detach_keys)?),
             sig_proxy: self.sig_proxy,
+            ..Options::default()
         })
     }
 }
@@ -142,6 +170,38 @@ mod tests {
             options.detach_keys,
             Some(DetachKeys::parse("ctrl-x").unwrap())
         );
+    }
+
+    #[test]
+    fn given_no_detach_flag_when_options_built_then_no_keys_are_active() {
+        let options = DetachFlag::default().options(true).unwrap();
+
+        assert_eq!(options.detach_keys, None);
+        assert!(options.sig_proxy);
+    }
+
+    #[test]
+    fn given_a_detach_flag_when_options_built_then_the_keys_and_sig_proxy_follow() {
+        let flag = DetachFlag {
+            detach_keys: Some("ctrl-x".into()),
+        };
+
+        let options = flag.options(false).unwrap();
+
+        assert_eq!(
+            options.detach_keys,
+            Some(DetachKeys::parse("ctrl-x").unwrap())
+        );
+        assert!(!options.sig_proxy);
+    }
+
+    #[test]
+    fn given_a_bad_detach_flag_when_options_built_then_it_fails() {
+        let flag = DetachFlag {
+            detach_keys: Some("nope".into()),
+        };
+
+        assert!(flag.options(true).is_err());
     }
 
     #[test]

@@ -493,3 +493,42 @@ fn given_logs_since_in_the_future_or_an_invalid_value_when_run_then_old_output_i
     assert!(String::from_utf8_lossy(&shown.stdout).contains("stub: echo"));
     assert!(!invalid.status.success());
 }
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_exec_with_a_missing_env_file_when_it_runs_then_it_exits_125_naming_the_file() {
+    // Arrange
+    let daemon = Daemon::spawn();
+    let mut cmd = daemon.cli();
+    cmd.args(["create", "--name", "envy", "alpine"]);
+    assert!(cmd.output().expect("create").status.success());
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["exec", "--env-file", "/no/such/file.env", "envy", "true"])
+        .assert();
+
+    // Assert
+    assertion
+        .code(DOCKER_CLI_FAILURE)
+        .stderr(predicate::str::contains("/no/such/file.env"));
+}
+
+#[cfg(not(feature = "krunvm"))]
+#[test]
+fn given_run_with_bad_detach_keys_when_it_runs_then_it_exits_125() {
+    // Arrange
+    let daemon = Daemon::spawn();
+
+    // Act
+    let mut cmd = daemon.cli();
+    let assertion = cmd
+        .args(["run", "--detach-keys", "nope", "alpine", "true"])
+        .assert();
+
+    // Assert
+    assertion
+        .code(DOCKER_CLI_FAILURE)
+        .stderr(predicate::str::contains("invalid detach keys"));
+}

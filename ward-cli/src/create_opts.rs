@@ -164,6 +164,16 @@ fn check_platform(platform: Option<&str>, host_arch: &str) -> Result<()> {
     Ok(())
 }
 
+/// The environment of one command: every env file in order, then each `-e`,
+/// with a bare key taking its value from this host.
+///
+/// # Errors
+///
+/// Fails on an unreadable or malformed file.
+pub fn host_environment(files: &[PathBuf], flags: &[String]) -> Result<HashMap<String, String>> {
+    environment(files, flags, host_env)
+}
+
 /// The sandbox environment: every env file in order, then each `-e`.
 fn environment(
     files: &[PathBuf],

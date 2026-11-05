@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -40,6 +41,9 @@ pub struct Options {
     pub detach_keys: Option<DetachKeys>,
     /// Hand SIGINT and SIGTERM to the process. Docker's `--sig-proxy`.
     pub sig_proxy: bool,
+    /// Set when the detach keys ended the attach, so the caller can tell it
+    /// from the process exiting with 0.
+    pub detached: AtomicBool,
 }
 
 impl Default for Options {
@@ -47,7 +51,15 @@ impl Default for Options {
         Self {
             detach_keys: None,
             sig_proxy: true,
+            detached: AtomicBool::new(false),
         }
+    }
+}
+
+impl Options {
+    /// True when the attach ended because the detach keys were typed.
+    pub fn was_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
     }
 }
 
@@ -81,25 +93,6 @@ pub fn require_exit(code: Option<i32>) -> Result<i32> {
     code.context("the attach stream ended without an exit status")
 }
 
-/// Streams one process to the terminal and returns its exit code, or `None`
-/// when the stream ended without one (a replay of a running process).
-///
-/// A SIGHUP ends the stream with `128 + signo`. So do SIGINT and SIGTERM
-/// when the CLI owns the terminal (raw mode) or only watches (replay);
-/// otherwise they go to the guest process.
-pub async fn attach(
-    client: &mut WardClient<Channel>,
-    target: &Resolved,
-    start: AttachStart,
-    forward_stdin: bool,
-) -> Result<Option<i32>> {
-    let sink = |output: Output| match output {
-        Output::Data(chunk) => write_to_terminal(chunk.stream, chunk.bytes),
-        Output::ReplayEnd => Ok(()),
-    };
-    attach_with(client, target, start, forward_stdin, sink).await
-}
-
 /// Writes a chunk to stdout, or to stderr when the process wrote it there.
 pub fn write_to_terminal(stream: AttachStream, bytes: &[u8]) -> std::io::Result<()> {
     write_to(
@@ -127,7 +120,7 @@ fn write_flushed(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     out.flush()
 }
 
-/// Like [`attach`], handing every output chunk and the replay end to `sink`.
+/// Like [`attach_opts`] with default settings, handing every output chunk and the replay end to `sink`.
 pub async fn attach_with(
     client: &mut WardClient<Channel>,
     target: &Resolved,
@@ -146,7 +139,13 @@ pub async fn attach_with(
     .await
 }
 
-/// Like [`attach_with`], with the settings of `docker attach`.
+/// Streams one process to the terminal and returns its exit code, or `None`
+/// when the stream ended without one (a replay of a running process), with
+/// the settings of `docker attach`.
+///
+/// A SIGHUP ends the stream with `128 + signo`. So do SIGINT and SIGTERM
+/// when the CLI owns the terminal (raw mode) or only watches (replay);
+/// otherwise they go to the guest process.
 pub async fn attach_opts(
     client: &mut WardClient<Channel>,
     target: &Resolved,
@@ -233,6 +232,7 @@ pub async fn attach_with_exits(
         code = recv_exit(exits, relay_signals) => Ok(Some(code)),
         () = detached => {
             was_detached = true;
+            options.detached.store(true, Ordering::Release);
             Ok(Some(DETACHED_EXIT_CODE))
         }
     };
