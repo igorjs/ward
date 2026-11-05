@@ -112,7 +112,10 @@ fn given_list_when_run_piped_then_emits_aligned_table_with_header() {
     // Assert: a header row plus one row, no tabs.
     assertion.success().stdout(predicate::function(|s: &str| {
         let lines: Vec<&str> = s.lines().collect();
-        lines.len() == 2 && lines[0].starts_with("ID ") && !s.contains('\t')
+        lines.len() == 2
+            && lines[0].starts_with("ID ")
+            && !s.contains('\t')
+            && lines[0].find("STATUS") == lines[1].find("running")
     }));
 }
 

@@ -52,19 +52,23 @@ pub fn emit_rows(
     }
 
     if !no_pretty {
-        let mut lines = vec![headers.iter().map(|h| h.to_uppercase()).collect()];
-        lines.extend(rows.iter().map(|row| row.iter().map(stringify).collect()));
-        print!("{}", crate::template::align(&lines));
+        print!("{}", table_text(headers, rows));
         return Ok(());
     }
 
-    // Empty output means "list found nothing"
-    // (same convention as `grep`); scripts distinguish via exit code.
+    // Rows only: with `--no-pretty` a list that found nothing prints nothing.
     for row in rows {
         let cols: Vec<String> = row.iter().map(stringify).collect();
         println!("{}", cols.join("\t"));
     }
     Ok(())
+}
+
+/// Docker's aligned table: upper case headers, then one line per row.
+fn table_text(headers: &[&str], rows: &[Vec<Value>]) -> String {
+    let mut lines = vec![headers.iter().map(|h| h.to_uppercase()).collect()];
+    lines.extend(rows.iter().map(|row| row.iter().map(stringify).collect()));
+    crate::template::align(&lines)
 }
 
 /// Stringify a `serde_json::Value` for human / TSV display. Strings
@@ -92,6 +96,23 @@ mod tests {
     #[test]
     fn given_no_pretty_when_header_built_then_columns_are_tab_separated() {
         assert_eq!(tsv_header(true, &["A", "B"]).as_deref(), Some("A\tB"));
+    }
+
+    #[test]
+    fn given_rows_when_tabled_then_headers_are_upper_case_and_columns_align() {
+        let rows = vec![
+            vec![json!("a"), json!(7)],
+            vec![json!("longer"), Value::Null],
+        ];
+
+        let text = table_text(&["id", "size"], &rows);
+
+        assert_eq!(text, "ID       SIZE\na        7\nlonger   \n");
+    }
+
+    #[test]
+    fn given_no_rows_when_tabled_then_only_the_header_prints() {
+        assert_eq!(table_text(&["id", "name"], &[]), "ID   NAME\n");
     }
 
     #[test]

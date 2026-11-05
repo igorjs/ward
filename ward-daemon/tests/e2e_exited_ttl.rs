@@ -34,8 +34,8 @@ fn create(d: &Daemon, extra: &[&str]) -> String {
 }
 
 fn status_of(d: &Daemon, id: &str) -> Option<String> {
-    ok(d, &["list"]).lines().find_map(|l| {
-        let mut cols = l.split_whitespace();
+    ok(d, &["--no-pretty", "list"]).lines().find_map(|l| {
+        let mut cols = l.split('\t');
         (cols.next() == Some(id)).then(|| cols.next().unwrap_or_default().to_string())
     })
 }
