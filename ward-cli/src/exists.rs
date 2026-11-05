@@ -56,6 +56,22 @@ pub async fn image(socket: &str, reference: &str) -> i32 {
     code_of(answer)
 }
 
+/// The exit code for a volume named `reference`: a name, an ID or a unique
+/// ID prefix.
+pub async fn volume(socket: &str, reference: &str) -> i32 {
+    let answer = async {
+        let mut c = client::connect(socket).await?;
+        let volumes = c.list_volumes(()).await?.into_inner().volumes;
+        anyhow::Ok(if crate::volume::find(&volumes, reference).is_ok() {
+            EXISTS
+        } else {
+            MISSING
+        })
+    }
+    .await;
+    code_of(answer)
+}
+
 fn code_of(answer: anyhow::Result<i32>) -> i32 {
     answer.unwrap_or_else(|e| {
         eprintln!("Error: {e:?}");
@@ -65,7 +81,7 @@ fn code_of(answer: anyhow::Result<i32>) -> i32 {
 
 /// Whether `reference` is one of the image's tags, with `:latest` implied, or
 /// a prefix of its ID.
-fn names_image(image: &ImageInfo, reference: &str) -> bool {
+pub(crate) fn names_image(image: &ImageInfo, reference: &str) -> bool {
     let wanted = reference.trim_start_matches(DIGEST_PREFIX);
     if wanted.is_empty() {
         return false;

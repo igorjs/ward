@@ -122,19 +122,19 @@ pub fn exited_ttl(seconds: u64) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Most labels one sandbox may carry.
+/// Most labels one sandbox or volume may carry.
 const MAX_LABELS: usize = 128;
 /// Longest label key, in bytes.
 const MAX_LABEL_KEY_LEN: usize = 256;
 /// Longest label value, in bytes.
 const MAX_LABEL_VALUE_LEN: usize = 4096;
 
-/// Validate sandbox labels: a bounded count, non-empty keys without control
+/// Validate sandbox or volume labels: a bounded count, non-empty keys without control
 /// characters, and bounded values.
 pub fn labels(labels: &std::collections::HashMap<String, String>) -> Result<(), ApiError> {
     if labels.len() > MAX_LABELS {
         return Err(ApiError::InvalidRequest(format!(
-            "a sandbox takes at most {MAX_LABELS} labels"
+            "at most {MAX_LABELS} labels are allowed"
         )));
     }
     for (key, value) in labels {

@@ -19,6 +19,7 @@ mod exists;
 mod export;
 mod guest_opts;
 mod history;
+mod image_inspect;
 mod images;
 mod import;
 mod inspect;
@@ -307,7 +308,8 @@ enum Commands {
         /// Go template for each sandbox.
         #[arg(short, long)]
         format: Option<String>,
-        /// Kind of object to inspect: container. Ward cannot inspect images yet.
+        /// Kind of object to inspect: container or image. Without it a
+        /// sandbox is tried first, then a cached image.
         #[arg(long = "type", value_name = "TYPE")]
         kind: Option<String>,
         /// Sandbox names, IDs or ID prefixes.
@@ -757,6 +759,22 @@ enum Commands {
     #[command(name = "image-exists", hide = true)]
     ImageExists(exists::Args),
 
+    /// Exit 0 if the volume exists, 1 if not, 125 on an error. Prints
+    /// nothing, as `podman volume exists` does.
+    #[command(name = "volume-exists", hide = true)]
+    VolumeExists(exists::Args),
+
+    /// Print low level details of one or more cached images as a JSON array.
+    #[command(name = "image-inspect", hide = true)]
+    ImageInspect {
+        /// Go template for each image.
+        #[arg(short, long)]
+        format: Option<String>,
+        /// Image tags, IDs or ID prefixes.
+        #[arg(required = true)]
+        references: Vec<String>,
+    },
+
     /// Remove every stopped and exited sandbox.
     Prune,
 
@@ -888,13 +906,7 @@ enum EgressCommands {
 #[derive(Debug, Subcommand)]
 enum VolumeCommands {
     /// Create a named volume.
-    Create {
-        /// Volume name.
-        name: String,
-        /// Size in MiB.
-        #[arg(long, default_value = "1024")]
-        size: u32,
-    },
+    Create(volume::CreateArgs),
     /// List volumes.
     #[command(alias = "ls")]
     List(volume::ListArgs),
@@ -1066,9 +1078,11 @@ fn subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 /// Docker's `container` subcommands and the top-level command each stands for.
-const CONTAINER_COMMANDS: [(&str, &str); 27] = [
+const CONTAINER_COMMANDS: [(&str, &str); 29] = [
     ("exists", "container-exists"),
     ("ls", "ps"),
+    ("list", "ps"),
+    ("export", "export"),
     ("ps", "ps"),
     ("create", "create"),
     ("run", "run"),
@@ -1096,8 +1110,9 @@ const CONTAINER_COMMANDS: [(&str, &str); 27] = [
     ("unpause", "unpause"),
 ];
 /// Docker's `image` subcommands that Ward has, and what they stand for.
-const IMAGE_COMMANDS: [(&str, &str); 12] = [
+const IMAGE_COMMANDS: [(&str, &str); 13] = [
     ("exists", "image-exists"),
+    ("inspect", "image-inspect"),
     ("prune", "image-prune"),
     ("ls", "images"),
     ("list", "images"),
@@ -1111,6 +1126,9 @@ const IMAGE_COMMANDS: [(&str, &str); 12] = [
     ("import", "import"),
 ];
 
+/// Docker's `volume` subcommands that are hidden top-level commands in Ward.
+const VOLUME_COMMANDS: [(&str, &str); 1] = [("exists", "volume-exists")];
+
 /// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
 /// same way, so both spellings share one definition and one help text.
 fn expand_groups(mut args: Vec<String>) -> Vec<String> {
@@ -1120,6 +1138,7 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     let table: &[(&str, &str)] = match args[group].as_str() {
         "container" => &CONTAINER_COMMANDS,
         "image" => &IMAGE_COMMANDS,
+        "volume" => &VOLUME_COMMANDS,
         _ => return args,
     };
     let target = args
@@ -1138,7 +1157,7 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
 fn reports_cli_failure_as_125(subcommand: Option<&str>) -> bool {
     matches!(
         subcommand,
-        Some("run" | "exec" | "container-exists" | "image-exists")
+        Some("run" | "exec" | "container-exists" | "image-exists" | "volume-exists")
     )
 }
 
@@ -1324,9 +1343,22 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             kind,
             references,
         } => {
-            inspect::check_type(kind.as_deref())?;
+            let kind = inspect::Kind::parse(kind.as_deref())?;
             let mut c = client::connect(&socket_path).await?;
-            inspect::inspect(&mut c, &token_store, &references, format.as_deref()).await?;
+            let options = inspect::InspectOptions {
+                format: format.as_deref(),
+                kind,
+            };
+            inspect::inspect(&mut c, &token_store, &references, options).await?;
+        }
+
+        Commands::ImageInspect { format, references } => {
+            let mut c = client::connect(&socket_path).await?;
+            let options = inspect::InspectOptions {
+                format: format.as_deref(),
+                kind: inspect::Kind::Image,
+            };
+            inspect::inspect(&mut c, &token_store, &references, options).await?;
         }
 
         Commands::Exec {
@@ -1801,6 +1833,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             std::process::exit(exists::image(&socket_path, &args.name).await)
         }
 
+        Commands::VolumeExists(args) => {
+            std::process::exit(exists::volume(&socket_path, &args.name).await)
+        }
+
         Commands::Update(args) => update::run(&socket_path, &token_store, args, json).await?,
 
         Commands::Pause(args) => pause::run(&socket_path, &token_store, args, json).await?,
@@ -1841,15 +1877,10 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
 
         Commands::Volume(vol_cmd) => match vol_cmd {
-            VolumeCommands::Create { name, size } => {
+            VolumeCommands::Create(args) => {
+                let request = args.request()?;
                 let mut c = client::connect(&socket_path).await?;
-                let resp = c
-                    .create_volume(ward_core::pb::CreateVolumeRequest {
-                        name,
-                        size_mb: size,
-                    })
-                    .await?
-                    .into_inner();
+                let resp = c.create_volume(request).await?.into_inner();
                 if json {
                     println!(
                         "{}",
@@ -2026,6 +2057,11 @@ mod tests {
     #[case::container_remove(&["ward", "container", "remove", "x"], &["ward", "rm", "x"])]
     #[case::image_ls(&["ward", "image", "ls"], &["ward", "images"])]
     #[case::image_pull(&["ward", "image", "pull", "alpine"], &["ward", "pull", "alpine"])]
+    #[case::container_list(&["ward", "container", "list"], &["ward", "ps"])]
+    #[case::container_export(&["ward", "container", "export", "-o", "f", "web1"], &["ward", "export", "-o", "f", "web1"])]
+    #[case::image_inspect(&["ward", "image", "inspect", "alpine"], &["ward", "image-inspect", "alpine"])]
+    #[case::volume_exists(&["ward", "volume", "exists", "data"], &["ward", "volume-exists", "data"])]
+    #[case::volume_ls_is_left_alone(&["ward", "volume", "ls"], &["ward", "volume", "ls"])]
     #[case::unknown_sub_is_left_alone(&["ward", "container", "nope"], &["ward", "container", "nope"])]
     #[case::other_command(&["ward", "ps", "container"], &["ward", "ps", "container"])]
     fn given_group_command_when_expanded_then_it_names_the_top_level_command(
@@ -2049,7 +2085,11 @@ mod tests {
         use clap::CommandFactory;
         let cli = Cli::command();
 
-        for (_, target) in CONTAINER_COMMANDS.iter().chain(&IMAGE_COMMANDS) {
+        for (_, target) in CONTAINER_COMMANDS
+            .iter()
+            .chain(&IMAGE_COMMANDS)
+            .chain(&VOLUME_COMMANDS)
+        {
             assert!(
                 cli.find_subcommand(target).is_some(),
                 "no top-level {target}"

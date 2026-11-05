@@ -107,6 +107,7 @@ struct VolumeEntry {
     size_mb: u32,
     created_at: SystemTime,
     mount_path: PathBuf,
+    labels: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -151,6 +152,7 @@ impl VolumeManager {
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
         crate::validate::volume_size(req.size_mb)?;
+        crate::validate::labels(&req.labels)?;
 
         // Enforce volume cap to prevent resource exhaustion.
         let current = self.volumes.read().await.len();
@@ -180,6 +182,7 @@ impl VolumeManager {
             size_mb: req.size_mb,
             created_at: SystemTime::now(),
             mount_path: mount_path.clone(),
+            labels: req.labels,
         };
 
         self.volumes.write().await.insert(id, entry.clone());
@@ -249,6 +252,7 @@ fn entry_to_pb(e: VolumeEntry) -> PbVolumeInfo {
             nanos: d.subsec_nanos() as i32,
         }),
         mount_path: e.mount_path.to_string_lossy().into_owned(),
+        labels: e.labels,
     }
 }
 
@@ -291,6 +295,7 @@ mod tests {
         CreateVolumeRequest {
             name: name.to_string(),
             size_mb,
+            ..Default::default()
         }
     }
 
@@ -589,5 +594,35 @@ mod tests {
         // (little-endian: bytes 0x53, 0xEF).
         let bytes = std::fs::read(&image).expect("read image");
         assert_eq!(&bytes[0x438..0x43A], &[0x53, 0xEF], "missing ext4 magic");
+    }
+
+    #[tokio::test]
+    async fn given_labels_when_volume_created_then_they_are_kept_and_listed() {
+        // Arrange
+        let mgr = build_manager(4);
+        let mut request = req("tagged", 10);
+        request.labels = [("env".to_string(), "dev".to_string())].into();
+
+        // Act
+        let created = mgr.create(request).await.expect("create");
+        let listed = mgr.list().await.expect("list");
+
+        // Assert
+        assert_eq!(created.labels["env"], "dev");
+        assert_eq!(listed[0].labels, created.labels);
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_label_key_when_volume_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let mut request = req("tagged", 10);
+        request.labels = [(String::new(), "x".to_string())].into();
+
+        // Act
+        let result = mgr.create(request).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
     }
 }

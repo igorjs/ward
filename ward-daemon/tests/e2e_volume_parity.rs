@@ -302,3 +302,62 @@ fn given_repeated_driver_filters_when_listed_then_either_value_matches() {
     // Assert
     assert_eq!(out, "one\n");
 }
+
+#[test]
+fn given_an_unsupported_driver_or_option_when_a_volume_is_created_then_it_is_refused_with_a_reason()
+{
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let driver = run(&d, &["volume", "create", "-d", "nfs", "data"]);
+    let option = run(&d, &["volume", "create", "-o", "type=tmpfs", "data"]);
+
+    // Assert
+    assert!(!driver.status.success());
+    assert!(stderr(&driver).contains("volume driver \"nfs\" is not supported"));
+    assert!(!option.status.success());
+    assert!(stderr(&option).contains("volume option \"type=tmpfs\" is not supported"));
+    assert_eq!(ok(&d, &["volume", "ls", "-q"]), "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn given_a_labelled_volume_when_listed_and_inspected_then_the_labels_show_and_filter() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "volume", "create", "-d", "local", "--label", "env=dev", "--label", "team", "--size",
+            "100", "web",
+        ],
+    );
+    ok(&d, &["volume", "create", "--size", "100", "plain"]);
+
+    // Act
+    let by_label = ok(&d, &["volume", "ls", "-q", "--filter", "label=env=dev"]);
+    let by_key = ok(&d, &["volume", "ls", "-q", "--filter", "label=team"]);
+    let miss = ok(&d, &["volume", "ls", "-q", "--filter", "label=env=prod"]);
+    let labels = ok(
+        &d,
+        &[
+            "volume",
+            "ls",
+            "--format",
+            "{{.Labels}}",
+            "--filter",
+            "name=web",
+        ],
+    );
+    let inspected = ok(&d, &["volume", "inspect", "-f", "{{json .Labels}}", "web"]);
+    let exists = run(&d, &["volume", "exists", "web"]);
+
+    // Assert
+    assert_eq!(by_label.trim(), "web");
+    assert_eq!(by_key.trim(), "web");
+    assert_eq!(miss, "");
+    assert_eq!(labels.trim(), "env=dev,team=");
+    assert_eq!(inspected.trim(), r#"{"env":"dev","team":""}"#);
+    assert_eq!(exists.status.code(), Some(0));
+}

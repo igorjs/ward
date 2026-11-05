@@ -17,8 +17,7 @@ use crate::{output, template};
 /// The only volume driver, and the only scope.
 const DRIVER: &str = "local";
 const SCOPE: &str = "local";
-/// Volumes carry no labels, and nothing links to them.
-const NO_LABELS: &str = "";
+/// Nothing links to a volume.
 const NO_LINKS: &str = "N/A";
 /// The words `dangling=` accepts, as Docker does.
 const TRUE_WORDS: [&str; 2] = ["true", "1"];
@@ -57,6 +56,49 @@ pub struct ListArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct CreateArgs {
+    /// Volume name.
+    pub name: String,
+    /// Size in MiB.
+    #[arg(long, default_value = "1024")]
+    pub size: u32,
+    /// Volume driver. Only `local` exists.
+    #[arg(short, long, default_value = DRIVER)]
+    pub driver: String,
+    /// Set a label, `KEY` or `KEY=VALUE`. Repeatable.
+    #[arg(long, value_name = "KEY[=VALUE]")]
+    pub label: Vec<String>,
+    /// Driver option, `KEY=VALUE`. The local driver has none here, so any is refused.
+    #[arg(short = 'o', long, value_name = "KEY=VALUE")]
+    pub opt: Vec<String>,
+}
+
+impl CreateArgs {
+    /// The request to send, once the driver and options are checked.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a driver other than `local`, on any `-o` option, or on a
+    /// label with an empty key.
+    pub fn request(self) -> Result<ward_core::pb::CreateVolumeRequest> {
+        if self.driver != DRIVER {
+            bail!(
+                "volume driver \"{}\" is not supported: only {DRIVER} exists",
+                self.driver
+            );
+        }
+        if let Some(opt) = self.opt.first() {
+            bail!("volume option \"{opt}\" is not supported: the {DRIVER} driver takes none here");
+        }
+        Ok(ward_core::pb::CreateVolumeRequest {
+            name: self.name,
+            size_mb: self.size,
+            labels: crate::create_opts::labels(&[], &self.label)?,
+        })
+    }
+}
+
+#[derive(clap::Args, Debug)]
 pub struct InspectArgs {
     /// Go template for each volume.
     #[arg(short, long)]
@@ -88,7 +130,7 @@ struct Filters {
 
 /// Why a reference names no single volume.
 #[derive(Debug, PartialEq)]
-enum FindError {
+pub(crate) enum FindError {
     NotFound(String),
     Ambiguous(String),
 }
@@ -128,18 +170,23 @@ impl Filters {
         Ok(filters)
     }
 
-    /// Volumes carry no labels, so any `label=` filter matches none. Values
-    /// of one key are alternatives, as in Docker.
+    /// Every `label=` filter must match, as in Docker. Values of the other
+    /// keys are alternatives.
     fn allows(&self, volume: &VolumeInfo) -> bool {
-        self.labels.is_empty()
-            && (self.dangling.is_empty() || self.dangling.contains(&true))
+        self.labels.iter().all(|label| match label.split_once('=') {
+            Some((key, value)) => volume.labels.get(key).is_some_and(|v| v == value),
+            None => volume.labels.contains_key(label),
+        }) && (self.dangling.is_empty() || self.dangling.contains(&true))
             && (self.drivers.is_empty() || self.drivers.iter().any(|d| d == DRIVER))
             && (self.names.is_empty() || self.names.iter().any(|n| volume.name.contains(n)))
     }
 }
 
 /// The volume `reference` names: a name, an ID or a unique ID prefix.
-fn find<'a>(volumes: &'a [VolumeInfo], reference: &str) -> Result<&'a VolumeInfo, FindError> {
+pub(crate) fn find<'a>(
+    volumes: &'a [VolumeInfo],
+    reference: &str,
+) -> Result<&'a VolumeInfo, FindError> {
     if let Some(volume) = volumes
         .iter()
         .find(|v| v.name == reference || v.id == reference)
@@ -168,7 +215,7 @@ fn inspect_object(volume: &VolumeInfo) -> Map<String, Value> {
             json!(created_seconds(volume).map(rfc3339)),
         ),
         ("Driver".to_string(), json!(DRIVER)),
-        ("Labels".to_string(), json!({})),
+        ("Labels".to_string(), json!(volume.labels)),
         ("Mountpoint".to_string(), json!(volume.mount_path)),
         ("Name".to_string(), json!(volume.name)),
         ("Options".to_string(), Value::Null),
@@ -176,6 +223,13 @@ fn inspect_object(volume: &VolumeInfo) -> Map<String, Value> {
         ("Id".to_string(), json!(volume.id)),
         ("SizeMB".to_string(), json!(volume.size_mb)),
     ])
+}
+
+/// `key=value,key2=value2` in key order, as `docker volume ls` prints labels.
+fn label_text(labels: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs.join(",")
 }
 
 /// The `ls --format` record.
@@ -188,7 +242,7 @@ fn list_record(volume: &VolumeInfo) -> Map<String, Value> {
         ("Mountpoint".to_string(), json!(volume.mount_path)),
         ("Scope".to_string(), json!(SCOPE)),
         ("Size".to_string(), json!(size_text(size))),
-        ("Labels".to_string(), json!(NO_LABELS)),
+        ("Labels".to_string(), json!(label_text(&volume.labels))),
         ("Links".to_string(), json!(NO_LINKS)),
     ])
 }
@@ -312,7 +366,17 @@ mod tests {
                 seconds: 0,
                 nanos: 0,
             }),
+            labels: Default::default(),
         }
+    }
+
+    fn labelled(name: &str, labels: &[(&str, &str)]) -> VolumeInfo {
+        let mut volume = volume("id", name);
+        volume.labels = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        volume
     }
 
     fn fleet() -> Vec<VolumeInfo> {
@@ -412,5 +476,75 @@ mod tests {
             .expect("render");
 
         assert_eq!(out, "cache 104.9MB local\n");
+    }
+
+    #[rstest::rstest]
+    #[case::key_only(&["label=env"], &["web"])]
+    #[case::pair(&["label=env=dev"], &["web"])]
+    #[case::wrong_value(&["label=env=prod"], &[])]
+    #[case::every_label_must_match(&["label=env", "label=tier=db"], &[])]
+    fn given_label_filters_when_applied_then_stored_labels_decide(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+        let filters = Filters::parse(&specs).expect("parse");
+        let volumes = [labelled("web", &[("env", "dev")]), labelled("bare", &[])];
+
+        let kept: Vec<&str> = volumes
+            .iter()
+            .filter(|v| filters.allows(v))
+            .map(|v| v.name.as_str())
+            .collect();
+
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn given_labels_when_listed_by_template_then_they_print_sorted_as_pairs() {
+        let record = list_record(&labelled("web", &[("b", "2"), ("a", "1")]));
+
+        assert_eq!(record["Labels"], "a=1,b=2");
+    }
+
+    fn create_args(driver: &str, labels: &[&str], opts: &[&str]) -> CreateArgs {
+        CreateArgs {
+            name: "data".into(),
+            size: 10,
+            driver: driver.into(),
+            label: labels.iter().map(ToString::to_string).collect(),
+            opt: opts.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn given_local_driver_and_labels_when_request_built_then_labels_are_carried() {
+        let request = create_args("local", &["env=dev", "bare"], &[])
+            .request()
+            .expect("request");
+
+        assert_eq!(request.labels["env"], "dev");
+        assert_eq!(request.labels["bare"], "");
+        assert_eq!(request.size_mb, 10);
+    }
+
+    #[rstest::rstest]
+    #[case::other_driver("nfs", &[], "volume driver \"nfs\" is not supported")]
+    #[case::option("local", &["type=tmpfs"], "volume option \"type=tmpfs\" is not supported")]
+    #[case::empty_label_key("local", &["=x"], "the key is empty")]
+    fn given_unsupported_input_when_request_built_then_the_reason_is_given(
+        #[case] driver: &str,
+        #[case] extra: &[&str],
+        #[case] said: &str,
+    ) {
+        let args = if said.contains("option") {
+            create_args(driver, &[], extra)
+        } else {
+            create_args(driver, extra, &[])
+        };
+
+        let error = args.request().expect_err("refused");
+
+        assert!(error.to_string().contains(said), "{error}");
     }
 }

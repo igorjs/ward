@@ -1113,6 +1113,11 @@ impl Ward for WardGrpcServer {
         Ok(Response::new(crate::pb::ImageHistoryResponse {
             image_id: view.image_id,
             layers,
+            entrypoint: view.config.entrypoint,
+            cmd: view.config.cmd,
+            working_dir: view.config.working_dir,
+            user: view.config.user,
+            env: view.config.env,
         }))
     }
 

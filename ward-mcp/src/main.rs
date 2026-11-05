@@ -546,6 +546,7 @@ impl Server {
         let req = pb::CreateVolumeRequest {
             name: args.name.clone(),
             size_mb: args.size_mb,
+            ..Default::default()
         };
         let info = self
             .runtime
