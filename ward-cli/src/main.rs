@@ -97,8 +97,9 @@ struct Cli {
 /// Footer for commands whose behavior differs from Docker's.
 const DOCKER_DIFFERENCES: &str = "See docs/docker-differences.md or https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
 
-const DEFAULT_MEMORY: &str = "512m";
-const DEFAULT_CPUS: &str = "1";
+/// Value sent for `--memory` and `--cpus` when the flag is absent: the daemon
+/// applies its own default, which is no limit unless the operator sets one.
+const DAEMON_DEFAULT_LIMIT: &str = "0";
 
 /// Help for `--time` on `stop` and `restart`.
 fn stop_time_help() -> String {
@@ -127,12 +128,14 @@ struct SandboxOpts {
     #[arg(long = "allow-domain", value_name = "DOMAIN")]
     allow_domain: Vec<String>,
     /// Memory limit: bytes, or a number with a k, m, g or t suffix (512m,
-    /// 1.5g). 0 uses the daemon default.
-    #[arg(short = 'm', long, default_value = DEFAULT_MEMORY, value_name = "SIZE")]
-    memory: String,
-    /// CPU limit. Fractions round up to a whole CPU. 0 uses the daemon default.
-    #[arg(long, default_value = DEFAULT_CPUS, value_name = "NUMBER")]
-    cpus: String,
+    /// 1.5g). Unset or 0 uses the daemon default, which is no limit unless the
+    /// operator sets one.
+    #[arg(short = 'm', long, value_name = "SIZE")]
+    memory: Option<String>,
+    /// CPU limit. Fractions round up to a whole CPU. Unset or 0 uses the
+    /// daemon default, which is no limit unless the operator sets one.
+    #[arg(long, value_name = "NUMBER")]
+    cpus: Option<String>,
     /// Process limit, as in Docker: 0 or -1 for unlimited. 0 uses the daemon
     /// default, which is unlimited unless the operator sets one.
     #[arg(
@@ -999,8 +1002,10 @@ fn create_request(
         other => anyhow::bail!("--egress must be 'deny', 'allowlist' or 'open', got '{other}'"),
     };
     let resources = ward_core::pb::ResourceLimits {
-        cpus: resources::parse_cpus(&opts.cpus)?,
-        memory_mb: resources::parse_memory_mib(&opts.memory)?,
+        cpus: resources::parse_cpus(opts.cpus.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT))?,
+        memory_mb: resources::parse_memory_mib(
+            opts.memory.as_deref().unwrap_or(DAEMON_DEFAULT_LIMIT),
+        )?,
         pids_max: resources::parse_pids_limit(opts.pids_limit)?,
         timeout_seconds,
         exited_ttl_seconds: opts.exited_ttl.unwrap_or_default(),
@@ -2135,6 +2140,22 @@ mod tests {
         // Assert
         let limits = request.resources.expect("resources");
         assert_eq!((limits.memory_mb, limits.cpus), (2048, 2));
+    }
+
+    #[test]
+    fn given_no_memory_or_cpus_flags_when_request_built_then_daemon_default_is_requested() {
+        // Arrange
+        let cli = Cli::try_parse_from(["ward", "run", "alpine", "true"]).expect("parse");
+        let Commands::Run { image, opts, .. } = cli.command else {
+            panic!("expected Run");
+        };
+
+        // Act
+        let request = create_request(image, opts, 0).expect("request");
+
+        // Assert
+        let limits = request.resources.expect("resources");
+        assert_eq!((limits.memory_mb, limits.cpus), (0, 0));
     }
 
     #[rstest::rstest]
