@@ -881,6 +881,7 @@ message SnapshotInfo {
 message CreateVolumeRequest {
   string name = 1;
   uint32 size_mb = 2;
+  map<string, string> labels = 3;
 }
 
 message GetVolumeRequest {
@@ -901,6 +902,7 @@ message VolumeInfo {
   uint32 size_mb = 3;
   google.protobuf.Timestamp created_at = 4;
   string mount_path = 5;
+  map<string, string> labels = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1056,13 @@ message ImageHistoryResponse {
   string image_id = 1;
   // Newest first.
   repeated HistoryLayer layers = 2;
+  // The image config, for `docker image inspect`. Empty when none was stored.
+  repeated string entrypoint = 3;
+  repeated string cmd = 4;
+  string working_dir = 5;
+  string user = 6;
+  // KEY=VALUE entries.
+  repeated string env = 7;
 }
 
 message SaveImagesRequest {

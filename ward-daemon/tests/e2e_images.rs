@@ -169,6 +169,45 @@ fn given_human_false_when_history_is_read_then_sizes_are_bytes() {
 }
 
 #[test]
+fn given_a_cached_image_when_inspected_then_docker_s_shape_and_config_print() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(
+        r#"{"cmd":["sh"],"env":["PATH=/bin"],"working_dir":"/app","history":[]}"#,
+    );
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["tag", IMAGE, ALIAS]);
+
+    // Act
+    let plain = run_ok(&d, &["inspect", IMAGE]);
+    let via_group = run_ok(&d, &["image", "inspect", "-f", "{{.Id}}", ALIAS]);
+    let typed = run_ok(
+        &d,
+        &[
+            "inspect",
+            "--type",
+            "image",
+            "-f",
+            "{{json .RepoTags}}",
+            IMAGE,
+        ],
+    );
+    let missing = run(&d, &["image", "inspect", "nope:1"]);
+    let nothing = run(&d, &["inspect", "nope:1"]);
+
+    // Assert
+    let parsed: serde_json::Value = serde_json::from_str(&plain).expect("json");
+    assert_eq!(parsed[0]["Config"]["Cmd"], serde_json::json!(["sh"]));
+    assert_eq!(parsed[0]["Config"]["WorkingDir"], "/app");
+    assert_eq!(parsed[0]["Os"], "linux");
+    assert_eq!(parsed[0]["RootFS"]["Type"], "layers");
+    assert_eq!(via_group.trim(), parsed[0]["Id"].as_str().unwrap());
+    assert!(typed.contains(IMAGE) && typed.contains(ALIAS), "{typed}");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No such image: nope:1"));
+    assert!(String::from_utf8_lossy(&nothing.stderr).contains("No such object: nope:1"));
+}
+
+#[test]
 fn given_a_missing_source_when_tagged_then_it_fails() {
     // Arrange
     let d = Daemon::spawn();

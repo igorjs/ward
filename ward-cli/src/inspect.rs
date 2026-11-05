@@ -12,6 +12,7 @@ use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
 use ward_core::protocol::RestartKind;
 
+use crate::image_inspect;
 use crate::lifecycle::Failures;
 use crate::ps_columns::{image_size, image_sizes, ports_text, size_column};
 use crate::ps_filter::{self, Filters};
@@ -667,18 +668,92 @@ fn created_at_text(seconds: i64) -> String {
     )
 }
 
-/// `--type` values. Ward has no image inspection yet.
 const TYPE_CONTAINER: &str = "container";
 const TYPE_IMAGE: &str = "image";
 
-/// Accept `--type container`, and say why `image` or anything else is refused.
-pub fn check_type(kind: Option<&str>) -> Result<()> {
-    match kind {
-        None | Some(TYPE_CONTAINER) => Ok(()),
-        Some(TYPE_IMAGE) => bail!("inspecting images is not supported yet; only --type container"),
-        Some(other) => {
-            bail!("invalid --type \"{other}\", expected {TYPE_CONTAINER} or {TYPE_IMAGE}")
+/// What `inspect` looks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A sandbox first, then a cached image, as Docker tries a container first.
+    Any,
+    Container,
+    Image,
+}
+
+impl Kind {
+    /// # Errors
+    ///
+    /// Fails on a `--type` that is neither `container` nor `image`.
+    pub fn parse(kind: Option<&str>) -> Result<Self> {
+        match kind {
+            None => Ok(Self::Any),
+            Some(TYPE_CONTAINER) => Ok(Self::Container),
+            Some(TYPE_IMAGE) => Ok(Self::Image),
+            Some(other) => {
+                bail!("invalid --type \"{other}\", expected {TYPE_CONTAINER} or {TYPE_IMAGE}")
+            }
         }
+    }
+}
+
+pub struct InspectOptions<'a> {
+    pub format: Option<&'a str>,
+    /// `-s`: add `SizeRootFs` to a sandbox.
+    pub size: bool,
+    pub kind: Kind,
+}
+
+/// Words the daemon uses for a name no sandbox can have, such as an image tag
+/// with a colon.
+const BAD_NAME_WORDS: &str = "invalid characters";
+
+/// Whether the daemon said no sandbox has this name. Any other invalid
+/// argument is a real error and is not hidden by the image lookup.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+        status.code() == tonic::Code::NotFound
+            || (status.code() == tonic::Code::InvalidArgument
+                && status.message().contains(BAD_NAME_WORDS))
+    })
+}
+
+async fn sandbox_value(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+    sizes: Option<&HashMap<String, u64>>,
+) -> Result<Value> {
+    let target = client::resolve(c, token_store, reference).await?;
+    let request = target.request(GetSandboxRequest {
+        id: target.id.clone(),
+    })?;
+    let info = c.get_sandbox(request).await?.into_inner();
+    let mut value = inspect_value(&info);
+    if let Some(sizes) = sizes {
+        add_sizes(&mut value, &info, sizes);
+    }
+    Ok(value)
+}
+
+async fn object_value(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+    kind: Kind,
+    sizes: Option<&HashMap<String, u64>>,
+) -> Result<Value> {
+    match kind {
+        Kind::Container => sandbox_value(c, token_store, reference, sizes).await,
+        Kind::Image => image_inspect::lookup(c, reference).await,
+        Kind::Any => match sandbox_value(c, token_store, reference, sizes).await {
+            Err(e) if is_not_found(&e) => match image_inspect::lookup(c, reference).await {
+                Err(e) if is_not_found(&e) => Err(anyhow::anyhow!(tonic::Status::not_found(
+                    format!("No such object: {reference}")
+                ))),
+                other => other,
+            },
+            other => other,
+        },
     }
 }
 
@@ -696,36 +771,22 @@ pub async fn inspect(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     references: &[String],
-    format: Option<&str>,
-    size: bool,
+    options: InspectOptions<'_>,
 ) -> Result<()> {
-    let template = format
+    let template = options
+        .format
         .map(|format| Template::parse(format, &[(ANY_FIELD, "")]))
         .transpose()?;
-    let sizes = if size {
-        image_sizes(&c.list_images(()).await?.into_inner().images)
+    let sizes = if options.size && options.kind != Kind::Image {
+        Some(image_sizes(&c.list_images(()).await?.into_inner().images))
     } else {
-        HashMap::new()
+        None
     };
     let mut found = Vec::new();
     let mut failures = Failures::new();
     for reference in references {
-        let result = async {
-            let target = client::resolve(c, token_store, reference).await?;
-            let request = target.request(GetSandboxRequest {
-                id: target.id.clone(),
-            })?;
-            anyhow::Ok(c.get_sandbox(request).await?.into_inner())
-        }
-        .await;
-        match result {
-            Ok(info) => {
-                let mut value = inspect_value(&info);
-                if size {
-                    add_sizes(&mut value, &info, &sizes);
-                }
-                found.push(value);
-            }
+        match object_value(c, token_store, reference, options.kind, sizes.as_ref()).await {
+            Ok(value) => found.push(value),
             Err(e) => failures.record(reference, &e),
         }
     }
@@ -781,15 +842,30 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::unset(None, true)]
-    #[case::container(Some("container"), true)]
-    #[case::image(Some("image"), false)]
-    #[case::unknown(Some("volume"), false)]
-    fn given_type_when_checked_then_only_container_passes(
-        #[case] kind: Option<&str>,
-        #[case] accepted: bool,
+    #[case::missing(tonic::Status::not_found("No such container: x"), true)]
+    #[case::bad_name(
+        tonic::Status::invalid_argument("sandbox name or ID contains invalid characters"),
+        true
+    )]
+    #[case::other_invalid(tonic::Status::invalid_argument("limit is negative"), false)]
+    #[case::unavailable(tonic::Status::unavailable("down"), false)]
+    fn given_a_daemon_status_when_checked_then_only_a_missing_sandbox_falls_through(
+        #[case] status: tonic::Status,
+        #[case] expected: bool,
     ) {
-        assert_eq!(check_type(kind).is_ok(), accepted);
+        assert_eq!(is_not_found(&anyhow::Error::from(status)), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::unset(None, Some(Kind::Any))]
+    #[case::container(Some("container"), Some(Kind::Container))]
+    #[case::image(Some("image"), Some(Kind::Image))]
+    #[case::unknown(Some("volume"), None)]
+    fn given_type_when_parsed_then_container_and_image_are_accepted(
+        #[case] kind: Option<&str>,
+        #[case] expected: Option<Kind>,
+    ) {
+        assert_eq!(Kind::parse(kind).ok(), expected);
     }
 
     const NOW: i64 = 1_000_000;

@@ -84,6 +84,7 @@ async fn given_a_named_volume_marked_anonymous_when_created_then_the_daemon_refu
         .create_volume(CreateVolumeRequest {
             name: "precious".into(),
             size_mb: 10,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -110,6 +111,7 @@ async fn given_an_existing_volume_with_a_hex_name_marked_anonymous_when_created_
         .create_volume(CreateVolumeRequest {
             name: ANONYMOUS_NAME.into(),
             size_mb: 10,
+            ..Default::default()
         })
         .await
         .unwrap();
