@@ -22,11 +22,11 @@ const FILTER_EXPOSE: &str = "expose";
 const FILTER_VOLUME: &str = "volume";
 const PORT_RANGE_SEPARATOR: char = '-';
 const PROTOCOL_SEPARATOR: char = '/';
-/// The only protocol a published port can have.
+/// The protocol of a port filter or mapping that names none.
 const PROTOCOL_TCP: &str = "tcp";
-/// Protocols Docker names in a port filter. Ward publishes only tcp, so the
-/// others match nothing.
-const OTHER_PROTOCOLS: [&str; 2] = ["udp", "sctp"];
+/// Protocols Docker names in a port filter. Ward publishes tcp and udp, so
+/// sctp matches nothing.
+const KNOWN_PROTOCOLS: [&str; 3] = [PROTOCOL_TCP, "udp", "sctp"];
 /// Docker's word for a sandbox with no health check.
 const HEALTH_NONE: &str = "none";
 const HEALTHS: [&str; 4] = ["starting", "healthy", "unhealthy", HEALTH_NONE];
@@ -99,8 +99,8 @@ fn with_tag(reference: &str) -> String {
 struct PortSpec {
     first: u16,
     last: u16,
-    /// False for a protocol Ward never publishes: the filter matches nothing.
-    tcp: bool,
+    /// Lower case; a mapping with no protocol is tcp.
+    protocol: String,
 }
 
 impl PortSpec {
@@ -119,15 +119,24 @@ impl PortSpec {
             last.parse().map_err(|_| bad())?,
         );
         let protocol = protocol.to_ascii_lowercase();
-        let tcp = protocol == PROTOCOL_TCP;
-        if first > last || !(tcp || OTHER_PROTOCOLS.contains(&protocol.as_str())) {
+        if first > last || !KNOWN_PROTOCOLS.contains(&protocol.as_str()) {
             return Err(bad());
         }
-        Ok(Self { first, last, tcp })
+        Ok(Self {
+            first,
+            last,
+            protocol,
+        })
     }
 
     fn matches(&self, mapping: &PortMapping) -> bool {
-        self.tcp && (u32::from(self.first)..=u32::from(self.last)).contains(&mapping.container_port)
+        let protocol = if mapping.protocol.is_empty() {
+            PROTOCOL_TCP
+        } else {
+            mapping.protocol.as_str()
+        };
+        protocol.eq_ignore_ascii_case(&self.protocol)
+            && (u32::from(self.first)..=u32::from(self.last)).contains(&mapping.container_port)
     }
 }
 
@@ -563,18 +572,32 @@ mod tests {
         assert!(!names(&newer).contains(&"undated".to_string()));
     }
 
+    fn publishing(protocol: &str, port: u32) -> SandboxInfo {
+        let mut info = with_ports(fleet().remove(0), &[port]);
+        info.published_ports[0].protocol = protocol.into();
+        info
+    }
+
     #[rstest::rstest]
-    #[case::udp("publish=80/udp")]
-    #[case::upper_tcp("publish=80/TCP")]
-    fn given_a_protocol_filter_when_selected_then_udp_matches_nothing_and_tcp_any_case_matches(
+    #[case::bare_port_is_tcp("publish=80", "tcp", true)]
+    #[case::bare_port_skips_udp("publish=80", "udp", false)]
+    #[case::explicit_tcp("expose=80/tcp", "", true)]
+    #[case::upper_tcp("publish=80/TCP", "tcp", true)]
+    #[case::udp_matches_udp("publish=80/udp", "udp", true)]
+    #[case::udp_range("expose=70-90/udp", "udp", true)]
+    #[case::udp_skips_tcp("publish=80/udp", "tcp", false)]
+    #[case::udp_skips_a_mapping_with_no_protocol("publish=80/udp", "", false)]
+    #[case::sctp_matches_nothing("publish=80/sctp", "tcp", false)]
+    fn given_a_protocol_filter_when_selected_then_the_mapping_protocol_must_agree(
         #[case] spec: &str,
+        #[case] mapping_protocol: &str,
+        #[case] listed_back: bool,
     ) {
-        let mut listed = fleet();
-        listed[0] = with_ports(listed[0].clone(), &[80]);
+        let listed = [publishing(mapping_protocol, 80)];
 
         let shown = select(&listed, true, &parse(&[spec]), None);
 
-        assert_eq!(shown.len(), usize::from(spec.ends_with("TCP")));
+        assert_eq!(shown.len(), usize::from(listed_back));
     }
 
     #[test]
@@ -667,6 +690,7 @@ mod tests {
             source: "/srv/data".into(),
             target: "/data".into(),
             readonly: false,
+            ..Default::default()
         }];
 
         let by_target = select(&listed, true, &parse(&["volume=/data"]), None);
