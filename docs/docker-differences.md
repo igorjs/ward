@@ -130,7 +130,7 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 - `ancestor=` takes a tag, or an image ID or prefix. There are no layers, so only the image itself matches.
 - `before=` and `since=` take a sandbox name or ID. An unknown one fails with `No such container`, and an ID prefix that fits several sandboxes fails with `multiple IDs found`. A sandbox with no creation time matches neither.
 - `exited=CODE` matches stopped sandboxes with that exit code, and needs `-a`, as in Docker.
-- `publish=` and `expose=` take a container port or range, with or without a protocol: `80`, `80/tcp`, `8000-8010`. Ward has no image `EXPOSE` data, so `expose` matches the published ports, as `publish` does. Only tcp is ever published, so `/udp` and `/sctp` match nothing.
+- `publish=` and `expose=` take a container port or range, with or without a protocol: `80`, `80/tcp`, `8000-8010`. Ward has no image `EXPOSE` data, so `expose` matches the published ports, as `publish` does. A bare port means tcp, as in Docker, and `/udp` matches udp mappings. `/sctp` is accepted and matches nothing, since Ward publishes only tcp and udp.
 - `volume=` matches the source or target path of a mount.
 - `.Mounts` and `.Networks` are always empty: the listing does not carry mounts, and a microVM has no Docker networks. `.LocalVolumes` does not exist. `.Ports` reads `127.0.0.1:8080->80/tcp`, with the host address Ward bound.
 - `-s` adds a SIZE column and fills `.Size`. Ward cannot tell how much a sandbox wrote on top of its image, so it prints `-- (virtual 7.8MB)`: the first figure is unmeasured and the second is the image size. Without `-s`, `.Size` is empty. COMMAND is `argv[0]` only. `State` also has `stopped` and `failed`, which Docker lacks.
