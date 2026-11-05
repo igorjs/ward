@@ -127,7 +127,8 @@ fn given_system_group_when_info_df_prune_then_each_runs() {
     let pruned = ok(&d, &["system", "prune", "-f"]);
 
     // Assert
-    assert!(info.contains("backend:"), "{info}");
+    assert!(info.contains("Isolation: microVM"), "{info}");
+    assert!(info.contains("Containers: 1"), "{info}");
     assert!(df.contains("Containers\t1\t0"), "{df}");
     assert!(pruned.contains(&id), "{pruned}");
 }
@@ -271,4 +272,51 @@ fn given_unknown_signal_when_kill_then_it_is_refused_before_any_call() {
     // Assert
     assert!(!bad.status.success());
     assert!(stderr(&bad).contains("invalid signal"), "{}", stderr(&bad));
+}
+
+#[test]
+fn given_info_format_when_host_fields_asked_then_the_daemon_reports_them() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = ok(
+        &d,
+        &[
+            "info",
+            "--format",
+            "{{.Name}}|{{.NCPU}}|{{.DockerRootDir}}|{{.ID}}|{{.ContainersPaused}}",
+        ],
+    );
+    let again = ok(&d, &["info", "--format", "{{.ID}}"]);
+
+    // Assert
+    let fields: Vec<&str> = out.trim().split('|').collect();
+    assert!(!fields[0].is_empty(), "{out}");
+    assert!(fields[1].parse::<u32>().expect("ncpu") > 0, "{out}");
+    assert!(!fields[2].is_empty(), "{out}");
+    assert!(!fields[3].is_empty(), "{out}");
+    assert_eq!(fields[3], again.trim());
+    assert_eq!(fields[4], "0");
+}
+
+#[test]
+fn given_system_df_when_run_then_docker_s_table_and_format_print() {
+    // Arrange
+    let d = Daemon::spawn();
+    create(&d, "web1");
+
+    // Act
+    let table = ok(&d, &["system", "df"]);
+    let kinds = ok(
+        &d,
+        &["system", "df", "--format", "{{.Type}}={{.TotalCount}}"],
+    );
+
+    // Assert
+    let header = table.lines().next().expect("header");
+    assert!(header.starts_with("TYPE "), "{table}");
+    assert!(header.ends_with("   RECLAIMABLE"), "{table}");
+    assert!(kinds.contains("Containers=1"), "{kinds}");
+    assert!(kinds.contains("Build Cache=0"), "{kinds}");
 }

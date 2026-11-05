@@ -919,6 +919,16 @@ message DaemonInfo {
   string platform = 2;
   string backend = 3;
   string arch = 4;
+  // Host figures for `docker info`. Empty or zero when unknown.
+  string hostname = 5;
+  string kernel_version = 6;
+  string operating_system = 7;
+  uint32 ncpu = 8;
+  uint64 mem_total_bytes = 9;
+  // The daemon's data directory.
+  string root_dir = 10;
+  // Stable identifier of this daemon's data directory.
+  string id = 11;
 }
 
 // ---------------------------------------------------------------------------
