@@ -28,12 +28,12 @@ Both ship with the [installer](../../install.sh) or `cargo build --release`.
 sb=$(ward create alpine:latest)
 echo "sandbox: $sb"
 
-# 2. Run untrusted code in it. `ward exec -d` returns immediately with a pid;
+# 2. Run untrusted code in it. `ward --json exec -d` returns immediately with a pid;
 #    output streams from `ward logs <id> <pid>` once the process has run
 #    (or in parallel for long-running commands). Without -d, `ward exec`
 #    would stay attached and print the output itself, like `docker exec`.
-pid=$(ward exec -d "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
-        | awk '/^pid:/{print $2}')
+pid=$(ward --json exec -d "$sb" -- sh -c "echo 'hello from inside'; whoami; uname -a" \
+        | sed -n 's/.*"pid":"\([^"]*\)".*/\1/p')
 ward logs "$sb" "$pid"
 
 # 3. (Optional) Run a language snippet via `ward run-code` with the

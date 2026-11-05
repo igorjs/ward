@@ -22,16 +22,10 @@ use std::process::{Command, Stdio};
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
-/// Pulls the value out of a `<prefix>value` line in `ward` CLI stdout,
-/// mirroring the sibling e2e files' `extract_field` helper for chaining
-/// `create` -> `exec` -> `logs` by id/pid.
-fn extract_field(stdout: &str, prefix: &str) -> String {
-    for line in stdout.lines() {
-        if let Some(rest) = line.strip_prefix(prefix) {
-            return rest.trim().to_string();
-        }
-    }
-    panic!("no {prefix:?} line in stdout:\n{stdout}");
+/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
+fn json_pid(stdout: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
+    value["pid"].as_str().expect("pid").to_string()
 }
 
 #[test]
@@ -82,7 +76,16 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
     // Act: resolve a real hostname from inside the guest via the
     // backend's DNS relay.
     let dns_exec = ward()
-        .args(["exec", "-d", &id, "--", "getent", "hosts", "example.com"])
+        .args([
+            "--json",
+            "exec",
+            "-d",
+            &id,
+            "--",
+            "getent",
+            "hosts",
+            "example.com",
+        ])
         .output()
         .expect("exec getent");
     assert!(
@@ -90,7 +93,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         "exec getent failed: {}",
         String::from_utf8_lossy(&dns_exec.stderr)
     );
-    let dns_pid = extract_field(std::str::from_utf8(&dns_exec.stdout).unwrap(), "pid: ");
+    let dns_pid = json_pid(std::str::from_utf8(&dns_exec.stdout).unwrap());
 
     // Assert: the resolver returned an address and the guest process
     // exited cleanly.
@@ -105,6 +108,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
     // path.
     let tcp_exec = ward()
         .args([
+            "--json",
             "exec",
             "-d",
             &id,
@@ -122,7 +126,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
         "exec wget failed: {}",
         String::from_utf8_lossy(&tcp_exec.stderr)
     );
-    let tcp_pid = extract_field(std::str::from_utf8(&tcp_exec.stdout).unwrap(), "pid: ");
+    let tcp_pid = json_pid(std::str::from_utf8(&tcp_exec.stdout).unwrap());
 
     // Assert: the guest's TCP connect/handshake/transfer completed and
     // the process exited cleanly.

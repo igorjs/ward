@@ -80,7 +80,7 @@ trap cleanup EXIT INT TERM
 # not this script. For argv-style invocation drop the wrapper and pass
 # the array directly:  ward exec -d "$sb" -- prog arg1 arg2
 log "Executing: ${command}"
-pid=$(ward exec -d "${sb}" -- sh -c "${command}" | awk '/^pid:/{print $2}')
+pid=$(ward --json exec -d "${sb}" -- sh -c "${command}" | sed -n 's/.*"pid":"\([^"]*\)".*/\1/p')
 if [[ -z "${pid}" ]]; then
   die "ward exec returned no pid"
 fi

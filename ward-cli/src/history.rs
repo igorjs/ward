@@ -38,6 +38,18 @@ pub struct Args {
     /// Do not cut the CREATED BY column or the image ID.
     #[arg(long)]
     pub no_trunc: bool,
+    /// Print sizes and dates in human readable form (default). Use
+    /// `--human=false` for byte counts and full timestamps.
+    #[arg(
+        short = 'H',
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_value_t = true,
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
+    pub human: bool,
     /// Go template for each layer: .ID .CreatedSince .CreatedAt .CreatedBy
     /// .Size .Comment, the `table ` prefix, and `json`.
     #[arg(long)]
@@ -65,7 +77,7 @@ pub async fn run(socket: &str, args: Args, json: bool) -> Result<()> {
                 0 => image_id(&reply.image_id, args.no_trunc),
                 _ => MISSING_ID.to_string(),
             };
-            record(layer, id, args.no_trunc, now)
+            record(layer, id, args.no_trunc, args.human, now)
         })
         .collect();
     if args.quiet {
@@ -109,6 +121,7 @@ fn record(
     layer: &HistoryLayer,
     id: String,
     no_trunc: bool,
+    human: bool,
     now: DateTime<Utc>,
 ) -> Map<String, Value> {
     let created_at = layer
@@ -119,16 +132,25 @@ fn record(
             || NO_TIME.to_string(),
             |t| t.format(CREATED_AT_FORMAT).to_string(),
         );
-    let since = seconds_since(&layer.created, now.timestamp()).map_or_else(
-        || NO_TIME.to_string(),
-        |s| format!("{} ago", duration_text(s)),
-    );
+    let since = if human {
+        seconds_since(&layer.created, now.timestamp()).map_or_else(
+            || NO_TIME.to_string(),
+            |s| format!("{} ago", duration_text(s)),
+        )
+    } else {
+        created_at.clone()
+    };
+    let size = if human {
+        human_size(layer.size_bytes, BYTES_PER_UNIT, &SIZE_UNITS)
+    } else {
+        layer.size_bytes.to_string()
+    };
     match json!({
         "ID": id,
         "CreatedSince": since,
         "CreatedAt": created_at,
         "CreatedBy": created_by(&layer.created_by, no_trunc),
-        "Size": human_size(layer.size_bytes, BYTES_PER_UNIT, &SIZE_UNITS),
+        "Size": size,
         "Comment": layer.comment,
     }) {
         Value::Object(map) => map,
@@ -165,8 +187,8 @@ mod tests {
         };
         let digest = format!("{DIGEST_PREFIX}{}", "ab".repeat(32));
         let records = vec![
-            record(&layer, image_id(&digest, false), false, Utc::now()),
-            record(&layer, MISSING_ID.to_string(), false, Utc::now()),
+            record(&layer, image_id(&digest, false), false, true, Utc::now()),
+            record(&layer, MISSING_ID.to_string(), false, true, Utc::now()),
         ];
         let template = Template::parse(DEFAULT_FORMAT, &FIELDS).expect("parse");
 
@@ -178,5 +200,43 @@ mod tests {
         assert!(rows[0].starts_with("abababababab"), "{}", rows[0]);
         assert!(rows[1].starts_with(MISSING_ID), "{}", rows[1]);
         assert!(rows[0].contains("7.8MB"), "{}", rows[0]);
+    }
+
+    #[test]
+    fn given_human_false_when_rendered_then_size_is_bytes_and_created_is_a_timestamp() {
+        // Arrange
+        let layer = HistoryLayer {
+            created: Some(prost_types::Timestamp::default()),
+            created_by: "RUN make".to_string(),
+            size_bytes: 7_800_000,
+            comment: String::new(),
+        };
+
+        // Act
+        let record = record(&layer, "abc".to_string(), false, false, Utc::now());
+
+        // Assert
+        assert_eq!(record["Size"], "7800000");
+        assert_eq!(record["CreatedSince"], record["CreatedAt"]);
+    }
+
+    #[test]
+    fn given_human_flag_forms_when_parsed_then_the_default_is_true() {
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: Args,
+        }
+        use clap::Parser;
+        let human = |extra: &[&str]| {
+            let mut argv = vec!["history"];
+            argv.extend_from_slice(extra);
+            argv.push("alpine");
+            Wrapper::try_parse_from(argv).expect("parse").args.human
+        };
+
+        assert!(human(&[]));
+        assert!(human(&["-H"]));
+        assert!(!human(&["--human=false"]));
     }
 }

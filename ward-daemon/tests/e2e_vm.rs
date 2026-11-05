@@ -43,6 +43,12 @@ fn image() -> String {
     std::env::var(IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
 }
 
+/// The PID `ward --json exec -d` prints; plain `exec -d` prints nothing.
+fn json_pid(stdout: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json output");
+    value["pid"].as_str().expect("pid").to_string()
+}
+
 fn field(stdout: &str, prefix: &str) -> String {
     stdout
         .lines()
@@ -81,12 +87,12 @@ struct Finished {
 /// Start a process and return its pid without waiting.
 fn start(d: &Daemon, id: &str, workdir: Option<&str>, argv: &[&str]) -> String {
     let mut cmd = d.cli();
-    cmd.args(["exec", "-d", id]);
+    cmd.args(["--json", "exec", "-d", id]);
     if let Some(dir) = workdir {
         cmd.args(["--workdir", dir]);
     }
     cmd.arg("--").args(argv);
-    field(&run_ok(cmd), "pid: ")
+    json_pid(&run_ok(cmd))
 }
 
 /// Read a process's output until it exits.
