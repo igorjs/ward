@@ -8,7 +8,7 @@ use super::{
     SandboxEvent, SandboxManager, backend_err,
 };
 use crate::pb::UpdateSandboxRequest;
-use crate::protocol::{LimitsUpdate, RestartKind, RestartPolicy};
+use crate::protocol::{CgroupLimits, CgroupUpdate, LimitsUpdate, RestartKind, RestartPolicy};
 use crate::sync::LockUnpoisoned;
 
 /// Docker's wording for `docker update` without a flag.
@@ -26,6 +26,14 @@ impl SandboxManager {
             memory_mb: req.memory_mb,
             nano_cpus: req.nano_cpus,
             pids_max: req.pids_max,
+            cgroup: CgroupUpdate {
+                memory_swap_bytes: req.memory_swap_bytes,
+                memory_reservation_bytes: req.memory_reservation_bytes,
+                cpu_shares: req.cpu_shares,
+                cpuset_cpus: req.cpuset_cpus.clone(),
+                cpu_period: req.cpu_period,
+                cpu_quota: req.cpu_quota,
+            },
         };
         if limits.is_empty() && req.restart_policy.is_none() {
             return Err(ApiError::InvalidRequest(NOTHING_TO_UPDATE.into()));
@@ -36,6 +44,7 @@ impl SandboxManager {
             .checked_restart(&id, req.restart_policy.as_ref())
             .await?;
         let previous = self.recorded_limits(&id).await?;
+        let previous_cgroup = self.recorded_cgroup(&id).await?;
         if !limits.is_empty() {
             let next = previous.updated(&limits);
             crate::validate::resource_limits(
@@ -44,13 +53,17 @@ impl SandboxManager {
                 next.pids_max,
                 next.timeout_seconds,
             )?;
+            crate::guest_limits::cgroup(&previous_cgroup.updated(&limits.cgroup), next.memory_mb)?;
             self.backend
                 .update_limits(&id, &limits)
                 .await
                 .map_err(backend_err)?;
         }
         if let Err(e) = self.record_update(&id, &limits, restart).await {
-            return Err(match self.restore_limits(&id, &limits, &previous).await {
+            let restored = self
+                .restore_limits(&id, &limits, &previous, &previous_cgroup)
+                .await;
+            return Err(match restored {
                 Ok(()) => e,
                 Err(stuck) => ApiError::Internal(format!(
                     "{e}; the old limits could not be put back, so the running sandbox may differ from its record: {stuck}"
@@ -68,11 +81,13 @@ impl SandboxManager {
         id: &str,
         limits: &LimitsUpdate,
         previous: &crate::protocol::ResourceLimits,
+        previous_cgroup: &CgroupLimits,
     ) -> std::result::Result<(), crate::backend::BackendError> {
         let undo = LimitsUpdate {
             memory_mb: limits.memory_mb.map(|_| previous.memory_mb),
             nano_cpus: limits.nano_cpus.map(|_| previous.nano_cpus),
             pids_max: limits.pids_max.map(|_| previous.pids_max),
+            cgroup: limits.cgroup.undoing(previous_cgroup),
         };
         if undo.is_empty() {
             return Ok(());
@@ -141,6 +156,15 @@ impl SandboxManager {
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))
     }
 
+    async fn recorded_cgroup(&self, id: &str) -> Result<CgroupLimits> {
+        self.entries
+            .read()
+            .await
+            .get(id)
+            .map(|entry| entry.meta.options.spec.guest.cgroup.clone())
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))
+    }
+
     async fn record_update(
         &self,
         id: &str,
@@ -153,6 +177,7 @@ impl SandboxManager {
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
         let mut next = entry.meta.clone();
         next.options.resources = next.options.resources.updated(limits);
+        next.options.spec.guest.cgroup = next.options.spec.guest.cgroup.updated(&limits.cgroup);
         if let Some(restart) = restart {
             next.options.spec.restart = restart;
         }

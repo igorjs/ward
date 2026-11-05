@@ -356,6 +356,16 @@ async fn answer_secrets<W: AsyncWrite + Unpin>(
     write_frame(writer, &encode_event(&Event { kind: Some(kind) })).await
 }
 
+/// The cpu, cpuset and memory.low settings a `SetLimits` frame asks for.
+fn cgroup_settings_of(set: &proto::SetLimits) -> cgroup_limits::CgroupSettings {
+    cgroup_limits::CgroupSettings {
+        memory_low: set.memory_low_bytes,
+        cpu_weight: set.cpu_weight,
+        cpu_max: set.cpu_max_quota.clone().zip(set.cpu_max_period),
+        cpuset_cpus: set.cpuset_cpus.clone(),
+    }
+}
+
 async fn answer_set_limits<W: AsyncWrite + Unpin>(
     set: &proto::SetLimits,
     writer: &mut W,
@@ -365,10 +375,19 @@ async fn answer_set_limits<W: AsyncWrite + Unpin>(
         nano_cpus: set.nano_cpus,
         pids_max: set.pids_max,
     };
+    let settings = cgroup_settings_of(set);
     let outcome = match SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir) {
         Some(dir) => {
             let dir = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || limits::apply(&dir, limits)).await?
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                limits::apply(&dir, limits)?;
+                if settings.is_empty() {
+                    return Ok(());
+                }
+                cgroup_limits::apply(Path::new(cgroup::CGROUP_ROOT), &dir, &settings)
+                    .map_err(std::io::Error::other)
+            })
+            .await?
         }
         None => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -978,6 +997,34 @@ fn signal_process_group(pid: Option<u32>, sig: rustix::process::Signal) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn given_a_set_limits_frame_when_read_then_cgroup_settings_follow_its_fields() {
+        let set = proto::SetLimits {
+            memory_low_bytes: Some(4096),
+            cpu_weight: Some(39),
+            cpu_max_quota: Some("max".into()),
+            cpu_max_period: Some(100_000),
+            cpuset_cpus: Some("0-1".into()),
+            ..Default::default()
+        };
+
+        let settings = cgroup_settings_of(&set);
+
+        assert_eq!(settings.memory_low, Some(4096));
+        assert_eq!(settings.cpu_weight, Some(39));
+        assert_eq!(settings.cpu_max, Some(("max".to_string(), 100_000)));
+        assert_eq!(settings.cpuset_cpus.as_deref(), Some("0-1"));
+    }
+
+    #[test]
+    fn given_only_a_quota_without_a_period_when_read_then_cpu_max_is_left_alone() {
+        let set = proto::SetLimits {
+            cpu_max_quota: Some("1000".into()),
+            ..Default::default()
+        };
+
+        assert!(cgroup_settings_of(&set).is_empty());
+    }
     use super::proto::Ping;
     use super::*;
     use std::collections::HashMap;

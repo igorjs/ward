@@ -903,10 +903,18 @@ impl Backend for KrunvmBackend {
             }
             state.vm_size.is_some()
         };
+        let merged = {
+            let sandboxes = self.sandboxes.read().await;
+            let state = sandboxes
+                .get(id)
+                .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+            state.opts.spec.guest.cgroup.updated(&update.cgroup)
+        };
         #[cfg(feature = "krunvm")]
         if vm_up && self.boot_vms {
+            let live = crate::guest_limits::live_settings(&update.cgroup, &merged);
             let stream = self.agent_stream(id).await?;
-            super::agent::set_limits(stream, update)
+            super::agent::set_limits(stream, update, &live)
                 .await
                 .map_err(|e| BackendError::Exec(format!("update the sandbox limits: {e}")))?;
         }
@@ -916,6 +924,7 @@ impl Backend for KrunvmBackend {
         let state = sandboxes
             .get_mut(id)
             .ok_or_else(|| BackendError::NotFound(id.to_string()))?;
+        state.opts.spec.guest.cgroup = merged;
         state.opts.resources = state.opts.resources.updated(update);
         state.info.resources = state.opts.resources.clone();
         Ok(())

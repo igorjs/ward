@@ -160,6 +160,57 @@ pub struct CgroupLimits {
     pub cpu_quota: i64,
 }
 
+/// Changes to Docker's cgroup options. A field left `None` is kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgroupUpdate {
+    pub memory_swap_bytes: Option<i64>,
+    pub memory_reservation_bytes: Option<u64>,
+    pub cpu_shares: Option<u32>,
+    pub cpuset_cpus: Option<String>,
+    pub cpu_period: Option<u64>,
+    pub cpu_quota: Option<i64>,
+}
+
+impl CgroupLimits {
+    /// These options with `update` applied.
+    #[must_use]
+    pub fn updated(&self, update: &CgroupUpdate) -> Self {
+        Self {
+            memory_swap_bytes: update.memory_swap_bytes.unwrap_or(self.memory_swap_bytes),
+            memory_reservation_bytes: update
+                .memory_reservation_bytes
+                .unwrap_or(self.memory_reservation_bytes),
+            cpu_shares: update.cpu_shares.unwrap_or(self.cpu_shares),
+            cpuset_cpus: update
+                .cpuset_cpus
+                .clone()
+                .unwrap_or_else(|| self.cpuset_cpus.clone()),
+            cpu_period: update.cpu_period.unwrap_or(self.cpu_period),
+            cpu_quota: update.cpu_quota.unwrap_or(self.cpu_quota),
+        }
+    }
+}
+
+impl CgroupUpdate {
+    /// The update that puts back `previous` for every field this one changes.
+    #[must_use]
+    pub fn undoing(&self, previous: &CgroupLimits) -> Self {
+        Self {
+            memory_swap_bytes: self.memory_swap_bytes.map(|_| previous.memory_swap_bytes),
+            memory_reservation_bytes: self
+                .memory_reservation_bytes
+                .map(|_| previous.memory_reservation_bytes),
+            cpu_shares: self.cpu_shares.map(|_| previous.cpu_shares),
+            cpuset_cpus: self
+                .cpuset_cpus
+                .as_ref()
+                .map(|_| previous.cpuset_cpus.clone()),
+            cpu_period: self.cpu_period.map(|_| previous.cpu_period),
+            cpu_quota: self.cpu_quota.map(|_| previous.cpu_quota),
+        }
+    }
+}
+
 /// Docker's default size for `/dev/shm`: 64 MiB.
 pub const DEFAULT_SHM_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -366,11 +417,12 @@ pub const NANOS_PER_CPU: u64 = 1_000_000_000;
 
 /// Limits `update` changes. A field left `None` is kept, and 0 removes that
 /// limit.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LimitsUpdate {
     pub memory_mb: Option<u32>,
     pub nano_cpus: Option<u64>,
     pub pids_max: Option<u32>,
+    pub cgroup: CgroupUpdate,
 }
 
 impl LimitsUpdate {

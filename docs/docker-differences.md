@@ -76,7 +76,7 @@ Each attach session is separate. A client that disconnects only detaches and lea
 
 ## Update
 
-`ward update` takes `--memory`, `--cpus`, `--pids-limit` and `--restart`, on a running or stopped sandbox. With none of them it fails, as Docker does. It reports `update` in `ward events`, and `inspect` shows the new values in `HostConfig`.
+`ward update` takes `--memory`, `--cpus`, `--pids-limit`, `--restart`, `-c/--cpu-shares`, `--cpuset-cpus`, `--cpu-period`, `--cpu-quota`, `--memory-reservation` and `--memory-swap`, on a running or stopped sandbox. The cgroup flags follow the rules of `create` (see Guest setup options): a running sandbox gets the new `cpu.weight`, `cpu.max`, `cpuset.cpus` and `memory.low` at once, and the record keeps them for the next boot. A change that the guest kernel refuses fails the update and leaves the old values. `--memory-swap` is accepted only when it equals the memory limit, because the guest has no swap; `-1` and every other value are refused. A new `--memory` has to be checked against a recorded swap or reservation, so change them together when needed. `--blkio-weight`, `--cpuset-mems`, `--cpu-rt-period` and `--cpu-rt-runtime` parse but are refused with the reason, because the guest has no block I/O controller, one memory node and no real-time scheduling. With none of them it fails, as Docker does. It reports `update` in `ward events`, and `inspect` shows the new values in `HostConfig`.
 
 On a running sandbox the limits apply at once, inside the VM: the guest agent writes `memory.max`, `cpu.max` and `pids.max` of the sandbox cgroup. The VM itself cannot change size while it runs, because libkrun fixes its memory and virtual CPUs at boot and has no ballooning or hot-plug. So:
 

@@ -86,6 +86,42 @@ fn given_running_sandbox_when_updated_then_the_guest_cgroup_holds_the_new_limits
 }
 
 #[test]
+fn given_running_sandbox_when_cgroup_options_updated_then_the_guest_cgroup_holds_them() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    let image = image();
+    run_ok(
+        &d,
+        &[
+            "run", "-d", "--name", "box", "-m", VM_MEMORY, &image, "sleep", "600",
+        ],
+    );
+
+    // Act
+    run_ok(
+        &d,
+        &[
+            "update",
+            "--cpu-shares",
+            "1024",
+            "--cpu-quota",
+            "50000",
+            "--cpu-period",
+            "100000",
+            "--memory-reservation",
+            "64m",
+            "box",
+        ],
+    );
+
+    // Assert
+    assert_eq!(cgroup_file(&d, "box", "cpu.weight"), "39");
+    assert_eq!(cgroup_file(&d, "box", "cpu.max"), "50000 100000");
+    assert_eq!(cgroup_file(&d, "box", "memory.low"), (64 * MIB).to_string());
+}
+
+#[test]
 fn given_running_sandbox_when_memory_raised_above_the_vm_then_the_update_is_refused() {
     require_vm!();
     // Arrange

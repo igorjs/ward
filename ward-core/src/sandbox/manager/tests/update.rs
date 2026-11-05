@@ -386,3 +386,107 @@ async fn given_updated_sandbox_when_removed_then_its_update_lock_is_dropped() {
     // Assert
     assert!(!mgr.update_locks.lock_unpoisoned().contains_key(&id));
 }
+
+#[tokio::test]
+async fn given_cgroup_options_when_updated_then_info_reports_them_and_the_rest_stay() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    mgr.create(sized(), "").await.unwrap();
+    mgr.update(UpdateSandboxRequest {
+        cpu_shares: Some(512),
+        cpuset_cpus: Some("0".into()),
+        ..change(NAME)
+    })
+    .await
+    .unwrap();
+
+    // Act
+    let updated = mgr
+        .update(UpdateSandboxRequest {
+            cpu_quota: Some(50_000),
+            cpu_period: Some(100_000),
+            memory_reservation_bytes: Some(64 << 20),
+            ..change(NAME)
+        })
+        .await
+        .unwrap();
+
+    // Assert
+    let cgroup = updated.guest.expect("guest").cgroup.expect("cgroup");
+    assert_eq!(cgroup.cpu_shares, 512);
+    assert_eq!(cgroup.cpuset_cpus, "0");
+    assert_eq!(cgroup.cpu_quota, 50_000);
+    assert_eq!(cgroup.cpu_period, 100_000);
+    assert_eq!(cgroup.memory_reservation_bytes, 64 << 20);
+}
+
+#[tokio::test]
+async fn given_a_swap_other_than_the_memory_limit_when_updated_then_it_is_refused_with_the_reason()
+{
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    mgr.create(sized(), "").await.unwrap();
+
+    // Act
+    let err = mgr
+        .update(UpdateSandboxRequest {
+            memory_swap_bytes: Some(-1),
+            ..change(NAME)
+        })
+        .await
+        .unwrap_err();
+
+    // Assert
+    assert!(err.to_string().contains("the guest has no swap"), "{err}");
+}
+
+#[tokio::test]
+async fn given_a_reservation_above_the_memory_limit_when_updated_then_it_is_refused() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    mgr.create(sized(), "").await.unwrap();
+
+    // Act
+    let err = mgr
+        .update(UpdateSandboxRequest {
+            memory_reservation_bytes: Some(u64::from(LARGER_MEMORY_MB) << 20),
+            ..change(NAME)
+        })
+        .await
+        .unwrap_err();
+
+    // Assert
+    assert!(err.to_string().contains("--memory-reservation"), "{err}");
+}
+
+#[tokio::test]
+async fn given_a_bad_cpuset_when_updated_then_nothing_changes() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    mgr.create(sized(), "").await.unwrap();
+
+    // Act
+    let err = mgr
+        .update(UpdateSandboxRequest {
+            cpuset_cpus: Some("3-1".into()),
+            ..change(NAME)
+        })
+        .await
+        .unwrap_err();
+
+    // Assert
+    assert!(err.to_string().contains("--cpuset-cpus"), "{err}");
+    let info = mgr.get(NAME).await.unwrap();
+    assert_eq!(
+        info.guest
+            .expect("guest")
+            .cgroup
+            .expect("cgroup")
+            .cpuset_cpus,
+        ""
+    );
+}

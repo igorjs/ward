@@ -199,6 +199,16 @@ message SetLimits {
   optional uint64 nano_cpus = 2;
   // pids.max. 0 removes the limit.
   optional uint32 pids_max = 3;
+  // memory.low in bytes. 0 removes it.
+  optional uint64 memory_low_bytes = 4;
+  // cpu.weight.
+  optional uint64 cpu_weight = 5;
+  // cpu.max as "max" or a quota in microseconds, with its period. Both are
+  // set together.
+  optional string cpu_max_quota = 6;
+  optional uint64 cpu_max_period = 7;
+  // cpuset.cpus.
+  optional string cpuset_cpus = 8;
 }
 
 // Must be the first and only frame on a connection. The agent freezes or
