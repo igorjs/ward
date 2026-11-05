@@ -323,6 +323,8 @@ async fn remove_named(c: &mut WardClient<Channel>, token_store: &Path, name: &st
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn given_env_file_and_flags_when_merged_for_exec_then_flags_win() {
         // Arrange
@@ -337,8 +339,6 @@ mod tests {
         assert_eq!(env["A"], "file");
         assert_eq!(env["B"], "flag");
     }
-
-    use super::*;
 
     const HOST_VALUE: &str = "from-host";
 

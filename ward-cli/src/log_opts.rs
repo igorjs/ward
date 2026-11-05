@@ -10,10 +10,10 @@ use anyhow::{Result, bail};
 use clap::Args;
 
 const DOCS: &str = "https://github.com/igorjs/ward/blob/main/docs/docker-differences.md";
-/// The drivers whose behavior Ward already has: the output is kept and
-/// `ward logs` reads it.
 const IGNORED_OPTS_WARNING: &str =
     "warning: --log-opt is ignored: Ward does not rotate or tag sandbox output";
+/// The drivers whose behavior Ward already has: the output is kept and
+/// `ward logs` reads it.
 const ACCEPTED_DRIVERS: [&str; 2] = ["json-file", "local"];
 
 #[derive(Debug, Args, Default)]
