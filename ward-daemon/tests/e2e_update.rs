@@ -90,6 +90,60 @@ fn given_running_sandbox_when_updated_then_inspect_shows_the_new_limits() {
 }
 
 #[test]
+fn given_cgroup_flags_when_updated_then_inspect_shows_them() {
+    // Arrange
+    let d = Daemon::spawn();
+    create(&d);
+
+    // Act
+    ok(
+        &d,
+        &[
+            "update",
+            "--cpu-shares",
+            "512",
+            "--cpuset-cpus",
+            "0",
+            "--cpu-period",
+            "100000",
+            "--cpu-quota",
+            "50000",
+            "--memory-reservation",
+            "64m",
+            "web1",
+        ],
+    );
+
+    // Assert
+    assert_eq!(host_config(&d, "CpuShares"), "512");
+    assert_eq!(host_config(&d, "CpusetCpus"), "0");
+    assert_eq!(host_config(&d, "CpuPeriod"), "100000");
+    assert_eq!(host_config(&d, "CpuQuota"), "50000");
+    assert_eq!(host_config(&d, "MemoryReservation"), (64 * MIB).to_string());
+}
+
+#[test]
+fn given_flags_the_guest_cannot_honour_when_updated_then_each_is_refused_with_a_reason() {
+    // Arrange
+    let d = Daemon::spawn();
+    create(&d);
+
+    // Act
+    let swap = run(&d, &["update", "--memory-swap", "-1", "web1"]);
+    let blkio = run(&d, &["update", "--blkio-weight", "100", "web1"]);
+
+    // Assert
+    assert!(!swap.status.success());
+    assert!(
+        stderr(&swap).contains("the guest has no swap"),
+        "{}",
+        stderr(&swap)
+    );
+    assert!(!blkio.status.success());
+    assert!(stderr(&blkio).contains("--blkio-weight is not supported"));
+}
+
+#[test]
 fn given_no_flags_when_updated_then_it_fails_asking_for_one() {
     // Arrange
     let d = Daemon::spawn();
