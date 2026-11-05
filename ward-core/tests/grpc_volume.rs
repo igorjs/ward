@@ -31,6 +31,7 @@ async fn given_empty_daemon_when_create_volume_then_returns_volume_info() {
         .create_volume(CreateVolumeRequest {
             name: "demo".into(),
             size_mb: 256,
+            ..Default::default()
         })
         .await
         .expect("create should succeed");
@@ -54,6 +55,7 @@ async fn given_existing_daemon_when_create_with_invalid_name_then_invalid_argume
         .create_volume(CreateVolumeRequest {
             name: "name with spaces".into(),
             size_mb: 256,
+            ..Default::default()
         })
         .await
         .expect_err("invalid name must be rejected");
@@ -80,6 +82,7 @@ async fn given_existing_volume_when_get_by_id_then_returns_same_info() {
         .create_volume(CreateVolumeRequest {
             name: "demo".into(),
             size_mb: 100,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -161,6 +164,7 @@ async fn given_two_created_volumes_when_list_then_both_appear() {
         .create_volume(CreateVolumeRequest {
             name: "alpha".into(),
             size_mb: 100,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -168,6 +172,7 @@ async fn given_two_created_volumes_when_list_then_both_appear() {
         .create_volume(CreateVolumeRequest {
             name: "beta".into(),
             size_mb: 200,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -199,6 +204,7 @@ async fn given_existing_volume_when_remove_then_subsequent_get_returns_not_found
         .create_volume(CreateVolumeRequest {
             name: "demo".into(),
             size_mb: 100,
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -248,6 +254,7 @@ async fn given_volumes_at_cap_when_create_one_more_then_invalid_argument_with_li
             .create_volume(CreateVolumeRequest {
                 name: format!("v{i}"),
                 size_mb: 10,
+                ..Default::default()
             })
             .await
             .expect("under cap");
@@ -258,6 +265,7 @@ async fn given_volumes_at_cap_when_create_one_more_then_invalid_argument_with_li
         .create_volume(CreateVolumeRequest {
             name: "overflow".into(),
             size_mb: 10,
+            ..Default::default()
         })
         .await
         .expect_err("over cap");
@@ -284,6 +292,7 @@ async fn given_volumes_at_cap_when_one_removed_then_create_again_succeeds() {
             .create_volume(CreateVolumeRequest {
                 name: format!("v{i}"),
                 size_mb: 10,
+                ..Default::default()
             })
             .await
             .unwrap()
@@ -302,6 +311,7 @@ async fn given_volumes_at_cap_when_one_removed_then_create_again_succeeds() {
         .create_volume(CreateVolumeRequest {
             name: "replacement".into(),
             size_mb: 10,
+            ..Default::default()
         })
         .await;
 

@@ -56,6 +56,27 @@ pub async fn image(socket: &str, reference: &str) -> i32 {
     code_of(answer)
 }
 
+/// The exit code for a volume named `reference`: a name, an ID or a unique
+/// ID prefix.
+pub async fn volume(socket: &str, reference: &str) -> i32 {
+    let answer = async {
+        let mut c = client::connect(socket).await?;
+        let volumes = c.list_volumes(()).await?.into_inner().volumes;
+        volume_code(&volumes, reference)
+    }
+    .await;
+    code_of(answer)
+}
+
+/// Exists, missing, or a failed check when the prefix fits several volumes.
+fn volume_code(volumes: &[ward_core::pb::VolumeInfo], reference: &str) -> anyhow::Result<i32> {
+    match crate::volume::find(volumes, reference) {
+        Ok(_) => Ok(EXISTS),
+        Err(crate::volume::FindError::NotFound(_)) => Ok(MISSING),
+        Err(ambiguous) => Err(anyhow::anyhow!("{ambiguous}")),
+    }
+}
+
 fn code_of(answer: anyhow::Result<i32>) -> i32 {
     answer.unwrap_or_else(|e| {
         eprintln!("Error: {e:?}");
@@ -119,5 +140,32 @@ mod tests {
     fn given_a_failed_check_when_coded_then_it_is_125() {
         assert_eq!(code_of(Err(anyhow::anyhow!("daemon down"))), FAILED);
         assert_eq!(code_of(Ok(MISSING)), MISSING);
+    }
+
+    fn volume_named(id: &str, name: &str) -> ward_core::pb::VolumeInfo {
+        ward_core::pb::VolumeInfo {
+            id: id.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::by_name("data", Some(EXISTS))]
+    #[case::by_unique_prefix("aab", Some(EXISTS))]
+    #[case::missing("nope", Some(MISSING))]
+    #[case::ambiguous_prefix("aa", None)]
+    fn given_volumes_when_checked_then_the_code_answers_and_an_ambiguous_prefix_fails(
+        #[case] reference: &str,
+        #[case] expected: Option<i32>,
+    ) {
+        let volumes = [
+            volume_named("aaa111", "cache"),
+            volume_named("aab222", "data"),
+        ];
+
+        let code = volume_code(&volumes, reference).ok();
+
+        assert_eq!(code, expected);
     }
 }

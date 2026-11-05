@@ -6,8 +6,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::{
-    BackendError, CacheMeta, DIGEST_ALGORITHM_PREFIX, HistoryEntry, ImageStore, Result,
-    validate_reference, write_meta_json,
+    BackendError, CacheMeta, DIGEST_ALGORITHM_PREFIX, HistoryEntry, ImageConfig, ImageStore,
+    Result, validate_reference, write_meta_json,
 };
 use crate::sync::LockUnpoisoned;
 
@@ -29,6 +29,8 @@ pub struct HistoryView {
     pub image_id: String,
     /// Oldest first.
     pub entries: Vec<HistoryEntry>,
+    /// The stored image config; default when the image has none.
+    pub config: ImageConfig,
 }
 
 /// How a name given by the user matched a cache entry.
@@ -180,9 +182,11 @@ impl ImageStore {
     /// The build steps of the image `name` refers to.
     pub fn image_history(&self, name: &str) -> Result<HistoryView> {
         let (_, meta, _) = self.require_named(name)?;
+        let config = meta.config.unwrap_or_default();
         Ok(HistoryView {
             image_id: meta.digest,
-            entries: meta.config.map(|config| config.history).unwrap_or_default(),
+            entries: config.history.clone(),
+            config,
         })
     }
 

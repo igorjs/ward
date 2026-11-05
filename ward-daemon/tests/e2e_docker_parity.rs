@@ -237,7 +237,8 @@ fn given_three_sandboxes_when_ps_last_and_latest_then_newest_come_first() {
 }
 
 #[test]
-fn given_sandbox_when_inspect_format_and_type_then_template_renders_and_image_type_is_refused() {
+fn given_sandbox_when_inspect_format_and_type_then_template_renders_and_image_type_finds_no_sandbox()
+ {
     // Arrange
     let d = Daemon::spawn();
     let id = create(&d, "web1");
@@ -255,7 +256,7 @@ fn given_sandbox_when_inspect_format_and_type_then_template_renders_and_image_ty
     assert_eq!(config.trim(), format!("\"{ALPINE}\""));
     assert!(!image.status.success());
     assert!(
-        stderr(&image).contains("not supported"),
+        stderr(&image).contains("No such image: web1"),
         "{}",
         stderr(&image)
     );

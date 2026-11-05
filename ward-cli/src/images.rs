@@ -213,7 +213,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 /// Splits `registry/name:tag` into its repository and tag. A reference with
 /// no tag is `latest`, and one pinned by digest has none.
-fn split_reference(reference: &str) -> (&str, &str) {
+pub(crate) fn split_reference(reference: &str) -> (&str, &str) {
     if let Some((repository, _)) = reference.split_once('@') {
         return (repository, NO_TAG);
     }

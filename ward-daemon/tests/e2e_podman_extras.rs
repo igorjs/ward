@@ -157,7 +157,13 @@ fn given_missing_arguments_when_exists_is_used_then_the_usage_error_exits_125() 
     let image = run(&d, &["image", "exists"]);
     let bare_digest = run(&d, &["image", "exists", "sha256:"]);
 
+    let volume = run(&d, &["volume", "exists"]);
+    let no_volume = run(&d, &["volume", "exists", "nope"]);
+
     // Assert
+    assert_eq!(volume.status.code(), Some(125));
+    assert_eq!(no_volume.status.code(), Some(1));
+    assert!(no_volume.stdout.is_empty() && no_volume.stderr.is_empty());
     assert_eq!(container.status.code(), Some(125));
     assert_eq!(image.status.code(), Some(125));
     assert_eq!(bare_digest.status.code(), Some(1));

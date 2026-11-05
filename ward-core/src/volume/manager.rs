@@ -47,6 +47,7 @@ struct VolumeEntry {
     created_at: SystemTime,
     /// The volume's own directory, which holds the metadata and the data.
     dir: PathBuf,
+    labels: HashMap<String, String>,
 }
 
 impl VolumeEntry {
@@ -62,6 +63,8 @@ struct VolumeMeta {
     name: String,
     size_mb: u32,
     created_at_secs: u64,
+    #[serde(default)]
+    labels: HashMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,30 +143,39 @@ impl VolumeManager {
     pub async fn create(&self, req: CreateVolumeRequest) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(&req.name)?;
         crate::validate::volume_size(req.size_mb)?;
-        self.create_if_missing(&req.name, req.size_mb).await
+        crate::validate::labels(&req.labels)?;
+        self.create_if_missing(&req.name, req.size_mb, req.labels)
+            .await
     }
 
     /// The volume called `name`, created with the default size when missing.
     pub async fn ensure(&self, name: &str) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(name)?;
-        self.create_if_missing(name, IMPLICIT_VOLUME_SIZE_MB).await
+        self.create_if_missing(name, IMPLICIT_VOLUME_SIZE_MB, HashMap::new())
+            .await
     }
 
     /// Create the volume called `name`, which must not exist yet.
     pub async fn create_new(&self, name: &str) -> Result<PbVolumeInfo> {
         crate::validate::volume_name(name)?;
-        self.insert_volume(name, IMPLICIT_VOLUME_SIZE_MB, true)
+        self.insert_volume(name, IMPLICIT_VOLUME_SIZE_MB, HashMap::new(), true)
             .await
     }
 
-    async fn create_if_missing(&self, name: &str, size_mb: u32) -> Result<PbVolumeInfo> {
-        self.insert_volume(name, size_mb, false).await
+    async fn create_if_missing(
+        &self,
+        name: &str,
+        size_mb: u32,
+        labels: HashMap<String, String>,
+    ) -> Result<PbVolumeInfo> {
+        self.insert_volume(name, size_mb, labels, false).await
     }
 
     async fn insert_volume(
         &self,
         name: &str,
         size_mb: u32,
+        labels: HashMap<String, String>,
         must_be_new: bool,
     ) -> Result<PbVolumeInfo> {
         // The write lock spans the check and the insert, so two sandboxes
@@ -193,6 +205,7 @@ impl VolumeManager {
             size_mb,
             created_at: SystemTime::now(),
             dir: self.data_dir.join(VOLUMES_DIR).join(&id),
+            labels,
         };
         write_volume(&entry).await?;
         volumes.insert(id, entry.clone());
@@ -310,6 +323,7 @@ async fn write_volume(entry: &VolumeEntry) -> Result<()> {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        labels: entry.labels.clone(),
     };
     let json = serde_json::to_vec(&meta)
         .map_err(|e| ApiError::Internal(format!("encode volume metadata: {e}")))?;
@@ -372,6 +386,7 @@ fn read_entry(dir: &Path) -> std::result::Result<VolumeEntry, String> {
         size_mb: meta.size_mb,
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(meta.created_at_secs),
         dir: dir.to_path_buf(),
+        labels: meta.labels,
     })
 }
 
@@ -394,6 +409,7 @@ fn entry_to_pb(e: VolumeEntry) -> PbVolumeInfo {
             seconds: d.as_secs() as i64,
             nanos: d.subsec_nanos() as i32,
         }),
+        labels: e.labels,
     }
 }
 
@@ -424,6 +440,7 @@ mod tests {
         CreateVolumeRequest {
             name: name.to_string(),
             size_mb,
+            ..Default::default()
         }
     }
 
@@ -795,5 +812,52 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(data_mode & 0o777, DIR_MODE);
+    }
+
+    #[tokio::test]
+    async fn given_labels_when_volume_created_then_they_are_kept_and_listed() {
+        // Arrange
+        let mgr = build_manager(4);
+        let mut request = req("tagged", 10);
+        request.labels = [("env".to_string(), "dev".to_string())].into();
+
+        // Act
+        let created = mgr.create(request).await.expect("create");
+        let listed = mgr.list().await.expect("list");
+
+        // Assert
+        assert_eq!(created.labels["env"], "dev");
+        assert_eq!(listed[0].labels, created.labels);
+    }
+
+    #[tokio::test]
+    async fn given_an_empty_label_key_when_volume_created_then_it_is_refused() {
+        // Arrange
+        let mgr = build_manager(4);
+        let mut request = req("tagged", 10);
+        request.labels = [(String::new(), "x".to_string())].into();
+
+        // Act
+        let result = mgr.create(request).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::InvalidRequest(_))));
+    }
+
+    #[tokio::test]
+    async fn given_a_labelled_volume_when_the_manager_reopens_then_the_labels_are_loaded() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = VolumeManager::new(dir.path().to_path_buf(), 4);
+        let mut request = req("tagged", 10);
+        request.labels = [("env".to_string(), "dev".to_string())].into();
+        first.create(request).await.expect("create");
+
+        // Act
+        let second = VolumeManager::new(dir.path().to_path_buf(), 4);
+        let listed = second.list().await.expect("list");
+
+        // Assert
+        assert_eq!(listed[0].labels["env"], "dev");
     }
 }
