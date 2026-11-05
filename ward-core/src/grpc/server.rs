@@ -370,7 +370,7 @@ impl Ward for WardGrpcServer {
         let id = authorized_id(&self.sandbox, &req.id, &token).await?;
         let info = self
             .sandbox
-            .stop_within(&id, req.grace_seconds)
+            .stop_with_signal(&id, req.grace_seconds, req.signal.as_deref())
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(info))
@@ -403,7 +403,7 @@ impl Ward for WardGrpcServer {
         let id = authorized_id(&self.sandbox, &req.id, &token).await?;
         let info = self
             .sandbox
-            .restart_within(&id, req.grace_seconds)
+            .restart_with_signal(&id, req.grace_seconds, req.signal.as_deref())
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(info))

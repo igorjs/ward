@@ -43,6 +43,7 @@ mod secrets;
 mod socket;
 mod start_attach;
 mod stats;
+mod stop_options;
 mod system;
 mod tag;
 mod template;
@@ -467,6 +468,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Start one or more stopped sandboxes.
@@ -488,6 +493,10 @@ enum Commands {
         refs: Vec<String>,
         #[arg(short = 't', long = "time", visible_alias = "timeout", allow_hyphen_values = true, help = stop_time_help())]
         time: Option<i32>,
+        /// Signal that asks the main process to end, by name or number,
+        /// instead of the sandbox's stop signal.
+        #[arg(short = 's', long, value_name = "SIGNAL")]
+        signal: Option<String>,
     },
 
     /// Remove one or more sandboxes.
@@ -1613,10 +1622,11 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
         },
 
-        Commands::Stop { refs, time } => {
+        Commands::Stop { refs, time, signal } => {
             let mut c = client::connect(&socket_path).await?;
             let action = lifecycle::Action::Stop;
-            lifecycle::lifecycle(&mut c, &token_store, action, &refs, time, json).await?;
+            let stop = stop_options::StopOptions::new(time, signal)?;
+            lifecycle::lifecycle(&mut c, &token_store, action, &refs, &stop, json).await?;
         }
 
         Commands::Start { refs, attach } if attach.wanted() => {
@@ -1636,20 +1646,21 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &token_store,
                 lifecycle::Action::Start,
                 &refs,
-                None,
+                &stop_options::StopOptions::default(),
                 json,
             )
             .await?;
         }
 
-        Commands::Restart { refs, time } => {
+        Commands::Restart { refs, time, signal } => {
+            let stop = stop_options::StopOptions::new(time, signal)?;
             let mut c = client::connect(&socket_path).await?;
             lifecycle::lifecycle(
                 &mut c,
                 &token_store,
                 lifecycle::Action::Restart,
                 &refs,
-                time,
+                &stop,
                 json,
             )
             .await?;
@@ -2559,6 +2570,23 @@ mod tests {
         match cli.command {
             Commands::Restart { time, .. } => assert_eq!(time, Some(5)),
             other => panic!("expected Restart, got {other:?}"),
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::stop_short(&["ward", "stop", "-s", "SIGINT", "web1"])]
+    #[case::stop_long(&["ward", "stop", "--signal", "SIGINT", "web1"])]
+    #[case::restart_short(&["ward", "restart", "-s", "SIGINT", "web1"])]
+    fn given_a_signal_flag_when_parsed_then_it_is_kept(#[case] args: &[&str]) {
+        // Act
+        let cli = Cli::try_parse_from(args).expect("parse");
+
+        // Assert
+        match cli.command {
+            Commands::Stop { signal, .. } | Commands::Restart { signal, .. } => {
+                assert_eq!(signal.as_deref(), Some("SIGINT"));
+            }
+            other => panic!("expected Stop or Restart, got {other:?}"),
         }
     }
 

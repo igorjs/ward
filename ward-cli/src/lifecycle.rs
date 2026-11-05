@@ -19,6 +19,7 @@ use ward_core::pb::{
 };
 
 use crate::client::{self, Resolved};
+use crate::stop_options::StopOptions;
 use crate::tokens;
 
 /// The state change a lifecycle command asks for.
@@ -43,19 +44,27 @@ impl Action {
         self,
         c: &mut WardClient<Channel>,
         target: &Resolved,
-        grace_seconds: Option<i32>,
+        stop: &StopOptions,
     ) -> Result<()> {
         let id = target.id.clone();
         match self {
             Self::Stop => {
-                let request = StopRequest { id, grace_seconds };
+                let request = StopRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.stop(target.request(request)?).await?;
             }
             Self::Start => {
                 c.start(target.request(StartRequest { id })?).await?;
             }
             Self::Restart => {
-                let request = RestartRequest { id, grace_seconds };
+                let request = RestartRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.restart(target.request(request)?).await?;
             }
         }
@@ -97,14 +106,14 @@ pub async fn lifecycle(
     token_store: &Path,
     action: Action,
     refs: &[String],
-    grace_seconds: Option<i32>,
+    stop: &StopOptions,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
     for reference in refs {
         let result = async {
             let target = client::resolve(c, token_store, reference).await?;
-            action.call(c, &target, grace_seconds).await
+            action.call(c, &target, stop).await
         }
         .await;
         match result {

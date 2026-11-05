@@ -99,6 +99,7 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 - `cp`, `top`, `stats` and `logs` work on a paused sandbox, as they do in Docker, because the agent answers outside the frozen group.
 - The guest clock and the sandbox timeout (`--timeout`) keep running while paused.
 - `exec` fails with `Container ID is paused, unpause the container before exec`.
+- `ward stop -s/--signal` and `ward restart -s/--signal` take a signal name or number and send it to the main process instead of the sandbox's `--stop-signal`. The grace period (`-t`, `--stop-timeout`) and the SIGKILL after it work the same. An unknown signal fails before anything is stopped.
 - `stop`, `restart` and `kill` with SIGKILL or the stop signal thaw the sandbox first, so the signal is delivered, as Docker does. `rm -f` removes it without thawing. Any other `kill` signal stays pending until `unpause`.
 - A paused sandbox shows `Up X (Paused)` in `ps`, `paused` as its state (so `--filter status=paused` works and `status=running` leaves it out), and `State.Paused` and `State.Status` in `inspect`. `ward events` reports `pause` and `unpause`.
 - The paused state is not kept across a daemon restart, because the VM does not survive one either.
