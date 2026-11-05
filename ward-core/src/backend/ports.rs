@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::{Backend, Result};
+use crate::protocol::PortProtocol;
 
 /// Why a sandbox without a microVM cannot publish ports.
 pub const NEEDS_MICROVM: &str = "port publishing needs a microVM";
@@ -26,7 +27,13 @@ pub type PortListener = Box<dyn OpenPort>;
 /// can stand in for the network stack.
 #[async_trait::async_trait]
 pub trait PortForwarder: Send + Sync {
-    async fn open(&self, id: &str, bind: SocketAddr, guest_port: u16) -> Result<PortListener>;
+    async fn open(
+        &self,
+        id: &str,
+        bind: SocketAddr,
+        guest_port: u16,
+        protocol: PortProtocol,
+    ) -> Result<PortListener>;
 }
 
 /// Forwards through the backend that runs the sandbox.
@@ -34,7 +41,13 @@ pub struct BackendForwarder(pub Arc<dyn Backend>);
 
 #[async_trait::async_trait]
 impl PortForwarder for BackendForwarder {
-    async fn open(&self, id: &str, bind: SocketAddr, guest_port: u16) -> Result<PortListener> {
-        self.0.publish_port(id, bind, guest_port).await
+    async fn open(
+        &self,
+        id: &str,
+        bind: SocketAddr,
+        guest_port: u16,
+        protocol: PortProtocol,
+    ) -> Result<PortListener> {
+        self.0.publish_port(id, bind, guest_port, protocol).await
     }
 }

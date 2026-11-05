@@ -5,7 +5,8 @@
 //! A host `TcpListener` accepts connections and hands each one to the
 //! smoltcp task, which opens a TCP connection from the gateway address to
 //! the guest and relays bytes both ways. Only TCP, and only toward the
-//! guest: egress policy does not apply to these flows.
+//! guest: egress policy does not apply to these flows. UDP is in
+//! `crate::inbound_udp`.
 
 use std::collections::VecDeque;
 use std::hash::{BuildHasher, RandomState};
@@ -120,6 +121,14 @@ pub struct InboundHandle {
 }
 
 impl InboundHandle {
+    pub(crate) fn new(local_addr: SocketAddr, accept_task: JoinHandle<()>, alive: Arc<()>) -> Self {
+        InboundHandle {
+            local_addr,
+            accept_task,
+            _alive: alive,
+        }
+    }
+
     /// Address the host listener is bound to (carries the chosen port when
     /// port 0 was requested).
     #[must_use]

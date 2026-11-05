@@ -323,13 +323,44 @@ impl SandboxSpec {
     }
 }
 
-/// A host TCP port forwarded to a guest port.
+/// Transport of a published port.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// A host port forwarded to a guest port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedPort {
     pub host_ip: std::net::IpAddr,
     /// 0 asks for any free port when the sandbox is created.
     pub host_port: u16,
+    /// Last port of a host range to try, or 0 for the single `host_port`.
+    /// Cleared once a port is bound.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub host_port_end: u16,
     pub container_port: u16,
+    #[serde(default)]
+    pub protocol: PortProtocol,
+}
+
+fn is_zero(value: &u16) -> bool {
+    *value == 0
 }
 
 impl PublishedPort {

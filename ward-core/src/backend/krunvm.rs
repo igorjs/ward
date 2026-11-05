@@ -720,6 +720,7 @@ impl Backend for KrunvmBackend {
         id: &str,
         bind: std::net::SocketAddr,
         guest_port: u16,
+        protocol: crate::protocol::PortProtocol,
     ) -> Result<super::ports::PortListener> {
         let sandboxes = self.sandboxes.read().await;
         let state = sandboxes
@@ -730,17 +731,18 @@ impl Backend for KrunvmBackend {
                 "port publishing needs the smoltcp network backend".to_string(),
             )
         })?;
-        let handle = smoltcp
-            .add_inbound(bind, guest_port)
-            .await
-            .map_err(|e| match e {
-                ward_net::Error::Listen { source, .. }
-                    if source.kind() == std::io::ErrorKind::AddrInUse =>
-                {
-                    BackendError::AddressInUse(bind.to_string())
-                }
-                other => BackendError::Internal(format!("cannot publish {bind}: {other}")),
-            })?;
+        let opened = match protocol {
+            crate::protocol::PortProtocol::Tcp => smoltcp.add_inbound(bind, guest_port).await,
+            crate::protocol::PortProtocol::Udp => smoltcp.add_inbound_udp(bind, guest_port).await,
+        };
+        let handle = opened.map_err(|e| match e {
+            ward_net::Error::Listen { source, .. }
+                if source.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                BackendError::AddressInUse(bind.to_string())
+            }
+            other => BackendError::Internal(format!("cannot publish {bind}: {other}")),
+        })?;
         Ok(Box::new(handle))
     }
 

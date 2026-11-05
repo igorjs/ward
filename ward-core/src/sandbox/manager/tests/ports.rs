@@ -36,12 +36,15 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
 struct FakeForwarder {
     /// Bind address and guest port of every `open`.
     opened: StdMutex<Vec<(SocketAddr, u16)>>,
+    /// Protocol of every `open`, in the same order.
+    protocols: StdMutex<Vec<crate::protocol::PortProtocol>>,
 }
 
 impl FakeForwarder {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             opened: StdMutex::new(Vec::new()),
+            protocols: StdMutex::new(Vec::new()),
         })
     }
 
@@ -80,6 +83,25 @@ impl Drop for FakePort {
     }
 }
 
+impl FakeForwarder {
+    /// A UDP socket that holds the port and serves nothing.
+    async fn open_udp(bind: SocketAddr) -> crate::backend::Result<PortListener> {
+        let socket = tokio::net::UdpSocket::bind(bind).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                BackendError::AddressInUse(bind.to_string())
+            } else {
+                BackendError::Internal(e.to_string())
+            }
+        })?;
+        let addr = socket.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+        Ok(Box::new(FakePort { addr, serving }))
+    }
+}
+
 #[async_trait::async_trait]
 impl PortForwarder for FakeForwarder {
     async fn open(
@@ -87,8 +109,13 @@ impl PortForwarder for FakeForwarder {
         _id: &str,
         bind: SocketAddr,
         guest_port: u16,
+        protocol: crate::protocol::PortProtocol,
     ) -> crate::backend::Result<PortListener> {
         use tokio::io::AsyncWriteExt;
+        self.protocols.lock().unwrap().push(protocol);
+        if protocol == crate::protocol::PortProtocol::Udp {
+            return Self::open_udp(bind).await;
+        }
         self.opened.lock().unwrap().push((bind, guest_port));
         let listener = TcpListener::bind(bind).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::AddrInUse {
@@ -120,12 +147,27 @@ fn port_manager() -> (Arc<SandboxManager>, Arc<FakeForwarder>) {
     (with_forwarder(host_manager(MAIN_OUTPUT_CAP), &fwd), fwd)
 }
 
+/// Highest port a test range starts from, so the range end stays valid.
+const LOW_PORT_CEILING: u16 = 65_000;
+/// Ports a test range spans beyond its first.
+const RANGE_SPAN: u32 = 8;
+
+/// A bound loopback port with room above it for a range.
+fn bind_low_port() -> std::net::TcpListener {
+    loop {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        if listener.local_addr().unwrap().port() <= LOW_PORT_CEILING {
+            return listener;
+        }
+    }
+}
+
 fn mapping(host_ip: &str, host_port: u32, container_port: u32) -> crate::pb::PortMapping {
     crate::pb::PortMapping {
         host_ip: host_ip.to_string(),
         host_port,
         container_port,
-        protocol: String::new(),
+        ..Default::default()
     }
 }
 
@@ -378,4 +420,115 @@ async fn given_no_published_ports_when_created_then_the_forwarder_is_not_used() 
     // Assert
     assert!(info.published_ports.is_empty());
     assert!(fwd.opened().is_empty());
+}
+
+#[tokio::test]
+async fn given_a_udp_mapping_when_published_then_the_forwarder_opens_it_as_udp() {
+    let _serial = serial().await;
+    // Arrange
+    let (mgr, fwd) = port_manager();
+    let ports = vec![crate::pb::PortMapping {
+        protocol: "udp".into(),
+        ..mapping(LOOPBACK, ANY_PORT, HTTP_PORT)
+    }];
+
+    // Act
+    let info = mgr.create(req_with(ports, &[]), "").await.unwrap();
+
+    // Assert
+    assert_eq!(
+        *fwd.protocols.lock().unwrap(),
+        vec![crate::protocol::PortProtocol::Udp]
+    );
+    assert_eq!(info.published_ports[0].protocol, "udp");
+}
+
+#[tokio::test]
+async fn given_a_host_range_with_its_first_port_busy_when_published_then_a_later_port_is_bound() {
+    let _serial = serial().await;
+    // Arrange
+    let (mgr, _) = port_manager();
+    let occupied = bind_low_port();
+    let busy = u32::from(occupied.local_addr().unwrap().port());
+    let range_end = busy + RANGE_SPAN;
+    let ports = vec![crate::pb::PortMapping {
+        host_port_end: range_end,
+        ..mapping(LOOPBACK, busy, HTTP_PORT)
+    }];
+
+    // Act
+    let info = mgr.create(req_with(ports, &[]), "").await.unwrap();
+
+    // Assert
+    let chosen = info.published_ports[0].host_port;
+    assert!((busy + 1..=range_end).contains(&chosen), "chose {chosen}");
+}
+
+#[tokio::test]
+async fn given_a_host_range_that_is_all_busy_when_published_then_it_fails_with_address_in_use() {
+    let _serial = serial().await;
+    // Arrange
+    let (mgr, _) = port_manager();
+    let occupied = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let busy = u32::from(occupied.local_addr().unwrap().port());
+    let ports = vec![crate::pb::PortMapping {
+        host_port_end: busy,
+        ..mapping(LOOPBACK, busy, HTTP_PORT)
+    }];
+
+    // Act
+    let err = mgr.create(req_with(ports, &[]), "").await.unwrap_err();
+
+    // Assert
+    assert!(matches!(err, ApiError::AddressInUse(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn given_a_busy_udp_host_port_when_published_then_it_fails_with_address_in_use() {
+    let _serial = serial().await;
+    // Arrange
+    let (mgr, _) = port_manager();
+    let occupied = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let busy = u32::from(occupied.local_addr().unwrap().port());
+    let ports = vec![crate::pb::PortMapping {
+        protocol: "udp".into(),
+        ..mapping(LOOPBACK, busy, HTTP_PORT)
+    }];
+
+    // Act
+    let err = mgr.create(req_with(ports, &[]), "").await.unwrap_err();
+
+    // Assert
+    assert!(matches!(err, ApiError::AddressInUse(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn given_a_range_listed_before_a_fixed_port_inside_it_when_published_then_both_open() {
+    let _serial = serial().await;
+    // Arrange
+    let (mgr, _) = port_manager();
+    let probe = bind_low_port();
+    let wanted = u32::from(probe.local_addr().unwrap().port());
+    drop(probe);
+    let ports = vec![
+        crate::pb::PortMapping {
+            host_port_end: wanted + RANGE_SPAN,
+            ..mapping(LOOPBACK, wanted, HTTP_PORT)
+        },
+        mapping(LOOPBACK, wanted, HTTPS_PORT),
+    ];
+
+    // Act
+    let info = mgr.create(req_with(ports, &[]), "").await.unwrap();
+
+    // Assert
+    let by_container = |port: u32| {
+        info.published_ports
+            .iter()
+            .find(|m| m.container_port == port)
+            .unwrap()
+            .host_port
+    };
+    assert_eq!(by_container(HTTPS_PORT), wanted);
+    assert_ne!(by_container(HTTP_PORT), wanted);
 }
