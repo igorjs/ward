@@ -239,6 +239,25 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Hex characters in the name of an anonymous volume, as Docker makes them.
+const ANONYMOUS_VOLUME_NAME_LEN: usize = 64;
+
+/// An anonymous volume is named by 64 lowercase hex characters. The daemon
+/// only treats a volume as anonymous when it has this name and is new.
+pub fn anonymous_volume_name(name: &str) -> Result<(), ApiError> {
+    let hex = name.len() == ANONYMOUS_VOLUME_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidRequest(format!(
+            "an anonymous volume needs a name of {ANONYMOUS_VOLUME_NAME_LEN} lowercase hex characters"
+        )))
+    }
+}
+
 /// Validate a volume size request.
 ///
 /// Rejects zero (no backing image possible) and sizes above `MAX_VOLUME_SIZE_MB`

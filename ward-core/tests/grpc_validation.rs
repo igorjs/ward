@@ -164,7 +164,10 @@ async fn remove_sandbox_rejects_empty_id() {
     let mut client = common::test_server().await;
 
     let err = client
-        .remove_sandbox(RemoveSandboxRequest { id: String::new() })
+        .remove_sandbox(RemoveSandboxRequest {
+            id: String::new(),
+            ..Default::default()
+        })
         .await
         .expect_err("empty ID must be rejected");
 

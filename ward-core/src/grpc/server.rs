@@ -307,7 +307,10 @@ impl Ward for WardGrpcServer {
             .authorize(&id, &token)
             .await
             .map_err(api_err_to_status)?;
-        self.sandbox.remove(&id).await.map_err(api_err_to_status)?;
+        self.sandbox
+            .remove_with_volumes(&id, req.remove_volumes)
+            .await
+            .map_err(api_err_to_status)?;
         Ok(Response::new(()))
     }
 

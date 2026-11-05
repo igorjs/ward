@@ -195,6 +195,9 @@ message CreateSandboxRequest {
   RestartPolicy restart_policy = 25;
   // Guest setup options, like Docker's HostConfig.
   GuestOptions guest = 26;
+  // Sandboxes whose volume and bind mounts this one shares, each
+  // "SANDBOX[:ro|rw]". The daemon resolves them when it creates the sandbox.
+  repeated string volumes_from = 27;
 }
 
 // Guest setup options of `docker run`. Every field is optional; new ones are
@@ -330,6 +333,9 @@ message GetSandboxRequest {
 
 message RemoveSandboxRequest {
   string id = 1;
+  // Also remove the anonymous volumes of the sandbox that no other sandbox
+  // mounts, like `docker rm -v`.
+  bool remove_volumes = 2;
 }
 
 // `id` is a sandbox name, id or unique id prefix.
@@ -444,6 +450,9 @@ message Mount {
   // Name of a daemon-managed volume. When set, the daemon creates the volume
   // if it is missing and fills in the source path.
   string volume = 4;
+  // The volume was made for this mount alone, so removing the sandbox with
+  // remove_volumes (or --rm) removes it too.
+  bool anonymous = 5;
 }
 
 message EgressPolicy {

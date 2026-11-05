@@ -86,3 +86,40 @@ fn given_a_read_only_volume_mount_when_written_then_the_write_fails() {
     assert!(out.contains('x'), "{out}");
     assert!(out.contains("write-refused"), "{out}");
 }
+
+#[test]
+fn given_an_anonymous_volume_when_a_run_writes_then_rm_leaves_no_volume() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+
+    // Act
+    let out = run_script(
+        &d,
+        &["-v", "/scratch"],
+        "echo x > /scratch/f && cat /scratch/f",
+    );
+
+    // Assert
+    assert_eq!(out.trim(), "x");
+    assert_eq!(run_ok(&d, &["volume", "ls", "-q"]), "");
+}
+
+#[test]
+fn given_volumes_from_a_sandbox_when_run_then_the_guest_sees_the_same_files() {
+    require_vm!();
+    // Arrange
+    let d = Daemon::spawn_vm();
+    run_script(&d, &["-v", "shared:/data"], "echo from-first > /data/note");
+    let image = image();
+    run_ok(
+        &d,
+        &["create", "--name", "owner", "-v", "shared:/data", &image],
+    );
+
+    // Act
+    let out = run_script(&d, &["--volumes-from", "owner:ro"], "cat /data/note");
+
+    // Assert
+    assert_eq!(out.trim(), "from-first");
+}

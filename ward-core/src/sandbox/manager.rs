@@ -713,6 +713,55 @@ struct Teardown {
     exited_ttl: Option<std::time::Duration>,
     /// Where a main process that may need starting again is reported.
     restarts: mpsc::UnboundedSender<RestartRequest>,
+    volumes: Option<Arc<crate::volume::VolumeManager>>,
+}
+
+/// Separates the sandbox from the mode in a `volumes_from` entry.
+const VOLUMES_FROM_MODE_SEPARATOR: char = ':';
+
+/// IDs of the sandboxes in `entries` that mount the volume called `name`.
+async fn volume_users_in(
+    entries: &RwLock<HashMap<String, SandboxEntry>>,
+    name: &str,
+) -> Vec<String> {
+    entries
+        .read()
+        .await
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .meta
+                .options
+                .mounts
+                .iter()
+                .any(|m| m.volume.as_deref() == Some(name))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Remove the anonymous volumes among `mounts` that no sandbox mounts or is
+/// being created to mount. One that cannot be removed stays; nothing depends
+/// on it.
+async fn release_anonymous_volumes(teardown: &Teardown, mounts: &[crate::protocol::Mount]) {
+    let Some(volumes) = &teardown.volumes else {
+        return;
+    };
+    for name in mounts
+        .iter()
+        .filter(|m| m.anonymous)
+        .filter_map(|m| m.volume.as_deref())
+    {
+        let entries = &teardown.entries;
+        let result = volumes
+            .remove_unused_by_name(name, |volume| async move {
+                volume_users_in(entries, &volume).await
+            })
+            .await;
+        if let Err(e) = result {
+            tracing::warn!(volume = name, error = %e, "cannot remove an anonymous volume");
+        }
+    }
 }
 
 fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -> SandboxEvent {
@@ -960,6 +1009,7 @@ impl SandboxManager {
             events: self.events.clone(),
             exited_ttl: self.exited_ttl,
             restarts: self.restart_tx.clone(),
+            volumes: self.volumes.clone(),
         }
     }
 
@@ -1035,34 +1085,77 @@ impl SandboxManager {
         self
     }
 
-    /// Claim the volume called `name`, creating it when missing, and return
-    /// its host path.
-    async fn claim_volume(&self, name: &str) -> Result<(crate::volume::VolumeClaim, String)> {
+    /// Claim the volume called `name` and return its host path. A volume that
+    /// is not `must_be_new` is created when missing; one that is must not
+    /// exist yet.
+    async fn claim_volume(
+        &self,
+        name: &str,
+        must_be_new: bool,
+    ) -> Result<(crate::volume::VolumeClaim, String)> {
         let volumes = self.volumes.as_ref().ok_or_else(|| {
             ApiError::InvalidRequest("this daemon cannot mount named volumes".into())
         })?;
         let claim = volumes.claim(name);
-        let path = volumes.ensure(name).await?.mount_path;
-        Ok((claim, path))
+        let info = if must_be_new {
+            volumes.create_new(name).await?
+        } else {
+            volumes.ensure(name).await?
+        };
+        Ok((claim, info.mount_path))
+    }
+
+    /// The mounts that `volumes_from` ("SANDBOX[:ro|rw]") stands for, with a
+    /// claim on each volume. They are read and claimed under the entries
+    /// lock, so the source cannot lose a volume in between. A mount whose
+    /// target is in `taken` is skipped: the explicit one wins.
+    async fn inherit_mounts(
+        &self,
+        volumes_from: &[String],
+        taken: &std::collections::HashSet<String>,
+    ) -> Result<(Vec<crate::protocol::Mount>, Vec<crate::volume::VolumeClaim>)> {
+        let mut mounts: Vec<crate::protocol::Mount> = Vec::new();
+        let mut claims = Vec::new();
+        for spec in volumes_from {
+            let (reference, mode) = spec
+                .split_once(VOLUMES_FROM_MODE_SEPARATOR)
+                .map_or((spec.as_str(), None), |(r, m)| (r, Some(m)));
+            let readonly = match mode {
+                None | Some("rw") => false,
+                Some("ro") => true,
+                Some(other) => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "invalid volumes-from mode \"{other}\" in \"{spec}\": use ro or rw"
+                    )));
+                }
+            };
+            let id = self.resolve(reference).await?;
+            let entries = self.entries.read().await;
+            let source = entries
+                .get(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(reference.to_string()))?;
+            for mount in &source.meta.options.mounts {
+                let target_taken = taken.contains(&mount.target)
+                    || mounts.iter().any(|m| m.target == mount.target);
+                if target_taken {
+                    continue;
+                }
+                if let (Some(name), Some(volumes)) = (&mount.volume, &self.volumes) {
+                    claims.push(volumes.claim(name));
+                }
+                mounts.push(crate::protocol::Mount {
+                    readonly: mount.readonly || readonly,
+                    ..mount.clone()
+                });
+            }
+        }
+        Ok((mounts, claims))
     }
 
     /// IDs of the sandboxes, stopped ones included, that mount the volume
     /// called `name`.
     pub async fn volume_users(&self, name: &str) -> Vec<String> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .meta
-                    .options
-                    .mounts
-                    .iter()
-                    .any(|m| m.volume.as_deref() == Some(name))
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
+        volume_users_in(&self.entries, name).await
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -1508,21 +1601,45 @@ impl SandboxManager {
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: None,
+                    anonymous: false,
                 });
             } else {
                 // The host path is the daemon's own, so the client's source
                 // is ignored and the host allowlist does not apply.
                 crate::validate::volume_mount(&m.volume, &m.target)?;
-                let (claim, source) = self.claim_volume(&m.volume).await?;
+                // Only a volume the daemon makes for this mount is anonymous.
+                let anonymous = m.anonymous;
+                if anonymous {
+                    crate::validate::anonymous_volume_name(&m.volume)?;
+                }
+                let (claim, source) = self.claim_volume(&m.volume, anonymous).await?;
                 volume_claims.push(claim);
                 mounts.push(crate::protocol::Mount {
                     source,
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: Some(m.volume.clone()),
+                    anonymous,
                 });
             }
         }
+        let taken: std::collections::HashSet<String> = mounts
+            .iter()
+            .map(|m| m.target.clone())
+            .chain(
+                req.guest
+                    .iter()
+                    .flat_map(|guest| guest.tmpfs.iter().map(|t| t.path.clone())),
+            )
+            .collect();
+        let (inherited, inherited_claims) = self.inherit_mounts(&req.volumes_from, &taken).await?;
+        for m in &inherited {
+            if m.volume.is_none() {
+                crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
+            }
+        }
+        mounts.extend(inherited);
+        volume_claims.extend(inherited_claims);
 
         // Validate volume references before they reach the backend.
         for vid in &req.volume_ids {
@@ -2161,11 +2278,23 @@ impl SandboxManager {
 
     /// Remove a sandbox.
     pub async fn remove(&self, id: &str) -> Result<()> {
+        self.remove_with_volumes(id, false).await
+    }
+
+    /// Remove a sandbox. With `remove_volumes`, its anonymous volumes go too,
+    /// unless another sandbox still mounts them.
+    pub async fn remove_with_volumes(&self, id: &str, remove_volumes: bool) -> Result<()> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
+        let mounts = match self.entries.read().await.get(id) {
+            Some(entry) if remove_volumes => entry.meta.options.mounts.clone(),
+            _ => Vec::new(),
+        };
         Self::cleanup_sandbox_inner(&self.teardown(), id, /* from_timeout = */ false)
             .await
-            .map_err(backend_err)
+            .map_err(backend_err)?;
+        release_anonymous_volumes(&self.teardown(), &mounts).await;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -3091,6 +3220,9 @@ impl SandboxManager {
         }
         let result = teardown.backend.remove_sandbox(id).await;
         if let Some(RemovedEntry { meta, .. }) = removed {
+            if meta.options.spec.auto_remove {
+                release_anonymous_volumes(teardown, &meta.options.mounts).await;
+            }
             metrics::counter!("wardd_sandbox_remove_total").increment(1);
             metrics::gauge!("wardd_sandbox_active").decrement(1.0);
             // Removing a running sandbox kills it, as `docker rm -f` does.
@@ -3610,6 +3742,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 target: m.target.clone(),
                 readonly: m.readonly,
                 volume: m.volume.clone().unwrap_or_default(),
+                anonymous: m.anonymous,
             })
             .collect(),
         paused: info.paused,
