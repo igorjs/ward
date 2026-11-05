@@ -8050,7 +8050,9 @@ pub(crate) mod tests {
     #[cfg(not(feature = "krunvm"))]
     const STOP_SIGNAL_EXIT_CODE: i32 = 42;
     /// A stop grace of -1 waits as long as it takes.
+    #[cfg(not(feature = "krunvm"))]
     const WAIT_FOREVER: i32 = -1;
+    #[cfg(not(feature = "krunvm"))]
     const RESTART_SIGNAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const DEFAULT_HOSTNAME_LEN: usize = 12;
     #[cfg(not(feature = "krunvm"))]
