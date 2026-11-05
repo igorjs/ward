@@ -970,4 +970,43 @@ mod tests {
         // Assert
         assert!(error.contains(said), "{error}");
     }
+
+    #[test]
+    fn given_a_cgroup_update_when_applied_then_only_the_named_fields_change() {
+        let base = CgroupLimits {
+            cpu_shares: 512,
+            cpuset_cpus: "0".into(),
+            cpu_quota: 1000,
+            ..Default::default()
+        };
+        let update = CgroupUpdate {
+            cpu_shares: Some(1024),
+            cpuset_cpus: Some(String::new()),
+            ..Default::default()
+        };
+
+        let next = base.updated(&update);
+
+        assert_eq!(next.cpu_shares, 1024);
+        assert_eq!(next.cpuset_cpus, "");
+        assert_eq!(next.cpu_quota, 1000);
+    }
+
+    #[test]
+    fn given_a_cgroup_update_when_undone_then_the_previous_values_come_back_for_its_fields() {
+        let previous = CgroupLimits {
+            cpu_shares: 512,
+            cpu_period: 200_000,
+            ..Default::default()
+        };
+        let update = CgroupUpdate {
+            cpu_shares: Some(1024),
+            ..Default::default()
+        };
+
+        let undo = update.undoing(&previous);
+
+        assert_eq!(undo.cpu_shares, Some(512));
+        assert_eq!(undo.cpu_period, None);
+    }
 }

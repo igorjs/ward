@@ -903,6 +903,8 @@ impl Backend for KrunvmBackend {
             }
             state.vm_size.is_some()
         };
+        // Merged here and stored below under a later lock: the manager
+        // serialises the updates of one sandbox, which keeps the base fresh.
         let merged = {
             let sandboxes = self.sandboxes.read().await;
             let state = sandboxes

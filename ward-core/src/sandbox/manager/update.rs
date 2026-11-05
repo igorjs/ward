@@ -22,7 +22,7 @@ impl SandboxManager {
     /// back in the VM.
     pub async fn update(&self, req: UpdateSandboxRequest) -> Result<PbSandboxInfo> {
         let id = self.resolve(&req.id).await?;
-        let limits = LimitsUpdate {
+        let mut limits = LimitsUpdate {
             memory_mb: req.memory_mb,
             nano_cpus: req.nano_cpus,
             pids_max: req.pids_max,
@@ -45,6 +45,15 @@ impl SandboxManager {
             .await?;
         let previous = self.recorded_limits(&id).await?;
         let previous_cgroup = self.recorded_cgroup(&id).await?;
+        // A recorded swap equals the memory limit (no swap), so it follows a
+        // new limit unless the request names a swap of its own.
+        if let Some(memory_mb) = limits.memory_mb
+            && limits.cgroup.memory_swap_bytes.is_none()
+            && previous_cgroup.memory_swap_bytes != 0
+        {
+            let bytes = u64::from(memory_mb) * crate::protocol::BYTES_PER_MIB;
+            limits.cgroup.memory_swap_bytes = Some(i64::try_from(bytes).unwrap_or(i64::MAX));
+        }
         if !limits.is_empty() {
             let next = previous.updated(&limits);
             crate::validate::resource_limits(
@@ -54,10 +63,14 @@ impl SandboxManager {
                 next.timeout_seconds,
             )?;
             crate::guest_limits::cgroup(&previous_cgroup.updated(&limits.cgroup), next.memory_mb)?;
-            self.backend
-                .update_limits(&id, &limits)
-                .await
-                .map_err(backend_err)?;
+            // The guest applies the options one by one, so a refusal midway
+            // can leave some changed: put the old values back.
+            if let Err(e) = self.backend.update_limits(&id, &limits).await {
+                let _ = self
+                    .restore_limits(&id, &limits, &previous, &previous_cgroup)
+                    .await;
+                return Err(backend_err(e));
+            }
         }
         if let Err(e) = self.record_update(&id, &limits, restart).await {
             let restored = self

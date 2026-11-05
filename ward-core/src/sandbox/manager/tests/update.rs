@@ -490,3 +490,31 @@ async fn given_a_bad_cpuset_when_updated_then_nothing_changes() {
         ""
     );
 }
+
+#[tokio::test]
+async fn given_a_swap_equal_to_memory_when_the_memory_limit_changes_then_the_swap_follows() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    mgr.create(sized(), "").await.unwrap();
+    let equal = i64::from(VM_MEMORY_MB) << 20;
+    mgr.update(UpdateSandboxRequest {
+        memory_swap_bytes: Some(equal),
+        ..change(NAME)
+    })
+    .await
+    .unwrap();
+
+    // Act
+    let updated = mgr
+        .update(UpdateSandboxRequest {
+            memory_mb: Some(SMALLER_MEMORY_MB),
+            ..change(NAME)
+        })
+        .await
+        .unwrap();
+
+    // Assert
+    let cgroup = updated.guest.expect("guest").cgroup.expect("cgroup");
+    assert_eq!(cgroup.memory_swap_bytes, i64::from(SMALLER_MEMORY_MB) << 20);
+}

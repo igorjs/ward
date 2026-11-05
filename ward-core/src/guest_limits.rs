@@ -207,6 +207,11 @@ fn cpu_max(limits: &CgroupLimits) -> Option<(String, u64)> {
     Some((quota, period))
 }
 
+/// `cpu.max` without a limit, for a quota of -1 or 0 and no period.
+fn cpu_max_removed() -> (String, u64) {
+    (CPU_MAX_UNLIMITED.to_string(), DEFAULT_CPU_PERIOD)
+}
+
 /// The cgroup settings a running sandbox needs to match `merged`, for the
 /// options `update` changes.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -242,9 +247,7 @@ pub fn live_settings(update: &CgroupUpdate, merged: &CgroupLimits) -> LiveSettin
                 merged.cpu_shares
             })
         }),
-        cpu_max: changes_cpu_max.then(|| {
-            cpu_max(merged).unwrap_or_else(|| (CPU_MAX_UNLIMITED.to_string(), DEFAULT_CPU_PERIOD))
-        }),
+        cpu_max: changes_cpu_max.then(|| cpu_max(merged).unwrap_or_else(cpu_max_removed)),
         cpuset_cpus: update
             .cpuset_cpus
             .as_ref()

@@ -376,7 +376,12 @@ async fn answer_set_limits<W: AsyncWrite + Unpin>(
         pids_max: set.pids_max,
     };
     let settings = cgroup_settings_of(set);
+    let half_cpu_max = set.cpu_max_quota.is_some() != set.cpu_max_period.is_some();
     let outcome = match SANDBOX_CGROUP.get().map(cgroup::SandboxCgroup::dir) {
+        Some(_) if half_cpu_max => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cpu.max needs a quota and a period together",
+        )),
         Some(dir) => {
             let dir = dir.to_path_buf();
             tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -997,6 +1002,11 @@ fn signal_process_group(pid: Option<u32>, sig: rustix::process::Signal) {
 
 #[cfg(test)]
 mod tests {
+    use super::proto::Ping;
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::io::AsyncWriteExt;
+
     #[test]
     fn given_a_set_limits_frame_when_read_then_cgroup_settings_follow_its_fields() {
         let set = proto::SetLimits {
@@ -1025,10 +1035,6 @@ mod tests {
 
         assert!(cgroup_settings_of(&set).is_empty());
     }
-    use super::proto::Ping;
-    use super::*;
-    use std::collections::HashMap;
-    use tokio::io::AsyncWriteExt;
 
     /// Encode a daemon-side `Request` for the in-memory transport.
     fn encode_request(req: &Request) -> Vec<u8> {

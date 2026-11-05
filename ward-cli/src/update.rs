@@ -15,6 +15,10 @@ use crate::client;
 use crate::lifecycle::Failures;
 use crate::resources;
 
+/// Why the real-time flags are refused.
+const NO_REAL_TIME: &str = "the guest runs no real-time scheduling";
+/// The `--memory-swap` value for unlimited swap, as bytes.
+const UNLIMITED_SWAP_BYTES: i64 = -1;
 /// The `--memory-swap` text for unlimited swap.
 const UNLIMITED_SWAP: &str = "-1";
 /// Docker's wording when no flag is given.
@@ -63,25 +67,23 @@ pub struct Args {
         allow_negative_numbers = true
     )]
     pub cpu_quota: Option<i64>,
-    /// Docker flags with no meaning in a microVM. They are accepted so the
-    /// command line parses, then refused with the reason.
-    #[arg(long = "blkio-weight", value_name = "N", hide = true)]
+    /// Accepted so the command line parses, then refused: the guest has no
+    /// block I/O controller.
+    #[arg(long = "blkio-weight", value_name = "N")]
     blkio_weight: Option<String>,
-    #[arg(long = "cpuset-mems", value_name = "LIST", hide = true)]
+    /// Accepted so the command line parses, then refused: the guest has a
+    /// single memory node.
+    #[arg(long = "cpuset-mems", value_name = "LIST")]
     cpuset_mems: Option<String>,
-    #[arg(long = "cpu-rt-period", value_name = "N", hide = true)]
+    /// Accepted so the command line parses, then refused: the guest runs no
+    /// real-time scheduling.
+    #[arg(long = "cpu-rt-period", value_name = "N")]
     cpu_rt_period: Option<String>,
-    #[arg(long = "cpu-rt-runtime", value_name = "N", hide = true)]
+    /// Accepted so the command line parses, then refused: the guest runs no
+    /// real-time scheduling.
+    #[arg(long = "cpu-rt-runtime", value_name = "N")]
     cpu_rt_runtime: Option<String>,
 }
-
-/// Flags Docker has that the guest cannot honour, and why.
-const REFUSED: [(&str, &str); 4] = [
-    ("--blkio-weight", "the guest has no block I/O controller"),
-    ("--cpuset-mems", "the guest has a single memory node"),
-    ("--cpu-rt-period", "the guest runs no real-time scheduling"),
-    ("--cpu-rt-runtime", "the guest runs no real-time scheduling"),
-];
 
 impl Args {
     /// The request for one sandbox, or an error for a bad value or no flag.
@@ -90,13 +92,21 @@ impl Args {
     ///
     /// Fails when no flag is given or a value cannot be parsed.
     pub fn request(&self, id: &str) -> Result<UpdateSandboxRequest> {
-        let given = [
-            &self.blkio_weight,
-            &self.cpuset_mems,
-            &self.cpu_rt_period,
-            &self.cpu_rt_runtime,
+        let refused = [
+            (
+                "--blkio-weight",
+                &self.blkio_weight,
+                "the guest has no block I/O controller",
+            ),
+            (
+                "--cpuset-mems",
+                &self.cpuset_mems,
+                "the guest has a single memory node",
+            ),
+            ("--cpu-rt-period", &self.cpu_rt_period, NO_REAL_TIME),
+            ("--cpu-rt-runtime", &self.cpu_rt_runtime, NO_REAL_TIME),
         ];
-        for ((flag, reason), value) in REFUSED.iter().zip(given) {
+        for (flag, value, reason) in refused {
             if value.is_some() {
                 bail!("{flag} is not supported: {reason}");
             }
@@ -156,7 +166,7 @@ fn changes_cgroup(request: &UpdateSandboxRequest) -> bool {
 /// `--memory-swap`: -1 for unlimited, else a size.
 fn parse_memory_swap(value: &str) -> Result<i64> {
     if value.trim() == UNLIMITED_SWAP {
-        return Ok(-1);
+        return Ok(UNLIMITED_SWAP_BYTES);
     }
     Ok(i64::try_from(resources::parse_size_bytes(value)?)?)
 }
