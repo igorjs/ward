@@ -316,3 +316,39 @@ fn given_only_unknown_references_when_inspect_then_empty_array_and_nonzero_exit(
     let entries: Vec<serde_json::Value> = serde_json::from_str(&stdout(&out)).expect("json array");
     assert!(entries.is_empty());
 }
+
+#[test]
+fn given_a_signal_flag_when_stop_and_restart_then_both_succeed_and_print_the_name() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "sig1"]);
+
+    // Act
+    let stopped = ok(&d, &["stop", "-s", "SIGINT", "sig1"]);
+    let restarted = ok(&d, &["restart", "--signal", "2", "sig1"]);
+
+    // Assert
+    assert_eq!(stopped.trim(), "sig1");
+    assert_eq!(restarted.trim(), "sig1");
+    assert_eq!(status_of(&d, &id).as_deref(), Some("running"));
+}
+
+#[test]
+fn given_an_unknown_signal_when_stop_then_it_fails_and_the_sandbox_is_untouched() {
+    // Arrange
+    let d = Daemon::spawn();
+    let id = create(&d, &["--name", "sig2"]);
+    let before = status_of(&d, &id);
+
+    // Act
+    let out = run(&d, &["stop", "-s", "SIGNOPE", "sig2"]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("invalid stop signal: SIGNOPE"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(status_of(&d, &id), before);
+}

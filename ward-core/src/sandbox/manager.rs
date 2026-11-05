@@ -155,6 +155,18 @@ impl Drop for NameReservation {
     }
 }
 
+/// The signal of `stop -s`, checked before anything is stopped. Empty means
+/// the sandbox's own stop signal.
+fn parse_stop_override(signal: Option<&str>) -> Result<Option<i32>> {
+    signal
+        .filter(|text| !text.is_empty())
+        .map(|text| {
+            crate::signal::parse(text)
+                .ok_or_else(|| ApiError::InvalidRequest(format!("invalid stop signal: {text}")))
+        })
+        .transpose()
+}
+
 fn name_in_use(name: &str, id: Option<&str>) -> ApiError {
     ApiError::NameInUse {
         name: name.to_string(),
@@ -2174,9 +2186,21 @@ impl SandboxManager {
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
+        self.stop_with_signal(reference, grace_seconds, None).await
+    }
+
+    /// Like [`stop_within`](Self::stop_within), asking the main process to
+    /// end with `signal` instead of the sandbox's stop signal.
+    pub async fn stop_with_signal(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+        signal: Option<&str>,
+    ) -> Result<PbSandboxInfo> {
+        let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         let grace = self.grace_for(&id, grace_seconds).await;
-        self.stop_resolved(&id, grace).await?;
+        self.stop_resolved(&id, grace, signal).await?;
         let info = self.info(&id, CommandView::Full).await?;
         if self.is_auto_remove(&id).await {
             self.remove(&id).await?;
@@ -2217,12 +2241,25 @@ impl SandboxManager {
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
+        self.restart_with_signal(reference, grace_seconds, None)
+            .await
+    }
+
+    /// Like [`restart_within`](Self::restart_within), with the stop signal
+    /// of [`stop_with_signal`](Self::stop_with_signal).
+    pub async fn restart_with_signal(
+        &self,
+        reference: &str,
+        grace_seconds: Option<i32>,
+        signal: Option<&str>,
+    ) -> Result<PbSandboxInfo> {
+        let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         self.refuse_if_had_secrets(&id).await?;
         let failed = self.recorded_status(&id).await? == crate::protocol::SandboxStatus::Failed;
         if !failed {
             let grace = self.grace_for(&id, grace_seconds).await;
-            self.stop_resolved(&id, grace).await?;
+            self.stop_resolved(&id, grace, signal).await?;
         }
         self.clear_restart_history(&id).await?;
         self.start_resolved(&id).await?;
@@ -2286,7 +2323,12 @@ impl SandboxManager {
             .unwrap_or(SIGTERM)
     }
 
-    async fn stop_resolved(&self, id: &str, grace: Option<std::time::Duration>) -> Result<()> {
+    async fn stop_resolved(
+        &self,
+        id: &str,
+        grace: Option<std::time::Duration>,
+        signal: Option<i32>,
+    ) -> Result<()> {
         let Some((before, meta)) = self.begin_stop(id).await? else {
             tracing::info!(sandbox_id = %id, "sandbox already stopped");
             return Ok(());
@@ -2296,7 +2338,7 @@ impl SandboxManager {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot thaw the paused sandbox before stopping it");
         }
         self.close_listeners(id).await;
-        let main_end = self.end_main_process(id, grace).await;
+        let main_end = self.end_main_process(id, grace, signal).await;
         let died_with = match main_end {
             MainEnd::NoMain => Some(0),
             MainEnd::Exited(code, _) => Some(code),
@@ -2343,7 +2385,12 @@ impl SandboxManager {
     /// and force it with SIGKILL once the grace period passes. Returns its exit code, or `None` when
     /// the sandbox has no main process, and unknown when it never reported an
     /// exit even after SIGKILL.
-    async fn end_main_process(&self, id: &str, grace: Option<std::time::Duration>) -> MainEnd {
+    async fn end_main_process(
+        &self,
+        id: &str,
+        grace: Option<std::time::Duration>,
+        signal: Option<i32>,
+    ) -> MainEnd {
         let (control, mut exit, oom_killed) = {
             let mains = self.mains.read().await;
             let Some(main) = mains.get(id) else {
@@ -2356,9 +2403,13 @@ impl SandboxManager {
             )
         };
         if let Some(control) = &control {
-            let _ = control
-                .send(ProcessControl::Signal(self.stop_signal_of(id).await))
-                .await;
+            let signal = match signal {
+                Some(signal) => signal,
+                None => self.stop_signal_of(id).await,
+            };
+            if control.send(ProcessControl::Signal(signal)).await.is_err() {
+                tracing::warn!(sandbox_id = %id, signal, "cannot deliver the stop signal");
+            }
         }
         if !ended_within(&mut exit, grace).await {
             tracing::warn!(sandbox_id = %id, "main process ignored the stop signal, forcing it");
@@ -8086,6 +8137,11 @@ pub(crate) mod tests {
     const SIGKILL_EXIT_CODE: i32 = 137;
     #[cfg(not(feature = "krunvm"))]
     const STOP_SIGNAL_EXIT_CODE: i32 = 42;
+    /// A stop grace of -1 waits as long as it takes.
+    #[cfg(not(feature = "krunvm"))]
+    const WAIT_FOREVER: i32 = -1;
+    #[cfg(not(feature = "krunvm"))]
+    const RESTART_SIGNAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
     const DEFAULT_HOSTNAME_LEN: usize = 12;
     #[cfg(not(feature = "krunvm"))]
     const SIGTERM_EXIT_CODE: i32 = 143;
@@ -8475,6 +8531,79 @@ pub(crate) mod tests {
 
         // Assert
         assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_signal_override_when_stopped_then_it_replaces_the_stop_signal() {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        mgr.stop_with_signal(&id, None, Some("SIGHUP"))
+            .await
+            .expect("stop");
+
+        // Assert
+        assert_eq!(exit_code_of(&mgr, &id).await, Some(STOP_SIGNAL_EXIT_CODE));
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_a_signal_override_when_restarted_then_the_old_process_gets_it() {
+        // Arrange: only SIGHUP ends the process, and the stop waits forever.
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            image: "alpine".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; trap 'exit 42' HUP; echo up; sleep 5 </dev/null >/dev/null 2>&1 & wait".into(),
+            ],
+            ..Default::default()
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        wait_for_output(&mgr, &id, "up\n").await;
+
+        // Act
+        let restarted = tokio::time::timeout(
+            RESTART_SIGNAL_DEADLINE,
+            mgr.restart_with_signal(&id, Some(WAIT_FOREVER), Some("SIGHUP")),
+        )
+        .await;
+
+        // Assert
+        assert!(
+            restarted
+                .expect("restart must not wait out the grace")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn given_an_unknown_signal_override_when_stopped_then_the_request_is_invalid() {
+        // Arrange
+        let mgr = build_manager(4);
+        let id = mgr.create(create_req("alpine"), "").await.unwrap().id;
+
+        // Act
+        let stop = mgr.stop_with_signal(&id, None, Some("SIGNOPE")).await;
+        let restart = mgr.restart_with_signal(&id, None, Some("99999")).await;
+
+        // Assert
+        assert!(matches!(stop, Err(ApiError::InvalidRequest(_))));
+        assert!(matches!(restart, Err(ApiError::InvalidRequest(_))));
     }
 
     #[tokio::test]

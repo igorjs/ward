@@ -344,6 +344,9 @@ message StopRequest {
   // Seconds to wait after SIGTERM before SIGKILL. Absent means 10, 0 kills
   // at once, a negative value waits without limit.
   optional int32 grace_seconds = 2;
+  // Signal that asks the main process to end, by name or number, instead of
+  // the sandbox's stop signal. Absent or empty keeps the sandbox's own.
+  optional string signal = 3;
 }
 
 message StartRequest {
@@ -354,6 +357,8 @@ message RestartRequest {
   string id = 1;
   // Same meaning as StopRequest.grace_seconds.
   optional int32 grace_seconds = 2;
+  // Same meaning as StopRequest.signal.
+  optional string signal = 3;
 }
 
 message ListSandboxesResponse {
