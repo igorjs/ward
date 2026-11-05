@@ -82,9 +82,8 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
-    /// Force tab-separated output for list commands even when stdout is
-    /// a TTY. Useful when the operator wants to copy the table cleanly
-    /// or pipe through an external pretty-printer. Also honoured via
+    /// Print list commands as tab-separated columns instead of Docker's
+    /// aligned table. Ward only; handy for `cut -f`. Also honoured via
     /// `WARD_NO_PRETTY=1`.
     #[arg(long, global = true)]
     no_pretty: bool,
