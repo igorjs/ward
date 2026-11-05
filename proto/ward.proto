@@ -195,6 +195,9 @@ message CreateSandboxRequest {
   RestartPolicy restart_policy = 25;
   // Guest setup options, like Docker's HostConfig.
   GuestOptions guest = 26;
+  // Sandboxes whose volume and bind mounts this one shares, each
+  // "SANDBOX[:ro|rw]". The daemon resolves them when it creates the sandbox.
+  repeated string volumes_from = 27;
 }
 
 // Guest setup options of `docker run`. Every field is optional; new ones are
@@ -317,8 +320,11 @@ message PortMapping {
   string host_ip = 1;
   uint32 host_port = 2;
   uint32 container_port = 3;
-  // "tcp" or empty. Other protocols are rejected.
+  // "tcp", "udp" or empty, which means tcp. Other protocols are rejected.
   string protocol = 4;
+  // Last host port to try when the host port is a range. 0 means a single
+  // host_port. The daemon binds the first free port from host_port to here.
+  uint32 host_port_end = 5;
 }
 
 message GetSandboxRequest {
@@ -327,6 +333,9 @@ message GetSandboxRequest {
 
 message RemoveSandboxRequest {
   string id = 1;
+  // Also remove the anonymous volumes of the sandbox that no other sandbox
+  // mounts, like `docker rm -v`.
+  bool remove_volumes = 2;
 }
 
 // `id` is a sandbox name, id or unique id prefix.
@@ -341,6 +350,9 @@ message StopRequest {
   // Seconds to wait after SIGTERM before SIGKILL. Absent means 10, 0 kills
   // at once, a negative value waits without limit.
   optional int32 grace_seconds = 2;
+  // Signal that asks the main process to end, by name or number, instead of
+  // the sandbox's stop signal. Absent or empty keeps the sandbox's own.
+  optional string signal = 3;
 }
 
 message StartRequest {
@@ -351,6 +363,8 @@ message RestartRequest {
   string id = 1;
   // Same meaning as StopRequest.grace_seconds.
   optional int32 grace_seconds = 2;
+  // Same meaning as StopRequest.signal.
+  optional string signal = 3;
 }
 
 message ListSandboxesResponse {
@@ -433,6 +447,12 @@ message Mount {
   string source = 1;
   string target = 2;
   bool readonly = 3;
+  // Name of a daemon-managed volume. When set, the daemon creates the volume
+  // if it is missing and fills in the source path.
+  string volume = 4;
+  // The volume was made for this mount alone, so removing the sandbox with
+  // remove_volumes (or --rm) removes it too.
+  bool anonymous = 5;
 }
 
 message EgressPolicy {
@@ -861,6 +881,7 @@ message SnapshotInfo {
 message CreateVolumeRequest {
   string name = 1;
   uint32 size_mb = 2;
+  map<string, string> labels = 3;
 }
 
 message GetVolumeRequest {
@@ -881,6 +902,7 @@ message VolumeInfo {
   uint32 size_mb = 3;
   google.protobuf.Timestamp created_at = 4;
   string mount_path = 5;
+  map<string, string> labels = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -919,6 +941,16 @@ message DaemonInfo {
   string platform = 2;
   string backend = 3;
   string arch = 4;
+  // Host figures for `docker info`. Empty or zero when unknown.
+  string hostname = 5;
+  string kernel_version = 6;
+  string operating_system = 7;
+  uint32 ncpu = 8;
+  uint64 mem_total_bytes = 9;
+  // The daemon's data directory.
+  string root_dir = 10;
+  // Stable identifier of this daemon's data directory.
+  string id = 11;
 }
 
 // ---------------------------------------------------------------------------
@@ -1024,6 +1056,13 @@ message ImageHistoryResponse {
   string image_id = 1;
   // Newest first.
   repeated HistoryLayer layers = 2;
+  // The image config, for `docker image inspect`. Empty when none was stored.
+  repeated string entrypoint = 3;
+  repeated string cmd = 4;
+  string working_dir = 5;
+  string user = 6;
+  // KEY=VALUE entries.
+  repeated string env = 7;
 }
 
 message SaveImagesRequest {
@@ -1087,6 +1126,13 @@ message UpdateSandboxRequest {
   // New limit on processes. 0 removes the limit.
   optional uint32 pids_max = 4;
   optional RestartPolicy restart_policy = 5;
+  // Docker's cgroup options, as in CgroupLimits. A field left unset is kept.
+  optional int64 memory_swap_bytes = 6;
+  optional uint64 memory_reservation_bytes = 7;
+  optional uint32 cpu_shares = 8;
+  optional string cpuset_cpus = 9;
+  optional uint64 cpu_period = 10;
+  optional int64 cpu_quota = 11;
 }
 
 // `id` is a sandbox name, id or unique id prefix.

@@ -3,11 +3,13 @@
 //! `ward volume ls`, `inspect` and `rm`, with the options of the Docker
 //! commands of the same names.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
-use ward_core::pb::{RemoveVolumeRequest, VolumeInfo};
+use ward_core::pb::{RemoveVolumeRequest, SandboxInfo, VolumeInfo};
 
 use crate::client;
 use crate::images::{BYTES_PER_MIB, size_text};
@@ -15,10 +17,11 @@ use crate::inspect::rfc3339;
 use crate::{output, template};
 
 /// The only volume driver, and the only scope.
-const DRIVER: &str = "local";
+pub const DRIVER: &str = "local";
 const SCOPE: &str = "local";
-/// Volumes carry no labels, and nothing links to them.
-const NO_LABELS: &str = "";
+/// Size of a new volume, in MiB.
+const DEFAULT_SIZE_MIB: u32 = 1024;
+/// `ls` shows no link count.
 const NO_LINKS: &str = "N/A";
 /// The words `dangling=` accepts, as Docker does.
 const TRUE_WORDS: [&str; 2] = ["true", "1"];
@@ -41,6 +44,105 @@ const FIELDS: [(&str, &str); 8] = [
     ("Links", "LINKS"),
 ];
 
+/// Mount options Docker accepts that change nothing here: SELinux labels,
+/// macOS consistency hints and `nocopy`, since Ward never copies image files
+/// into a volume.
+const IGNORED_OPTIONS: [&str; 6] = ["z", "Z", "cached", "delegated", "consistent", "nocopy"];
+const READ_ONLY_OPTION: &str = "ro";
+const READ_WRITE_OPTION: &str = "rw";
+const OPTION_SEPARATOR: char = ',';
+const FIELD_SEPARATOR: char = ':';
+
+/// Length of the name of an anonymous volume: 64 hex characters, as Docker
+/// makes them. Two UUIDs give that many digits.
+pub const ANONYMOUS_NAME_LEN: usize = 64;
+
+/// A name for the volume of a bare `-v /path`.
+fn anonymous_name() -> String {
+    let mut name = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    name.truncate(ANONYMOUS_NAME_LEN);
+    name
+}
+
+/// A mount of a new volume that goes away with the sandbox.
+pub fn anonymous_mount(target: &str, readonly: bool) -> ward_core::pb::Mount {
+    ward_core::pb::Mount {
+        anonymous: true,
+        ..named_mount(&anonymous_name(), target, readonly)
+    }
+}
+
+/// Parse `-v`: `/TARGET`, `SOURCE:TARGET` or `SOURCE:TARGET:OPTIONS`.
+pub fn parse_flag(spec: &str) -> Result<ward_core::pb::Mount> {
+    let parts: Vec<&str> = spec.split(FIELD_SEPARATOR).collect();
+    match parts.as_slice() {
+        [target] if target.starts_with('/') => Ok(anonymous_mount(target, false)),
+        [source, target] => mount_for(source, target, false),
+        [source, target, options] => {
+            let readonly = parse_options(options, spec)?;
+            mount_for(source, target, readonly)
+        }
+        [name] => bail!(
+            "--volume expects SOURCE:TARGET[:OPTIONS] or an absolute /TARGET, got '{name}': use {name}:/path to mount the volume {name}"
+        ),
+        _ => bail!("--volume expects SOURCE:TARGET[:OPTIONS], got '{spec}'"),
+    }
+}
+
+/// Whether `options` ask for a read-only mount. Unknown words and a
+/// contradiction between `ro` and `rw` are errors, as in Docker.
+fn parse_options(options: &str, spec: &str) -> Result<bool> {
+    let words: Vec<&str> = options.split(OPTION_SEPARATOR).collect();
+    for word in &words {
+        if *word != READ_ONLY_OPTION
+            && *word != READ_WRITE_OPTION
+            && !IGNORED_OPTIONS.contains(word)
+        {
+            bail!("invalid volume specification '{spec}': invalid mode: {word}");
+        }
+    }
+    let readonly = words.contains(&READ_ONLY_OPTION);
+    if readonly && words.contains(&READ_WRITE_OPTION) {
+        bail!("invalid volume specification '{spec}': invalid mode: {options}");
+    }
+    Ok(readonly)
+}
+
+/// A mount of the volume called `name`.
+pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::Mount {
+    ward_core::pb::Mount {
+        source: String::new(),
+        target: target.to_string(),
+        readonly,
+        volume: name.to_string(),
+        anonymous: false,
+    }
+}
+
+/// The mount for `SOURCE:TARGET`: a bind mount when `source` is an absolute
+/// host path, otherwise the volume it names.
+pub fn mount_for(source: &str, target: &str, readonly: bool) -> Result<ward_core::pb::Mount> {
+    if source.starts_with('/') {
+        return Ok(ward_core::pb::Mount {
+            source: source.to_string(),
+            target: target.to_string(),
+            readonly,
+            volume: String::new(),
+            anonymous: false,
+        });
+    }
+    if source.contains('/') || source.starts_with(['~', '.']) {
+        bail!(
+            "invalid volume specification: bind mount source '{source}' must be an absolute path"
+        );
+    }
+    Ok(named_mount(source, target, readonly))
+}
+
 #[derive(clap::Args, Debug)]
 pub struct ListArgs {
     /// Print only the volume names.
@@ -54,6 +156,49 @@ pub struct ListArgs {
     /// driver=local or label=. Repeatable.
     #[arg(short, long)]
     pub filter: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CreateArgs {
+    /// Volume name.
+    pub name: String,
+    /// Size in MiB.
+    #[arg(long, default_value_t = DEFAULT_SIZE_MIB)]
+    pub size: u32,
+    /// Volume driver. Only `local` exists.
+    #[arg(short, long, default_value = DRIVER)]
+    pub driver: String,
+    /// Set a label, `KEY` or `KEY=VALUE`. Repeatable.
+    #[arg(long, value_name = "KEY[=VALUE]")]
+    pub label: Vec<String>,
+    /// Driver option, `KEY=VALUE`. The local driver has none here, so any is refused.
+    #[arg(short = 'o', long, value_name = "KEY=VALUE")]
+    pub opt: Vec<String>,
+}
+
+impl CreateArgs {
+    /// The request to send, once the driver and options are checked.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a driver other than `local`, on any `-o` option, or on a
+    /// label with an empty key.
+    pub fn request(self) -> Result<ward_core::pb::CreateVolumeRequest> {
+        if self.driver != DRIVER {
+            bail!(
+                "volume driver \"{}\" is not supported: only {DRIVER} exists",
+                self.driver
+            );
+        }
+        if let Some(opt) = self.opt.first() {
+            bail!("volume option \"{opt}\" is not supported: the {DRIVER} driver takes none here");
+        }
+        Ok(ward_core::pb::CreateVolumeRequest {
+            name: self.name,
+            size_mb: self.size,
+            labels: crate::create_opts::labels(&[], &self.label)?,
+        })
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -80,7 +225,7 @@ pub struct RemoveArgs {
 #[derive(Debug, Default, PartialEq)]
 struct Filters {
     names: Vec<String>,
-    /// Ward volumes cannot be attached to a sandbox, so all are dangling.
+    /// A volume no sandbox mounts is dangling.
     dangling: Vec<bool>,
     drivers: Vec<String>,
     labels: Vec<String>,
@@ -88,7 +233,7 @@ struct Filters {
 
 /// Why a reference names no single volume.
 #[derive(Debug, PartialEq)]
-enum FindError {
+pub(crate) enum FindError {
     NotFound(String),
     Ambiguous(String),
 }
@@ -128,18 +273,23 @@ impl Filters {
         Ok(filters)
     }
 
-    /// Volumes carry no labels, so any `label=` filter matches none. Values
-    /// of one key are alternatives, as in Docker.
-    fn allows(&self, volume: &VolumeInfo) -> bool {
-        self.labels.is_empty()
-            && (self.dangling.is_empty() || self.dangling.contains(&true))
+    /// Every `label=` filter must match, as in Docker. Values of the other
+    /// keys are alternatives. `links` is how many sandboxes mount the volume.
+    fn allows(&self, volume: &VolumeInfo, links: usize) -> bool {
+        self.labels.iter().all(|label| match label.split_once('=') {
+            Some((key, value)) => volume.labels.get(key).is_some_and(|v| v == value),
+            None => volume.labels.contains_key(label),
+        }) && (self.dangling.is_empty() || self.dangling.contains(&(links == 0)))
             && (self.drivers.is_empty() || self.drivers.iter().any(|d| d == DRIVER))
             && (self.names.is_empty() || self.names.iter().any(|n| volume.name.contains(n)))
     }
 }
 
 /// The volume `reference` names: a name, an ID or a unique ID prefix.
-fn find<'a>(volumes: &'a [VolumeInfo], reference: &str) -> Result<&'a VolumeInfo, FindError> {
+pub(crate) fn find<'a>(
+    volumes: &'a [VolumeInfo],
+    reference: &str,
+) -> Result<&'a VolumeInfo, FindError> {
     if let Some(volume) = volumes
         .iter()
         .find(|v| v.name == reference || v.id == reference)
@@ -168,7 +318,7 @@ fn inspect_object(volume: &VolumeInfo) -> Map<String, Value> {
             json!(created_seconds(volume).map(rfc3339)),
         ),
         ("Driver".to_string(), json!(DRIVER)),
-        ("Labels".to_string(), json!({})),
+        ("Labels".to_string(), json!(volume.labels)),
         ("Mountpoint".to_string(), json!(volume.mount_path)),
         ("Name".to_string(), json!(volume.name)),
         ("Options".to_string(), Value::Null),
@@ -176,6 +326,13 @@ fn inspect_object(volume: &VolumeInfo) -> Map<String, Value> {
         ("Id".to_string(), json!(volume.id)),
         ("SizeMB".to_string(), json!(volume.size_mb)),
     ])
+}
+
+/// `key=value,key2=value2` in key order, as `docker volume ls` prints labels.
+fn label_text(labels: &std::collections::HashMap<String, String>) -> String {
+    let mut pairs: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    pairs.sort();
+    pairs.join(",")
 }
 
 /// The `ls --format` record.
@@ -188,9 +345,26 @@ fn list_record(volume: &VolumeInfo) -> Map<String, Value> {
         ("Mountpoint".to_string(), json!(volume.mount_path)),
         ("Scope".to_string(), json!(SCOPE)),
         ("Size".to_string(), json!(size_text(size))),
-        ("Labels".to_string(), json!(NO_LABELS)),
+        ("Labels".to_string(), json!(label_text(&volume.labels))),
         ("Links".to_string(), json!(NO_LINKS)),
     ])
+}
+
+/// How many sandboxes, stopped ones included, mount each volume by name.
+pub fn link_counts(sandboxes: &[SandboxInfo]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for sandbox in sandboxes {
+        let names: HashSet<&str> = sandbox
+            .mounts
+            .iter()
+            .filter(|m| !m.volume.is_empty())
+            .map(|m| m.volume.as_str())
+            .collect();
+        for name in names {
+            *counts.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    counts
 }
 
 async fn all_volumes(c: &mut WardClient<Channel>) -> Result<Vec<VolumeInfo>> {
@@ -205,10 +379,11 @@ pub async fn list(socket: &str, args: ListArgs, json: bool, no_pretty: bool) -> 
         .map(|format| template::Template::parse(format, &FIELDS))
         .transpose()?;
     let mut c = client::connect(socket).await?;
+    let links = link_counts(&c.list_sandboxes(()).await?.into_inner().sandboxes);
     let volumes: Vec<VolumeInfo> = all_volumes(&mut c)
         .await?
         .into_iter()
-        .filter(|v| filters.allows(v))
+        .filter(|v| filters.allows(v, links.get(&v.name).copied().unwrap_or_default()))
         .collect();
     if args.quiet {
         volumes.iter().for_each(|v| println!("{}", v.name));
@@ -300,6 +475,76 @@ pub async fn remove(socket: &str, args: RemoveArgs, json: bool) -> Result<bool> 
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::selinux_shared("/a:/b:z", false)]
+    #[case::selinux_private("/a:/b:Z", false)]
+    #[case::cached("/a:/b:cached", false)]
+    #[case::delegated("/a:/b:delegated", false)]
+    #[case::consistent("/a:/b:consistent", false)]
+    #[case::read_only_with_label("/a:/b:ro,z", true)]
+    #[case::label_then_read_only("/a:/b:Z,ro", true)]
+    #[case::explicit_read_write("/a:/b:rw", false)]
+    #[case::named_volume("data:/b:nocopy,ro", true)]
+    fn given_mount_options_when_parsed_then_only_ro_makes_it_read_only(
+        #[case] spec: &str,
+        #[case] readonly: bool,
+    ) {
+        // Act
+        let mount = parse_flag(spec).unwrap();
+
+        // Assert
+        assert_eq!(mount.readonly, readonly);
+        assert_eq!(mount.target, "/b");
+    }
+
+    #[rstest::rstest]
+    #[case::unknown_word(
+        "/a:/b:fast",
+        "invalid volume specification '/a:/b:fast': invalid mode: fast"
+    )]
+    #[case::contradiction(
+        "/a:/b:ro,rw",
+        "invalid volume specification '/a:/b:ro,rw': invalid mode: ro,rw"
+    )]
+    #[case::too_many_fields(
+        "/a:/b:ro:x",
+        "--volume expects SOURCE:TARGET[:OPTIONS], got '/a:/b:ro:x'"
+    )]
+    #[case::bare_name("data", "use data:/path to mount the volume data")]
+    fn given_a_bad_volume_flag_when_parsed_then_the_exact_reason_is_given(
+        #[case] spec: &str,
+        #[case] reason: &str,
+    ) {
+        // Act
+        let error = parse_flag(spec).unwrap_err();
+
+        // Assert
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+
+    #[test]
+    fn given_a_bare_path_when_parsed_then_it_is_an_anonymous_volume() {
+        // Act
+        let first = parse_flag("/data").unwrap();
+        let second = parse_flag("/data").unwrap();
+
+        // Assert
+        assert!(first.anonymous && first.source.is_empty());
+        assert_eq!(first.volume.len(), ANONYMOUS_NAME_LEN);
+        assert!(first.volume.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first.volume, second.volume);
+    }
+
+    #[test]
+    fn given_a_named_volume_flag_when_parsed_then_it_is_not_anonymous() {
+        // Act
+        let mount = parse_flag("data:/data").unwrap();
+
+        // Assert
+        assert!(!mount.anonymous);
+        assert_eq!(mount.volume, "data");
+    }
+
     use super::*;
 
     fn volume(id: &str, name: &str) -> VolumeInfo {
@@ -312,7 +557,17 @@ mod tests {
                 seconds: 0,
                 nanos: 0,
             }),
+            ..Default::default()
         }
+    }
+
+    fn labelled(name: &str, labels: &[(&str, &str)]) -> VolumeInfo {
+        let mut volume = volume("id", name);
+        volume.labels = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        volume
     }
 
     fn fleet() -> Vec<VolumeInfo> {
@@ -375,7 +630,7 @@ mod tests {
 
         let kept: Vec<String> = fleet()
             .into_iter()
-            .filter(|v| filters.allows(v))
+            .filter(|v| filters.allows(v, 0))
             .map(|v| v.name)
             .collect();
 
@@ -412,5 +667,88 @@ mod tests {
             .expect("render");
 
         assert_eq!(out, "cache 104.9MB local\n");
+    }
+
+    #[rstest::rstest]
+    #[case::key_only(&["label=env"], &["web"])]
+    #[case::pair(&["label=env=dev"], &["web"])]
+    #[case::wrong_value(&["label=env=prod"], &[])]
+    #[case::every_label_must_match(&["label=env", "label=tier=db"], &[])]
+    fn given_label_filters_when_applied_then_stored_labels_decide(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let specs: Vec<String> = specs.iter().map(ToString::to_string).collect();
+        let filters = Filters::parse(&specs).expect("parse");
+        let volumes = [labelled("web", &[("env", "dev")]), labelled("bare", &[])];
+
+        let kept: Vec<&str> = volumes
+            .iter()
+            .filter(|v| filters.allows(v, 0))
+            .map(|v| v.name.as_str())
+            .collect();
+
+        assert_eq!(kept, expected);
+    }
+
+    #[test]
+    fn given_labels_when_listed_by_template_then_they_print_sorted_as_pairs() {
+        let record = list_record(&labelled("web", &[("b", "2"), ("a", "1")]));
+
+        assert_eq!(record["Labels"], "a=1,b=2");
+    }
+
+    fn create_args(driver: &str, labels: &[&str], opts: &[&str]) -> CreateArgs {
+        CreateArgs {
+            name: "data".into(),
+            size: 10,
+            driver: driver.into(),
+            label: labels.iter().map(ToString::to_string).collect(),
+            opt: opts.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn given_local_driver_and_labels_when_request_built_then_labels_are_carried() {
+        let request = create_args("local", &["env=dev", "bare"], &[])
+            .request()
+            .expect("request");
+
+        assert_eq!(request.labels["env"], "dev");
+        assert_eq!(request.labels["bare"], "");
+        assert_eq!(request.size_mb, 10);
+    }
+
+    #[test]
+    fn given_another_driver_when_request_built_then_it_is_refused() {
+        let error = create_args("nfs", &[], &[]).request().expect_err("refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("volume driver \"nfs\" is not supported")
+        );
+    }
+
+    #[test]
+    fn given_an_option_when_request_built_then_it_is_refused_with_the_reason() {
+        let error = create_args("local", &[], &["type=tmpfs"])
+            .request()
+            .expect_err("refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("volume option \"type=tmpfs\" is not supported")
+        );
+    }
+
+    #[test]
+    fn given_a_label_with_an_empty_key_when_request_built_then_it_is_refused() {
+        let error = create_args("local", &["=x"], &[])
+            .request()
+            .expect_err("refused");
+
+        assert!(error.to_string().contains("invalid label"), "{error}");
     }
 }

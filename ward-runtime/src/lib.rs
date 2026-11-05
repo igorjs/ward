@@ -98,6 +98,7 @@ impl Runtime {
             )),
         };
         let broker = Arc::new(Broker::new());
+        let volume_manager = Arc::new(VolumeManager::new(data_dir.clone(), cfg.max_volumes));
         let sandbox_manager = Arc::new(
             SandboxManager::new(
                 Arc::clone(&backend),
@@ -108,12 +109,12 @@ impl Runtime {
             )
             .with_exited_ttl(cfg.exited_ttl)
             .with_default_limits(cfg.default_limits)
+            .with_volumes(Arc::clone(&volume_manager))
             .with_data_dir(data_dir.clone()),
         );
         sandbox_manager.spawn_restart_supervisor();
         sandbox_manager.spawn_health_supervisor();
         sandbox_manager.restore().await;
-        let volume_manager = Arc::new(VolumeManager::new(data_dir, cfg.max_volumes));
         Self {
             backend,
             broker,

@@ -314,7 +314,10 @@ async fn given_existing_sandbox_when_remove_then_subsequent_get_returns_not_foun
     // Act
     client
         .remove_sandbox(common::with_token(
-            RemoveSandboxRequest { id: s.id.clone() },
+            RemoveSandboxRequest {
+                id: s.id.clone(),
+                ..Default::default()
+            },
             &s.token,
         ))
         .await
@@ -337,6 +340,7 @@ async fn given_unknown_id_when_remove_sandbox_then_not_found() {
     let err = client
         .remove_sandbox(RemoveSandboxRequest {
             id: "00000000-0000-0000-0000-000000000000".into(),
+            ..Default::default()
         })
         .await
         .expect_err("unknown id");
@@ -410,6 +414,7 @@ async fn given_sandboxes_at_cap_when_one_removed_then_create_again_succeeds() {
         .remove_sandbox(common::with_token(
             RemoveSandboxRequest {
                 id: created[0].id.clone(),
+                ..Default::default()
             },
             &created[0].token,
         ))

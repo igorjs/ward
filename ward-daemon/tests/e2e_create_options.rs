@@ -528,7 +528,7 @@ fn given_an_unsupported_log_driver_when_create_then_it_fails_with_one_line_and_n
     // Assert
     assert!(!out.status.success());
     assert!(stderr(&out).contains("--log-driver syslog is not supported"));
-    assert_eq!(ok(&d, &["list"]).lines().count(), 0);
+    assert_eq!(ok(&d, &["ps", "-a", "-q"]), "");
 }
 
 #[test]

@@ -311,3 +311,42 @@ fn given_cached_image_when_run_with_pull_never_then_it_starts() {
     // Assert
     assertion.success();
 }
+
+#[test]
+fn given_entrypoint_flag_when_created_with_arguments_then_both_are_recorded() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(ENTRYPOINT_IMAGE);
+
+    // Act
+    run_ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "made",
+            "--entrypoint",
+            "/other",
+            IMAGE,
+            "--flag",
+        ],
+    );
+    let config = config_of(&d, "made");
+
+    // Assert
+    assert_eq!(config["Entrypoint"], json!(["/other"]));
+    assert_eq!(config["Cmd"], json!(["--flag"]));
+}
+
+#[test]
+fn given_no_entrypoint_flag_when_created_then_the_image_config_is_not_applied() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(ENTRYPOINT_IMAGE);
+
+    // Act
+    run_ok(&d, &["create", "--name", "idle", IMAGE]);
+    let config = config_of(&d, "idle");
+
+    // Assert
+    assert!(config["Entrypoint"].is_null());
+    assert!(config["Cmd"].as_array().is_none_or(Vec::is_empty));
+}

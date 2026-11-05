@@ -97,7 +97,7 @@ pub async fn run(
         );
     }
     if flags.rm && !options.was_detached() {
-        let removal = lifecycle::remove_resolved(&mut c, token_store, &target);
+        let removal = lifecycle::remove_with_volumes(&mut c, token_store, &target, true);
         let interrupt = async {
             match exits.as_mut() {
                 Some(exits) => exits.recv_exit_code().await,

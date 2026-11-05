@@ -2,6 +2,7 @@
 
 //! `ward ps`, `ward inspect`, `ward kill` and the signal names `-s` accepts.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -11,8 +12,9 @@ use ward_core::pb::ward_client::WardClient;
 use ward_core::pb::{EndReason, GetSandboxRequest, KillProcessRequest, SandboxInfo, SandboxStatus};
 use ward_core::protocol::RestartKind;
 
+use crate::image_inspect;
 use crate::lifecycle::Failures;
-use crate::ps_columns::{image_sizes, ports_text, size_column};
+use crate::ps_columns::{image_size, image_sizes, ports_text, size_column};
 use crate::ps_filter::{self, Filters};
 use crate::template::{ANY_FIELD, LABEL_MAP_KEY, LABELS_FIELD, Template};
 use crate::{client, output, status_name};
@@ -30,6 +32,8 @@ pub const PS_HEADERS: [&str; 7] = [
 /// The column `ps -s` adds.
 const PS_SIZE_HEADER: &str = "SIZE";
 
+/// The `inspect -s` field for the size of the image.
+const SIZE_ROOT_FS_KEY: &str = "SizeRootFs";
 /// Docker shows the first 12 characters of an id.
 const SHORT_ID_LEN: usize = 12;
 /// What Docker reports when a container's exit status was lost.
@@ -207,7 +211,7 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Names": info.name,
         "Labels": labels_text(&info.labels),
         "Ports": ports_text(info),
-        "Mounts": "",
+        "Mounts": mounts_text(info),
         "Networks": "",
         "Size": "",
     })
@@ -264,7 +268,14 @@ pub async fn ps(c: &mut WardClient<Channel>, options: PsOptions) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs() as i64;
     let listed = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let mut shown = ps_filter::select(&listed, options.all, &options.filters, options.limit);
+    let mut filters = options.filters;
+    let cached = if filters.needs_images() {
+        c.list_images(()).await?.into_inner().images
+    } else {
+        Vec::new()
+    };
+    filters.resolve(&listed, &cached)?;
+    let mut shown = ps_filter::select(&listed, options.all, &filters, options.limit);
     if let Some(field) = options.sort {
         ps_filter::sort(&mut shown, field);
     }
@@ -456,17 +467,48 @@ fn health_value(health: &ward_core::pb::HealthState) -> Value {
     })
 }
 
-/// Docker's top-level `Mounts`: the bind mounts, then the tmpfs mounts.
+/// What `ps` shows under `.Mounts`: a volume by name, a bind by its source.
+fn mounts_text(info: &SandboxInfo) -> String {
+    info.mounts
+        .iter()
+        .map(|m| {
+            if m.volume.is_empty() {
+                &m.source
+            } else {
+                &m.volume
+            }
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Docker's top-level `Mounts`: the bind and volume mounts, then the tmpfs
+/// mounts.
 fn mounts(info: &SandboxInfo) -> Vec<Value> {
     let binds = info.mounts.iter().map(|m| {
-        json!({
-            "Type": "bind",
-            "Source": m.source,
-            "Destination": m.target,
-            "Mode": if m.readonly { READ_ONLY_MODE } else { "" },
-            "RW": !m.readonly,
-            "Propagation": BIND_PROPAGATION,
-        })
+        let mode = if m.readonly { READ_ONLY_MODE } else { "" };
+        if m.volume.is_empty() {
+            json!({
+                "Type": "bind",
+                "Source": m.source,
+                "Destination": m.target,
+                "Mode": mode,
+                "RW": !m.readonly,
+                "Propagation": BIND_PROPAGATION,
+            })
+        } else {
+            json!({
+                "Type": "volume",
+                "Name": m.volume,
+                "Source": m.source,
+                "Destination": m.target,
+                "Driver": crate::volume::DRIVER,
+                "Mode": mode,
+                "RW": !m.readonly,
+                "Propagation": "",
+            })
+        }
     });
     let tmpfs = info.guest.iter().flat_map(|guest| &guest.tmpfs).map(|t| {
         let read_only = last_access_mode(&t.options) == READ_ONLY_MODE;
@@ -626,18 +668,100 @@ fn created_at_text(seconds: i64) -> String {
     )
 }
 
-/// `--type` values. Ward has no image inspection yet.
 const TYPE_CONTAINER: &str = "container";
 const TYPE_IMAGE: &str = "image";
 
-/// Accept `--type container`, and say why `image` or anything else is refused.
-pub fn check_type(kind: Option<&str>) -> Result<()> {
-    match kind {
-        None | Some(TYPE_CONTAINER) => Ok(()),
-        Some(TYPE_IMAGE) => bail!("inspecting images is not supported yet; only --type container"),
-        Some(other) => {
-            bail!("invalid --type \"{other}\", expected {TYPE_CONTAINER} or {TYPE_IMAGE}")
+/// What `inspect` looks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A sandbox first, then a cached image, as Docker tries a container first.
+    Any,
+    Container,
+    Image,
+}
+
+impl Kind {
+    /// # Errors
+    ///
+    /// Fails on a `--type` that is neither `container` nor `image`.
+    pub fn parse(kind: Option<&str>) -> Result<Self> {
+        match kind {
+            None => Ok(Self::Any),
+            Some(TYPE_CONTAINER) => Ok(Self::Container),
+            Some(TYPE_IMAGE) => Ok(Self::Image),
+            Some(other) => {
+                bail!("invalid --type \"{other}\", expected {TYPE_CONTAINER} or {TYPE_IMAGE}")
+            }
         }
+    }
+}
+
+pub struct InspectOptions<'a> {
+    pub format: Option<&'a str>,
+    /// `-s`: add `SizeRootFs` to a sandbox.
+    pub size: bool,
+    pub kind: Kind,
+}
+
+/// Words the daemon uses for a name no sandbox can have, such as an image tag
+/// with a colon.
+const BAD_NAME_WORDS: &str = "invalid characters";
+
+/// Whether the daemon said no sandbox has this name. Any other invalid
+/// argument is a real error and is not hidden by the image lookup.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<tonic::Status>().is_some_and(|status| {
+        status.code() == tonic::Code::NotFound
+            || (status.code() == tonic::Code::InvalidArgument
+                && status.message().contains(BAD_NAME_WORDS))
+    })
+}
+
+async fn sandbox_value(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+    sizes: Option<&HashMap<String, u64>>,
+) -> Result<Value> {
+    let target = client::resolve(c, token_store, reference).await?;
+    let request = target.request(GetSandboxRequest {
+        id: target.id.clone(),
+    })?;
+    let info = c.get_sandbox(request).await?.into_inner();
+    let mut value = inspect_value(&info);
+    if let Some(sizes) = sizes {
+        add_sizes(&mut value, &info, sizes);
+    }
+    Ok(value)
+}
+
+async fn object_value(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    reference: &str,
+    kind: Kind,
+    sizes: Option<&HashMap<String, u64>>,
+) -> Result<Value> {
+    match kind {
+        Kind::Container => sandbox_value(c, token_store, reference, sizes).await,
+        Kind::Image => image_inspect::lookup(c, reference).await,
+        Kind::Any => match sandbox_value(c, token_store, reference, sizes).await {
+            Err(e) if is_not_found(&e) => match image_inspect::lookup(c, reference).await {
+                Err(e) if is_not_found(&e) => Err(anyhow::anyhow!(tonic::Status::not_found(
+                    format!("No such object: {reference}")
+                ))),
+                other => other,
+            },
+            other => other,
+        },
+    }
+}
+
+/// Adds `SizeRootFs`, the size of the image the sandbox runs. `SizeRw`, what
+/// the sandbox wrote on top of it, is left out because Ward does not measure it.
+fn add_sizes(value: &mut Value, info: &SandboxInfo, sizes: &HashMap<String, u64>) {
+    if let Some(bytes) = image_size(info, sizes) {
+        value[SIZE_ROOT_FS_KEY] = json!(bytes);
     }
 }
 
@@ -647,24 +771,22 @@ pub async fn inspect(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     references: &[String],
-    format: Option<&str>,
+    options: InspectOptions<'_>,
 ) -> Result<()> {
-    let template = format
+    let template = options
+        .format
         .map(|format| Template::parse(format, &[(ANY_FIELD, "")]))
         .transpose()?;
+    let sizes = if options.size && options.kind != Kind::Image {
+        Some(image_sizes(&c.list_images(()).await?.into_inner().images))
+    } else {
+        None
+    };
     let mut found = Vec::new();
     let mut failures = Failures::new();
     for reference in references {
-        let result = async {
-            let target = client::resolve(c, token_store, reference).await?;
-            let request = target.request(GetSandboxRequest {
-                id: target.id.clone(),
-            })?;
-            anyhow::Ok(c.get_sandbox(request).await?.into_inner())
-        }
-        .await;
-        match result {
-            Ok(info) => found.push(inspect_value(&info)),
+        match object_value(c, token_store, reference, options.kind, sizes.as_ref()).await {
+            Ok(value) => found.push(value),
             Err(e) => failures.record(reference, &e),
         }
     }
@@ -720,18 +842,59 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::unset(None, true)]
-    #[case::container(Some("container"), true)]
-    #[case::image(Some("image"), false)]
-    #[case::unknown(Some("volume"), false)]
-    fn given_type_when_checked_then_only_container_passes(
-        #[case] kind: Option<&str>,
-        #[case] accepted: bool,
+    #[case::missing(tonic::Status::not_found("No such container: x"), true)]
+    #[case::bad_name(
+        tonic::Status::invalid_argument("sandbox name or ID contains invalid characters"),
+        true
+    )]
+    #[case::other_invalid(tonic::Status::invalid_argument("limit is negative"), false)]
+    #[case::unavailable(tonic::Status::unavailable("down"), false)]
+    fn given_a_daemon_status_when_checked_then_only_a_missing_sandbox_falls_through(
+        #[case] status: tonic::Status,
+        #[case] expected: bool,
     ) {
-        assert_eq!(check_type(kind).is_ok(), accepted);
+        assert_eq!(is_not_found(&anyhow::Error::from(status)), expected);
+    }
+
+    #[rstest::rstest]
+    #[case::unset(None, Some(Kind::Any))]
+    #[case::container(Some("container"), Some(Kind::Container))]
+    #[case::image(Some("image"), Some(Kind::Image))]
+    #[case::unknown(Some("volume"), None)]
+    fn given_type_when_parsed_then_container_and_image_are_accepted(
+        #[case] kind: Option<&str>,
+        #[case] expected: Option<Kind>,
+    ) {
+        assert_eq!(Kind::parse(kind).ok(), expected);
     }
 
     const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn given_a_cached_image_when_sizes_added_then_size_root_fs_is_the_image_size() {
+        let mut value = json!({"Id": "x"});
+        let mut sandbox = info(SandboxStatus::Running, None);
+        sandbox.image = "alpine:latest".into();
+        let sizes = HashMap::from([("alpine:latest".to_string(), 7_800_000)]);
+
+        add_sizes(&mut value, &sandbox, &sizes);
+
+        assert_eq!(value["SizeRootFs"], 7_800_000);
+        assert!(value.get("SizeRw").is_none());
+    }
+
+    #[test]
+    fn given_an_uncached_image_when_sizes_added_then_nothing_is_added() {
+        let mut value = json!({"Id": "x"});
+
+        add_sizes(
+            &mut value,
+            &info(SandboxStatus::Running, None),
+            &HashMap::new(),
+        );
+
+        assert!(value.get("SizeRootFs").is_none());
+    }
 
     fn info(status: SandboxStatus, exit_code: Option<i32>) -> SandboxInfo {
         SandboxInfo {
@@ -1145,6 +1308,7 @@ mod tests {
                 source: "/tmp/data".into(),
                 target: "/data".into(),
                 readonly: true,
+                ..Default::default()
             }],
             ..info(SandboxStatus::Running, None)
         };

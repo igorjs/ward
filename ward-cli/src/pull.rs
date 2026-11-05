@@ -20,6 +20,9 @@ pub struct Flags {
     /// Pull every tag of the repository. Ward does not support it.
     #[arg(short = 'a', long)]
     pub all_tags: bool,
+    /// Accepted for Docker scripts. Ward does not verify image signatures.
+    #[arg(long)]
+    pub disable_content_trust: bool,
 }
 
 /// This machine's architecture in OCI names.
@@ -93,7 +96,18 @@ mod tests {
         Flags {
             platform: platform.map(String::from),
             all_tags,
+            disable_content_trust: false,
         }
+    }
+
+    #[test]
+    fn given_disable_content_trust_when_checked_then_it_passes() {
+        let flags = Flags {
+            disable_content_trust: true,
+            ..flags(None, false)
+        };
+
+        assert!(flags.check().is_ok());
     }
 
     #[test]

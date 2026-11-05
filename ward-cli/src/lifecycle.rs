@@ -19,7 +19,11 @@ use ward_core::pb::{
 };
 
 use crate::client::{self, Resolved};
+use crate::stop_options::StopOptions;
 use crate::tokens;
+
+/// Why `rm --link` is refused.
+const NO_LINKS: &str = "--link is not supported: sandboxes have no links to remove";
 
 /// The state change a lifecycle command asks for.
 #[derive(Clone, Copy)]
@@ -43,19 +47,27 @@ impl Action {
         self,
         c: &mut WardClient<Channel>,
         target: &Resolved,
-        grace_seconds: Option<i32>,
+        stop: &StopOptions,
     ) -> Result<()> {
         let id = target.id.clone();
         match self {
             Self::Stop => {
-                let request = StopRequest { id, grace_seconds };
+                let request = StopRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.stop(target.request(request)?).await?;
             }
             Self::Start => {
                 c.start(target.request(StartRequest { id })?).await?;
             }
             Self::Restart => {
-                let request = RestartRequest { id, grace_seconds };
+                let request = RestartRequest {
+                    id,
+                    grace_seconds: stop.grace_seconds,
+                    signal: stop.signal.clone(),
+                };
                 c.restart(target.request(request)?).await?;
             }
         }
@@ -97,14 +109,14 @@ pub async fn lifecycle(
     token_store: &Path,
     action: Action,
     refs: &[String],
-    grace_seconds: Option<i32>,
+    stop: &StopOptions,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
     for reference in refs {
         let result = async {
             let target = client::resolve(c, token_store, reference).await?;
-            action.call(c, &target, grace_seconds).await
+            action.call(c, &target, stop).await
         }
         .await;
         match result {
@@ -116,11 +128,24 @@ pub async fn lifecycle(
     failures.finish(refs.len(), action.past())
 }
 
+/// Refuse `rm --link`, which Docker uses to drop a link between containers.
+///
+/// # Errors
+///
+/// Fails when `link` is set.
+pub fn refuse_link(link: bool) -> Result<()> {
+    if link {
+        anyhow::bail!(NO_LINKS);
+    }
+    Ok(())
+}
+
 pub async fn remove(
     c: &mut WardClient<Channel>,
     token_store: &Path,
     refs: &[String],
     force: bool,
+    remove_volumes: bool,
     json: bool,
 ) -> Result<()> {
     let mut failures = Failures::new();
@@ -132,7 +157,7 @@ pub async fn remove(
             if !force && target.status == SandboxStatus::Running {
                 anyhow::bail!("cannot remove a running sandbox: stop it first or use -f");
             }
-            remove_resolved(c, token_store, &target).await
+            remove_with_volumes(c, token_store, &target, remove_volumes).await
         }
         .await;
         match result {
@@ -211,8 +236,20 @@ pub async fn remove_resolved(
     token_store: &Path,
     target: &Resolved,
 ) -> Result<()> {
+    remove_with_volumes(c, token_store, target, false).await
+}
+
+/// [`remove_resolved`] that also removes the sandbox's anonymous volumes
+/// when `remove_volumes` is set.
+pub async fn remove_with_volumes(
+    c: &mut WardClient<Channel>,
+    token_store: &Path,
+    target: &Resolved,
+    remove_volumes: bool,
+) -> Result<()> {
     let request = RemoveSandboxRequest {
         id: target.id.clone(),
+        remove_volumes,
     };
     c.remove_sandbox(target.request(request)?).await?;
     // The daemon already removed the sandbox, so a store failure is only a
@@ -221,4 +258,24 @@ pub async fn remove_resolved(
         eprintln!("warning: could not prune local token store: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_link_flag_when_refused_then_the_error_is_one_line_with_the_reason() {
+        // Act
+        let error = refuse_link(true).unwrap_err().to_string();
+
+        // Assert
+        assert_eq!(error, NO_LINKS);
+        assert_eq!(error.lines().count(), 1);
+    }
+
+    #[test]
+    fn given_no_link_flag_when_refused_then_it_passes() {
+        assert!(refuse_link(false).is_ok());
+    }
 }

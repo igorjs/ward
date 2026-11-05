@@ -45,6 +45,35 @@ fn given_a_tagged_image_when_one_tag_is_removed_then_the_image_stays() {
 }
 
 #[test]
+fn given_two_tags_when_rmi_all_then_every_image_goes_and_the_exit_is_zero() {
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["tag", IMAGE, ALIAS]);
+
+    // Act
+    let removed = run_ok(&d, &["rmi", "-a"]);
+    let listed = run_ok(&d, &["images", "-q"]);
+
+    // Assert
+    assert!(removed.contains(&format!("Untagged: {ALIAS}")), "{removed}");
+    assert!(removed.contains("Deleted: sha256:"), "{removed}");
+    assert!(listed.is_empty(), "{listed}");
+}
+
+#[test]
+fn given_an_empty_cache_when_rmi_all_then_nothing_prints_and_the_exit_is_zero() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let removed = run_ok(&d, &["rmi", "--all"]);
+
+    // Assert
+    assert_eq!(removed, "");
+}
+
+#[test]
 fn given_the_last_tag_when_removed_then_the_image_is_deleted() {
     // Arrange
     let d = Daemon::spawn();
@@ -126,6 +155,59 @@ fn given_an_image_config_when_history_is_read_then_layers_print_newest_first() {
 }
 
 #[test]
+fn given_human_false_when_history_is_read_then_sizes_are_bytes() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(IMAGE_CONFIG);
+    run_ok(&d, &["pull", IMAGE]);
+
+    // Act
+    let table = run_ok(&d, &["history", "--human=false", IMAGE]);
+
+    // Assert
+    assert!(table.contains("7800000"), "{table}");
+    assert!(!table.contains("7.8MB"), "{table}");
+}
+
+#[test]
+fn given_a_cached_image_when_inspected_then_docker_s_shape_and_config_print() {
+    // Arrange
+    let d = Daemon::spawn_with_image_config(
+        r#"{"cmd":["sh"],"env":["PATH=/bin"],"working_dir":"/app","history":[]}"#,
+    );
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["tag", IMAGE, ALIAS]);
+
+    // Act
+    let plain = run_ok(&d, &["inspect", IMAGE]);
+    let via_group = run_ok(&d, &["image", "inspect", "-f", "{{.Id}}", ALIAS]);
+    let typed = run_ok(
+        &d,
+        &[
+            "inspect",
+            "--type",
+            "image",
+            "-f",
+            "{{json .RepoTags}}",
+            IMAGE,
+        ],
+    );
+    let missing = run(&d, &["image", "inspect", "nope:1"]);
+    let nothing = run(&d, &["inspect", "nope:1"]);
+
+    // Assert
+    let parsed: serde_json::Value = serde_json::from_str(&plain).expect("json");
+    assert_eq!(parsed[0]["Config"]["Cmd"], serde_json::json!(["sh"]));
+    assert_eq!(parsed[0]["Config"]["WorkingDir"], "/app");
+    assert_eq!(parsed[0]["Os"], "linux");
+    assert_eq!(parsed[0]["RootFS"]["Type"], "layers");
+    assert_eq!(via_group.trim(), parsed[0]["Id"].as_str().unwrap());
+    assert!(typed.contains(IMAGE) && typed.contains(ALIAS), "{typed}");
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No such image: nope:1"));
+    assert!(String::from_utf8_lossy(&nothing.stderr).contains("No such object: nope:1"));
+}
+
+#[test]
 fn given_a_missing_source_when_tagged_then_it_fails() {
     // Arrange
     let d = Daemon::spawn();
@@ -136,4 +218,43 @@ fn given_a_missing_source_when_tagged_then_it_fails() {
     // Assert
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("No such image: nope:1"));
+}
+
+#[test]
+fn given_cached_images_when_listed_with_digests_and_relative_filters_then_they_narrow() {
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["pull", "busybox:1"]);
+
+    // Act
+    let digests = run_ok(&d, &["images", "--digests"]);
+    let labelled = run_ok(&d, &["images", "-q", "--filter", "label=env=dev"]);
+    let not_labelled = run_ok(&d, &["images", "-q", "--filter", "label!=env=dev"]);
+    let missing = run(&d, &["images", "--filter", "before=ghost:1"]);
+
+    // Assert
+    let header: Vec<&str> = digests.lines().next().unwrap().split_whitespace().collect();
+    assert_eq!(&header[..3], ["REPOSITORY", "TAG", "DIGEST"]);
+    assert_eq!(labelled, "");
+    assert_eq!(not_labelled.lines().count(), 2);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No such image: ghost:1"));
+}
+
+#[test]
+fn given_a_sandbox_and_a_cached_image_when_inspected_with_size_then_size_root_fs_is_the_image_size()
+{
+    // Arrange
+    let d = Daemon::spawn();
+    run_ok(&d, &["pull", IMAGE]);
+    run_ok(&d, &["create", "--name", "web1", IMAGE]);
+
+    // Act
+    let plain = run_ok(&d, &["inspect", "-f", "{{json .}}", "web1"]);
+    let sized = run_ok(&d, &["inspect", "-s", "-f", "{{.SizeRootFs}}", "web1"]);
+
+    // Assert
+    assert!(!plain.contains("SizeRootFs"));
+    assert!(sized.trim().parse::<u64>().is_ok(), "{sized}");
 }

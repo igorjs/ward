@@ -22,7 +22,6 @@ use predicates::prelude::*;
 // scenarios need that ID for subsequent commands.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
 fn extract_id(stdout: &str) -> String {
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("id: ") {
@@ -36,11 +35,6 @@ fn extract_id(stdout: &str) -> String {
 // Feature: volume create
 // ---------------------------------------------------------------------------
 
-// mkfs.ext4 is Linux-only with no usable macOS port. Tests that go through
-// `ward volume create` need the formatter to succeed, so gate them to Linux.
-// Sibling tests that only exercise list-empty, name validation, or unknown-id
-// remove paths stay un-gated.
-#[cfg(target_os = "linux")]
 #[test]
 fn given_running_daemon_when_user_creates_volume_then_command_succeeds_and_prints_id() {
     // Arrange
@@ -84,7 +78,7 @@ fn given_running_daemon_when_user_creates_volume_with_invalid_name_then_fails_wi
 // ---------------------------------------------------------------------------
 
 #[test]
-fn given_no_volumes_when_user_runs_list_then_output_is_empty() {
+fn given_no_volumes_when_user_runs_list_then_only_the_header_prints() {
     // Arrange: a daemon with zero volumes (fresh state).
     let daemon = common::Daemon::spawn();
 
@@ -92,12 +86,13 @@ fn given_no_volumes_when_user_runs_list_then_output_is_empty() {
     let mut cmd = daemon.cli();
     let output = cmd.args(["volume", "list"]).assert();
 
-    // Assert: command exits 0 and prints nothing. Empty output is the
-    // contract for "no matches" — distinct from error (non-zero exit).
-    output.success().stdout(predicate::str::is_empty());
+    // Assert: exits 0 and prints only the header row, as Docker does.
+    output.success().stdout(
+        predicate::str::starts_with("ID ")
+            .and(predicate::function(|s: &str| s.lines().count() == 1)),
+    );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_two_created_volumes_when_user_runs_list_then_both_names_appear() {
     // Arrange
@@ -129,7 +124,6 @@ fn given_two_created_volumes_when_user_runs_list_then_both_names_appear() {
 // Feature: volume remove
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_created_volume_when_user_removes_it_then_list_no_longer_shows_it() {
     // Arrange: create one volume, capture its ID.
@@ -182,7 +176,6 @@ fn given_unknown_id_when_user_removes_volume_then_fails_with_not_found() {
 // The daemon defaults to max_volumes = 256, too many for an E2E test.
 // We override via the env var to make the cap exercise practical.
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_message() {
     // Arrange: spawn a daemon configured with a tiny volume cap by setting
@@ -237,7 +230,6 @@ fn given_max_volumes_is_two_when_user_creates_third_then_fails_with_limit_messag
     let _ = wardd.wait();
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_volume_cap_reached_when_user_removes_one_then_create_succeeds_again() {
     // Arrange: bespoke spawn with a tiny cap, fill it, then exercise the

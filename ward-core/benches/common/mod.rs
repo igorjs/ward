@@ -12,9 +12,8 @@ use ward_core::backend::image::{ImagePuller, ImageStore, PulledImage};
 use ward_core::backend::krunvm::KrunvmBackend;
 use ward_core::comms::Broker;
 use ward_core::config::NetworkBackendChoice;
-use ward_core::protocol::ApiError;
 use ward_core::sandbox::SandboxManager;
-use ward_core::volume::{VolumeFormatter, VolumeManager};
+use ward_core::volume::VolumeManager;
 
 const IMAGE_CACHE_CAPACITY: usize = 64;
 const MAX_SANDBOXES: usize = 8;
@@ -29,17 +28,6 @@ impl ImagePuller for FakePuller {
     async fn pull(&self, _reference: &str, dest: &Path) -> Result<PulledImage, BackendError> {
         std::fs::create_dir_all(dest.join("bin")).map_err(BackendError::Io)?;
         Ok(PulledImage::without_config("sha256:bench".to_string()))
-    }
-}
-
-/// Skips `mkfs.ext4`; the benches never create volumes.
-#[derive(Debug)]
-struct NoopFormatter;
-
-#[async_trait::async_trait]
-impl VolumeFormatter for NoopFormatter {
-    async fn format(&self, _image_path: &Path, _size_mb: u32) -> Result<(), ApiError> {
-        Ok(())
     }
 }
 
@@ -62,10 +50,6 @@ pub fn managers(data_dir: &Path) -> (Arc<SandboxManager>, Arc<VolumeManager>) {
         /* allow_host_mounts = */ false,
         NetworkBackendChoice::Smoltcp,
     ));
-    let volumes = Arc::new(VolumeManager::with_formatter(
-        data_dir.to_path_buf(),
-        MAX_VOLUMES,
-        Arc::new(NoopFormatter),
-    ));
+    let volumes = Arc::new(VolumeManager::new(data_dir.to_path_buf(), MAX_VOLUMES));
     (sandboxes, volumes)
 }

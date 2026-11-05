@@ -276,6 +276,7 @@ async fn given_a_sandbox_created_stopped_and_removed_when_events_are_read_then_t
     let remove = common::with_token(
         ward_core::pb::RemoveSandboxRequest {
             id: info.id.clone(),
+            ..Default::default()
         },
         &info.token,
     );

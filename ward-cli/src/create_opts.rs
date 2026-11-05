@@ -191,7 +191,7 @@ fn environment(
 }
 
 /// The sandbox labels: every label file in order, then each `-l`.
-fn labels(files: &[PathBuf], flags: &[String]) -> Result<HashMap<String, String>> {
+pub(crate) fn labels(files: &[PathBuf], flags: &[String]) -> Result<HashMap<String, String>> {
     let mut labels = HashMap::new();
     for file in files {
         for (key, value) in read_pairs(file, None)? {

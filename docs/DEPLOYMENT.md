@@ -7,7 +7,6 @@ This guide covers running `wardd` on a host you look after: where it keeps files
 - Linux 5.10+ with KVM, or macOS 12+ on Apple Silicon. See [`platforms.md`](platforms.md).
 - A `wardd` built with the `krunvm` feature. The stub build boots no VMs.
 - On Linux, the daemon's user needs read and write access to `/dev/kvm`. Add it to the `kvm` group.
-- `mkfs.ext4` on the host, if you create volumes.
 
 ## Files and sockets
 

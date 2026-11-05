@@ -1,8 +1,7 @@
 // Copyright 2026 Ward Contributors. SPDX-License-Identifier: AGPL-3.0-only
 
 //! E2E scenarios for the Docker shaped `volume` options and `system df -v`.
-//! They run the real `ward` binary against a stub-backend `wardd`. Creating a
-//! volume needs the Linux ext4 formatter, so those scenarios are Linux only.
+//! They run the real `ward` binary against a stub-backend `wardd`.
 
 mod common;
 
@@ -164,14 +163,12 @@ fn given_json_when_system_df_verbose_then_it_is_refused() {
     assert!(stderr(&out).contains("--json"), "{}", stderr(&out));
 }
 
-#[cfg(target_os = "linux")]
 fn create_volumes(d: &Daemon, names: &[&str]) {
     for name in names {
         ok(d, &["volume", "create", name, "--size", "100"]);
     }
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_a_volume_when_listed_inspected_and_removed_by_name_then_name_and_id_both_work() {
     // Arrange
@@ -198,7 +195,6 @@ fn given_a_volume_when_listed_inspected_and_removed_by_name_then_name_and_id_bot
     assert_eq!(ok(&d, &["volume", "ls", "-q"]), "");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_several_volumes_and_one_missing_when_removed_then_the_rest_go_and_it_exits_1() {
     // Arrange
@@ -218,7 +214,6 @@ fn given_several_volumes_and_one_missing_when_removed_then_the_rest_go_and_it_ex
     assert_eq!(ok(&d, &["volume", "ls", "-q"]), "");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_a_real_and_a_missing_volume_when_force_removed_then_the_real_one_goes_and_it_succeeds() {
     // Arrange
@@ -234,7 +229,6 @@ fn given_a_real_and_a_missing_volume_when_force_removed_then_the_real_one_goes_a
     assert!(stderr(&out).is_empty(), "{}", stderr(&out));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_the_same_volume_twice_when_removed_then_the_repeat_is_an_error_but_skipped_with_force() {
     // Arrange
@@ -256,7 +250,6 @@ fn given_the_same_volume_twice_when_removed_then_the_repeat_is_an_error_but_skip
     assert_eq!(stdout(&forced), "dup2\n");
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_one_found_and_one_missing_volume_when_inspected_then_the_found_one_prints_and_it_exits_1()
 {
@@ -278,7 +271,6 @@ fn given_one_found_and_one_missing_volume_when_inspected_then_the_found_one_prin
     );
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn given_repeated_driver_filters_when_listed_then_either_value_matches() {
     // Arrange
@@ -301,4 +293,63 @@ fn given_repeated_driver_filters_when_listed_then_either_value_matches() {
 
     // Assert
     assert_eq!(out, "one\n");
+}
+
+#[test]
+fn given_an_unsupported_driver_or_option_when_a_volume_is_created_then_it_is_refused_with_a_reason()
+{
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let driver = run(&d, &["volume", "create", "-d", "nfs", "data"]);
+    let option = run(&d, &["volume", "create", "-o", "type=tmpfs", "data"]);
+
+    // Assert
+    assert!(!driver.status.success());
+    assert!(stderr(&driver).contains("volume driver \"nfs\" is not supported"));
+    assert!(!option.status.success());
+    assert!(stderr(&option).contains("volume option \"type=tmpfs\" is not supported"));
+    assert_eq!(ok(&d, &["volume", "ls", "-q"]), "");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn given_a_labelled_volume_when_listed_and_inspected_then_the_labels_show_and_filter() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &[
+            "volume", "create", "-d", "local", "--label", "env=dev", "--label", "team", "--size",
+            "100", "web",
+        ],
+    );
+    ok(&d, &["volume", "create", "--size", "100", "plain"]);
+
+    // Act
+    let by_label = ok(&d, &["volume", "ls", "-q", "--filter", "label=env=dev"]);
+    let by_key = ok(&d, &["volume", "ls", "-q", "--filter", "label=team"]);
+    let miss = ok(&d, &["volume", "ls", "-q", "--filter", "label=env=prod"]);
+    let labels = ok(
+        &d,
+        &[
+            "volume",
+            "ls",
+            "--format",
+            "{{.Labels}}",
+            "--filter",
+            "name=web",
+        ],
+    );
+    let inspected = ok(&d, &["volume", "inspect", "-f", "{{json .Labels}}", "web"]);
+    let exists = run(&d, &["volume", "exists", "web"]);
+
+    // Assert
+    assert_eq!(by_label.trim(), "web");
+    assert_eq!(by_key.trim(), "web");
+    assert_eq!(miss, "");
+    assert_eq!(labels.trim(), "env=dev,team=");
+    assert_eq!(inspected.trim(), r#"{"env":"dev","team":""}"#);
+    assert_eq!(exists.status.code(), Some(0));
 }
