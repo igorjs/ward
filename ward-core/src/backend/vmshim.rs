@@ -63,6 +63,24 @@ pub struct NetSpec {
     pub mac: [u8; 6],
 }
 
+/// libkrun's own sizing, used for whichever of CPUs and memory a spec leaves
+/// at 0 when the other is set.
+const DEFAULT_VCPUS: u32 = 1;
+const DEFAULT_MEMORY_MIB: u32 = 512;
+
+/// The CPU count and memory to give libkrun, or `None` to keep its defaults.
+/// Setting only one of the two must not drop the other.
+fn vm_config(cpus: u32, memory_mb: u32) -> Option<(u32, u32)> {
+    if cpus == 0 && memory_mb == 0 {
+        return None;
+    }
+    let or_default = |value: u32, default: u32| if value == 0 { default } else { value };
+    Some((
+        or_default(cpus, DEFAULT_VCPUS),
+        or_default(memory_mb, DEFAULT_MEMORY_MIB),
+    ))
+}
+
 /// Everything the shim needs to configure and boot one microVM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmSpec {
@@ -159,11 +177,11 @@ fn boot(spec: &VmSpec) -> Result<(), String> {
         krun_ffi::krun_set_log_level(KRUN_LOG_LEVEL_ERROR);
         let ctx = check(krun_ffi::krun_create_ctx(), "krun_create_ctx")?;
 
-        if spec.cpus > 0 {
-            let vcpus = u8::try_from(spec.cpus)
-                .map_err(|_| format!("cpus={} exceeds libkrun's limit of 255", spec.cpus))?;
+        if let Some((cpus, memory_mb)) = vm_config(spec.cpus, spec.memory_mb) {
+            let vcpus = u8::try_from(cpus)
+                .map_err(|_| format!("cpus={cpus} exceeds libkrun's limit of 255"))?;
             check(
-                krun_ffi::krun_set_vm_config(ctx, vcpus, spec.memory_mb),
+                krun_ffi::krun_set_vm_config(ctx, vcpus, memory_mb),
                 "krun_set_vm_config",
             )?;
         }
@@ -321,6 +339,19 @@ mod tests {
                 mac: [2, 0, 0, 0, 0, 2],
             }),
         }
+    }
+
+    #[rstest::rstest]
+    #[case::neither_set(0, 0, None)]
+    #[case::only_memory(0, 2048, Some((1, 2048)))]
+    #[case::only_cpus(4, 0, Some((4, 512)))]
+    #[case::both(2, 256, Some((2, 256)))]
+    fn given_partial_limits_when_vm_config_built_then_the_unset_one_gets_libkrun_default(
+        #[case] cpus: u32,
+        #[case] memory_mb: u32,
+        #[case] want: Option<(u32, u32)>,
+    ) {
+        assert_eq!(vm_config(cpus, memory_mb), want);
     }
 
     #[test]
