@@ -103,19 +103,20 @@ async fn serve(data_dir: std::path::PathBuf, persistent: bool) -> WardClient<Cha
         image_store,
     ));
     let broker = Arc::new(Broker::new());
+    let volume_mgr = Arc::new(VolumeManager::new(data_dir.clone(), 4));
     let mut manager = SandboxManager::new(
         Arc::clone(&backend),
         Arc::clone(&broker),
         4,
         /* allow_host_mounts = */ false,
         ward_core::config::NetworkBackendChoice::Smoltcp,
-    );
+    )
+    .with_volumes(Arc::clone(&volume_mgr));
     if persistent {
         manager = manager.with_data_dir(data_dir.clone());
         manager.restore().await;
     }
     let sandbox_mgr = Arc::new(manager);
-    let volume_mgr = Arc::new(VolumeManager::new(data_dir, 4));
     let service = WardGrpcServer::new(sandbox_mgr, volume_mgr);
 
     // 2) Bind to loopback on port 0 — the kernel picks a free port for us.

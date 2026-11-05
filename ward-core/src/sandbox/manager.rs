@@ -704,26 +704,49 @@ struct Teardown {
     volumes: Option<Arc<crate::volume::VolumeManager>>,
 }
 
-/// Remove the anonymous volumes among `mounts` that no remaining sandbox
-/// mounts. A volume that cannot be removed stays; nothing depends on it.
+/// Separates the sandbox from the mode in a `volumes_from` entry.
+const VOLUMES_FROM_MODE_SEPARATOR: char = ':';
+
+/// IDs of the sandboxes in `entries` that mount the volume called `name`.
+async fn volume_users_in(
+    entries: &RwLock<HashMap<String, SandboxEntry>>,
+    name: &str,
+) -> Vec<String> {
+    entries
+        .read()
+        .await
+        .iter()
+        .filter(|(_, entry)| {
+            entry
+                .meta
+                .options
+                .mounts
+                .iter()
+                .any(|m| m.volume.as_deref() == Some(name))
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Remove the anonymous volumes among `mounts` that no sandbox mounts or is
+/// being created to mount. One that cannot be removed stays; nothing depends
+/// on it.
 async fn release_anonymous_volumes(teardown: &Teardown, mounts: &[crate::protocol::Mount]) {
     let Some(volumes) = &teardown.volumes else {
         return;
     };
-    let entries = teardown.entries.read().await;
     for name in mounts
         .iter()
         .filter(|m| m.anonymous)
         .filter_map(|m| m.volume.as_deref())
     {
-        let shared = entries.values().any(|e| {
-            e.meta
-                .options
-                .mounts
-                .iter()
-                .any(|m| m.volume.as_deref() == Some(name))
-        });
-        if !shared && let Err(e) = volumes.remove_by_name(name).await {
+        let entries = &teardown.entries;
+        let result = volumes
+            .remove_unused_by_name(name, |volume| async move {
+                volume_users_in(entries, &volume).await
+            })
+            .await;
+        if let Err(e) = result {
             tracing::warn!(volume = name, error = %e, "cannot remove an anonymous volume");
         }
     }
@@ -1050,31 +1073,77 @@ impl SandboxManager {
         self
     }
 
-    /// Host path of the volume called `name`, which is created when missing.
-    async fn volume_path(&self, name: &str) -> Result<String> {
+    /// Claim the volume called `name` and return its host path. A volume that
+    /// is not `must_be_new` is created when missing; one that is must not
+    /// exist yet.
+    async fn claim_volume(
+        &self,
+        name: &str,
+        must_be_new: bool,
+    ) -> Result<(crate::volume::VolumeClaim, String)> {
         let volumes = self.volumes.as_ref().ok_or_else(|| {
             ApiError::InvalidRequest("this daemon cannot mount named volumes".into())
         })?;
-        Ok(volumes.ensure(name).await?.mount_path)
+        let claim = volumes.claim(name);
+        let info = if must_be_new {
+            volumes.create_new(name).await?
+        } else {
+            volumes.ensure(name).await?
+        };
+        Ok((claim, info.mount_path))
+    }
+
+    /// The mounts that `volumes_from` ("SANDBOX[:ro|rw]") stands for, with a
+    /// claim on each volume. They are read and claimed under the entries
+    /// lock, so the source cannot lose a volume in between. A mount whose
+    /// target is in `taken` is skipped: the explicit one wins.
+    async fn inherit_mounts(
+        &self,
+        volumes_from: &[String],
+        taken: &std::collections::HashSet<String>,
+    ) -> Result<(Vec<crate::protocol::Mount>, Vec<crate::volume::VolumeClaim>)> {
+        let mut mounts: Vec<crate::protocol::Mount> = Vec::new();
+        let mut claims = Vec::new();
+        for spec in volumes_from {
+            let (reference, mode) = spec
+                .split_once(VOLUMES_FROM_MODE_SEPARATOR)
+                .map_or((spec.as_str(), None), |(r, m)| (r, Some(m)));
+            let readonly = match mode {
+                None | Some("rw") => false,
+                Some("ro") => true,
+                Some(other) => {
+                    return Err(ApiError::InvalidRequest(format!(
+                        "invalid volumes-from mode \"{other}\" in \"{spec}\": use ro or rw"
+                    )));
+                }
+            };
+            let id = self.resolve(reference).await?;
+            let entries = self.entries.read().await;
+            let source = entries
+                .get(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(reference.to_string()))?;
+            for mount in &source.meta.options.mounts {
+                let target_taken = taken.contains(&mount.target)
+                    || mounts.iter().any(|m| m.target == mount.target);
+                if target_taken {
+                    continue;
+                }
+                if let (Some(name), Some(volumes)) = (&mount.volume, &self.volumes) {
+                    claims.push(volumes.claim(name));
+                }
+                mounts.push(crate::protocol::Mount {
+                    readonly: mount.readonly || readonly,
+                    ..mount.clone()
+                });
+            }
+        }
+        Ok((mounts, claims))
     }
 
     /// IDs of the sandboxes, stopped ones included, that mount the volume
     /// called `name`.
     pub async fn volume_users(&self, name: &str) -> Vec<String> {
-        self.entries
-            .read()
-            .await
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .meta
-                    .options
-                    .mounts
-                    .iter()
-                    .any(|m| m.volume.as_deref() == Some(name))
-            })
-            .map(|(id, _)| id.clone())
-            .collect()
+        volume_users_in(&self.entries, name).await
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -1509,6 +1578,9 @@ impl SandboxManager {
         // mount allowlist, because the validator reads the snapshot,
         // not the live env.
         let mut mounts = Vec::with_capacity(req.mounts.len());
+        // Held until the sandbox is recorded, so a volume it names cannot be
+        // removed while the image is still being pulled.
+        let mut volume_claims = Vec::new();
         for m in &req.mounts {
             if m.volume.is_empty() {
                 crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
@@ -1523,15 +1595,39 @@ impl SandboxManager {
                 // The host path is the daemon's own, so the client's source
                 // is ignored and the host allowlist does not apply.
                 crate::validate::volume_mount(&m.volume, &m.target)?;
+                // Only a volume the daemon makes for this mount is anonymous.
+                let anonymous = m.anonymous;
+                if anonymous {
+                    crate::validate::anonymous_volume_name(&m.volume)?;
+                }
+                let (claim, source) = self.claim_volume(&m.volume, anonymous).await?;
+                volume_claims.push(claim);
                 mounts.push(crate::protocol::Mount {
-                    source: self.volume_path(&m.volume).await?,
+                    source,
                     target: m.target.clone(),
                     readonly: m.readonly,
                     volume: Some(m.volume.clone()),
-                    anonymous: m.anonymous,
+                    anonymous,
                 });
             }
         }
+        let taken: std::collections::HashSet<String> = mounts
+            .iter()
+            .map(|m| m.target.clone())
+            .chain(
+                req.guest
+                    .iter()
+                    .flat_map(|guest| guest.tmpfs.iter().map(|t| t.path.clone())),
+            )
+            .collect();
+        let (inherited, inherited_claims) = self.inherit_mounts(&req.volumes_from, &taken).await?;
+        for m in &inherited {
+            if m.volume.is_none() {
+                crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
+            }
+        }
+        mounts.extend(inherited);
+        volume_claims.extend(inherited_claims);
 
         // Validate volume references before they reach the backend.
         for vid in &req.volume_ids {

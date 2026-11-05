@@ -928,3 +928,39 @@ mod tests {
         assert!(error.contains(said), "{error}");
     }
 }
+
+#[cfg(test)]
+mod mount_serde_tests {
+    use super::Mount;
+
+    #[test]
+    fn given_a_stored_mount_without_anonymous_when_loaded_then_it_is_not_anonymous() {
+        // Arrange
+        let stored = r#"{"source":"/tmp/a","target":"/a","readonly":false}"#;
+
+        // Act
+        let mount: Mount = serde_json::from_str(stored).unwrap();
+
+        // Assert
+        assert!(!mount.anonymous);
+        assert_eq!(mount.volume, None);
+    }
+
+    #[test]
+    fn given_an_anonymous_mount_when_stored_and_loaded_then_the_flag_survives() {
+        // Arrange
+        let mount = Mount {
+            source: "/v".into(),
+            target: "/a".into(),
+            readonly: false,
+            volume: Some("v".into()),
+            anonymous: true,
+        };
+
+        // Act
+        let back: Mount = serde_json::from_str(&serde_json::to_string(&mount).unwrap()).unwrap();
+
+        // Assert
+        assert_eq!(back, mount);
+    }
+}

@@ -239,6 +239,25 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Hex characters in the name of an anonymous volume, as Docker makes them.
+const ANONYMOUS_VOLUME_NAME_LEN: usize = 64;
+
+/// An anonymous volume is named by 64 lowercase hex characters. The daemon
+/// only treats a volume as anonymous when it has this name and is new.
+pub fn anonymous_volume_name(name: &str) -> Result<(), ApiError> {
+    let hex = name.len() == ANONYMOUS_VOLUME_NAME_LEN
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex {
+        Ok(())
+    } else {
+        Err(ApiError::InvalidRequest(format!(
+            "an anonymous volume needs a name of {ANONYMOUS_VOLUME_NAME_LEN} lowercase hex characters"
+        )))
+    }
+}
+
 /// Validate a volume size request.
 ///
 /// Rejects zero (no backing image possible) and sizes above `MAX_VOLUME_SIZE_MB`
@@ -261,30 +280,25 @@ pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
 /// is the daemon's own, so only the volume name is checked.
 pub fn volume_mount(name: &str, target: &str) -> Result<(), ApiError> {
     volume_name(name)?;
-    mount_path_shape(MOUNT_PATH_ANCHOR, target)
+    mount_path_shape("target", target)
 }
 
-/// Any absolute path stands in for the host side of a volume mount.
-const MOUNT_PATH_ANCHOR: &str = "/";
-
-/// Both paths must be absolute and free of `..`.
-fn mount_path_shape(source: &str, target: &str) -> Result<(), ApiError> {
-    for (label, path) in [("source", source), ("target", target)] {
-        if path.is_empty() {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must not be empty"
-            )));
-        }
-        if !path.starts_with('/') {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must be an absolute path: {path}"
-            )));
-        }
-        if path.split('/').any(|c| c == "..") {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must not contain '..': {path}"
-            )));
-        }
+/// A mount path must be absolute and free of `..`.
+fn mount_path_shape(label: &str, path: &str) -> Result<(), ApiError> {
+    if path.is_empty() {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must not be empty"
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must be an absolute path: {path}"
+        )));
+    }
+    if path.split('/').any(|c| c == "..") {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must not contain '..': {path}"
+        )));
     }
     Ok(())
 }
@@ -305,7 +319,8 @@ fn mount_path_shape(source: &str, target: &str) -> Result<(), ApiError> {
 /// `/lib`, `/bin`, `/sbin`) still require `readonly: true` so a sandbox
 /// can't overwrite host system files.
 pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
-    mount_path_shape(source, target)?;
+    mount_path_shape("source", source)?;
+    mount_path_shape("target", target)?;
 
     // SEC-020: source allowlist (host-side path the sandbox can see).
     if !allow_host && !is_default_allowed_source(source) {
@@ -1043,6 +1058,9 @@ mod tests {
     #[case::with_dash("build-cache")]
     #[case::with_underscore("shared_state")]
     #[case::mixed("agent-1_logs")]
+    #[case::dotted("data.v1")]
+    // Dots are safe: a volume's directory is named by its id, never its name.
+    #[case::trailing_dots("a..")]
     fn volume_name_accepts_valid(#[case] input: &str) {
         assert!(volume_name(input).is_ok());
     }

@@ -998,12 +998,14 @@ fn create_request(
         .iter()
         .map(|spec| volume::parse_flag(spec))
         .collect::<anyhow::Result<Vec<_>>>()?;
+    let volumes_from = opts.volumes_from.clone();
     let published_ports = ports::parse_all(&opts.publish)?;
     ports::warn_if_exposed(&published_ports);
     let mut request = ward_core::pb::CreateSandboxRequest {
         image,
         mounts,
         published_ports,
+        volumes_from,
         egress: Some(ward_core::pb::EgressPolicy {
             mode: egress_mode as i32,
             domains: opts.allow_domain,
@@ -1208,10 +1210,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 other => anyhow::bail!("--comms-mode must be 'deny' or 'group', got '{other}'"),
             };
             let hooks = opts.extras.hooks(opts.name.as_deref());
-            let volumes_from = opts.volumes_from.clone();
             let mut req = create_request(image, opts, timeout)?;
-            req.mounts
-                .extend(volume::mounts_from(&socket_path, &volumes_from).await?);
             req.command = command;
             req.comms = Some(ward_core::pb::CommunicationPolicy {
                 mode: comms_mode_pb as i32,
@@ -1391,11 +1390,7 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             opts.extras.check_rm(rm)?;
             let hooks = opts.extras.hooks(opts.name.as_deref());
-            let volumes_from = opts.volumes_from.clone();
             let mut request = create_request(image, opts, DAEMON_DEFAULT_TIMEOUT_SECONDS)?;
-            request
-                .mounts
-                .extend(volume::mounts_from(&socket_path, &volumes_from).await?);
             request.secrets = secrets::load_all(&secret)?;
             request.command = command;
             request.use_image_config = true;
@@ -2311,6 +2306,19 @@ mod tests {
     #[test]
     fn given_ro_suffix_when_parse_mount_then_readonly() {
         assert!(volume::parse_flag("/tmp/a:/data:ro").unwrap().readonly);
+    }
+
+    #[rstest::rstest]
+    #[case::dot_slash("./data:/d")]
+    #[case::home("~/data:/d")]
+    #[case::relative_path("dir/data:/d")]
+    fn given_a_relative_bind_source_when_parsed_then_the_error_says_absolute(#[case] spec: &str) {
+        let error = volume::parse_flag(spec).unwrap_err();
+
+        assert!(
+            error.to_string().contains("must be an absolute path"),
+            "{error}"
+        );
     }
 
     #[test]

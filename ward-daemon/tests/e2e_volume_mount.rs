@@ -89,8 +89,13 @@ fn given_a_volume_in_use_when_pruned_then_only_the_unused_one_goes() {
     let report = ok(&d, &["volume", "prune", "-f"]);
 
     // Assert
-    assert!(report.contains("idle"), "{report}");
-    assert!(!report.contains("used"), "{report}");
+    let deleted: Vec<&str> = report
+        .lines()
+        .skip_while(|l| *l != "Deleted Volumes:")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .collect();
+    assert_eq!(deleted, ["idle"], "{report}");
     assert_eq!(ok(&d, &["volume", "ls", "-q"]), "used\n");
 }
 
@@ -129,6 +134,20 @@ fn given_a_volume_mount_when_ps_and_inspect_then_they_show_the_volume() {
     assert_eq!(mount["Name"], "data");
     assert_eq!(mount["Destination"], "/data");
     assert_eq!(mount["RW"], false);
+}
+
+#[test]
+fn given_a_path_like_volume_name_when_mounted_then_the_create_fails_and_nothing_is_made() {
+    // Arrange
+    let d = Daemon::spawn();
+
+    // Act
+    let out = run(&d, &["create", "-v", "../x:/data", ALPINE]);
+
+    // Assert
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("absolute path"), "{}", stderr(&out));
+    assert_eq!(ok(&d, &["volume", "ls", "-q"]), "");
 }
 
 #[test]
@@ -296,4 +315,68 @@ fn given_volumes_from_an_unknown_sandbox_when_created_then_it_fails() {
 
     // Assert
     assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("No such container: nope"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(ok(&d, &["ps", "-a", "-q"]), "");
+}
+
+#[test]
+fn given_a_bind_mount_when_inherited_with_ro_then_it_is_read_only_on_the_new_sandbox() {
+    // Arrange
+    let d = Daemon::spawn();
+    let host = tempfile::tempdir_in("/tmp").unwrap();
+    let bind = format!("{}:/shared", host.path().display());
+    ok(&d, &["create", "--name", "src", "-v", &bind, ALPINE]);
+
+    // Act
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "dst",
+            "--volumes-from",
+            "src:ro",
+            ALPINE,
+        ],
+    );
+
+    // Assert
+    let dst: serde_json::Value = serde_json::from_str(&ok(&d, &["inspect", "dst"])).unwrap();
+    let mount = &dst[0]["Mounts"][0];
+    assert_eq!(mount["Type"], "bind");
+    assert_eq!(mount["RW"], false);
+}
+
+#[test]
+fn given_an_explicit_mount_on_an_inherited_target_when_created_then_the_explicit_one_wins() {
+    // Arrange
+    let d = Daemon::spawn();
+    ok(
+        &d,
+        &["create", "--name", "src", "-v", "shared:/data", ALPINE],
+    );
+
+    // Act
+    ok(
+        &d,
+        &[
+            "create",
+            "--name",
+            "dst",
+            "-v",
+            "mine:/data",
+            "--volumes-from",
+            "src",
+            ALPINE,
+        ],
+    );
+
+    // Assert
+    let dst: serde_json::Value = serde_json::from_str(&ok(&d, &["inspect", "dst"])).unwrap();
+    assert_eq!(dst[0]["Mounts"].as_array().unwrap().len(), 1);
+    assert_eq!(dst[0]["Mounts"][0]["Name"], "mine");
 }

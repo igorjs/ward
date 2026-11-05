@@ -46,28 +46,25 @@ const FIELDS: [(&str, &str); 8] = [
 /// Mount options Docker accepts that change nothing here: SELinux labels,
 /// macOS consistency hints and `nocopy`, since Ward never copies image files
 /// into a volume.
-const IGNORED_OPTIONS: [&str; 7] = [
-    "z",
-    "Z",
-    "cached",
-    "delegated",
-    "consistent",
-    "nocopy",
-    "rw",
-];
+const IGNORED_OPTIONS: [&str; 6] = ["z", "Z", "cached", "delegated", "consistent", "nocopy"];
 const READ_ONLY_OPTION: &str = "ro";
 const READ_WRITE_OPTION: &str = "rw";
 const OPTION_SEPARATOR: char = ',';
 const FIELD_SEPARATOR: char = ':';
 
-/// A name for the volume of a bare `-v /path`: 64 hex characters, which is
-/// what Docker generates.
+/// Length of the name of an anonymous volume: 64 hex characters, as Docker
+/// makes them. Two UUIDs give that many digits.
+pub const ANONYMOUS_NAME_LEN: usize = 64;
+
+/// A name for the volume of a bare `-v /path`.
 fn anonymous_name() -> String {
-    format!(
+    let mut name = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
         uuid::Uuid::new_v4().simple()
-    )
+    );
+    name.truncate(ANONYMOUS_NAME_LEN);
+    name
 }
 
 /// A mount of a new volume that goes away with the sandbox.
@@ -83,11 +80,14 @@ pub fn parse_flag(spec: &str) -> Result<ward_core::pb::Mount> {
     let parts: Vec<&str> = spec.split(FIELD_SEPARATOR).collect();
     match parts.as_slice() {
         [target] if target.starts_with('/') => Ok(anonymous_mount(target, false)),
-        [source, target] => Ok(mount_for(source, target, false)),
+        [source, target] => mount_for(source, target, false),
         [source, target, options] => {
             let readonly = parse_options(options, spec)?;
-            Ok(mount_for(source, target, readonly))
+            mount_for(source, target, readonly)
         }
+        [name] => bail!(
+            "--volume expects SOURCE:TARGET[:OPTIONS] or an absolute /TARGET, got '{name}': use {name}:/path to mount the volume {name}"
+        ),
         _ => bail!("--volume expects SOURCE:TARGET[:OPTIONS], got '{spec}'"),
     }
 }
@@ -97,7 +97,10 @@ pub fn parse_flag(spec: &str) -> Result<ward_core::pb::Mount> {
 fn parse_options(options: &str, spec: &str) -> Result<bool> {
     let words: Vec<&str> = options.split(OPTION_SEPARATOR).collect();
     for word in &words {
-        if *word != READ_ONLY_OPTION && !IGNORED_OPTIONS.contains(word) {
+        if *word != READ_ONLY_OPTION
+            && *word != READ_WRITE_OPTION
+            && !IGNORED_OPTIONS.contains(word)
+        {
             bail!("invalid volume specification '{spec}': invalid mode: {word}");
         }
     }
@@ -106,41 +109,6 @@ fn parse_options(options: &str, spec: &str) -> Result<bool> {
         bail!("invalid volume specification '{spec}': invalid mode: {options}");
     }
     Ok(readonly)
-}
-
-/// The mounts `--volumes-from SANDBOX[:ro|rw]` stand for: every volume and
-/// bind mount of each named sandbox. An anonymous volume stays anonymous, and
-/// the daemon removes it with the last sandbox that mounts it.
-///
-/// # Errors
-///
-/// Fails when a sandbox is unknown, the mode is not `ro` or `rw`, or the
-/// daemon cannot be reached.
-pub async fn mounts_from(socket: &str, specs: &[String]) -> Result<Vec<ward_core::pb::Mount>> {
-    if specs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut c = client::connect(socket).await?;
-    let mut mounts = Vec::new();
-    for spec in specs {
-        let (reference, mode) = spec.split_once(FIELD_SEPARATOR).unwrap_or((spec, ""));
-        let readonly = match mode {
-            "" | READ_WRITE_OPTION => false,
-            READ_ONLY_OPTION => true,
-            other => bail!("invalid volumes-from mode '{other}' in '{spec}': use ro or rw"),
-        };
-        let source = c
-            .get_sandbox(ward_core::pb::GetSandboxRequest {
-                id: reference.to_string(),
-            })
-            .await?
-            .into_inner();
-        mounts.extend(source.mounts.into_iter().map(|mut mount| {
-            mount.readonly |= readonly;
-            mount
-        }));
-    }
-    Ok(mounts)
 }
 
 /// A mount of the volume called `name`.
@@ -156,18 +124,22 @@ pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::M
 
 /// The mount for `SOURCE:TARGET`: a bind mount when `source` is an absolute
 /// host path, otherwise the volume it names.
-pub fn mount_for(source: &str, target: &str, readonly: bool) -> ward_core::pb::Mount {
+pub fn mount_for(source: &str, target: &str, readonly: bool) -> Result<ward_core::pb::Mount> {
     if source.starts_with('/') {
-        ward_core::pb::Mount {
+        return Ok(ward_core::pb::Mount {
             source: source.to_string(),
             target: target.to_string(),
             readonly,
             volume: String::new(),
             anonymous: false,
-        }
-    } else {
-        named_mount(source, target, readonly)
+        });
     }
+    if source.contains('/') || source.starts_with(['~', '.']) {
+        bail!(
+            "invalid volume specification: bind mount source '{source}' must be an absolute path"
+        );
+    }
+    Ok(named_mount(source, target, readonly))
 }
 
 #[derive(clap::Args, Debug)]
@@ -471,16 +443,28 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::unknown_word("/a:/b:fast")]
-    #[case::contradiction("/a:/b:ro,rw")]
-    #[case::too_many_fields("/a:/b:ro:x")]
-    #[case::bare_name("data")]
-    fn given_a_bad_volume_flag_when_parsed_then_it_is_refused(#[case] spec: &str) {
+    #[case::unknown_word(
+        "/a:/b:fast",
+        "invalid volume specification '/a:/b:fast': invalid mode: fast"
+    )]
+    #[case::contradiction(
+        "/a:/b:ro,rw",
+        "invalid volume specification '/a:/b:ro,rw': invalid mode: ro,rw"
+    )]
+    #[case::too_many_fields(
+        "/a:/b:ro:x",
+        "--volume expects SOURCE:TARGET[:OPTIONS], got '/a:/b:ro:x'"
+    )]
+    #[case::bare_name("data", "use data:/path to mount the volume data")]
+    fn given_a_bad_volume_flag_when_parsed_then_the_exact_reason_is_given(
+        #[case] spec: &str,
+        #[case] reason: &str,
+    ) {
         // Act
         let error = parse_flag(spec).unwrap_err();
 
         // Assert
-        assert!(error.to_string().contains("--volume") || error.to_string().contains("invalid"));
+        assert!(error.to_string().contains(reason), "{error}");
     }
 
     #[test]
@@ -491,7 +475,7 @@ mod tests {
 
         // Assert
         assert!(first.anonymous && first.source.is_empty());
-        assert_eq!(first.volume.len(), 64);
+        assert_eq!(first.volume.len(), ANONYMOUS_NAME_LEN);
         assert!(first.volume.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(first.volume, second.volume);
     }

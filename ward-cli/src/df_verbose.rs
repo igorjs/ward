@@ -13,7 +13,6 @@ use crate::ps_columns::uses_image;
 use crate::volume::link_counts;
 
 const COLUMN_PADDING: usize = 3;
-/// A sandbox cannot mount a volume yet, and no volume has a sandbox using it.
 /// Shown for a figure Ward does not measure.
 const UNMEASURED: &str = "--";
 /// What `docker system df -v` prints for the build cache; Ward has none.

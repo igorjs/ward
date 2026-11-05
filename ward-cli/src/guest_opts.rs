@@ -398,7 +398,7 @@ mod tests {
 
         // Assert
         assert!(mount.anonymous && mount.source.is_empty());
-        assert_eq!(mount.volume.len(), 64);
+        assert_eq!(mount.volume.len(), volume::ANONYMOUS_NAME_LEN);
     }
 
     #[test]
