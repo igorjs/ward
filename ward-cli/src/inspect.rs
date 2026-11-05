@@ -207,7 +207,7 @@ pub fn ps_json_object(info: &SandboxInfo, now_seconds: i64) -> Value {
         "Names": info.name,
         "Labels": labels_text(&info.labels),
         "Ports": ports_text(info),
-        "Mounts": "",
+        "Mounts": mounts_text(info),
         "Networks": "",
         "Size": "",
     })
@@ -456,17 +456,48 @@ fn health_value(health: &ward_core::pb::HealthState) -> Value {
     })
 }
 
-/// Docker's top-level `Mounts`: the bind mounts, then the tmpfs mounts.
+/// What `ps` shows under `.Mounts`: a volume by name, a bind by its source.
+fn mounts_text(info: &SandboxInfo) -> String {
+    info.mounts
+        .iter()
+        .map(|m| {
+            if m.volume.is_empty() {
+                &m.source
+            } else {
+                &m.volume
+            }
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Docker's top-level `Mounts`: the bind and volume mounts, then the tmpfs
+/// mounts.
 fn mounts(info: &SandboxInfo) -> Vec<Value> {
     let binds = info.mounts.iter().map(|m| {
-        json!({
-            "Type": "bind",
-            "Source": m.source,
-            "Destination": m.target,
-            "Mode": if m.readonly { READ_ONLY_MODE } else { "" },
-            "RW": !m.readonly,
-            "Propagation": BIND_PROPAGATION,
-        })
+        let mode = if m.readonly { READ_ONLY_MODE } else { "" };
+        if m.volume.is_empty() {
+            json!({
+                "Type": "bind",
+                "Source": m.source,
+                "Destination": m.target,
+                "Mode": mode,
+                "RW": !m.readonly,
+                "Propagation": BIND_PROPAGATION,
+            })
+        } else {
+            json!({
+                "Type": "volume",
+                "Name": m.volume,
+                "Source": m.source,
+                "Destination": m.target,
+                "Driver": crate::volume::DRIVER,
+                "Mode": mode,
+                "RW": !m.readonly,
+                "Propagation": "",
+            })
+        }
     });
     let tmpfs = info.guest.iter().flat_map(|guest| &guest.tmpfs).map(|t| {
         let read_only = last_access_mode(&t.options) == READ_ONLY_MODE;
@@ -1145,6 +1176,7 @@ mod tests {
                 source: "/tmp/data".into(),
                 target: "/data".into(),
                 readonly: true,
+                ..Default::default()
             }],
             ..info(SandboxStatus::Running, None)
         };

@@ -940,7 +940,8 @@ enum SnapshotCommands {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Parse `SOURCE:TARGET[:ro]` from `--volume`.
+/// Parse `SOURCE:TARGET[:ro]` from `--volume`. A source that is not an
+/// absolute path names a volume.
 fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
     let parts: Vec<&str> = spec.split(':').collect();
     let (source, target, readonly) = match parts.as_slice() {
@@ -949,11 +950,7 @@ fn parse_mount_spec(spec: &str) -> anyhow::Result<ward_core::pb::Mount> {
         [source, target, "rw"] => (*source, *target, false),
         _ => anyhow::bail!("--volume expects SOURCE:TARGET[:ro|rw], got '{spec}'"),
     };
-    Ok(ward_core::pb::Mount {
-        source: source.to_string(),
-        target: target.to_string(),
-        readonly,
-    })
+    volume::mount_for(source, target, readonly)
 }
 
 /// Parse repeated `KEY=VALUE` flags. Splitting on the first '=' lets values
@@ -2344,6 +2341,19 @@ mod tests {
     #[test]
     fn given_ro_suffix_when_parse_mount_then_readonly() {
         assert!(parse_mount_spec("/tmp/a:/data:ro").unwrap().readonly);
+    }
+
+    #[rstest::rstest]
+    #[case::dot_slash("./data:/d")]
+    #[case::home("~/data:/d")]
+    #[case::relative_path("dir/data:/d")]
+    fn given_a_relative_bind_source_when_parsed_then_the_error_says_absolute(#[case] spec: &str) {
+        let error = parse_mount_spec(spec).unwrap_err();
+
+        assert!(
+            error.to_string().contains("must be an absolute path"),
+            "{error}"
+        );
     }
 
     #[test]

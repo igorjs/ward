@@ -3,11 +3,13 @@
 //! `ward volume ls`, `inspect` and `rm`, with the options of the Docker
 //! commands of the same names.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Result, bail};
 use serde_json::{Map, Value, json};
 use tonic::transport::Channel;
 use ward_core::pb::ward_client::WardClient;
-use ward_core::pb::{RemoveVolumeRequest, VolumeInfo};
+use ward_core::pb::{RemoveVolumeRequest, SandboxInfo, VolumeInfo};
 
 use crate::client;
 use crate::images::{BYTES_PER_MIB, size_text};
@@ -15,9 +17,9 @@ use crate::inspect::rfc3339;
 use crate::{output, template};
 
 /// The only volume driver, and the only scope.
-const DRIVER: &str = "local";
+pub const DRIVER: &str = "local";
 const SCOPE: &str = "local";
-/// Volumes carry no labels, and nothing links to them.
+/// Volumes carry no labels, and `ls` shows no link count.
 const NO_LABELS: &str = "";
 const NO_LINKS: &str = "N/A";
 /// The words `dangling=` accepts, as Docker does.
@@ -40,6 +42,35 @@ const FIELDS: [(&str, &str); 8] = [
     ("Labels", "LABELS"),
     ("Links", "LINKS"),
 ];
+
+/// A mount of the volume called `name`.
+pub fn named_mount(name: &str, target: &str, readonly: bool) -> ward_core::pb::Mount {
+    ward_core::pb::Mount {
+        source: String::new(),
+        target: target.to_string(),
+        readonly,
+        volume: name.to_string(),
+    }
+}
+
+/// The mount for `SOURCE:TARGET`: a bind mount when `source` is an absolute
+/// host path, otherwise the volume it names.
+pub fn mount_for(source: &str, target: &str, readonly: bool) -> Result<ward_core::pb::Mount> {
+    if source.starts_with('/') {
+        return Ok(ward_core::pb::Mount {
+            source: source.to_string(),
+            target: target.to_string(),
+            readonly,
+            volume: String::new(),
+        });
+    }
+    if source.contains('/') || source.starts_with(['~', '.']) {
+        bail!(
+            "invalid volume specification: bind mount source '{source}' must be an absolute path"
+        );
+    }
+    Ok(named_mount(source, target, readonly))
+}
 
 #[derive(clap::Args, Debug)]
 pub struct ListArgs {
@@ -80,7 +111,7 @@ pub struct RemoveArgs {
 #[derive(Debug, Default, PartialEq)]
 struct Filters {
     names: Vec<String>,
-    /// Ward volumes cannot be attached to a sandbox, so all are dangling.
+    /// A volume no sandbox mounts is dangling.
     dangling: Vec<bool>,
     drivers: Vec<String>,
     labels: Vec<String>,
@@ -129,10 +160,11 @@ impl Filters {
     }
 
     /// Volumes carry no labels, so any `label=` filter matches none. Values
-    /// of one key are alternatives, as in Docker.
-    fn allows(&self, volume: &VolumeInfo) -> bool {
+    /// of one key are alternatives, as in Docker. `links` is how many
+    /// sandboxes mount the volume.
+    fn allows(&self, volume: &VolumeInfo, links: usize) -> bool {
         self.labels.is_empty()
-            && (self.dangling.is_empty() || self.dangling.contains(&true))
+            && (self.dangling.is_empty() || self.dangling.contains(&(links == 0)))
             && (self.drivers.is_empty() || self.drivers.iter().any(|d| d == DRIVER))
             && (self.names.is_empty() || self.names.iter().any(|n| volume.name.contains(n)))
     }
@@ -193,6 +225,23 @@ fn list_record(volume: &VolumeInfo) -> Map<String, Value> {
     ])
 }
 
+/// How many sandboxes, stopped ones included, mount each volume by name.
+pub fn link_counts(sandboxes: &[SandboxInfo]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for sandbox in sandboxes {
+        let names: HashSet<&str> = sandbox
+            .mounts
+            .iter()
+            .filter(|m| !m.volume.is_empty())
+            .map(|m| m.volume.as_str())
+            .collect();
+        for name in names {
+            *counts.entry(name.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
 async fn all_volumes(c: &mut WardClient<Channel>) -> Result<Vec<VolumeInfo>> {
     Ok(c.list_volumes(()).await?.into_inner().volumes)
 }
@@ -205,10 +254,11 @@ pub async fn list(socket: &str, args: ListArgs, json: bool, no_pretty: bool) -> 
         .map(|format| template::Template::parse(format, &FIELDS))
         .transpose()?;
     let mut c = client::connect(socket).await?;
+    let links = link_counts(&c.list_sandboxes(()).await?.into_inner().sandboxes);
     let volumes: Vec<VolumeInfo> = all_volumes(&mut c)
         .await?
         .into_iter()
-        .filter(|v| filters.allows(v))
+        .filter(|v| filters.allows(v, links.get(&v.name).copied().unwrap_or_default()))
         .collect();
     if args.quiet {
         volumes.iter().for_each(|v| println!("{}", v.name));
@@ -375,7 +425,7 @@ mod tests {
 
         let kept: Vec<String> = fleet()
             .into_iter()
-            .filter(|v| filters.allows(v))
+            .filter(|v| filters.allows(v, 0))
             .map(|v| v.name)
             .collect();
 

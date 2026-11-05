@@ -844,6 +844,8 @@ pub struct SandboxManager {
     /// once and cannot mutate mid-process (in particular, a sandbox
     /// escape that touches `/proc/<pid>/environ` cannot widen it).
     allow_host_mounts: bool,
+    /// Volumes a sandbox may mount by name; `None` refuses named volumes.
+    volumes: Option<Arc<crate::volume::VolumeManager>>,
     /// Snapshot of `Config::network_backend`, same rationale as
     /// `allow_host_mounts`. Only the smoltcp backend has a datapath that
     /// enforces `EgressMode::Allowlist` (its per-flow guard in
@@ -898,6 +900,7 @@ impl SandboxManager {
             max_sandboxes,
             create_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sandboxes)),
             allow_host_mounts,
+            volumes: None,
             network_backend,
             processes: Arc::new(RwLock::new(HashMap::new())),
             mains: Arc::new(RwLock::new(HashMap::new())),
@@ -1012,6 +1015,42 @@ impl SandboxManager {
             tracing::warn!(sandbox_id = %id, error = %e, "cannot end the VM after the main process failed");
         }
         self.broker.deregister_sandbox(id).await;
+    }
+
+    /// Let sandboxes mount named volumes from `volumes`.
+    pub fn with_volumes(mut self, volumes: Arc<crate::volume::VolumeManager>) -> Self {
+        self.volumes = Some(volumes);
+        self
+    }
+
+    /// Claim the volume called `name`, creating it when missing, and return
+    /// its host path.
+    async fn claim_volume(&self, name: &str) -> Result<(crate::volume::VolumeClaim, String)> {
+        let volumes = self.volumes.as_ref().ok_or_else(|| {
+            ApiError::InvalidRequest("this daemon cannot mount named volumes".into())
+        })?;
+        let claim = volumes.claim(name);
+        let path = volumes.ensure(name).await?.mount_path;
+        Ok((claim, path))
+    }
+
+    /// IDs of the sandboxes, stopped ones included, that mount the volume
+    /// called `name`.
+    pub async fn volume_users(&self, name: &str) -> Vec<String> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .meta
+                    .options
+                    .mounts
+                    .iter()
+                    .any(|m| m.volume.as_deref() == Some(name))
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Persist sandbox records under `data_dir` and reload them with
@@ -1446,13 +1485,31 @@ impl SandboxManager {
         // mount allowlist, because the validator reads the snapshot,
         // not the live env.
         let mut mounts = Vec::with_capacity(req.mounts.len());
+        // Held until the sandbox is recorded, so a volume it names cannot be
+        // removed while the image is still being pulled.
+        let mut volume_claims = Vec::new();
         for m in &req.mounts {
-            crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
-            mounts.push(crate::protocol::Mount {
-                source: m.source.clone(),
-                target: m.target.clone(),
-                readonly: m.readonly,
-            });
+            if m.volume.is_empty() {
+                crate::validate::mount(&m.source, &m.target, m.readonly, self.allow_host_mounts)?;
+                mounts.push(crate::protocol::Mount {
+                    source: m.source.clone(),
+                    target: m.target.clone(),
+                    readonly: m.readonly,
+                    volume: None,
+                });
+            } else {
+                // The host path is the daemon's own, so the client's source
+                // is ignored and the host allowlist does not apply.
+                crate::validate::volume_mount(&m.volume, &m.target)?;
+                let (claim, source) = self.claim_volume(&m.volume).await?;
+                volume_claims.push(claim);
+                mounts.push(crate::protocol::Mount {
+                    source,
+                    target: m.target.clone(),
+                    readonly: m.readonly,
+                    volume: Some(m.volume.clone()),
+                });
+            }
         }
 
         // Validate volume references before they reach the backend.
@@ -3472,6 +3529,7 @@ fn protocol_info_to_pb(info: crate::protocol::SandboxInfo, view: CommandView) ->
                 source: m.source.clone(),
                 target: m.target.clone(),
                 readonly: m.readonly,
+                volume: m.volume.clone().unwrap_or_default(),
             })
             .collect(),
         paused: info.paused,

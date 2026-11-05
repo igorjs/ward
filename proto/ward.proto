@@ -433,6 +433,9 @@ message Mount {
   string source = 1;
   string target = 2;
   bool readonly = 3;
+  // Name of a daemon-managed volume. When set, the daemon creates the volume
+  // if it is missing and fills in the source path.
+  string volume = 4;
 }
 
 message EgressPolicy {

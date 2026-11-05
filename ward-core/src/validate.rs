@@ -213,7 +213,8 @@ pub fn restart_policy(
 }
 
 /// Validate a volume name.
-/// Must be non-empty, alphanumeric + dash/underscore, max 64 chars.
+/// Docker's rule: starts with an alphanumeric, then alphanumerics, dash,
+/// underscore or dot, max 64 chars.
 pub fn volume_name(name: &str) -> Result<(), ApiError> {
     if name.is_empty() {
         return Err(ApiError::InvalidRequest(
@@ -225,13 +226,15 @@ pub fn volume_name(name: &str) -> Result<(), ApiError> {
             "volume name exceeds 64 characters".into(),
         ));
     }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    let starts_ok = name.starts_with(|c: char| c.is_ascii_alphanumeric());
+    if !starts_ok
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        return Err(ApiError::InvalidRequest(
-            "volume name must contain only alphanumeric characters, dashes, and underscores".into(),
-        ));
+        return Err(ApiError::InvalidRequest(format!(
+            "invalid volume name \"{name}\": it must start with a letter or digit and contain only letters, digits, '-', '_' and '.'"
+        )));
     }
     Ok(())
 }
@@ -254,6 +257,33 @@ pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A volume mount's guest path follows the bind mount rules; its host path
+/// is the daemon's own, so only the volume name is checked.
+pub fn volume_mount(name: &str, target: &str) -> Result<(), ApiError> {
+    volume_name(name)?;
+    mount_path_shape("target", target)
+}
+
+/// A mount path must be absolute and free of `..`.
+fn mount_path_shape(label: &str, path: &str) -> Result<(), ApiError> {
+    if path.is_empty() {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must not be empty"
+        )));
+    }
+    if !path.starts_with('/') {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must be an absolute path: {path}"
+        )));
+    }
+    if path.split('/').any(|c| c == "..") {
+        return Err(ApiError::InvalidRequest(format!(
+            "mount {label} must not contain '..': {path}"
+        )));
+    }
+    Ok(())
+}
+
 /// Validate a bind mount's source (host) and target (guest) paths.
 ///
 /// Both must be absolute, and neither may contain a `..` component — a guest
@@ -270,23 +300,8 @@ pub fn volume_size(size_mb: u32) -> Result<(), ApiError> {
 /// `/lib`, `/bin`, `/sbin`) still require `readonly: true` so a sandbox
 /// can't overwrite host system files.
 pub fn mount(source: &str, target: &str, readonly: bool, allow_host: bool) -> Result<(), ApiError> {
-    for (label, path) in [("source", source), ("target", target)] {
-        if path.is_empty() {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must not be empty"
-            )));
-        }
-        if !path.starts_with('/') {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must be an absolute path: {path}"
-            )));
-        }
-        if path.split('/').any(|c| c == "..") {
-            return Err(ApiError::InvalidRequest(format!(
-                "mount {label} must not contain '..': {path}"
-            )));
-        }
-    }
+    mount_path_shape("source", source)?;
+    mount_path_shape("target", target)?;
 
     // SEC-020: source allowlist (host-side path the sandbox can see).
     if !allow_host && !is_default_allowed_source(source) {
@@ -1024,6 +1039,9 @@ mod tests {
     #[case::with_dash("build-cache")]
     #[case::with_underscore("shared_state")]
     #[case::mixed("agent-1_logs")]
+    #[case::dotted("data.v1")]
+    // Dots are safe: a volume's directory is named by its id, never its name.
+    #[case::trailing_dots("a..")]
     fn volume_name_accepts_valid(#[case] input: &str) {
         assert!(volume_name(input).is_ok());
     }
@@ -1032,7 +1050,8 @@ mod tests {
     #[case::empty("")]
     #[case::slash("../escape")]
     #[case::space("my volume")]
-    #[case::dot("my.volume")]
+    #[case::leading_dot(".volume")]
+    #[case::leading_dash("-volume")]
     #[case::null("vol\0name")]
     fn volume_name_rejects_invalid(#[case] input: &str) {
         assert!(volume_name(input).is_err());
@@ -1368,11 +1387,11 @@ mod proptests {
     // ----- volume_name ----------------------------------------------------
 
     proptest! {
-        /// Any non-empty alphanumeric+dash+underscore string up to 64 chars
-        /// is accepted.
+        /// Any name that starts alphanumeric and continues with letters,
+        /// digits, dash, underscore or dot, up to 64 chars, is accepted.
         #[test]
         fn property_volume_name_accepts_valid_alphabet(
-            name in "[a-zA-Z0-9_-]{1,64}"
+            name in "[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}"
         ) {
             prop_assert!(volume_name(&name).is_ok(), "rejected: {name:?}");
         }

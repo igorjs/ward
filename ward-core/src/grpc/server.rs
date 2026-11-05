@@ -49,6 +49,7 @@ pub(super) fn api_err_to_status(err: ApiError) -> Status {
         }
         ApiError::NameInUse { name, id } => Status::already_exists(name_conflict_message(name, id)),
         ApiError::VolumeNotFound(id) => Status::not_found(format!("volume not found: {id}")),
+        ApiError::VolumeInUse(msg) => Status::failed_precondition(msg.clone()),
         ApiError::SnapshotNotFound(id) => Status::not_found(format!("snapshot not found: {id}")),
         ApiError::ProcessNotFound(id) => Status::not_found(format!("process not found: {id}")),
         ApiError::ImageNotFound(msg) => Status::not_found(msg.clone()),
@@ -724,7 +725,9 @@ impl Ward for WardGrpcServer {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         self.volume
-            .remove(&req.id)
+            .remove_if_unused(&req.id, |name| async move {
+                self.sandbox.volume_users(&name).await
+            })
             .await
             .map_err(api_err_to_status)?;
         Ok(Response::new(()))
