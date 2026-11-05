@@ -6,7 +6,8 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use ward_core::pb::SandboxStatus;
 
-use crate::images::size_text;
+use crate::images::{BYTES_PER_MIB, size_text};
+use crate::ps_columns::uses_image;
 use crate::template::{ANY_FIELD, Template};
 use crate::{client, output};
 
@@ -14,7 +15,18 @@ const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const INDENT: &str = " ";
 /// Shown for a figure Ward does not measure, as `ward stats` does.
 const UNMEASURED: &str = "--";
-const DF_HEADERS: [&str; 4] = ["TYPE", "TOTAL", "ACTIVE", "SIZE"];
+const DF_HEADERS: [&str; 5] = ["TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"];
+const DF_DEFAULT_FORMAT: &str =
+    "table {{.Type}}\t{{.TotalCount}}\t{{.Active}}\t{{.Size}}\t{{.Reclaimable}}";
+/// Each `system df --format` field with the header a `table` template gives it.
+const DF_FIELDS: [(&str, &str); 5] = [
+    ("Type", "TYPE"),
+    ("TotalCount", "TOTAL"),
+    ("Active", "ACTIVE"),
+    ("Size", "SIZE"),
+    ("Reclaimable", "RECLAIMABLE"),
+];
+const PERCENT: u64 = 100;
 
 /// The `docker version` record: `.Client.Version`, `.Server.Version`, and so on.
 fn version_record(server: Option<&ward_core::pb::DaemonInfo>) -> Value {
@@ -74,10 +86,10 @@ pub async fn info(socket: &str, format: Option<&str>, json: bool) -> Result<()> 
         .transpose()?;
     let mut c = client::connect(socket).await?;
     let resp = c.get_info(()).await?.into_inner();
+    let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
+    let images = c.list_images(()).await?.into_inner().images;
+    let record = info_record(&resp, &sandboxes, images.len());
     if let Some(template) = template {
-        let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
-        let images = c.list_images(()).await?.into_inner().images;
-        let record = info_record(&resp, &sandboxes, images.len());
         print!("{}", template.render(&[record])?);
     } else if json {
         println!(
@@ -90,10 +102,7 @@ pub async fn info(socket: &str, format: Option<&str>, json: bool) -> Result<()> 
             })
         );
     } else {
-        println!("version: {}", resp.version);
-        println!("platform: {}", resp.platform);
-        println!("arch: {}", resp.arch);
-        println!("backend: {}", resp.backend);
+        print!("{}", info_text(&record));
     }
     Ok(())
 }
@@ -104,18 +113,25 @@ fn info_record(
     sandboxes: &[ward_core::pb::SandboxInfo],
     images: usize,
 ) -> serde_json::Map<String, Value> {
-    let running = sandboxes
-        .iter()
-        .filter(|s| s.status == SandboxStatus::Running as i32)
-        .count();
+    let alive = |s: &&ward_core::pb::SandboxInfo| s.status == SandboxStatus::Running as i32;
+    let paused = sandboxes.iter().filter(alive).filter(|s| s.paused).count();
+    let running = sandboxes.iter().filter(alive).count() - paused;
     let Value::Object(map) = json!({
+        "ID": info.id,
+        "Name": info.hostname,
         "ServerVersion": info.version,
         "OSType": info.platform,
+        "OperatingSystem": info.operating_system,
+        "KernelVersion": info.kernel_version,
         "Architecture": info.arch,
         "Driver": info.backend,
+        "NCPU": info.ncpu,
+        "MemTotal": info.mem_total_bytes,
+        "DockerRootDir": info.root_dir,
         "Containers": sandboxes.len(),
         "ContainersRunning": running,
-        "ContainersStopped": sandboxes.len() - running,
+        "ContainersPaused": paused,
+        "ContainersStopped": sandboxes.len() - running - paused,
         "Images": images,
     }) else {
         unreachable!("json! of an object")
@@ -123,37 +139,164 @@ fn info_record(
     map
 }
 
-/// Counts sandboxes and cached images, like `docker system df`.
-pub async fn df(socket: &str, json: bool, no_pretty: bool) -> Result<()> {
-    let mut c = client::connect(socket).await?;
-    let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
-    let images = c.list_images(()).await?.into_inner().images;
+/// The sectioned text of `docker info`.
+fn info_text(record: &serde_json::Map<String, Value>) -> String {
+    let text = |key: &str| match &record[key] {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let memory = size_text(record["MemTotal"].as_u64().unwrap_or(0));
+    format!(
+        "Server:\n\
+         {INDENT}Containers: {}\n\
+         {INDENT}{INDENT}Running: {}\n\
+         {INDENT}{INDENT}Paused: {}\n\
+         {INDENT}{INDENT}Stopped: {}\n\
+         {INDENT}Images: {}\n\
+         {INDENT}Server Version: {}\n\
+         {INDENT}Isolation: microVM ({})\n\
+         {INDENT}Kernel Version: {}\n\
+         {INDENT}Operating System: {}\n\
+         {INDENT}OSType: {}\n\
+         {INDENT}Architecture: {}\n\
+         {INDENT}CPUs: {}\n\
+         {INDENT}Total Memory: {memory}\n\
+         {INDENT}Name: {}\n\
+         {INDENT}ID: {}\n\
+         {INDENT}Docker Root Dir: {}\n",
+        text("Containers"),
+        text("ContainersRunning"),
+        text("ContainersPaused"),
+        text("ContainersStopped"),
+        text("Images"),
+        text("ServerVersion"),
+        text("Driver"),
+        text("KernelVersion"),
+        text("OperatingSystem"),
+        text("OSType"),
+        text("Architecture"),
+        text("NCPU"),
+        text("Name"),
+        text("ID"),
+        text("DockerRootDir"),
+    )
+}
+
+/// One `docker system df` row: the figures of one kind of object.
+struct DfRow {
+    kind: &'static str,
+    total: usize,
+    active: usize,
+    size: String,
+    reclaimable: String,
+}
+
+impl DfRow {
+    fn cells(&self) -> Vec<Value> {
+        vec![
+            self.kind.into(),
+            self.total.into(),
+            self.active.into(),
+            self.size.clone().into(),
+            self.reclaimable.clone().into(),
+        ]
+    }
+
+    fn record(&self) -> serde_json::Map<String, Value> {
+        let Value::Object(map) = json!({
+            "Type": self.kind,
+            "TotalCount": self.total,
+            "Active": self.active,
+            "Size": self.size,
+            "Reclaimable": self.reclaimable,
+        }) else {
+            unreachable!("json! of an object")
+        };
+        map
+    }
+}
+
+/// `1.2GB (66%)`: the reclaimable bytes and their share of the total.
+fn reclaimable_text(reclaimable: u64, total: u64) -> String {
+    let percent = reclaimable
+        .saturating_mul(PERCENT)
+        .checked_div(total)
+        .unwrap_or(0);
+    format!("{} ({percent}%)", size_text(reclaimable))
+}
+
+/// The rows of `docker system df`, from what the daemon holds.
+fn df_rows(
+    sandboxes: &[ward_core::pb::SandboxInfo],
+    images: &[ward_core::pb::ImageInfo],
+    volumes: &[ward_core::pb::VolumeInfo],
+) -> Vec<DfRow> {
     let running = sandboxes
         .iter()
         .filter(|s| s.status == SandboxStatus::Running as i32)
         .count();
-    let cache_bytes: u64 = images.iter().map(|image| image.size_bytes).sum();
-    let row = |kind: &str, total: usize, active: Value, size: String| {
-        vec![kind.into(), total.into(), active, size.into()]
-    };
-    let rows = vec![
-        row(
-            "Images",
-            images.len(),
-            UNMEASURED.into(),
-            size_text(cache_bytes),
-        ),
-        row(
-            "Containers",
-            sandboxes.len(),
-            running.into(),
-            UNMEASURED.into(),
-        ),
-    ];
+    let used = |image: &&ward_core::pb::ImageInfo| sandboxes.iter().any(|s| uses_image(s, image));
+    let image_bytes: u64 = images.iter().map(|i| i.size_bytes).sum();
+    let unused_bytes: u64 = images
+        .iter()
+        .filter(|i| !used(i))
+        .map(|i| i.size_bytes)
+        .sum();
+    // A volume cannot be attached to a sandbox yet, so none is in use.
+    let volume_bytes: u64 = volumes
+        .iter()
+        .map(|v| u64::from(v.size_mb) * BYTES_PER_MIB)
+        .sum();
+    vec![
+        DfRow {
+            kind: "Images",
+            total: images.len(),
+            active: images.iter().filter(used).count(),
+            size: size_text(image_bytes),
+            reclaimable: reclaimable_text(unused_bytes, image_bytes),
+        },
+        DfRow {
+            kind: "Containers",
+            total: sandboxes.len(),
+            active: running,
+            size: UNMEASURED.into(),
+            reclaimable: UNMEASURED.into(),
+        },
+        DfRow {
+            kind: "Local Volumes",
+            total: volumes.len(),
+            active: 0,
+            size: size_text(volume_bytes),
+            reclaimable: reclaimable_text(volume_bytes, volume_bytes),
+        },
+        DfRow {
+            kind: "Build Cache",
+            total: 0,
+            active: 0,
+            size: size_text(0),
+            reclaimable: size_text(0),
+        },
+    ]
+}
+
+/// Prints the usage table of `docker system df`.
+pub async fn df(socket: &str, format: Option<&str>, json: bool, no_pretty: bool) -> Result<()> {
+    let template = Template::parse(format.unwrap_or(DF_DEFAULT_FORMAT), &DF_FIELDS)?;
+    let mut c = client::connect(socket).await?;
+    let sandboxes = c.list_sandboxes(()).await?.into_inner().sandboxes;
+    let images = c.list_images(()).await?.into_inner().images;
+    let volumes = c.list_volumes(()).await?.into_inner().volumes;
+    let rows = df_rows(&sandboxes, &images, &volumes);
+    if format.is_some() || !(json || no_pretty) {
+        let records: Vec<_> = rows.iter().map(DfRow::record).collect();
+        print!("{}", template.render(&records)?);
+        return Ok(());
+    }
     if let Some(header) = output::tsv_header(no_pretty, &DF_HEADERS).filter(|_| !json) {
         println!("{header}");
     }
-    output::emit_rows(json, no_pretty, &DF_HEADERS, &rows)
+    let cells: Vec<Vec<Value>> = rows.iter().map(DfRow::cells).collect();
+    output::emit_rows(json, no_pretty, &DF_HEADERS, &cells)
 }
 
 #[cfg(test)]
@@ -166,6 +309,22 @@ mod tests {
             platform: "linux".into(),
             backend: "krunvm".into(),
             arch: "aarch64".into(),
+            hostname: "box".into(),
+            kernel_version: "6.1.0".into(),
+            operating_system: "Debian".into(),
+            ncpu: 4,
+            mem_total_bytes: 8_000_000_000,
+            root_dir: "/var/lib/ward".into(),
+            id: "abc".into(),
+        }
+    }
+
+    fn sandbox(status: SandboxStatus, paused: bool, image: &str) -> ward_core::pb::SandboxInfo {
+        ward_core::pb::SandboxInfo {
+            status: status as i32,
+            paused,
+            image: image.into(),
+            ..Default::default()
         }
     }
 
@@ -198,5 +357,91 @@ mod tests {
         let rendered = template.render(&[map]).unwrap();
 
         assert_eq!(rendered, format!("1.2.3/{CLIENT_VERSION}\n"));
+    }
+
+    #[test]
+    fn given_paused_and_stopped_sandboxes_when_info_built_then_states_are_counted_apart() {
+        let sandboxes = [
+            sandbox(SandboxStatus::Running, false, "a"),
+            sandbox(SandboxStatus::Running, true, "a"),
+            sandbox(SandboxStatus::Stopped, false, "a"),
+        ];
+
+        let record = info_record(&daemon(), &sandboxes, 2);
+
+        assert_eq!(record["Containers"], 3);
+        assert_eq!(record["ContainersRunning"], 1);
+        assert_eq!(record["ContainersPaused"], 1);
+        assert_eq!(record["ContainersStopped"], 1);
+        assert_eq!(record["Name"], "box");
+        assert_eq!(record["NCPU"], 4);
+        assert_eq!(record["DockerRootDir"], "/var/lib/ward");
+    }
+
+    #[test]
+    fn given_a_record_when_info_text_built_then_sections_and_host_facts_print() {
+        let text = info_text(&info_record(&daemon(), &[], 0));
+
+        assert!(
+            text.starts_with("Server:\n Containers: 0\n  Running: 0\n"),
+            "{text}"
+        );
+        assert!(text.contains(" Kernel Version: 6.1.0\n"), "{text}");
+        assert!(text.contains(" Total Memory: 8GB\n"), "{text}");
+        assert!(text.contains(" Docker Root Dir: /var/lib/ward\n"), "{text}");
+    }
+
+    #[test]
+    fn given_images_and_sandboxes_when_df_rows_built_then_unused_images_are_reclaimable() {
+        let used = ward_core::pb::ImageInfo {
+            reference: "alpine:latest".into(),
+            size_bytes: 3_000_000,
+            ..Default::default()
+        };
+        let idle = ward_core::pb::ImageInfo {
+            reference: "busybox:latest".into(),
+            size_bytes: 1_000_000,
+            ..Default::default()
+        };
+        let sandboxes = [sandbox(SandboxStatus::Running, false, "alpine:latest")];
+
+        let rows = df_rows(&sandboxes, &[used, idle], &[]);
+
+        assert_eq!(rows[0].kind, "Images");
+        assert_eq!((rows[0].total, rows[0].active), (2, 1));
+        assert_eq!(rows[0].size, "4MB");
+        assert_eq!(rows[0].reclaimable, "1MB (25%)");
+        assert_eq!((rows[1].total, rows[1].active), (1, 1));
+        assert_eq!(rows[3].kind, "Build Cache");
+    }
+
+    #[test]
+    fn given_volumes_when_df_rows_built_then_all_of_their_size_is_reclaimable() {
+        let volume = ward_core::pb::VolumeInfo {
+            size_mb: 10,
+            ..Default::default()
+        };
+
+        let rows = df_rows(&[], &[], &[volume]);
+
+        assert_eq!(rows[2].kind, "Local Volumes");
+        assert!(
+            rows[2].reclaimable.ends_with("(100%)"),
+            "{}",
+            rows[2].reclaimable
+        );
+    }
+
+    #[test]
+    fn given_a_df_row_when_rendered_with_the_default_format_then_the_header_is_docker_s() {
+        let template = Template::parse(DF_DEFAULT_FORMAT, &DF_FIELDS).expect("parse");
+        let records: Vec<_> = df_rows(&[], &[], &[]).iter().map(DfRow::record).collect();
+
+        let text = template.render(&records).expect("render");
+
+        assert!(
+            text.starts_with("TYPE            TOTAL   ACTIVE   SIZE   RECLAIMABLE\n"),
+            "{text}"
+        );
     }
 }

@@ -857,11 +857,14 @@ enum SystemCommands {
         #[arg(short, long)]
         format: Option<String>,
     },
-    /// Count sandboxes and cached images.
+    /// Show disk usage of images, containers and volumes.
     Df {
         /// Show a table per sandbox, image and volume.
         #[arg(short, long)]
         verbose: bool,
+        /// Go template per row: .Type .TotalCount .Active .Size .Reclaimable.
+        #[arg(long)]
+        format: Option<String>,
     },
     /// Remove stopped sandboxes, and with -a unused images and with
     /// --volumes volumes, asking first unless -f is given.
@@ -1111,6 +1114,9 @@ const IMAGE_COMMANDS: [(&str, &str); 12] = [
     ("import", "import"),
 ];
 
+/// Docker's `system` subcommands that are top-level commands in Ward.
+const SYSTEM_COMMANDS: [(&str, &str); 1] = [("events", "events")];
+
 /// Rewrite `ward container ls -a` to `ward ps -a`, and the `image` group the
 /// same way, so both spellings share one definition and one help text.
 fn expand_groups(mut args: Vec<String>) -> Vec<String> {
@@ -1120,6 +1126,7 @@ fn expand_groups(mut args: Vec<String>) -> Vec<String> {
     let table: &[(&str, &str)] = match args[group].as_str() {
         "container" => &CONTAINER_COMMANDS,
         "image" => &IMAGE_COMMANDS,
+        "system" => &SYSTEM_COMMANDS,
         _ => return args,
     };
     let target = args
@@ -1826,12 +1833,15 @@ async fn run_cli(cli: Cli) -> anyhow::Result<()> {
             system::version(&socket_path, format.as_deref(), json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: true }) => {
+        Commands::System(SystemCommands::Df { verbose: true, .. }) => {
             df_verbose::run(&socket_path, json).await?;
         }
 
-        Commands::System(SystemCommands::Df { verbose: false }) => {
-            system::df(&socket_path, json, no_pretty).await?;
+        Commands::System(SystemCommands::Df {
+            verbose: false,
+            format,
+        }) => {
+            system::df(&socket_path, format.as_deref(), json, no_pretty).await?;
         }
 
         Commands::Container { .. } | Commands::Image { .. } => {
@@ -2026,6 +2036,8 @@ mod tests {
     #[case::container_remove(&["ward", "container", "remove", "x"], &["ward", "rm", "x"])]
     #[case::image_ls(&["ward", "image", "ls"], &["ward", "images"])]
     #[case::image_pull(&["ward", "image", "pull", "alpine"], &["ward", "pull", "alpine"])]
+    #[case::system_events(&["ward", "system", "events", "--since", "1h"], &["ward", "events", "--since", "1h"])]
+    #[case::system_info_is_left_alone(&["ward", "system", "info"], &["ward", "system", "info"])]
     #[case::unknown_sub_is_left_alone(&["ward", "container", "nope"], &["ward", "container", "nope"])]
     #[case::other_command(&["ward", "ps", "container"], &["ward", "ps", "container"])]
     fn given_group_command_when_expanded_then_it_names_the_top_level_command(
