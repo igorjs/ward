@@ -3,13 +3,28 @@
 //! Which sandboxes `ward ps` shows: `--filter`, `-n` and `-l`, newest first.
 
 use anyhow::{Result, bail};
-use ward_core::pb::{SandboxInfo, SandboxStatus};
+use ward_core::pb::{ImageInfo, PortMapping, SandboxInfo, SandboxStatus};
+
+use crate::exists::names_image;
+use crate::ps_columns::uses_image;
 
 const FILTER_NAME: &str = "name";
 const FILTER_ID: &str = "id";
 const FILTER_STATUS: &str = "status";
 const FILTER_LABEL: &str = "label";
 const FILTER_HEALTH: &str = "health";
+const FILTER_ANCESTOR: &str = "ancestor";
+const FILTER_BEFORE: &str = "before";
+const FILTER_SINCE: &str = "since";
+const FILTER_EXITED: &str = "exited";
+const FILTER_PUBLISH: &str = "publish";
+const FILTER_EXPOSE: &str = "expose";
+const FILTER_VOLUME: &str = "volume";
+const PORT_RANGE_SEPARATOR: char = '-';
+const PROTOCOL_SEPARATOR: char = '/';
+/// The only protocol a published port can have.
+const PROTOCOL_TCP: &str = "tcp";
+const DEFAULT_TAG_SUFFIX: &str = ":latest";
 /// Docker's word for a sandbox with no health check.
 const HEALTH_NONE: &str = "none";
 const HEALTHS: [&str; 4] = ["starting", "healthy", "unhealthy", HEALTH_NONE];
@@ -39,6 +54,75 @@ pub struct Filters {
     healths: Vec<String>,
     /// `key` or `key=value`; a sandbox must match every one.
     labels: Vec<String>,
+    ancestors: Vec<Ancestor>,
+    exit_codes: Vec<i32>,
+    /// Name or ID of the sandbox the others must predate; the last one given wins.
+    before: Option<String>,
+    /// Name or ID of the sandbox the others must follow; the last one given wins.
+    since: Option<String>,
+    before_at: Option<(i64, i32)>,
+    since_at: Option<(i64, i32)>,
+    publishes: Vec<PortSpec>,
+    exposes: Vec<PortSpec>,
+    /// A volume name, or a path inside or outside the guest that is mounted.
+    volumes: Vec<String>,
+}
+
+/// An `ancestor=` value, tied to the cached image it names when there is one.
+#[derive(Debug)]
+struct Ancestor {
+    wanted: String,
+    image: Option<ImageInfo>,
+}
+
+impl Ancestor {
+    fn matches(&self, info: &SandboxInfo) -> bool {
+        match &self.image {
+            Some(image) => uses_image(info, image),
+            None => with_tag(&info.image) == with_tag(&self.wanted),
+        }
+    }
+}
+
+fn with_tag(reference: &str) -> String {
+    match reference.rsplit_once(':') {
+        Some((_, tag)) if !tag.contains('/') => reference.to_string(),
+        _ => format!("{reference}{DEFAULT_TAG_SUFFIX}"),
+    }
+}
+
+/// A `publish=` or `expose=` value: `80`, `80/tcp`, `8000-8010` or
+/// `8000-8010/tcp`.
+#[derive(Debug)]
+struct PortSpec {
+    first: u32,
+    last: u32,
+}
+
+impl PortSpec {
+    fn parse(filter: &str, value: &str) -> Result<Self> {
+        let bad = || anyhow::anyhow!("invalid filter '{filter}={value}'");
+        let (ports, protocol) = match value.split_once(PROTOCOL_SEPARATOR) {
+            Some((ports, protocol)) => (ports, protocol),
+            None => (value, PROTOCOL_TCP),
+        };
+        let (first, last) = match ports.split_once(PORT_RANGE_SEPARATOR) {
+            Some((first, last)) => (first, last),
+            None => (ports, ports),
+        };
+        let (first, last) = (
+            first.parse().map_err(|_| bad())?,
+            last.parse().map_err(|_| bad())?,
+        );
+        if first > last || protocol != PROTOCOL_TCP {
+            return Err(bad());
+        }
+        Ok(Self { first, last })
+    }
+
+    fn matches(&self, mapping: &PortMapping) -> bool {
+        (self.first..=self.last).contains(&mapping.container_port)
+    }
 }
 
 impl Filters {
@@ -66,10 +150,58 @@ impl Filters {
                     bail!("invalid filter 'label={value}'")
                 }
                 FILTER_LABEL => filters.labels.push(value.to_string()),
+                FILTER_ANCESTOR if !value.is_empty() => filters.ancestors.push(Ancestor {
+                    wanted: value.to_string(),
+                    image: None,
+                }),
+                FILTER_BEFORE if !value.is_empty() => filters.before = Some(value.to_string()),
+                FILTER_SINCE if !value.is_empty() => filters.since = Some(value.to_string()),
+                FILTER_EXITED => match value.parse() {
+                    Ok(code) => filters.exit_codes.push(code),
+                    Err(_) => bail!("invalid filter 'exited={value}'"),
+                },
+                FILTER_PUBLISH => filters.publishes.push(PortSpec::parse(key, value)?),
+                FILTER_EXPOSE => filters.exposes.push(PortSpec::parse(key, value)?),
+                FILTER_VOLUME if !value.is_empty() => filters.volumes.push(value.to_string()),
+                FILTER_ANCESTOR | FILTER_BEFORE | FILTER_SINCE | FILTER_VOLUME => {
+                    bail!("invalid filter '{key}={value}'")
+                }
                 _ => bail!("invalid filter '{key}'"),
             }
         }
         Ok(filters)
+    }
+
+    /// Whether the filters need the cached images to be resolved.
+    pub fn needs_images(&self) -> bool {
+        !self.ancestors.is_empty()
+    }
+
+    /// Looks up what `ancestor=`, `before=` and `since=` name.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `before=` or `since=` names no sandbox.
+    pub fn resolve(&mut self, listed: &[SandboxInfo], images: &[ImageInfo]) -> Result<()> {
+        for ancestor in &mut self.ancestors {
+            ancestor.image = images
+                .iter()
+                .find(|image| names_image(image, &ancestor.wanted))
+                .cloned();
+        }
+        let created_of = |name: &Option<String>| -> Result<Option<(i64, i32)>> {
+            let Some(name) = name else { return Ok(None) };
+            match listed
+                .iter()
+                .find(|s| s.name == *name || s.id.starts_with(name.as_str()))
+            {
+                Some(found) => Ok(created(found)),
+                None => bail!("No such container: {name}"),
+            }
+        };
+        self.before_at = created_of(&self.before)?;
+        self.since_at = created_of(&self.since)?;
+        Ok(())
     }
 
     fn allows(&self, info: &SandboxInfo) -> bool {
@@ -85,11 +217,36 @@ impl Filters {
                     .as_ref()
                     .map_or(HEALTH_NONE, |h| h.status.as_str())
             })
+            && (self.ancestors.is_empty() || self.ancestors.iter().any(|a| a.matches(info)))
+            && (self.exit_codes.is_empty()
+                || info
+                    .exit_code
+                    .is_some_and(|code| self.exit_codes.contains(&code)))
+            && self
+                .before_at
+                .is_none_or(|cutoff| created(info) < Some(cutoff))
+            && self
+                .since_at
+                .is_none_or(|cutoff| created(info) > Some(cutoff))
+            && (self.publishes.is_empty() || self.publishes.iter().any(|p| publishes(info, p)))
+            && (self.exposes.is_empty() || self.exposes.iter().any(|p| publishes(info, p)))
+            && (self.volumes.is_empty()
+                || self.volumes.iter().any(|wanted| {
+                    info.mounts
+                        .iter()
+                        .any(|m| m.target == *wanted || m.source == *wanted)
+                }))
             && self.labels.iter().all(|label| match label.split_once('=') {
                 Some((key, value)) => info.labels.get(key).is_some_and(|v| v == value),
                 None => info.labels.contains_key(label),
             })
     }
+}
+
+/// Whether the sandbox publishes a container port in the range. Ward has no
+/// image `EXPOSE`, so a port is exposed exactly when it is published.
+fn publishes(info: &SandboxInfo, ports: &PortSpec) -> bool {
+    info.published_ports.iter().any(|m| ports.matches(m))
 }
 
 fn status_word(info: &SandboxInfo) -> &'static str {
@@ -333,8 +490,138 @@ mod tests {
         assert_eq!(names(&shown), ["web2"]);
     }
 
+    fn resolved(specs: &[&str], images: &[ImageInfo]) -> Filters {
+        let mut filters = parse(specs);
+        filters.resolve(&fleet(), images).expect("resolve");
+        filters
+    }
+
+    fn with_ports(mut info: SandboxInfo, ports: &[u32]) -> SandboxInfo {
+        info.published_ports = ports
+            .iter()
+            .map(|&container_port| PortMapping {
+                container_port,
+                host_port: 8080,
+                ..Default::default()
+            })
+            .collect();
+        info
+    }
+
+    #[rstest::rstest]
+    #[case::older_than(&["before=web2"], &["db", "web1"])]
+    #[case::newer_than(&["since=web1"], &["web2", "db"])]
+    #[case::by_id_prefix(&["since=bbb"], &[])]
+    #[case::window(&["since=web1", "before=web2"], &["db"])]
+    fn given_before_or_since_when_selected_then_only_that_side_of_the_sandbox_remains(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let filters = resolved(specs, &[]);
+
+        let listed = fleet();
+        let shown = select(&listed, true, &filters, None);
+
+        assert_eq!(names(&shown), expected);
+    }
+
+    #[test]
+    fn given_before_naming_nothing_when_resolved_then_it_is_refused() {
+        let mut filters = parse(&["before=ghost"]);
+
+        let error = filters.resolve(&fleet(), &[]).expect_err("refused");
+
+        assert_eq!(error.to_string(), "No such container: ghost");
+    }
+
+    #[rstest::rstest]
+    #[case::code_zero(&["exited=0"], &["web2"])]
+    #[case::other_code(&["exited=3"], &[])]
+    fn given_exited_when_selected_then_the_exit_code_decides(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let mut listed = fleet();
+        listed[1].exit_code = Some(0);
+
+        let shown = select(&listed, true, &parse(specs), None);
+
+        assert_eq!(names(&shown), expected);
+    }
+
+    #[test]
+    fn given_a_cached_image_when_ancestor_resolved_then_a_tag_or_id_prefix_finds_its_sandboxes() {
+        let image = ImageInfo {
+            reference: "alpine:3".into(),
+            digest: "sha256:abcdef0123456789".into(),
+            ..Default::default()
+        };
+        let mut listed = fleet();
+        listed[0].image = "alpine:3".into();
+        listed[1].image = "busybox".into();
+        let mut by_tag = parse(&["ancestor=alpine:3"]);
+        let mut by_id = parse(&["ancestor=abcdef"]);
+        let mut uncached = parse(&["ancestor=busybox"]);
+        for filters in [&mut by_tag, &mut by_id, &mut uncached] {
+            filters
+                .resolve(&listed, std::slice::from_ref(&image))
+                .expect("resolve");
+        }
+
+        let tag = names(&select(&listed, true, &by_tag, None));
+        let id = names(&select(&listed, true, &by_id, None));
+        let plain = names(&select(&listed, true, &uncached, None));
+
+        assert_eq!(tag, ["web1"]);
+        assert_eq!(id, ["web1"]);
+        assert_eq!(plain, ["web2"]);
+    }
+
+    #[rstest::rstest]
+    #[case::single(&["publish=80"], &["web1"])]
+    #[case::with_protocol(&["publish=80/tcp"], &["web1"])]
+    #[case::range(&["publish=8000-8100"], &["web2"])]
+    #[case::either(&["publish=80", "publish=8080"], &["web2", "web1"])]
+    #[case::unpublished(&["publish=22"], &[])]
+    #[case::expose_matches_published(&["expose=80"], &["web1"])]
+    fn given_port_filters_when_selected_then_published_container_ports_decide(
+        #[case] specs: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let mut listed = fleet();
+        listed[0] = with_ports(listed[0].clone(), &[80]);
+        listed[1] = with_ports(listed[1].clone(), &[8080]);
+
+        let shown = select(&listed, true, &parse(specs), None);
+
+        assert_eq!(names(&shown), expected);
+    }
+
+    #[test]
+    fn given_volume_filter_when_selected_then_a_mount_source_or_target_matches() {
+        let mut listed = fleet();
+        listed[0].mounts = vec![ward_core::pb::Mount {
+            source: "/srv/data".into(),
+            target: "/data".into(),
+            readonly: false,
+        }];
+
+        let by_target = select(&listed, true, &parse(&["volume=/data"]), None);
+        let by_source = select(&listed, true, &parse(&["volume=/srv/data"]), None);
+        let miss = select(&listed, true, &parse(&["volume=/other"]), None);
+
+        assert_eq!(names(&by_target), ["web1"]);
+        assert_eq!(names(&by_source), ["web1"]);
+        assert!(miss.is_empty());
+    }
+
     #[rstest::rstest]
     #[case::unknown_key("color=red", "invalid filter 'color'")]
+    #[case::bad_exit("exited=x", "exited=x")]
+    #[case::bad_port("publish=http", "publish=http")]
+    #[case::udp("expose=53/udp", "expose=53/udp")]
+    #[case::backwards_range("publish=90-80", "publish=90-80")]
+    #[case::empty_ancestor("ancestor=", "ancestor=")]
     #[case::bad_status("status=sleeping", "status=sleeping")]
     #[case::empty_label("label=", "label=")]
     #[case::no_value("name", "name=value")]

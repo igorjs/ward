@@ -105,7 +105,7 @@ pub fn image_sizes(images: &[ImageInfo]) -> HashMap<String, u64> {
 /// The size of the image a sandbox was created from. The digest it resolved to
 /// is exact; otherwise the reference as written, then with the default tag,
 /// then as a digest or ID prefix.
-fn image_size(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> Option<u64> {
+pub fn image_size(info: &SandboxInfo, sizes: &HashMap<String, u64>) -> Option<u64> {
     let by_name = |name: &str| sizes.get(name).copied();
     let tagged = format!("{}:{DEFAULT_TAG}", info.image);
     let by_prefix = || {
