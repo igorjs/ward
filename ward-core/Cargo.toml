@@ -39,6 +39,9 @@ flate2 = "1"
 # outside deny.toml's allowlist. default-features off drops the bundled
 # test-registry harness we don't ship.
 oci-client = { version = "0.17", default-features = false, features = ["native-tls"] }
+# reqwest: already pulled in by oci-client. Named here to classify its typed
+# errors (timeout, connect). No features of its own, so nothing new is built.
+reqwest = { version = "0.13", default-features = false }
 prost = "0.14"
 prost-types = "0.14"
 serde = { version = "1", features = ["derive"] }
