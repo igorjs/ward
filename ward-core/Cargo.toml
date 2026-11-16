@@ -40,8 +40,7 @@ flate2 = "1"
 # test-registry harness we don't ship.
 oci-client = { version = "0.17", default-features = false, features = ["native-tls"] }
 # reqwest: already pulled in by oci-client. Named here to classify its typed
-# errors (timeout, connect) and to read a registry's token realm before
-# credentials are sent. No features of its own, so nothing new is built.
+# errors (timeout, connect). No features of its own, so nothing new is built.
 reqwest = { version = "0.13", default-features = false }
 # http-auth: the challenge parser oci-client uses, so Ward and oci-client read
 # a registry's WWW-Authenticate header the same way. Already in the tree.

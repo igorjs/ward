@@ -26,6 +26,7 @@ jobs:
   # base to diff against (new branch, force-push with no prior ref).
   changes:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
     steps:
@@ -72,6 +73,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -116,6 +118,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -181,6 +184,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -216,6 +220,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
+        with:
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -250,26 +257,26 @@ jobs:
         # e2e job which spawns wardd with a timeout via assert_cmd.
         run: ./target/debug/ward --version
       - name: Unit tests (all crates)
-        run: cargo test --workspace --lib --bins
+        run: cargo nextest run --workspace --lib --bins
       - name: Integration tests (ward-core)
-        run: cargo test -p ward-core --tests
+        run: cargo nextest run -p ward-core --tests
       - name: Integration tests (ward-net)
         # Separate step from the two above: ward-core's --tests run
         # doesn't touch ward-net's own tests/ directory.
-        run: cargo test -p ward-net --tests
+        run: cargo nextest run -p ward-net --tests
       - name: Integration tests (ward-mcp)
         # Separate step: ward-mcp's tests/ (handshake, tool_calls) exercise
         # the stdio JSON-RPC server against the stub backend, no libkrun.
-        run: cargo test -p ward-mcp --tests
+        run: cargo nextest run -p ward-mcp --tests
       - name: Integration tests (ward-runtime)
         # Separate step: ward-runtime's tests/ boot the embedded runtime
         # with the default (non-krunvm) stub backend, no libkrun.
-        run: cargo test -p ward-runtime --tests
+        run: cargo nextest run -p ward-runtime --tests
       - name: Integration tests (ward-client SDK)
         # Separate step: ward-client's tests/e2e.rs spawns the wardd
         # binary (built above) and drives it over gRPC using the default
         # stub backend, no libkrun.
-        run: cargo test -p ward-client --tests
+        run: cargo nextest run -p ward-client --tests
 
   # ── E2E tests ───────────────────────────────────────────────────────
   # Slow tier: spawns the real wardd binary as a subprocess and runs the
@@ -285,6 +292,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -320,6 +328,9 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
+        with:
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -344,7 +355,7 @@ jobs:
       - name: Build (required so assert_cmd finds wardd and ward binaries)
         run: cargo build --workspace
       - name: E2E tests (wardd subprocess + ward CLI)
-        run: cargo test -p ward-daemon --tests
+        run: cargo nextest run -p ward-daemon --tests
 
   # ── libkrun feature build ────────────────────────────────────────────
   # Compiles, lints and unit-tests the workspace with the real microVM
@@ -366,6 +377,7 @@ jobs:
             target: aarch64-apple-darwin
             guest_target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -404,6 +416,9 @@ jobs:
           components: clippy
           targets: ${{ matrix.guest_target }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
+        with:
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -422,11 +437,14 @@ jobs:
       - name: Clippy (--features krunvm)
         run: cargo clippy --all-targets --features ward-core/krunvm -- -D warnings
       - name: Unit tests (--features krunvm)
-        run: cargo test -p ward-core --lib --features krunvm
+        run: cargo nextest run -p ward-core --lib --features krunvm
       - name: Compile e2e test targets (--features krunvm)
         run: RUSTFLAGS=-Dwarnings cargo test -p ward-daemon --features krunvm --test smoltcp_e2e --no-run
       - name: Bundle tests with the libraries embedded
-        run: cargo test -p ward-bundle --features embed
+        run: cargo nextest run -p ward-bundle --features embed
+      - name: Bundle doc tests with the libraries embedded
+        # nextest does not run doc tests.
+        run: cargo test --doc -p ward-bundle --features embed
 
   # ── Real microVM end-to-end ──────────────────────────────────────────
   # Boots real Linux guests through the shipped code path: wardd, the
@@ -506,6 +524,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -564,6 +583,7 @@ jobs:
   proto-compat:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -587,6 +607,7 @@ jobs:
   # ── SDK tests (Go, Python, TypeScript) ───────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -637,6 +658,7 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -689,6 +711,7 @@ jobs:
     needs: [changes, clippy]
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:

@@ -7,15 +7,19 @@
 //! that registry's own host and port. Every other http realm is a realm a
 //! real https registry could name, and the login must not reach it.
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use ward_core::backend::image::{ImagePuller, OciPuller};
+use ward_core::backend::image::{ImagePuller, OciPuller, PullSession};
 use ward_core::registry_auth::{self, Credentials};
 
 const USERNAME: &str = "ada";
@@ -40,7 +44,7 @@ struct Recorded {
 struct Reply {
     status: u16,
     headers: Vec<(String, String)>,
-    body: String,
+    body: Vec<u8>,
 }
 
 impl Reply {
@@ -48,7 +52,7 @@ impl Reply {
         Self {
             status,
             headers: Vec::new(),
-            body: String::new(),
+            body: Vec::new(),
         }
     }
 
@@ -57,7 +61,7 @@ impl Reply {
         self
     }
 
-    fn body(mut self, body: impl Into<String>) -> Self {
+    fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
     }
@@ -135,7 +139,7 @@ async fn serve(
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
     if method != "HEAD" {
-        let _ = stream.write_all(reply.body.as_bytes()).await;
+        let _ = stream.write_all(&reply.body).await;
     }
     let _ = stream.shutdown().await;
 }
@@ -146,23 +150,77 @@ fn basic(password: &str) -> String {
     format!("Basic {encoded}")
 }
 
-fn manifest() -> (String, String) {
-    let body = serde_json::json!({
-        "schemaVersion": 2,
-        "mediaType": OCI_MANIFEST_TYPE,
-        "config": {
-            "mediaType": "application/vnd.oci.image.config.v1+json",
-            "digest": format!("sha256:{}", "0".repeat(64)),
-            "size": 2,
-        },
-        "layers": [],
-    })
-    .to_string();
-    let hex: String = Sha256::digest(body.as_bytes())
+fn sha256_digest(bytes: &[u8]) -> String {
+    let hex: String = Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    (body, format!("sha256:{hex}"))
+    format!("sha256:{hex}")
+}
+
+/// A manifest with its config and layer blobs, as the registry serves them.
+struct Published {
+    body: String,
+    digest: String,
+    blobs: HashMap<String, Vec<u8>>,
+    first_layer_path: Option<String>,
+}
+
+fn publish(layers: &[Vec<u8>]) -> Published {
+    let config = br#"{"config":{"Cmd":["/bin/sh"]}}"#.to_vec();
+    let mut blobs = HashMap::new();
+    let mut descriptor = |media_type: &str, bytes: &[u8]| {
+        let digest = sha256_digest(bytes);
+        blobs.insert(format!("/v2/{REPOSITORY}/blobs/{digest}"), bytes.to_vec());
+        serde_json::json!({"mediaType": media_type, "digest": digest, "size": bytes.len()})
+    };
+    let config_descriptor = descriptor("application/vnd.oci.image.config.v1+json", &config);
+    let layer_descriptors: Vec<_> = layers
+        .iter()
+        .map(|layer| descriptor("application/vnd.oci.image.layer.v1.tar+gzip", layer))
+        .collect();
+    let first_layer_path = layer_descriptors.first().map(|d| {
+        format!(
+            "/v2/{REPOSITORY}/blobs/{}",
+            d["digest"].as_str().unwrap_or_default()
+        )
+    });
+    let body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": OCI_MANIFEST_TYPE,
+        "config": config_descriptor,
+        "layers": layer_descriptors,
+    })
+    .to_string();
+    let digest = sha256_digest(body.as_bytes());
+    Published {
+        body,
+        digest,
+        blobs,
+        first_layer_path,
+    }
+}
+
+fn manifest() -> (String, String) {
+    let published = publish(&[]);
+    (published.body, published.digest)
+}
+
+/// A gzip tar layer holding one file.
+fn layer(path: &str, contents: &str) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, contents.as_bytes())
+        .expect("file");
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&builder.into_inner().expect("tar"))
+        .expect("gzip");
+    encoder.finish().expect("gzip")
 }
 
 /// What a test varies in the registry. Its token service lives on the same
@@ -182,6 +240,10 @@ struct RegistryPlan {
     token_redirect: Option<String>,
     minted: Arc<AtomicUsize>,
     password: Arc<Mutex<String>>,
+    /// Layers of the image, bottom first.
+    layers: Vec<Vec<u8>>,
+    /// Refuse the token that fetched the first layer from then on.
+    revoke_after_first_layer: bool,
 }
 
 impl RegistryPlan {
@@ -194,6 +256,8 @@ impl RegistryPlan {
             token_redirect: None,
             minted: Arc::default(),
             password: Arc::new(Mutex::new(PASSWORD.to_string())),
+            layers: Vec::new(),
+            revoke_after_first_layer: false,
         }
     }
 
@@ -218,13 +282,13 @@ impl RegistryPlan {
     async fn start(&self) -> Server {
         let plan = self.clone();
         Server::start(move |addr| {
-            let (body, digest) = manifest();
-            Arc::new(move |req: &Recorded| plan.answer(addr, req, &body, &digest))
+            let published = publish(&plan.layers);
+            Arc::new(move |req: &Recorded| plan.answer(addr, req, &published))
         })
         .await
     }
 
-    fn answer(&self, addr: SocketAddr, req: &Recorded, body: &str, digest: &str) -> Reply {
+    fn answer(&self, addr: SocketAddr, req: &Recorded, published: &Published) -> Reply {
         let challenge = (self.challenge)(addr);
         let unauthorized = || {
             let reply = Reply::new(401);
@@ -265,22 +329,29 @@ impl RegistryPlan {
             .authorization
             .as_deref()
             .and_then(|value| value.strip_prefix("Bearer "));
-        match bearer {
-            Some(token)
-                if !self
-                    .revoked
+        let Some(token) =
+            bearer.filter(|t| !self.revoked.lock().expect("revoked").iter().any(|r| r == t))
+        else {
+            return unauthorized();
+        };
+        if let Some(blob) = published.blobs.get(&req.target) {
+            if self.revoke_after_first_layer
+                && published.first_layer_path.as_deref() == Some(req.target.as_str())
+            {
+                self.revoked
                     .lock()
                     .expect("revoked")
-                    .iter()
-                    .any(|r| r == token) =>
-            {
-                Reply::new(200)
-                    .header("Content-Type", OCI_MANIFEST_TYPE)
-                    .header("Docker-Content-Digest", digest)
-                    .body(body)
+                    .push(token.to_string());
             }
-            _ => unauthorized(),
+            return Reply::new(200)
+                .header("Content-Type", "application/octet-stream")
+                .header("Docker-Content-Digest", sha256_digest(blob))
+                .body(blob.clone());
         }
+        Reply::new(200)
+            .header("Content-Type", OCI_MANIFEST_TYPE)
+            .header("Docker-Content-Digest", published.digest.clone())
+            .body(published.body.clone())
     }
 }
 
@@ -675,4 +746,48 @@ async fn given_check_login_when_the_realm_is_another_http_host_then_it_is_refuse
     assert!(message.contains("refused"), "{message}");
     assert!(!message.contains(PASSWORD));
     assert!(other.requests().is_empty());
+}
+
+#[tokio::test]
+async fn given_a_token_that_ends_between_layers_when_pulled_then_one_new_token_completes_the_pull()
+{
+    // Arrange
+    let env = Env::new().await;
+    let mut plan = RegistryPlan::own_realm();
+    plan.layers = vec![layer("one.txt", "1"), layer("two.txt", "2")];
+    plan.revoke_after_first_layer = true;
+    let registry = plan.start().await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+    let staging = tempfile::tempdir().expect("tempdir");
+    let dest = staging.path().join("rootfs");
+    std::fs::create_dir_all(&dest).expect("rootfs");
+    let mut session = PullSession::new(u64::MAX, u64::MAX, None);
+
+    // Act
+    let pulled = puller
+        .pull_streaming(&reference(registry.addr), &dest, &mut session)
+        .await
+        .expect("the pull completes");
+
+    // Assert
+    assert_eq!(pulled.digest, publish(&plan.layers).digest);
+    assert_eq!(
+        std::fs::read_to_string(dest.join("one.txt")).expect("layer one"),
+        "1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("two.txt")).expect("layer two"),
+        "2"
+    );
+    assert_eq!(registry.count("/token"), 2);
+    let blob_tokens: Vec<_> = registry
+        .requests()
+        .into_iter()
+        .filter(|r| r.target.contains("/blobs/"))
+        .filter_map(|r| r.authorization)
+        .collect();
+    assert_eq!(blob_tokens.last().map(String::as_str), Some("Bearer tok-2"));
+    let with_password = requests_with_password(&[&registry], PASSWORD);
+    assert!(with_password.iter().all(|r| r.target.starts_with("/token")));
 }

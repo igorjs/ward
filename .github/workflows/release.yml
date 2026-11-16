@@ -31,6 +31,7 @@ jobs:
   # ── Resolve version + decide build features once ───────────────────
   resolve:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.r.outputs.version }}
       tag: ${{ steps.r.outputs.tag }}
@@ -111,6 +112,7 @@ jobs:
             runner: ubuntu-24.04-arm
             guest_target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -275,6 +277,7 @@ jobs:
   combine_hashes:
     needs: [build]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       hashes: ${{ steps.combine.outputs.hashes }}
     steps:
@@ -343,6 +346,7 @@ jobs:
   publish:
     needs: [resolve, build, slsa_provenance]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Attaches assets to the GitHub Release.
     permissions:
       contents: write
@@ -446,6 +450,7 @@ jobs:
     needs: [resolve, publish]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -512,6 +517,7 @@ jobs:
     needs: [resolve, publish]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:

@@ -513,6 +513,11 @@ impl OciPuller {
             None => (oci_client::secrets::RegistryAuth::Anonymous, None),
         };
         let client = self.new_client();
+        // A blob request alone does not store the auth, so a fresh client
+        // would send it with no token.
+        client
+            .store_auth_if_needed(image_ref.resolve_registry(), &auth)
+            .await;
         self.clients.lock_unpoisoned().insert(
             key,
             CachedClient {
@@ -597,7 +602,7 @@ impl OciPuller {
             let has_login = session.has_login;
             match retry_raw(reference, || request(session.clone())).await {
                 Ok(value) => return Ok(value),
-                Err(e) if has_login && !refresh && is_access_denied(&e) => refresh = true,
+                Err(e) if has_login && !refresh && is_unauthorized(&e) => refresh = true,
                 Err(e) => return Err(pull_error(reference, e)),
             }
         }
@@ -889,7 +894,7 @@ where
     let mut attempt = 1;
     loop {
         match attempt_once().await {
-            Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) => {
+            Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) && !is_unauthorized(&e) => {
                 let delay = PULL_RETRY_BASE_DELAY * attempt;
                 tracing::warn!(
                     reference,
@@ -921,12 +926,23 @@ fn is_unknown_image(e: &OciDistributionError) -> bool {
 /// Registries answer an anonymous pull of a missing or private repository
 /// with an authorisation failure, which Docker reports as access denied.
 fn is_access_denied(e: &OciDistributionError) -> bool {
-    matches!(
-        e,
-        OciDistributionError::UnauthorizedError { .. }
-            | OciDistributionError::AuthenticationFailure(_)
-    )
+    is_unauthorized(e) || matches!(e, OciDistributionError::AuthenticationFailure(_))
 }
+
+/// The registry answered 401. A manifest request reports it as
+/// `UnauthorizedError` and a blob request as a failed HTTP status.
+fn is_unauthorized(e: &OciDistributionError) -> bool {
+    match e {
+        OciDistributionError::UnauthorizedError { .. } => true,
+        OciDistributionError::ServerError { code, .. } => *code == UNAUTHORIZED_STATUS,
+        OciDistributionError::RequestError(request) => request
+            .status()
+            .is_some_and(|s| s.as_u16() == UNAUTHORIZED_STATUS),
+        _ => false,
+    }
+}
+
+const UNAUTHORIZED_STATUS: u16 = 401;
 
 /// What went wrong between Ward and the registry, told apart by typed
 /// checks on the error and never by its text.
@@ -4283,18 +4299,19 @@ mod tests {
         assert!(!message.contains("registry.example"), "{message}");
     }
 
-    #[tokio::test]
-    async fn given_an_unresolvable_name_when_requested_then_the_message_says_dns() {
+    #[test]
+    fn given_a_failed_name_lookup_when_classified_then_the_message_says_dns() {
         // Arrange
-        let request_error = reqwest::get("http://ward-test.invalid/")
-            .await
-            .expect_err("the name does not resolve");
+        use std::net::ToSocketAddrs;
+        // An empty host name fails in the C resolver before any query leaves
+        // the machine, and gives the same io error as an unknown name.
+        let lookup = ("", 0).to_socket_addrs().expect_err("an empty name fails");
 
         // Act
-        let failure = request_failure(&request_error);
+        let failure = transport_failure(false, true, &lookup);
 
         // Assert
-        assert_eq!(failure, RegistryFailure::Dns);
+        assert_eq!(failure, RegistryFailure::Dns, "{lookup:?}");
         assert_eq!(failure_hint(failure), Some(DNS_HINT));
     }
 
