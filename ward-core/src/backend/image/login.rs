@@ -22,9 +22,14 @@ const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
 /// A shorter `expires_in` is raised to this, so a token service cannot make
 /// Ward send the password again for every request.
 const MIN_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
-/// The longest one login request may take in all, however slowly the body
-/// arrives. The read timeout alone restarts with every byte.
+/// The longest one whole `plan_login`, probe and token request together, may
+/// take, however slowly the bytes arrive. The read timeout alone restarts
+/// with every byte.
 pub(super) const LOGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// What a failed `/v2/` probe and a failed token request put in the error, so
+/// the pull can tell them from an image that is not found.
+const PROBE_STAGE: &str = "the registry answered /v2/ with";
+const TOKEN_STAGE: &str = "the token service answered";
 const BASIC_SCHEME: &str = "Basic";
 const BEARER_SCHEME: &str = "Bearer";
 const HTTPS_SCHEME: &str = "https";
@@ -139,9 +144,8 @@ pub(super) fn acceptable_realm(realm: &str, registry: &str, registry_is_http: bo
 
 /// A client for the login requests. It never follows a redirect, so a login
 /// cannot be passed on to another host.
-fn login_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+fn login_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
-        .timeout(timeout)
         .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
         .read_timeout(REGISTRY_READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -160,7 +164,25 @@ pub(super) async fn plan_login(
     credentials: &Credentials,
     timeout: Duration,
 ) -> Result<LoginPlan, OciDistributionError> {
-    let client = login_client(timeout)?;
+    tokio::time::timeout(
+        timeout,
+        exchange(registry, registry_is_http, repository, credentials),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(OciDistributionError::IoError(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        )))
+    })
+}
+
+async fn exchange(
+    registry: &str,
+    registry_is_http: bool,
+    repository: &str,
+    credentials: &Credentials,
+) -> Result<LoginPlan, OciDistributionError> {
+    let client = login_client()?;
     let scheme = if registry_is_http {
         HTTP_SCHEME
     } else {
@@ -183,7 +205,7 @@ pub(super) async fn plan_login(
         && !status.is_success()
         && status != reqwest::StatusCode::UNAUTHORIZED
     {
-        return Err(token_status_error(status));
+        return Err(stage_error(PROBE_STAGE, status));
     }
     let bearer = match challenge {
         Challenge::None => return Ok(LoginPlan::NoLoginNeeded),
@@ -218,19 +240,37 @@ pub(super) async fn plan_login(
     parse_token_response(&body)
 }
 
-/// The error for a status a registry or token service answered with. 401 and
-/// 403 mean the credentials were refused. Anything else says nothing about
-/// them: 429 and 5xx are retried, and the rest fail the call.
+/// The error for a token service status. 401 and 403 mean the credentials
+/// were refused. Anything else says nothing about them: 429 and 5xx are
+/// retried, and the rest fail the call.
 fn token_status_error(status: reqwest::StatusCode) -> OciDistributionError {
     match status.as_u16() {
         401 | 403 => OciDistributionError::AuthenticationFailure(
             "the token service refused the login".to_string(),
         ),
-        code => OciDistributionError::ServerError {
-            code,
-            url: String::new(),
-            message: "unexpected answer while logging in".to_string(),
-        },
+        _ => stage_error(TOKEN_STAGE, status),
+    }
+}
+
+fn stage_error(stage: &'static str, status: reqwest::StatusCode) -> OciDistributionError {
+    OciDistributionError::ServerError {
+        code: status.as_u16(),
+        url: String::new(),
+        message: stage.to_string(),
+    }
+}
+
+/// What to tell the user when the probe or the token service answered with a
+/// status that is not about the image or the credentials. A 429 is left to the
+/// rate limit message.
+pub(super) fn login_failure(e: &OciDistributionError) -> Option<String> {
+    match e {
+        OciDistributionError::ServerError { code, message, .. }
+            if *code != 429 && (message == PROBE_STAGE || message == TOKEN_STAGE) =>
+        {
+            Some(format!("{message} {code}"))
+        }
+        _ => None,
     }
 }
 
@@ -267,6 +307,9 @@ mod tests {
     const TEST_LOGIN_TIMEOUT: Duration = Duration::from_millis(200);
     const DRIP_INTERVAL: Duration = Duration::from_millis(20);
     const DRIP_BYTES: usize = 250;
+    const BODY_CHUNK_BYTES: usize = 8192;
+    const STEP_DELAY: Duration = Duration::from_millis(150);
+    const TWO_STEPS_TIMEOUT: Duration = Duration::from_millis(250);
 
     fn challenge(text: &str) -> Challenge {
         parse_challenge(text)
@@ -420,10 +463,14 @@ mod tests {
                     if line.starts_with("GET /v2/") {
                         return;
                     }
-                    for _ in 0..body_bytes {
-                        if stream.write_all(b" ").await.is_err() {
+                    let chunk = if slowly { 1 } else { BODY_CHUNK_BYTES };
+                    let mut sent = 0;
+                    while sent < body_bytes {
+                        let size = chunk.min(body_bytes - sent);
+                        if stream.write_all(&vec![b' '; size]).await.is_err() {
                             return;
                         }
+                        sent += size;
                         if slowly {
                             tokio::time::sleep(DRIP_INTERVAL).await;
                         }
@@ -485,7 +532,7 @@ mod tests {
 
         // Assert
         assert!(
-            matches!(&outcome, Err(OciDistributionError::RequestError(e)) if e.is_timeout()),
+            matches!(&outcome, Err(OciDistributionError::IoError(e)) if e.kind() == std::io::ErrorKind::TimedOut),
             "{}",
             outcome.is_ok()
         );
@@ -536,5 +583,88 @@ mod tests {
         assert!(parse_token_response(br#"{"token":""}"#).is_err());
         assert!(parse_token_response(b"{\"token\":\"a\\nb\"}").is_err());
         assert!(parse_token_response(b"not json").is_err());
+    }
+
+    /// A registry whose `/v2/` and token service each answer after `STEP_DELAY`.
+    async fn slow_registry() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let line = String::from_utf8_lossy(&request[..read]).into_owned();
+                    tokio::time::sleep(STEP_DELAY).await;
+                    let reply = if line.starts_with("GET /v2/") {
+                        format!(
+                            "HTTP/1.1 401 X\r\nWWW-Authenticate: Bearer realm=\"http://{addr}/token\"\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = r#"{"token":"t","expires_in":300}"#;
+                        format!(
+                            "HTTP/1.1 200 X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = stream.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn given_a_slow_probe_and_a_slow_token_service_when_the_login_runs_then_one_timeout_covers_both()
+     {
+        // Arrange
+        let addr = slow_registry().await;
+
+        // Act
+        let within_each_step = plan_login(
+            &addr.to_string(),
+            true,
+            "team/app",
+            &credentials(),
+            LOGIN_REQUEST_TIMEOUT,
+        )
+        .await;
+        let over_both = plan_login(
+            &addr.to_string(),
+            true,
+            "team/app",
+            &credentials(),
+            TWO_STEPS_TIMEOUT,
+        )
+        .await;
+
+        // Assert
+        assert!(within_each_step.is_ok(), "the exchange itself works");
+        assert!(
+            matches!(&over_both, Err(OciDistributionError::IoError(e)) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{}",
+            over_both.is_ok()
+        );
+    }
+
+    #[test]
+    fn given_probe_and_token_statuses_when_reported_then_they_name_their_stage_and_leave_429_alone()
+    {
+        // Assert
+        let probe = stage_error(PROBE_STAGE, reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            login_failure(&probe).as_deref(),
+            Some("the registry answered /v2/ with 404")
+        );
+        let token = token_status_error(reqwest::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            login_failure(&token).as_deref(),
+            Some("the token service answered 502")
+        );
+        let limited = token_status_error(reqwest::StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(login_failure(&limited), None);
     }
 }

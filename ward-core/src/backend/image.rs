@@ -404,10 +404,21 @@ pub struct OciPuller {
     /// One client per registry and repository, so connections and tokens
     /// outlive a call.
     clients: Mutex<HashMap<ClientKey, CachedClient>>,
+    /// Who may ask for a token now, and when the login was last sent, per key.
+    flights: Mutex<HashMap<ClientKey, Arc<Flight>>>,
     /// The shortest time between two token requests that carry the login for
     /// one repository.
     token_request_interval: std::time::Duration,
     login_timeout: std::time::Duration,
+    retry_base_delay: std::time::Duration,
+}
+
+/// Lets one caller at a time ask the token service for a key, and remembers
+/// when the login was last sent for it.
+#[derive(Debug, Default)]
+struct Flight {
+    turn: tokio::sync::Mutex<()>,
+    last_login_request: Mutex<Option<std::time::Instant>>,
 }
 
 impl Default for OciPuller {
@@ -415,8 +426,10 @@ impl Default for OciPuller {
         Self {
             http_registries: Vec::new(),
             clients: Mutex::default(),
+            flights: Mutex::default(),
             token_request_interval: TOKEN_REQUEST_INTERVAL,
             login_timeout: login::LOGIN_REQUEST_TIMEOUT,
+            retry_base_delay: PULL_RETRY_BASE_DELAY,
         }
     }
 }
@@ -496,10 +509,20 @@ impl OciPuller {
     }
 
     /// Set the shortest time between two token requests for one repository.
+    /// For tests only. There is no feature gate, so it is hidden from the docs.
     #[doc(hidden)]
     #[must_use]
     pub fn with_token_request_interval(mut self, interval: std::time::Duration) -> Self {
         self.token_request_interval = interval;
+        self
+    }
+
+    /// Set the delay before the first retry. For tests only, hidden like
+    /// `with_token_request_interval`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_retry_base_delay(mut self, delay: std::time::Duration) -> Self {
+        self.retry_base_delay = delay;
         self
     }
 
@@ -536,7 +559,16 @@ impl OciPuller {
     /// reused while the login is unchanged and the token has time left.
     /// oci-client keeps the first auth it sees per registry and its tokens
     /// are keyed by repository, so a new token means a new client.
-    async fn session(&self, reference: &str, refresh: bool) -> Result<ClientSession> {
+    ///
+    /// `stale` is the issue time of a token the registry just refused. Callers
+    /// of one key take turns, and one that finds a newer token reuses it, so
+    /// the login goes out once however many calls hit the same 401. `None`
+    /// comes back when a replacement is too soon after the last login request.
+    async fn session(
+        &self,
+        reference: &str,
+        stale: Option<std::time::Instant>,
+    ) -> Result<Option<ClientSession>> {
         let image_ref = self.parse_reference(reference)?;
         let registry = image_ref.resolve_registry().to_string();
         let key = (registry.clone(), image_ref.repository().to_string());
@@ -547,11 +579,31 @@ impl OciPuller {
             .map_err(|e| BackendError::Internal(format!("login lookup panicked: {e}")))?;
         let fingerprint = login.as_ref().map(login_fingerprint);
         self.drop_stale_entries(&registry, fingerprint);
-        if !refresh && let Some(cached) = self.cached_session(&key, &image_ref) {
-            return Ok(cached);
+        if stale.is_none()
+            && let Some(cached) = self.cached_session(&key, fingerprint, &image_ref)
+        {
+            return Ok(Some(cached));
+        }
+        let flight = self.flight_for(&key);
+        let _turn = flight.turn.lock().await;
+        if let Some(cached) = self.cached_session(&key, fingerprint, &image_ref)
+            && stale.is_none_or(|stale| cached.issued > stale)
+        {
+            return Ok(Some(cached));
+        }
+        if stale.is_some()
+            && login.is_some()
+            && flight
+                .last_login_request
+                .lock_unpoisoned()
+                .is_some_and(|sent| sent.elapsed() < self.token_request_interval)
+        {
+            return Ok(None);
         }
         let (auth, lifetime) = match &login {
             Some(login) => {
+                // Counted before it is sent, so a failed request counts too.
+                *flight.last_login_request.lock_unpoisoned() = Some(std::time::Instant::now());
                 self.token_for(reference, &registry, image_ref.repository(), login)
                     .await?
             }
@@ -579,18 +631,35 @@ impl OciPuller {
                 last_used: now,
             },
         );
-        Ok(ClientSession {
+        Ok(Some(ClientSession {
             client,
             image_ref,
             auth,
             has_token,
             issued: now,
-        })
+        }))
+    }
+
+    /// The turn-taking state for `key`. State for a key whose last login
+    /// request is older than the interval holds nothing and is dropped once
+    /// the map grows past the cache limit.
+    fn flight_for(&self, key: &ClientKey) -> Arc<Flight> {
+        let mut flights = self.flights.lock_unpoisoned();
+        if flights.len() >= MAX_CACHED_CLIENTS {
+            flights.retain(|_, flight| {
+                Arc::strong_count(flight) > 1
+                    || flight
+                        .last_login_request
+                        .lock_unpoisoned()
+                        .is_some_and(|sent| sent.elapsed() < self.token_request_interval)
+            });
+        }
+        flights.entry(key.clone()).or_default().clone()
     }
 
     /// Drop what a changed or removed login makes stale: every client of this
     /// registry made for another login, whatever its repository, and every
-    /// entry past its end.
+    /// entry past its end. A logout takes effect on the next call.
     fn drop_stale_entries(&self, registry: &str, fingerprint: Option<LoginFingerprint>) {
         let now = std::time::Instant::now();
         self.clients.lock_unpoisoned().retain(|(host, _), cached| {
@@ -598,16 +667,20 @@ impl OciPuller {
         });
     }
 
-    /// The kept client for `key`, unless its token is about to end.
+    /// The kept client for `key` if it was made for `fingerprint` and its
+    /// token is not about to end. The login is compared here, under the same
+    /// lock as the read, so another call's entry for a different login is
+    /// never used.
     fn cached_session(
         &self,
         key: &ClientKey,
+        fingerprint: Option<LoginFingerprint>,
         image_ref: &oci_client::Reference,
     ) -> Option<ClientSession> {
         let mut clients = self.clients.lock_unpoisoned();
         let cached = clients.get_mut(key)?;
         let now = std::time::Instant::now();
-        if cached.expires <= now + TOKEN_REFRESH_MARGIN {
+        if cached.login != fingerprint || cached.expires <= now + TOKEN_REFRESH_MARGIN {
             return None;
         }
         cached.last_used = now;
@@ -615,8 +688,7 @@ impl OciPuller {
             client: cached.client.clone(),
             image_ref: image_ref.clone(),
             auth: cached.auth.clone(),
-            has_token: cached.login.is_some()
-                && matches!(cached.auth, oci_client::secrets::RegistryAuth::Bearer(_)),
+            has_token: matches!(cached.auth, oci_client::secrets::RegistryAuth::Bearer(_)),
             issued: cached.issued,
         })
     }
@@ -647,7 +719,7 @@ impl OciPuller {
         login: &crate::registry_auth::Credentials,
     ) -> Result<(oci_client::secrets::RegistryAuth, std::time::Duration)> {
         let http = self.is_http_registry(registry);
-        let plan = with_retry(reference, || {
+        let plan = with_retry(reference, self.retry_base_delay, || {
             login::plan_login(registry, http, repository, login, self.login_timeout)
         })
         .await?;
@@ -671,7 +743,8 @@ impl OciPuller {
 
     /// Run `request` with the client for `reference`, retrying transient
     /// failures. When a token the registry stopped accepting causes a 401,
-    /// the token is replaced once and the request runs again.
+    /// the token is replaced once and the request runs again, unless the
+    /// login went out too recently.
     async fn with_session<T, F, Fut>(&self, reference: &str, request: F) -> Result<T>
     where
         F: Fn(ClientSession) -> Fut,
@@ -679,15 +752,23 @@ impl OciPuller {
                 Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
             >,
     {
-        let mut refresh = false;
+        let mut stale = None;
+        let mut refused = None;
         loop {
-            let session = self.session(reference, refresh).await?;
-            let may_refresh = session.has_token
-                && !refresh
-                && session.issued.elapsed() >= self.token_request_interval;
-            match retry_raw(reference, || request(session.clone())).await {
+            let Some(session) = self.session(reference, stale).await? else {
+                let error = refused.take().expect("a refresh follows a failed request");
+                return Err(pull_error(reference, error));
+            };
+            match retry_raw(reference, self.retry_base_delay, || {
+                request(session.clone())
+            })
+            .await
+            {
                 Ok(value) => return Ok(value),
-                Err(e) if may_refresh && is_unauthorized(&e) => refresh = true,
+                Err(e) if session.has_token && stale.is_none() && is_unauthorized(&e) => {
+                    stale = Some(session.issued);
+                    refused = Some(e);
+                }
                 Err(e) => return Err(pull_error(reference, e)),
             }
         }
@@ -808,7 +889,7 @@ impl ImagePuller for OciPuller {
         let resolved = image_ref.resolve_registry();
         let http = self.is_http_registry(resolved);
         // The login being tested is not stored yet, so nothing is cached.
-        match retry_raw(&probe, || {
+        match retry_raw(&probe, self.retry_base_delay, || {
             login::plan_login(
                 resolved,
                 http,
@@ -956,19 +1037,25 @@ fn offline_image_config() -> Result<ImageConfig> {
 
 /// A repository name to ask a registry for a token for, when checking a login.
 const LOGIN_PROBE_REPOSITORY: &str = "ward/login-check:latest";
-/// Attempts for one registry pull. Registries drop or throttle anonymous
-/// requests, and the failure surfaces as an opaque decode error.
+/// Attempts for one registry request. Registries drop or throttle anonymous
+/// requests, and the failure surfaces as an opaque decode error. A login
+/// exchange sends the password up to this many times, and a refresh after a
+/// 401 runs one more exchange, so one call sends it at most twice this often.
 const PULL_ATTEMPTS: u32 = 3;
 const PULL_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn with_retry<T, F, Fut>(reference: &str, attempt_once: F) -> Result<T>
+async fn with_retry<T, F, Fut>(
+    reference: &str,
+    base_delay: std::time::Duration,
+    attempt_once: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<
             Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
         >,
 {
-    retry_raw(reference, attempt_once)
+    retry_raw(reference, base_delay, attempt_once)
         .await
         .map_err(|e| pull_error(reference, e))
 }
@@ -976,6 +1063,7 @@ where
 /// `with_retry` that leaves the last error unmapped.
 async fn retry_raw<T, F, Fut>(
     reference: &str,
+    base_delay: std::time::Duration,
     mut attempt_once: F,
 ) -> std::result::Result<T, OciDistributionError>
 where
@@ -986,7 +1074,7 @@ where
     loop {
         match attempt_once().await {
             Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) && !is_unauthorized(&e) => {
-                let delay = PULL_RETRY_BASE_DELAY * attempt;
+                let delay = base_delay * attempt;
                 tracing::warn!(
                     reference,
                     attempt,
@@ -1217,6 +1305,9 @@ fn pull_error(reference: &str, e: OciDistributionError) -> BackendError {
         return BackendError::ResourceExhausted(format!(
             "a layer of {reference} is larger than its manifest declares"
         ));
+    }
+    if let Some(failure) = login::login_failure(&e) {
+        return BackendError::Unavailable(format!("pull {reference} failed: {failure}"));
     }
     if is_unknown_image(&e) {
         return BackendError::ImageNotFound(format!(
@@ -4571,5 +4662,34 @@ mod tests {
         let clients = puller.clients.lock_unpoisoned();
         assert_eq!(clients.len(), 1);
         assert!(clients.contains_key(&key("other.example", "team/a")));
+    }
+
+    #[test]
+    fn given_a_cached_client_when_read_with_another_login_then_it_is_not_used() {
+        // Arrange
+        let puller = OciPuller::default();
+        let image_ref: oci_client::Reference = "registry.example/team/app:latest"
+            .parse()
+            .expect("reference");
+        let end = std::time::Instant::now() + ANONYMOUS_ENTRY_LIFETIME;
+        let entry_key = key("registry.example", "team/app");
+        puller.remember_client(entry_key.clone(), cached(&puller, Some(1), end));
+
+        // Assert
+        assert!(
+            puller
+                .cached_session(&entry_key, Some([1; 32]), &image_ref)
+                .is_some()
+        );
+        assert!(
+            puller
+                .cached_session(&entry_key, Some([2; 32]), &image_ref)
+                .is_none()
+        );
+        assert!(
+            puller
+                .cached_session(&entry_key, None, &image_ref)
+                .is_none()
+        );
     }
 }

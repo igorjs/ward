@@ -31,6 +31,8 @@ const HEADER_END: &[u8] = b"\r\n\r\n";
 const LONG_LIVED_TOKEN_SECS: u64 = 300;
 /// Below the floor Ward raises a token lifetime to.
 const TINY_TOKEN_SECS: u64 = 1;
+const CONCURRENT_CALLS: usize = 8;
+const FAST_RETRY: Duration = Duration::from_millis(1);
 const FIFO_HOLD: Duration = Duration::from_millis(400);
 const TICK: Duration = Duration::from_millis(50);
 const OCI_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -892,7 +894,9 @@ async fn given_a_v2_endpoint_that_fails_without_a_challenge_when_resolved_then_n
     let recovered = puller.resolve_digest(&reference(registry.addr)).await;
 
     // Assert
-    assert!(failed.is_err());
+    let message = failed.expect_err("the probe failed").to_string();
+    assert!(message.contains("answered /v2/ with 404"), "{message}");
+    assert!(!message.contains("not found"), "{message}");
     assert!(recovered.is_ok(), "{recovered:?}");
     assert_eq!(requests_with_password(&[&registry], PASSWORD).len(), 1);
     let manifest_request = registry
@@ -1040,4 +1044,62 @@ async fn given_a_login_file_that_blocks_when_resolved_then_the_runtime_keeps_run
         !released_when_the_timer_fired,
         "the login lookup blocked the runtime"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn given_many_calls_on_a_refused_token_when_they_refresh_then_the_login_goes_out_once() {
+    // Arrange
+    let env = Env::new().await;
+    let plan = RegistryPlan::own_realm();
+    let registry = plan.start().await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = Arc::new(
+        OciPuller::with_http_registry(registry.addr.to_string())
+            .with_token_request_interval(Duration::ZERO),
+    );
+    puller
+        .resolve_digest(&reference(registry.addr))
+        .await
+        .expect("first");
+    plan.revoked.lock().expect("revoked").push("tok-1".into());
+
+    // Act
+    let calls: Vec<_> = (0..CONCURRENT_CALLS)
+        .map(|_| {
+            let (puller, reference) = (puller.clone(), reference(registry.addr));
+            tokio::spawn(async move { puller.resolve_digest(&reference).await })
+        })
+        .collect();
+    for call in calls {
+        call.await.expect("task").expect("resolve");
+    }
+
+    // Assert
+    assert_eq!(registry.count("/token"), 2);
+    assert_eq!(requests_with_password(&[&registry], PASSWORD).len(), 2);
+}
+
+#[tokio::test]
+async fn given_a_token_service_that_rate_limits_when_checking_a_login_then_it_retries_and_does_not_blame_the_credentials()
+ {
+    // Arrange
+    let _env = Env::new().await;
+    let mut plan = RegistryPlan::own_realm();
+    plan.token_status = Some(429);
+    let registry = plan.start().await;
+    let puller =
+        OciPuller::with_http_registry(registry.addr.to_string()).with_retry_base_delay(FAST_RETRY);
+    let login = Credentials {
+        username: USERNAME.to_string(),
+        password: PASSWORD.to_string(),
+    };
+
+    // Act
+    let outcome = puller.check_login(&registry.addr.to_string(), &login).await;
+
+    // Assert
+    let message = outcome.expect_err("rate limited").to_string();
+    assert!(message.contains("rate limiting"), "{message}");
+    assert!(!message.contains("did not accept"), "{message}");
+    assert_eq!(registry.count("/token"), 3);
 }
