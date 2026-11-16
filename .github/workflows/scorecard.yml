@@ -23,6 +23,7 @@ permissions: read-all
 jobs:
   analysis:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       # Required by scorecard-action; scoped per job rather than
       # workflow-wide so the schedule trigger doesn't inherit

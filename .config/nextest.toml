@@ -1,0 +1,3 @@
+[profile.default]
+# A test past 60s is reported by name; five periods (5 minutes) kills it.
+slow-timeout = { period = "60s", terminate-after = 5 }
