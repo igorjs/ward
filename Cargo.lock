@@ -3771,6 +3771,7 @@ dependencies = [
  "chrono",
  "criterion",
  "flate2",
+ "http-auth",
  "hyper-util",
  "libloading",
  "metrics",

@@ -43,6 +43,7 @@ use crate::pb::PullPolicy;
 use crate::sync::LockUnpoisoned;
 
 mod archive;
+mod login;
 mod manage;
 
 pub use archive::{ImportSpec, LoadedImage, SavedArchive};
@@ -329,14 +330,6 @@ pub trait ImagePuller: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// The login stored for `registry`, or anonymous access when there is none.
-fn registry_auth_for(registry: &str) -> oci_client::secrets::RegistryAuth {
-    match crate::registry_auth::lookup(registry) {
-        Some(found) => oci_client::secrets::RegistryAuth::Basic(found.username, found.password),
-        None => oci_client::secrets::RegistryAuth::Anonymous,
-    }
-}
-
 /// One progress line of a pull, in Docker's wording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullProgress {
@@ -408,29 +401,78 @@ impl PullSession {
 pub struct OciPuller {
     /// `host:port` registries reached over plain HTTP, for local test registries.
     http_registries: Vec<String>,
+    /// One client per registry and repository, so connections and tokens
+    /// outlive a call.
+    clients: Mutex<HashMap<String, CachedClient>>,
 }
 
 /// How long a registry may take to accept a connection.
 const REGISTRY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long a registry may stay silent mid-response before the call fails.
 const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A token with less than this left is replaced before a request uses it.
+const TOKEN_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// SHA-256 of a stored login, to tell whether it changed without keeping it.
+type LoginFingerprint = [u8; 32];
+
+fn login_fingerprint(login: &crate::registry_auth::Credentials) -> LoginFingerprint {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(login.username.as_bytes());
+    hash.update([0]);
+    hash.update(login.password.as_bytes());
+    hash.finalize().into()
+}
+
+/// A registry client with what it presents to the registry: a bearer token
+/// or nothing. The password is never kept here, and oci-client never sees it.
+struct CachedClient {
+    /// The stored login the token was issued for, `None` when anonymous.
+    login: Option<LoginFingerprint>,
+    client: oci_client::Client,
+    auth: oci_client::secrets::RegistryAuth,
+    /// When the token ends, `None` for an anonymous client.
+    expires: Option<std::time::Instant>,
+}
+
+impl std::fmt::Debug for CachedClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedClient")
+            .field("has_login", &self.login.is_some())
+            .field("expires", &self.expires)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The client for one call, with the reference it was made for.
+#[derive(Clone)]
+struct ClientSession {
+    client: oci_client::Client,
+    image_ref: oci_client::Reference,
+    auth: oci_client::secrets::RegistryAuth,
+    has_login: bool,
+}
 
 impl OciPuller {
     /// A puller that reaches `registry` (`host:port`) over plain HTTP.
     pub fn with_http_registry(registry: impl Into<String>) -> Self {
         Self {
             http_registries: vec![registry.into()],
+            clients: Mutex::default(),
         }
     }
 
-    /// Parse `reference`, enforce the registry allowlist and build a client.
-    fn client_for(&self, reference: &str) -> Result<(oci_client::Client, oci_client::Reference)> {
+    fn parse_reference(&self, reference: &str) -> Result<oci_client::Reference> {
         let image_ref: oci_client::Reference = reference.parse().map_err(|e| {
             BackendError::Image(format!("invalid image reference {reference}: {e}"))
         })?;
         check_registry_allowlist(&image_ref)?;
-        let client = oci_client::Client::new(self.client_config());
-        Ok((client, image_ref))
+        Ok(image_ref)
+    }
+
+    fn new_client(&self) -> oci_client::Client {
+        oci_client::Client::new(self.client_config())
     }
 
     fn client_config(&self) -> oci_client::client::ClientConfig {
@@ -440,6 +482,129 @@ impl OciPuller {
             connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
             read_timeout: Some(REGISTRY_READ_TIMEOUT),
             ..Default::default()
+        }
+    }
+
+    fn is_http_registry(&self, registry: &str) -> bool {
+        self.http_registries.iter().any(|r| r == registry)
+    }
+
+    /// The client for `reference`. The stored login is read on every call.
+    ///
+    /// A login is never handed to oci-client: Ward gets a token from the
+    /// registry's token service and gives oci-client only that. The client is
+    /// reused while the login is unchanged and the token has time left.
+    /// oci-client keeps the first auth it sees per registry and its tokens
+    /// are keyed by repository, so a new token means a new client.
+    async fn session(&self, reference: &str, refresh: bool) -> Result<ClientSession> {
+        let image_ref = self.parse_reference(reference)?;
+        let registry = image_ref.resolve_registry().to_string();
+        let key = format!("{registry}/{}", image_ref.repository());
+        let login = crate::registry_auth::lookup(image_ref.registry());
+        let fingerprint = login.as_ref().map(login_fingerprint);
+        if !refresh && let Some(cached) = self.cached_session(&key, fingerprint, &image_ref) {
+            return Ok(cached);
+        }
+        let (auth, expires) = match &login {
+            Some(login) => {
+                self.token_for(reference, &registry, image_ref.repository(), login)
+                    .await?
+            }
+            None => (oci_client::secrets::RegistryAuth::Anonymous, None),
+        };
+        let client = self.new_client();
+        // A blob request alone does not store the auth, so a fresh client
+        // would send it with no token.
+        client
+            .store_auth_if_needed(image_ref.resolve_registry(), &auth)
+            .await;
+        self.clients.lock_unpoisoned().insert(
+            key,
+            CachedClient {
+                login: fingerprint,
+                client: client.clone(),
+                auth: auth.clone(),
+                expires,
+            },
+        );
+        Ok(ClientSession {
+            client,
+            image_ref,
+            auth,
+            has_login: login.is_some(),
+        })
+    }
+
+    /// The kept client for `key`, unless the login changed or its token is
+    /// about to end.
+    fn cached_session(
+        &self,
+        key: &str,
+        fingerprint: Option<LoginFingerprint>,
+        image_ref: &oci_client::Reference,
+    ) -> Option<ClientSession> {
+        let clients = self.clients.lock_unpoisoned();
+        let cached = clients.get(key)?;
+        let fresh = cached
+            .expires
+            .is_none_or(|end| end > std::time::Instant::now() + TOKEN_REFRESH_MARGIN);
+        (cached.login == fingerprint && fresh).then(|| ClientSession {
+            client: cached.client.clone(),
+            image_ref: image_ref.clone(),
+            auth: cached.auth.clone(),
+            has_login: fingerprint.is_some(),
+        })
+    }
+
+    /// A bearer token for the login, or anonymous access when the login must
+    /// not be used.
+    async fn token_for(
+        &self,
+        reference: &str,
+        registry: &str,
+        repository: &str,
+        login: &crate::registry_auth::Credentials,
+    ) -> Result<(
+        oci_client::secrets::RegistryAuth,
+        Option<std::time::Instant>,
+    )> {
+        let http = self.is_http_registry(registry);
+        let plan = with_retry(reference, || {
+            login::plan_login(registry, http, repository, login)
+        })
+        .await?;
+        Ok(match plan {
+            login::LoginPlan::Token { token, lifetime } => (
+                oci_client::secrets::RegistryAuth::Bearer(token),
+                Some(std::time::Instant::now() + lifetime),
+            ),
+            login::LoginPlan::NoLoginNeeded => (oci_client::secrets::RegistryAuth::Anonymous, None),
+            login::LoginPlan::Refused(reason) => {
+                tracing::warn!(registry, reason, "pulling without the stored login");
+                (oci_client::secrets::RegistryAuth::Anonymous, None)
+            }
+        })
+    }
+
+    /// Run `request` with the client for `reference`, retrying transient
+    /// failures. When a token the registry stopped accepting causes a 401,
+    /// the token is replaced once and the request runs again.
+    async fn with_session<T, F, Fut>(&self, reference: &str, request: F) -> Result<T>
+    where
+        F: Fn(ClientSession) -> Fut,
+        Fut: std::future::Future<
+                Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
+            >,
+    {
+        let mut refresh = false;
+        loop {
+            let session = self.session(reference, refresh).await?;
+            let has_login = session.has_login;
+            match retry_raw(reference, || request(session.clone())).await {
+                Ok(value) => return Ok(value),
+                Err(e) if has_login && !refresh && is_unauthorized(&e) => refresh = true,
+                Err(e) => return Err(pull_error(reference, e)),
+            }
         }
     }
 }
@@ -477,18 +642,19 @@ impl ImagePuller for OciPuller {
 
         use oci_client::manifest;
 
-        let (client, image_ref) = self.client_for(reference)?;
-        let auth = registry_auth_for(image_ref.registry());
         let accepted = [
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_MEDIA_TYPE,
         ];
 
-        let (image_manifest, digest, config_blob) = with_retry(reference, || {
-            client.pull_manifest_and_config(&image_ref, &auth)
-        })
-        .await?;
+        let (image_manifest, digest, config_blob) = self
+            .with_session(reference, |s| async move {
+                s.client
+                    .pull_manifest_and_config(&s.image_ref, &s.auth)
+                    .await
+            })
+            .await?;
         let layer_sizes: Vec<u64> = image_manifest
             .layers
             .iter()
@@ -518,9 +684,12 @@ impl ImagePuller for OciPuller {
             let id = layer_id(&layer.digest);
             session.report(&id, "Pulling fs layer");
             let blob = dest.with_file_name(format!("{id}.blob"));
-            with_retry(reference, || async {
-                let stream = client.pull_blob_stream(&image_ref, layer).await?;
-                Ok(spool(stream, &blob, u64::try_from(layer.size).unwrap_or(0)).await?)
+            self.with_session(reference, |s| {
+                let blob = &blob;
+                async move {
+                    let stream = s.client.pull_blob_stream(&s.image_ref, layer).await?;
+                    Ok(spool(stream, blob, u64::try_from(layer.size).unwrap_or(0)).await?)
+                }
             })
             .await?;
             session.report(&id, "Download complete");
@@ -550,20 +719,24 @@ impl ImagePuller for OciPuller {
             return Ok(());
         }
         let probe = format!("{registry}/{LOGIN_PROBE_REPOSITORY}");
-        let (client, image_ref) = self.client_for(&probe)?;
-        let auth = oci_client::secrets::RegistryAuth::Basic(
-            credentials.username.clone(),
-            credentials.password.clone(),
-        );
-        client
-            .auth(&image_ref, &auth, oci_client::RegistryOperation::Pull)
-            .await
-            .map(|_| ())
-            .map_err(|_| {
-                BackendError::Image(format!(
-                    "login to {registry} failed: the registry did not accept the credentials"
-                ))
-            })
+        let image_ref = self.parse_reference(&probe)?;
+        let resolved = image_ref.resolve_registry();
+        let http = self.is_http_registry(resolved);
+        // The login being tested is not stored yet, so nothing is cached.
+        match retry_raw(&probe, || {
+            login::plan_login(resolved, http, image_ref.repository(), credentials)
+        })
+        .await
+        {
+            Ok(login::LoginPlan::Token { .. } | login::LoginPlan::NoLoginNeeded) => Ok(()),
+            Ok(login::LoginPlan::Refused(reason)) => Err(BackendError::Image(format!(
+                "login to {registry} refused: {reason}"
+            ))),
+            Err(e) if is_access_denied(&e) => Err(BackendError::Image(format!(
+                "login to {registry} failed: the registry did not accept the credentials"
+            ))),
+            Err(e) => Err(pull_error(&probe, e)),
+        }
     }
 
     async fn resolve_digest(&self, reference: &str) -> Result<Option<String>> {
@@ -573,10 +746,11 @@ impl ImagePuller for OciPuller {
         }
 
         use oci_client::manifest::OciManifest;
-        let (client, image_ref) = self.client_for(reference)?;
-        let auth = registry_auth_for(image_ref.registry());
-        let (manifest, digest) =
-            with_retry(reference, || client.pull_manifest(&image_ref, &auth)).await?;
+        let (manifest, digest) = self
+            .with_session(reference, |s| async move {
+                s.client.pull_manifest(&s.image_ref, &s.auth).await
+            })
+            .await?;
         // An index points at one manifest per platform: the pull stores the
         // one for this host, so that is the digest to compare.
         Ok(match manifest {
@@ -696,18 +870,31 @@ const LOGIN_PROBE_REPOSITORY: &str = "ward/login-check:latest";
 const PULL_ATTEMPTS: u32 = 3;
 const PULL_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn with_retry<T, F, Fut>(reference: &str, mut attempt_once: F) -> Result<T>
+async fn with_retry<T, F, Fut>(reference: &str, attempt_once: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<
             Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
         >,
 {
+    retry_raw(reference, attempt_once)
+        .await
+        .map_err(|e| pull_error(reference, e))
+}
+
+/// `with_retry` that leaves the last error unmapped.
+async fn retry_raw<T, F, Fut>(
+    reference: &str,
+    mut attempt_once: F,
+) -> std::result::Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, OciDistributionError>>,
+{
     let mut attempt = 1;
     loop {
         match attempt_once().await {
-            Ok(value) => return Ok(value),
-            Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) => {
+            Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) && !is_unauthorized(&e) => {
                 let delay = PULL_RETRY_BASE_DELAY * attempt;
                 tracing::warn!(
                     reference,
@@ -717,7 +904,7 @@ where
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(pull_error(reference, e)),
+            done => return done,
         }
     }
 }
@@ -739,12 +926,23 @@ fn is_unknown_image(e: &OciDistributionError) -> bool {
 /// Registries answer an anonymous pull of a missing or private repository
 /// with an authorisation failure, which Docker reports as access denied.
 fn is_access_denied(e: &OciDistributionError) -> bool {
-    matches!(
-        e,
-        OciDistributionError::UnauthorizedError { .. }
-            | OciDistributionError::AuthenticationFailure(_)
-    )
+    is_unauthorized(e) || matches!(e, OciDistributionError::AuthenticationFailure(_))
 }
+
+/// The registry answered 401. A manifest request reports it as
+/// `UnauthorizedError` and a blob request as a failed HTTP status.
+fn is_unauthorized(e: &OciDistributionError) -> bool {
+    match e {
+        OciDistributionError::UnauthorizedError { .. } => true,
+        OciDistributionError::ServerError { code, .. } => *code == UNAUTHORIZED_STATUS,
+        OciDistributionError::RequestError(request) => request
+            .status()
+            .is_some_and(|s| s.as_u16() == UNAUTHORIZED_STATUS),
+        _ => false,
+    }
+}
+
+const UNAUTHORIZED_STATUS: u16 = 401;
 
 /// What went wrong between Ward and the registry, told apart by typed
 /// checks on the error and never by its text.
