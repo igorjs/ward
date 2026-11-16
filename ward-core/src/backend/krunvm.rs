@@ -2734,7 +2734,6 @@ mod tests {
         use crate::backend::VmExit;
         use crate::backend::vmshim::{ShimExit, ShimProcess};
 
-        const SIGKILL_NUMBER: i32 = 9;
         const FAKE_VM_LIFETIME_SECS: &str = "60";
         const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2783,7 +2782,7 @@ mod tests {
                 sandbox_id: id.to_string(),
                 generation,
                 code: None,
-                signal: Some(SIGKILL_NUMBER),
+                signal: Some(crate::signal::SIGKILL),
                 ran_for: std::time::Duration::ZERO,
             }
         }
@@ -2867,7 +2866,7 @@ mod tests {
             // Assert
             assert_eq!(report.sandbox_id, "sb1");
             assert_eq!(report.generation, generation);
-            assert_eq!(report.signal, Some(SIGKILL_NUMBER));
+            assert_eq!(report.signal, Some(crate::signal::SIGKILL));
             assert!(backend.vm_exit_is_current(&report).await);
         }
 
@@ -2895,7 +2894,7 @@ mod tests {
             assert!(living.is_none());
             assert_eq!(dead.generation, generation);
             assert_eq!(dead.signal, probe.signal);
-            assert_eq!(dead.signal, Some(SIGKILL_NUMBER));
+            assert_eq!(dead.signal, Some(crate::signal::SIGKILL));
         }
     }
 }

@@ -68,7 +68,8 @@ impl SandboxManager {
                 // A removal right after the exit can beat the next poll, so
                 // the live status is read before the record.
                 let ended = live.and_then(|exit| exit.borrow().map(decode_wait_status));
-                return Ok(ended.or(last).unwrap_or_default());
+                let from_vm = self.recorded_vm_exit_code(id);
+                return Ok(from_vm.or(ended).or(last).unwrap_or_default());
             };
             last = exit_code.or(last);
             if status == SandboxStatus::Running && live.is_none() {

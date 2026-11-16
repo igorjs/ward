@@ -832,6 +832,23 @@ async fn mark_exited_on_main_end(
     }
 }
 
+/// The error for a start whose VM died before the main process could run.
+fn vm_died_during_start(id: &str) -> ApiError {
+    ApiError::Unavailable(format!("the VM of sandbox {id} died during start"))
+}
+
+/// How many times a VM death is saved before it is kept in memory only.
+const VM_EXIT_PERSIST_RETRIES: u32 = 3;
+
+/// The wait before the first new try of a failed save. It doubles each time.
+#[cfg(not(test))]
+const VM_EXIT_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(test)]
+const VM_EXIT_PERSIST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// How many recent VM death codes are kept for `wait` after a removal.
+const VM_EXIT_CODES_KEPT: usize = 256;
+
 /// How long a client waits for the host side to record a VM death after its
 /// output stream closed.
 const VM_EXIT_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -884,17 +901,34 @@ fn request_restart(
 /// Remove sandbox `id` if it is still exited from the run that `pid` was.
 /// A start since the exit was recorded owns the sandbox now, so it stays.
 async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
+    remove_ended_run(teardown, id, EndedRun::Main(pid)).await;
+}
+
+/// Which ended run an auto-removal is for.
+enum EndedRun<'a> {
+    /// The run whose main process has this pid.
+    Main(&'a str),
+    /// The run that ended at this time. For a run with no main process.
+    At(Option<std::time::SystemTime>),
+}
+
+async fn remove_ended_run(teardown: &Teardown, id: &str, run: EndedRun<'_>) {
     let removed = {
         let mut entries = teardown.entries.write().await;
         let exited = entries
             .get(id)
             .is_some_and(|entry| entry.meta.status == crate::protocol::SandboxStatus::Exited);
-        let same_run = teardown
-            .mains
-            .read()
-            .await
-            .get(id)
-            .is_some_and(|m| m.pid == pid);
+        let same_run = match run {
+            EndedRun::Main(pid) => teardown
+                .mains
+                .read()
+                .await
+                .get(id)
+                .is_some_and(|m| m.pid == pid),
+            EndedRun::At(finished_at) => entries
+                .get(id)
+                .is_some_and(|entry| entry.meta.finished_at == finished_at),
+        };
         if !(exited && same_run) {
             tracing::info!(sandbox_id = %id, "sandbox started again, keeping it");
             return;
@@ -975,6 +1009,15 @@ pub struct SandboxManager {
     restart_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<RestartRequest>>>,
     /// The wait before each sandbox's next restart, kept while it restarts.
     restart_delays: std::sync::Mutex<HashMap<String, std::time::Duration>>,
+    /// Death reports to handle again after the record could not be saved,
+    /// with the number of the attempt.
+    vm_exit_retry_tx: mpsc::UnboundedSender<(crate::backend::VmExit, u32)>,
+    /// Taken by [`spawn_vm_exit_watcher`](Self::spawn_vm_exit_watcher).
+    vm_exit_retry_rx:
+        std::sync::Mutex<Option<mpsc::UnboundedReceiver<(crate::backend::VmExit, u32)>>>,
+    /// Exit codes of recent VM deaths, so a `wait` that finds the sandbox
+    /// already removed can still report them. Oldest first.
+    vm_exit_codes: std::sync::Mutex<std::collections::VecDeque<(String, i32)>>,
 }
 
 impl SandboxManager {
@@ -986,6 +1029,7 @@ impl SandboxManager {
         network_backend: crate::config::NetworkBackendChoice,
     ) -> Self {
         let (restart_tx, restart_rx) = mpsc::unbounded_channel();
+        let (vm_exit_retry_tx, vm_exit_retry_rx) = mpsc::unbounded_channel();
         Self {
             forwarder: Arc::new(BackendForwarder(Arc::clone(&backend))),
             backend,
@@ -1010,6 +1054,9 @@ impl SandboxManager {
             restart_tx,
             restart_rx: std::sync::Mutex::new(Some(restart_rx)),
             restart_delays: std::sync::Mutex::new(HashMap::new()),
+            vm_exit_retry_tx,
+            vm_exit_retry_rx: std::sync::Mutex::new(Some(vm_exit_retry_rx)),
+            vm_exit_codes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -1278,13 +1325,23 @@ impl SandboxManager {
         let Some(mut exits) = self.backend.take_vm_exits() else {
             return;
         };
+        let Some(mut retries) = self.vm_exit_retry_rx.lock_unpoisoned().take() else {
+            return;
+        };
         let manager = Arc::downgrade(self);
         tokio::spawn(async move {
-            while let Some(exit) = exits.recv().await {
+            loop {
+                let (exit, attempt) = tokio::select! {
+                    Some(exit) = exits.recv() => (exit, 0),
+                    Some(retry) = retries.recv() => retry,
+                    else => break,
+                };
                 let Some(manager) = manager.upgrade() else {
                     break;
                 };
-                tokio::spawn(async move { manager.handle_vm_exit(exit).await });
+                tokio::spawn(async move {
+                    manager.handle_vm_exit_attempt(exit, attempt).await;
+                });
             }
         });
     }
@@ -1293,23 +1350,36 @@ impl SandboxManager {
     /// egress stack, agent socket and registrations. A stop, a removal or a
     /// newer boot that got there first leaves the sandbox alone. The restart
     /// or auto-removal comes last, so it never meets half-released state.
-    async fn handle_vm_exit(&self, exit: crate::backend::VmExit) {
+    ///
+    /// Returns whether the VM is known to be dead and the sandbox is, or is
+    /// about to be, recorded as such.
+    async fn handle_vm_exit(&self, exit: crate::backend::VmExit) -> bool {
+        self.handle_vm_exit_attempt(exit, 0).await
+    }
+
+    /// One try at [`handle_vm_exit`](Self::handle_vm_exit). When the record
+    /// cannot be saved, the report comes back after a delay. Past
+    /// [`VM_EXIT_PERSIST_RETRIES`] the death is kept in memory only, so the
+    /// VM's resources are still released.
+    async fn handle_vm_exit_attempt(&self, exit: crate::backend::VmExit, attempt: u32) -> bool {
         let id = exit.sandbox_id.as_str();
         let code = vm_exit_code(&exit);
         let teardown = self.teardown();
         let (listeners, finished_at) = {
             let mut entries = self.entries.write().await;
             let Some(entry) = entries.get_mut(id) else {
-                return;
+                return false;
             };
             if entry.meta.status != crate::protocol::SandboxStatus::Running {
-                return;
+                return false;
             }
             if !self.backend.vm_exit_is_current(&exit).await {
-                return;
+                return false;
             }
+            let last_try = attempt >= VM_EXIT_PERSIST_RETRIES;
+            let store = if last_try { None } else { self.store.as_ref() };
             let ended = commit_meta_ended(
-                self.store.as_ref(),
+                store,
                 &teardown,
                 entry,
                 crate::protocol::SandboxStatus::Exited,
@@ -1318,9 +1388,22 @@ impl SandboxManager {
             )
             .await;
             if let Err(e) = ended {
-                tracing::warn!(sandbox_id = %id, error = %e, "cannot record the VM exit");
-                return;
+                tracing::warn!(
+                    sandbox_id = %id,
+                    error = %e,
+                    attempt,
+                    "cannot record the VM exit, trying again"
+                );
+                self.retry_vm_exit(exit, attempt + 1);
+                return true;
             }
+            if last_try {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    "the store kept failing, the VM exit is recorded in memory only"
+                );
+            }
+            self.record_vm_exit_code(id, code);
             tracing::warn!(
                 sandbox_id = %id,
                 code = ?exit.code,
@@ -1336,43 +1419,74 @@ impl SandboxManager {
         };
         close_all(listeners).await;
         if !self.backend.release_dead_vm(&exit).await {
-            return;
+            return true;
         }
-        let remove_run = {
+        let auto_remove = {
             let entries = self.entries.read().await;
             let Some(entry) = entries.get(id) else {
-                return;
+                return true;
             };
             // A start since the death owns the sandbox and its registrations.
             if entry.meta.status != crate::protocol::SandboxStatus::Exited
                 || entry.meta.finished_at != finished_at
             {
-                return;
+                return true;
             }
             self.processes
                 .write()
                 .await
                 .retain(|_, rec| rec.sandbox_id != id);
             self.broker.deregister_sandbox(id).await;
-            if entry.meta.options.spec.auto_remove {
-                self.mains.read().await.get(id).map(|m| m.pid.clone())
-            } else {
+            let auto_remove = entry.meta.options.spec.auto_remove;
+            if !auto_remove {
                 request_restart(&teardown, entry, code, Some(exit.ran_for));
-                None
             }
+            auto_remove
         };
-        if let Some(pid) = remove_run {
-            auto_remove_ended(&teardown, id, &pid).await;
+        if auto_remove {
+            remove_ended_run(&teardown, id, EndedRun::At(finished_at)).await;
         }
+        true
+    }
+
+    /// Ask for the report to be handled again after a back-off.
+    fn retry_vm_exit(&self, exit: crate::backend::VmExit, attempt: u32) {
+        let tx = self.vm_exit_retry_tx.clone();
+        let delay = VM_EXIT_PERSIST_BACKOFF * 2u32.pow(attempt.saturating_sub(1));
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = tx.send((exit, attempt));
+        });
+    }
+
+    /// Remember the exit code of a VM death for [`VM_EXIT_CODES_KEPT`] deaths.
+    fn record_vm_exit_code(&self, id: &str, code: i32) {
+        let mut codes = self.vm_exit_codes.lock_unpoisoned();
+        codes.retain(|(known, _)| known != id);
+        codes.push_back((id.to_string(), code));
+        while codes.len() > VM_EXIT_CODES_KEPT {
+            codes.pop_front();
+        }
+    }
+
+    fn recorded_vm_exit_code(&self, id: &str) -> Option<i32> {
+        let codes = self.vm_exit_codes.lock_unpoisoned();
+        codes.iter().find(|(known, _)| known == id).map(|(_, c)| *c)
     }
 
     /// Act on a VM that died before its report could be handled: during
     /// create, before the sandbox was in the table, or during start, before
-    /// it was `running`.
-    async fn recheck_vm(&self, id: &str) {
+    /// it was `running`. Returns whether the sandbox now counts as having
+    /// lost its VM, so the caller must not start its main process.
+    async fn recheck_vm(&self, id: &str) -> bool {
         if let Some(exit) = self.backend.dead_vm(id).await {
-            self.handle_vm_exit(exit).await;
+            return self.handle_vm_exit(exit).await;
         }
+        // The report may have been handled while the caller was busy.
+        self.entries.read().await.get(id).is_some_and(|entry| {
+            entry.meta.status == crate::protocol::SandboxStatus::Exited
+                && entry.meta.end_reason == Some(EndReason::VmDied)
+        })
     }
 
     /// Wait out the back-off, then start the sandbox again unless a stop,
@@ -1986,7 +2100,9 @@ impl SandboxManager {
         // Before the main process starts, so its `die` cannot come first.
         self.emit_event(&id, EventAction::Create, None).await;
         self.emit_event(&id, EventAction::Start, None).await;
-        self.recheck_vm(&id).await;
+        if self.recheck_vm(&id).await {
+            return Err(vm_died_during_start(&id));
+        }
 
         // Secrets land before the main process so it can read them at start.
         let started = match self.put_secrets(&id, &secret_owner, &secrets).await {
@@ -2766,7 +2882,9 @@ impl SandboxManager {
         }
         self.commit_running_and_register(id, comms).await?;
         self.emit_event(id, EventAction::Start, None).await;
-        self.recheck_vm(id).await;
+        if self.recheck_vm(id).await {
+            return Err(vm_died_during_start(id));
+        }
         if let Err(e) = self.spawn_main(id).await {
             if self.fail_main_start(id).await {
                 self.release_failed_start(id).await;
@@ -3101,11 +3219,16 @@ impl SandboxManager {
                 (entry.meta.status.clone(), entry.meta.exit_code, has_main)
             });
             let Some((status, exit_code, has_main)) = recorded else {
+                // A death of the VM is the real outcome, even when removing
+                // the sandbox then ended its main process.
+                let from_vm = self.recorded_vm_exit_code(&id);
                 let Some(exit) = live else {
-                    return Err(ApiError::SandboxNotFound(id));
+                    return from_vm.ok_or(ApiError::SandboxNotFound(id));
                 };
                 let raw = *exit.borrow();
-                return Ok(raw.map_or(SIGNAL_EXIT_BASE + SIGKILL, decode_wait_status));
+                return Ok(from_vm.unwrap_or_else(|| {
+                    raw.map_or(SIGNAL_EXIT_BASE + SIGKILL, decode_wait_status)
+                }));
             };
             match status {
                 State::Exited | State::Stopped => {
@@ -3299,6 +3422,9 @@ impl SandboxManager {
         self.commit(entry, crate::protocol::SandboxStatus::Running, exit_code)
             .await?;
         entry.runs_started += 1;
+        self.vm_exit_codes
+            .lock_unpoisoned()
+            .retain(|(known, _)| known != id);
         self.run_changes.send_replace(());
         self.broker.register_sandbox(id.to_string(), comms).await;
         Ok(())
@@ -6629,6 +6755,13 @@ pub(crate) mod tests {
         released: std::sync::atomic::AtomicUsize,
         /// Fires each time the manager asked whether a report is current.
         consulted: tokio::sync::Notify,
+        /// How many times the manager asked whether a report is current.
+        consults: std::sync::atomic::AtomicUsize,
+        /// Removed when the manager asks for the second time, to end a fault
+        /// that made the first try fail.
+        unblock_on_second_consult: std::sync::Mutex<Option<std::path::PathBuf>>,
+        /// Calls that reached `exec`, which only a main process makes here.
+        exec_calls: std::sync::atomic::AtomicUsize,
     }
 
     /// Controls `add_egress_allow` on a `BootGate`: it can park the call
@@ -6652,6 +6785,21 @@ pub(crate) mod tests {
             self.vm_exits.lock().unwrap().take()
         }
         async fn vm_exit_is_current(&self, _exit: &crate::backend::VmExit) -> bool {
+            let nth = self
+                .vm_gate
+                .consults
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if nth == 2
+                && let Some(path) = self
+                    .vm_gate
+                    .unblock_on_second_consult
+                    .lock()
+                    .unwrap()
+                    .take()
+            {
+                std::fs::remove_dir(path).unwrap();
+            }
             self.vm_gate.consulted.notify_one();
             !self.vm_gate.stale.load(Ordering::SeqCst)
         }
@@ -6736,6 +6884,9 @@ pub(crate) mod tests {
             env: HashMap<String, String>,
             mode: crate::backend::ExecMode,
         ) -> crate::backend::Result<crate::backend::ProcessHandle> {
+            self.vm_gate
+                .exec_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner
                 .exec(sandbox_id, command, working_dir, env, mode)
                 .await
@@ -6999,7 +7150,6 @@ pub(crate) mod tests {
     }
 
     const KILLED_VM_GENERATION: u64 = 7;
-    const SIGKILL_SIGNAL: i32 = 9;
     const VM_RAN_FOR: std::time::Duration = std::time::Duration::from_secs(7);
 
     fn vm_killed(id: &str) -> crate::backend::VmExit {
@@ -7007,7 +7157,7 @@ pub(crate) mod tests {
             sandbox_id: id.to_string(),
             generation: KILLED_VM_GENERATION,
             code: None,
-            signal: Some(SIGKILL_SIGNAL),
+            signal: Some(SIGKILL),
             ran_for: VM_RAN_FOR,
         }
     }
@@ -7048,15 +7198,17 @@ pub(crate) mod tests {
         // Assert
         assert!(exited, "the sandbox never became exited");
         let info = mgr.get(&created.id).await.unwrap();
-        assert_eq!(info.exit_code, Some(SIGNAL_EXIT_BASE + SIGKILL_SIGNAL));
+        assert_eq!(info.exit_code, Some(SIGNAL_EXIT_BASE + SIGKILL));
         assert_eq!(info.end_reason, crate::pb::EndReason::VmDied as i32);
-        assert_eq!(
+        let released = wait_until(|| async {
             gated
                 .gate
                 .released
-                .load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+        })
+        .await;
+        assert!(released, "the VM was never released");
         assert_eq!(
             actions_so_far(&mgr).await,
             [EventAction::Create, EventAction::Start, EventAction::Die]
@@ -7104,7 +7256,7 @@ pub(crate) mod tests {
 
         // Assert
         let request = restarts.try_recv().expect("a restart request");
-        assert_eq!(request.exit_code, SIGNAL_EXIT_BASE + SIGKILL_SIGNAL);
+        assert_eq!(request.exit_code, SIGNAL_EXIT_BASE + SIGKILL);
         assert_eq!(request.ran_for, VM_RAN_FOR);
         assert!(request.finished_at.is_some());
     }
@@ -7172,42 +7324,6 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn given_vm_that_died_during_start_when_the_sandbox_is_running_then_it_is_exited() {
-        // Arrange
-        let tmp = tempfile::tempdir().unwrap();
-        let gated = manager_with_vm_exits(tmp.path(), 2);
-        let mgr = gated.manager;
-        let created = mgr.create(create_req("alpine"), "").await.unwrap();
-        mgr.stop(&created.id).await.unwrap();
-        *gated.gate.dead.lock().unwrap() = Some(vm_killed(&created.id));
-
-        // Act
-        mgr.start(&created.id).await.unwrap();
-
-        // Assert
-        let info = mgr.get(&created.id).await.unwrap();
-        assert_eq!(info.status, SandboxStatus::Exited as i32);
-        assert_eq!(info.end_reason, crate::pb::EndReason::VmDied as i32);
-    }
-
-    #[tokio::test]
-    async fn given_vm_that_died_during_create_when_the_sandbox_is_inserted_then_it_is_exited() {
-        // Arrange
-        let tmp = tempfile::tempdir().unwrap();
-        let gated = manager_with_vm_exits(tmp.path(), 2);
-        let mgr = gated.manager;
-        *gated.gate.dead.lock().unwrap() = Some(vm_killed(""));
-
-        // Act
-        let created = mgr.create(create_req("alpine"), "").await.unwrap();
-
-        // Assert
-        let info = mgr.get(&created.id).await.unwrap();
-        assert_eq!(info.status, SandboxStatus::Exited as i32);
-        assert_eq!(info.end_reason, crate::pb::EndReason::VmDied as i32);
-    }
-
-    #[tokio::test]
     async fn given_main_process_whose_stream_closed_when_the_vm_death_is_recorded_then_the_client_gets_its_code()
      {
         // Arrange
@@ -7238,7 +7354,7 @@ pub(crate) mod tests {
 
         // Assert
         let raw = waiter.await.unwrap().unwrap();
-        assert_eq!(decode_wait_status(raw), SIGNAL_EXIT_BASE + SIGKILL_SIGNAL);
+        assert_eq!(decode_wait_status(raw), SIGNAL_EXIT_BASE + SIGKILL);
     }
 
     #[cfg(not(feature = "krunvm"))]
@@ -7261,9 +7377,229 @@ pub(crate) mod tests {
         assert!(mgr.get(&id).await.is_err(), "the sandbox is still there");
     }
 
+    fn command_req(command: &[&str]) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            command: command.iter().map(|part| part.to_string()).collect(),
+            ..create_req("alpine")
+        }
+    }
+
+    #[tokio::test]
+    async fn given_command_less_auto_remove_sandbox_when_its_vm_dies_then_it_is_removed() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_with_vm_exits(tmp.path(), 2).manager;
+        let req = CreateSandboxRequest {
+            auto_remove: true,
+            ..create_req("alpine")
+        };
+        let created = mgr.create(req, "").await.unwrap();
+
+        // Act
+        mgr.handle_vm_exit(vm_killed(&created.id)).await;
+
+        // Assert
+        assert!(mgr.get(&created.id).await.is_err(), "still there");
+    }
+
+    #[tokio::test]
+    async fn given_store_that_fails_once_when_the_vm_dies_then_the_report_is_handled_again() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        mgr.spawn_vm_exit_watcher();
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        let blocker = tmp
+            .path()
+            .join("sandboxes")
+            .join(&created.id)
+            .join(crate::sandbox::store::META_TMP_FILE);
+        std::fs::create_dir(&blocker).unwrap();
+        *gated.gate.unblock_on_second_consult.lock().unwrap() = Some(blocker);
+
+        // Act
+        gated.vm_exits.send(vm_killed(&created.id)).unwrap();
+        let exited =
+            wait_until(|| async { status_of(&mgr, &created.id).await == SandboxStatus::Exited })
+                .await;
+
+        // Assert
+        assert!(exited, "the sandbox never became exited");
+        let consults = gated
+            .gate
+            .consults
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(consults, 2, "one failed try and one that saved");
+        let reloaded = restart(tmp.path()).await;
+        assert_eq!(
+            status_of(&reloaded, &created.id).await,
+            SandboxStatus::Exited
+        );
+    }
+
+    #[tokio::test]
+    async fn given_store_that_keeps_failing_when_the_vm_dies_then_the_vm_is_still_released() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        mgr.spawn_vm_exit_watcher();
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        let blocker = tmp
+            .path()
+            .join("sandboxes")
+            .join(&created.id)
+            .join(crate::sandbox::store::META_TMP_FILE);
+        std::fs::create_dir(&blocker).unwrap();
+
+        // Act
+        gated.vm_exits.send(vm_killed(&created.id)).unwrap();
+        let released = wait_until(|| async {
+            gated
+                .gate
+                .released
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 1
+        })
+        .await;
+
+        // Assert
+        assert!(released, "the VM was never released");
+        assert_eq!(status_of(&mgr, &created.id).await, SandboxStatus::Exited);
+        assert!(actions_so_far(&mgr).await.contains(&EventAction::Die));
+    }
+
+    #[tokio::test]
+    async fn given_vm_that_died_during_create_when_secrets_and_main_would_follow_then_neither_runs()
+    {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        *gated.gate.dead.lock().unwrap() = Some(vm_killed(""));
+
+        // Act
+        let result = mgr.create(command_req(&["true"]), "").await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::Unavailable(ref m)) if m.contains("died")));
+        let listed = mgr.list().await.unwrap();
+        assert_eq!(listed.len(), 1, "the sandbox stays, exited");
+        assert_eq!(listed[0].status, SandboxStatus::Exited as i32);
+        assert_eq!(listed[0].end_reason, crate::pb::EndReason::VmDied as i32);
+        assert_eq!(
+            gated
+                .gate
+                .exec_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn given_vm_that_died_during_start_when_main_would_follow_then_it_does_not_run() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        let created = mgr.create(command_req(&["true"]), "").await.unwrap();
+        mgr.stop(&created.id).await.unwrap();
+        let before = gated
+            .gate
+            .exec_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        *gated.gate.dead.lock().unwrap() = Some(vm_killed(&created.id));
+
+        // Act
+        let result = mgr.start(&created.id).await;
+
+        // Assert
+        assert!(matches!(result, Err(ApiError::Unavailable(ref m)) if m.contains("died")));
+        let info = mgr.get(&created.id).await.unwrap();
+        assert_eq!(info.status, SandboxStatus::Exited as i32);
+        assert_eq!(info.end_reason, crate::pb::EndReason::VmDied as i32);
+        assert_eq!(
+            gated
+                .gate
+                .exec_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before
+        );
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_always_policy_and_a_command_when_the_vm_dies_then_the_run_time_comes_from_the_main()
+     {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let mut restarts = take_restart_requests(&mgr);
+        let id = create_restarting(&mgr, "sleep 30", "always", 0).await;
+
+        // Act
+        mgr.handle_vm_exit(vm_killed(&id)).await;
+
+        // Assert
+        let request = restarts.try_recv().expect("a restart request");
+        assert!(request.ran_for < VM_RAN_FOR);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[rstest::rstest]
+    #[case::clean_exit(Some(0), None, VM_LOST_EXIT)]
+    #[case::signal(None, Some(SIGKILL), SIGNAL_EXIT_BASE + SIGKILL)]
+    #[tokio::test]
+    async fn given_auto_remove_sandbox_when_its_vm_dies_then_wait_reports_the_vm_exit_code(
+        #[case] code: Option<i32>,
+        #[case] signal: Option<i32>,
+        #[case] want: i32,
+    ) {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            auto_remove: true,
+            ..command_req(&["sleep", "30"])
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+        let exit = crate::backend::VmExit {
+            code,
+            signal,
+            ..vm_killed(&id)
+        };
+
+        // Act
+        let (waited, _) = tokio::join!(mgr.wait(&id), mgr.handle_vm_exit(exit));
+
+        // Assert
+        assert_eq!(waited.unwrap(), want);
+    }
+
+    #[cfg(not(feature = "krunvm"))]
+    #[tokio::test]
+    async fn given_auto_remove_sandbox_when_its_vm_dies_then_wait_removed_reports_the_vm_exit_code()
+    {
+        // Arrange
+        let mgr = host_manager(MAIN_OUTPUT_CAP);
+        let req = CreateSandboxRequest {
+            auto_remove: true,
+            ..command_req(&["sleep", "30"])
+        };
+        let id = mgr.create(req, "").await.expect("create").id;
+
+        // Act
+        let (waited, _) = tokio::join!(
+            mgr.wait_until(&id, crate::pb::WaitCondition::Removed),
+            mgr.handle_vm_exit(vm_killed(&id))
+        );
+
+        // Assert
+        assert_eq!(waited.unwrap(), SIGNAL_EXIT_BASE + SIGKILL);
+    }
+
     #[rstest::rstest]
     #[case::own_code(Some(3), None, 3)]
-    #[case::signal(None, Some(SIGKILL_SIGNAL), 137)]
+    #[case::signal(None, Some(SIGKILL), 137)]
     #[case::unknown(None, None, VM_LOST_EXIT)]
     #[case::clean_exit_is_not_success(Some(0), None, VM_LOST_EXIT)]
     fn given_vm_exit_when_converted_then_code_follows_shell_convention(

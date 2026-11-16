@@ -452,7 +452,6 @@ mod tests {
     }
 
     const FAKE_SHIM_LIFETIME_SECS: &str = "60";
-    const SIGKILL_NUMBER: i32 = 9;
     const EXIT_WAIT: Duration = Duration::from_secs(30);
 
     /// A long-lived child that stands in for the VM host process.
@@ -486,7 +485,7 @@ mod tests {
             .expect("some");
 
         // Assert
-        assert_eq!(ended.signal, Some(SIGKILL_NUMBER));
+        assert_eq!(ended.signal, Some(crate::signal::SIGKILL));
         assert_eq!(ended.code, None);
         assert!(!shim.is_running());
     }
