@@ -16,10 +16,8 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
-
-use assert_cmd::cargo::CommandCargoExt;
 
 /// Send SIGTERM to a child by pid. Wraps the rustix call so the test
 /// body stays focused on assertions.
@@ -37,8 +35,7 @@ fn given_running_daemon_with_sandbox_when_sigterm_then_clean_exit() {
     let data_dir = tempfile::tempdir().expect("tmpdir");
     let socket = data_dir.path().join("ward.sock");
 
-    let mut wardd = Command::cargo_bin("wardd")
-        .expect("locate wardd binary")
+    let mut wardd = common::wardd_command()
         .env("WARD_SOCKET", &socket)
         .env("WARD_DATA_DIR", data_dir.path())
         .env("WARD_LOG_LEVEL", "warn")
@@ -56,8 +53,7 @@ fn given_running_daemon_with_sandbox_when_sigterm_then_clean_exit() {
     // Default backend is the stub when --features krunvm is off; the
     // stub still goes through SandboxManager + Backend::create so the
     // shutdown teardown path is exercised end-to-end.
-    let create = Command::cargo_bin("ward")
-        .expect("locate ward binary")
+    let create = common::ward_command()
         .env("WARD_SOCKET", &socket)
         .args(["create", "alpine:latest"])
         .output()
@@ -123,8 +119,7 @@ fn given_running_daemon_without_sandboxes_when_sigint_then_exits_quickly() {
     let data_dir = tempfile::tempdir().expect("tmpdir");
     let socket = data_dir.path().join("ward.sock");
 
-    let mut wardd = Command::cargo_bin("wardd")
-        .expect("locate wardd binary")
+    let mut wardd = common::wardd_command()
         .env("WARD_SOCKET", &socket)
         .env("WARD_DATA_DIR", data_dir.path())
         .env("WARD_LOG_LEVEL", "warn")

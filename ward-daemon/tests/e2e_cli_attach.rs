@@ -299,7 +299,7 @@ fn given_an_unknown_sandbox_when_exec_runs_then_it_exits_125() {
 #[test]
 fn given_no_daemon_when_run_executes_then_it_exits_125() {
     // Arrange
-    let mut cmd = std::process::Command::cargo_bin("ward").expect("locate ward");
+    let mut cmd = common::ward_command();
     cmd.env("WARD_SOCKET", "/nonexistent/ward.sock");
 
     // Act
