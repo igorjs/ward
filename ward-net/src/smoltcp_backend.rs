@@ -24,7 +24,7 @@
 //! `attach`/`detach` on [`SmoltcpBackend`] are unused by that path (see
 //! their own doc comments below).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -455,7 +455,7 @@ const MAX_FLOW_ENTRIES: usize = 1024;
 /// `CONNECT_TIMEOUT`, so this bounds what a SYN flood can spawn. A SYN over the
 /// cap is dropped (not reset), so the guest's own SYN retransmit retries it
 /// once a slot frees. Pending connects also count against `MAX_FLOW_ENTRIES`.
-const MAX_PENDING_CONNECTS: usize = 64;
+pub const MAX_PENDING_CONNECTS: usize = 64;
 
 /// How long a flow may stay half-closed after ward sent its FIN. A guest that
 /// never closes its own side (an idle keep-alive pool) would otherwise hold a
@@ -597,10 +597,10 @@ pub(crate) const TCP_SOCKET_BUFFER_BYTES: usize = 16384;
 /// never block the flow indefinitely.
 const HOST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a flow's spawned connect task waits for `Connector::connect` to
-/// resolve before giving up. Without this, an unresponsive remote would
-/// leave the flow `Connecting` forever with no way to notice the guest gave
-/// up waiting.
+/// How long a guest SYN may stay pending while its egress check and
+/// `Connector::connect` run. When it passes, the guest is reset. Without this,
+/// an unresponsive remote would hold a pending slot, and leave the guest
+/// waiting, with no end.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Pending chunks a host-io task's write channel can hold before
@@ -637,14 +637,35 @@ enum FlowState {
         host_failed: Arc<AtomicBool>,
         /// Last time bytes moved in either direction.
         last_activity: std::time::Instant,
+        /// Set once smoltcp has taken the flow's SYN and the socket's remote
+        /// endpoint was checked against the flow key. smoltcp hands a SYN to
+        /// any listener on the destination, so this guards against a socket
+        /// answering another flow's SYN and being bridged to the wrong host
+        /// stream.
+        verified: bool,
     },
 }
 
 /// A guest SYN waiting on its egress check and host connect.
 struct PendingConnect {
     result: oneshot::Receiver<std::io::Result<TcpStream>>,
-    /// The SYN exactly as the guest sent it, replayed to smoltcp on completion.
+    /// Set once the connect task reported, until the flow can be admitted.
+    outcome: Option<std::io::Result<TcpStream>>,
+    /// The newest SYN the guest sent for this flow, replayed to smoltcp on
+    /// completion. A retransmit replaces it, so the SYN-ACK always acknowledges
+    /// the guest's latest sequence number.
     syn_frame: Vec<u8>,
+    /// The connect task, aborted when this entry is dropped so no host
+    /// connection opens after the flow or the stack is gone.
+    task: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for PendingConnect {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
 }
 
 /// One guest-initiated TCP flow: the smoltcp socket handle backing it plus
@@ -880,6 +901,8 @@ pub struct Stack {
     sockets_pending_removal: Vec<SocketHandle>,
     /// See [`HALF_CLOSE_TIMEOUT`]. A field so tests can shorten it.
     half_close_timeout: std::time::Duration,
+    /// See [`CONNECT_TIMEOUT`]. A field so tests can shorten it.
+    connect_timeout: std::time::Duration,
     /// See [`FLOW_IDLE_TIMEOUT`]. A field so tests can shorten it.
     idle_timeout: std::time::Duration,
     dns_socket_handle: SocketHandle,
@@ -983,6 +1006,7 @@ impl Stack {
             pending_connects: HashMap::new(),
             sockets_pending_removal: Vec::new(),
             half_close_timeout: HALF_CLOSE_TIMEOUT,
+            connect_timeout: CONNECT_TIMEOUT,
             idle_timeout: FLOW_IDLE_TIMEOUT,
             dns_socket_handle,
             pending_dns_queries: VecDeque::new(),
@@ -1068,6 +1092,11 @@ impl Stack {
         self.half_close_timeout = timeout;
     }
 
+    /// Shortens the connect deadline so a test need not wait 10 seconds.
+    pub fn set_connect_timeout_for_test(&mut self, timeout: std::time::Duration) {
+        self.connect_timeout = timeout;
+    }
+
     /// Shortens the idle deadline so a test need not wait 15 minutes.
     pub fn set_idle_timeout_for_test(&mut self, timeout: std::time::Duration) {
         self.idle_timeout = timeout;
@@ -1079,10 +1108,10 @@ impl Stack {
         self.inbound_tuning = tuning;
     }
 
-    /// Number of guest TCP flows currently tracked.
+    /// Number of guest TCP flows with an open host connection.
     #[must_use]
     pub fn flow_count_for_test(&self) -> usize {
-        self.flows.len() + self.pending_connects.len()
+        self.flows.len()
     }
 
     /// Number of guest SYNs held while their egress check and connect run.
@@ -1109,8 +1138,8 @@ impl Stack {
         self.interface.poll_maintenance(now);
 
         let mut result = PollResult::None;
-        self.resolve_pending_connects();
         loop {
+            self.resolve_pending_connects();
             while self.poll_flows() {}
             match self
                 .interface
@@ -1156,8 +1185,15 @@ impl Stack {
             return false;
         }
         if self.pending_connects.contains_key(&(src, dst)) {
-            // A SYN retransmit while the connect is still running.
-            self.discard_guest_frame();
+            // A SYN retransmit while the connect is still running. It carries
+            // the same 4-tuple, so the egress decision is the same: keep only
+            // the newest SYN so the SYN-ACK matches the guest's latest ISN.
+            if let Some(frame) = self.recv_guest_frame(0)
+                && parse_guest_syn(&frame) == Some((src, dst))
+                && let Some(pending) = self.pending_connects.get_mut(&(src, dst))
+            {
+                pending.syn_frame = frame;
+            }
             return true;
         }
         if self.flow_table_is_full() {
@@ -1202,6 +1238,10 @@ impl Stack {
             return true;
         };
         let addr = SocketAddr::from(dst);
+        if !is_flow_destination_safe(addr.ip()) {
+            self.device.replay.push_back(syn_frame);
+            return true;
+        }
         // The resolved map only ever attributes a domain to an address a
         // relayed DNS answer actually produced, so a destination reached by
         // a literal SYN (never looked up) falls back to the bare IP. That
@@ -1215,20 +1255,13 @@ impl Stack {
             .unwrap_or_else(|| addr.ip().to_string());
 
         let (connect_tx, connect_rx) = oneshot::channel();
-        self.pending_connects.insert(
-            (src, dst),
-            PendingConnect {
-                result: connect_rx,
-                syn_frame,
-            },
-        );
         let connector = Arc::clone(&self.connector);
         let egress_check = Arc::clone(&self.egress_check);
         // The deadline covers the egress check and the connect together, so a
         // hung policy check cannot hold a pending slot past `CONNECT_TIMEOUT`.
         // It is anchored to now rather than to the spawned task's first poll.
-        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
-        tokio::task::spawn(async move {
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        let task = tokio::task::spawn(async move {
             let attempt = async {
                 if !egress_check(&domain, addr.port()).await {
                     return Err(std::io::Error::new(
@@ -1259,34 +1292,76 @@ impl Stack {
             // The receiver is gone only if the stack was dropped.
             let _ = connect_tx.send(result);
         });
+        self.pending_connects.insert(
+            (src, dst),
+            PendingConnect {
+                result: connect_rx,
+                outcome: None,
+                syn_frame,
+                task: Some(task.abort_handle()),
+            },
+        );
         true
     }
 
-    /// Finishes every pending connect whose task has reported. On success the
-    /// flow gets a listening socket and its held SYN is replayed, so smoltcp
-    /// sends the SYN-ACK now. On failure the SYN is replayed with no socket
-    /// listening, so smoltcp answers it with an RST and the guest never sees
-    /// an accept.
+    /// Finishes pending connects whose task has reported, in key order. On
+    /// success the flow gets a listening socket and its held SYN is replayed,
+    /// so smoltcp sends the SYN-ACK now. On failure the SYN is replayed with
+    /// no socket listening, so smoltcp answers it with an RST and the guest
+    /// never sees an accept.
+    ///
+    /// smoltcp gives a SYN to the first listener on the destination whatever
+    /// the source, so only one flow per destination is handled at a time: it is
+    /// admitted or reset here, and the next flow to that destination waits
+    /// until `poll` has fed the replayed SYN to smoltcp. A failed flow is
+    /// never replayed while another flow's listener could answer it.
     fn resolve_pending_connects(&mut self) {
-        let mut done = Vec::new();
+        let mut busy: HashSet<IpEndpoint> = self
+            .sockets
+            .iter()
+            .filter_map(|(_, socket)| match socket {
+                smoltcp::socket::Socket::Tcp(tcp) => Some(tcp),
+                _ => None,
+            })
+            .filter(|socket| socket.state() == tcp::State::Listen)
+            .filter_map(|socket| {
+                let endpoint = socket.listen_endpoint();
+                endpoint
+                    .addr
+                    .map(|addr| IpEndpoint::new(addr, endpoint.port))
+            })
+            .collect();
+        let mut ready = Vec::new();
         for (&key, pending) in self.pending_connects.iter_mut() {
-            match pending.result.try_recv() {
-                Ok(result) => done.push((key, result)),
-                Err(oneshot::error::TryRecvError::Empty) => {}
-                Err(oneshot::error::TryRecvError::Closed) => done.push((
-                    key,
-                    Err(std::io::Error::other("connect task ended without a result")),
-                )),
+            if pending.outcome.is_none() {
+                match pending.result.try_recv() {
+                    Ok(result) => pending.outcome = Some(result),
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        pending.outcome = Some(Err(std::io::Error::other(
+                            "connect task ended without a result",
+                        )));
+                    }
+                }
+            }
+            if pending.outcome.is_some() {
+                ready.push(key);
             }
         }
-        for (key, result) in done {
-            let Some(pending) = self.pending_connects.remove(&key) else {
+        ready.sort();
+        for key in ready {
+            if !busy.insert(key.1) {
+                continue;
+            }
+            let Some(mut pending) = self.pending_connects.remove(&key) else {
                 continue;
             };
-            if let Ok(stream) = result {
+            if let Some(Ok(stream)) = pending.outcome.take() {
                 self.admit_flow(key, stream);
             }
-            self.device.replay.push_back(pending.syn_frame);
+            self.device
+                .replay
+                .push_back(std::mem::take(&mut pending.syn_frame));
         }
     }
 
@@ -1321,6 +1396,7 @@ impl Stack {
                     fin_sent_at: None,
                     host_failed,
                     last_activity: std::time::Instant::now(),
+                    verified: false,
                 },
             },
         );
@@ -1353,7 +1429,23 @@ impl Stack {
                     fin_sent_at,
                     host_failed,
                     last_activity,
+                    verified,
                 } => {
+                    if !*verified {
+                        let socket = self.sockets.get::<tcp::Socket>(flow.handle);
+                        if socket.state() != tcp::State::Listen {
+                            if socket.remote_endpoint() == Some(key.0) {
+                                *verified = true;
+                            } else {
+                                tracing::warn!(
+                                    destination = %key.1,
+                                    "dropping a guest TCP flow: its socket answered another peer"
+                                );
+                                to_remove.push((key, flow.handle));
+                                continue;
+                            }
+                        }
+                    }
                     match to_host_tx.try_reserve() {
                         Ok(permit) => {
                             let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
@@ -1656,7 +1748,9 @@ impl Stack {
             ),
             PendingConnect {
                 result: connect_rx,
+                outcome: None,
                 syn_frame: Vec::new(),
+                task: None,
             },
         );
     }
