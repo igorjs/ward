@@ -1598,8 +1598,8 @@ async fn given_pending_connect_when_guest_retransmits_syn_then_it_is_dropped_wit
 }
 
 #[tokio::test]
-async fn given_pending_connect_when_syn_is_retransmitted_with_new_isn_then_syn_ack_acks_the_newest()
-{
+async fn given_pending_connect_when_syn_is_retransmitted_with_new_isn_then_syn_ack_acks_the_replacement()
+ {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let (release_tx, release_rx) = oneshot::channel();
     let connector: Box<dyn Connector> = Box::new(GatedConnector {
@@ -1719,6 +1719,10 @@ async fn given_pending_connect_when_stack_is_dropped_then_connect_task_is_aborte
 }
 
 /// A MAC that is not the interface's.
+/// Offset of the TCP checksum in a SYN frame with no IP options: Ethernet 14,
+/// IPv4 20, then 16 into the TCP header.
+const MIN_TCP_CHECKSUM_OFFSET: usize = 14 + 20 + 16;
+
 const OTHER_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x99]);
 
 #[tokio::test]
@@ -1870,12 +1874,34 @@ async fn given_pending_connect_when_replacement_syn_has_a_bad_mac_then_the_origi
     );
 }
 
+/// Sends a SYN from `port`, waits for the SYN-ACK, then answers it with an RST
+/// the way a guest that gave up on the connection does.
+async fn syn_then_guest_reset(stack: &mut Stack, guest_fd: &OwnedFd, port: u16) {
+    write_frame(guest_fd, &build_tcp_syn_frame_from(port));
+    let syn_ack = poll_until_syn_ack(stack, guest_fd, Duration::from_secs(2))
+        .await
+        .expect("SYN-ACK once the host connect succeeds");
+    let rst = build_tcp_frame_from(
+        port,
+        TcpControl::Rst,
+        TcpSeqNumber(1),
+        syn_ack.seq_number + 1,
+        &[],
+    );
+    write_frame(guest_fd, &rst);
+    drain_guest(stack, guest_fd, Duration::from_millis(50)).await;
+}
+
 #[tokio::test]
-async fn given_syn_smoltcp_does_not_accept_when_connect_succeeds_then_no_flow_no_pending_and_host_stream_closed()
+async fn given_guest_resets_during_handshake_when_polled_then_flow_is_gone_and_next_flow_gets_its_own_stream()
  {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_a = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_b = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let connector: Box<dyn Connector> = Box::new(SequenceConnector {
-        answers: Mutex::new(VecDeque::from([Some(listener.local_addr().unwrap())])),
+        answers: Mutex::new(VecDeque::from([
+            Some(listener_a.local_addr().unwrap()),
+            Some(listener_b.local_addr().unwrap()),
+        ])),
     });
     let (guest_fd, host_fd) = socketpair_dgram();
     let mut stack = Stack::new(
@@ -1886,29 +1912,107 @@ async fn given_syn_smoltcp_does_not_accept_when_connect_succeeds_then_no_flow_no
     );
     perform_arp_handshake(&mut stack, &guest_fd).await;
 
-    // smoltcp leaves a listener alone when the SYN carries a zero MSS.
+    syn_then_guest_reset(&mut stack, &guest_fd, GUEST_SRC_PORT).await;
+
+    assert_eq!(
+        stack.flow_count_for_test(),
+        0,
+        "a reset handshake frees its slot"
+    );
+    let (mut stream_a, _) = listener_a.accept().await.unwrap();
+    let mut buf = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_secs(1), stream_a.read(&mut buf)).await;
+    assert_eq!(read.expect("host stream closed").unwrap(), 0);
+
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(OTHER_SRC_PORT));
+    let syn_ack = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("the next flow is accepted");
+    let ack = syn_ack.seq_number + 1;
     write_frame(
         &guest_fd,
-        &build_tcp_syn_custom(
-            GUEST_SRC_PORT,
-            DEST_PORT,
-            TcpSeqNumber(0),
-            GATEWAY_MAC,
-            Some(0),
-        ),
+        &build_tcp_ack_frame_from(OTHER_SRC_PORT, TcpSeqNumber(1), ack, &[]),
     );
-    let seen = drain_guest(&mut stack, &guest_fd, Duration::from_millis(400)).await;
+    stack.poll();
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame_from(OTHER_SRC_PORT, TcpSeqNumber(1), ack, b"second"),
+    );
+    let (stream_b, _) = listener_b.accept().await.unwrap();
+    let got = poll_until_stream_bytes(&mut stack, &stream_b, Duration::from_secs(2)).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"second"[..]),
+        "bridged to its own stream"
+    );
+}
 
-    assert!(
-        seen.is_empty(),
-        "no SYN-ACK for a SYN smoltcp did not take: {seen:?}"
+#[tokio::test]
+async fn given_flow_reset_during_handshake_when_same_tuple_syns_again_then_a_fresh_connect_starts()
+{
+    let listener_a = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_b = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let connector: Box<dyn Connector> = Box::new(SequenceConnector {
+        answers: Mutex::new(VecDeque::from([
+            Some(listener_a.local_addr().unwrap()),
+            Some(listener_b.local_addr().unwrap()),
+        ])),
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
     );
-    assert_eq!(stack.flow_count_for_test(), 0);
-    assert_eq!(stack.pending_connect_count_for_test(), 0);
-    let (mut host_stream, _) = listener.accept().await.unwrap();
-    let mut buf = [0u8; 8];
-    let read = tokio::time::timeout(Duration::from_secs(1), host_stream.read(&mut buf))
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    syn_then_guest_reset(&mut stack, &guest_fd, GUEST_SRC_PORT).await;
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(GUEST_SRC_PORT));
+    let accepted = async {
+        loop {
+            stack.poll();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if stack.flow_count_for_test() == 1 {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(2), accepted)
         .await
-        .expect("the host stream is dropped, so the read ends");
-    assert_eq!(read.unwrap(), 0, "host stream closed with no flow");
+        .expect("a new flow is registered");
+    let (_stream_b, _) = tokio::time::timeout(Duration::from_secs(1), listener_b.accept())
+        .await
+        .expect("the SYN started a second host connect")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn given_syns_smoltcp_would_ignore_when_polled_then_only_the_valid_syn_starts_a_connect() {
+    let connector: Box<dyn Connector> = Box::new(HangingConnector);
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    let mut bad_checksum = build_tcp_syn_frame_from(40_010);
+    let checksum_at = MIN_TCP_CHECKSUM_OFFSET;
+    bad_checksum[checksum_at] ^= 0xFF;
+    write_frame(&guest_fd, &bad_checksum);
+    let port_zero = build_tcp_syn_custom(40_011, 0, TcpSeqNumber(0), GATEWAY_MAC, None);
+    write_frame(&guest_fd, &port_zero);
+    let zero_mss = build_tcp_syn_custom(40_012, DEST_PORT, TcpSeqNumber(0), GATEWAY_MAC, Some(0));
+    write_frame(&guest_fd, &zero_mss);
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(OTHER_SRC_PORT));
+    stack.poll();
+
+    assert_eq!(
+        stack.pending_connect_count_for_test(),
+        1,
+        "a bad checksum, destination port 0 and a zero MSS each start no connect"
+    );
 }

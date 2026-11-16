@@ -656,9 +656,8 @@ struct PendingConnect {
     result: oneshot::Receiver<std::io::Result<TcpStream>>,
     /// Set once the connect task reported, until the flow can be admitted.
     outcome: Option<std::io::Result<TcpStream>>,
-    /// The newest SYN the guest sent for this flow, replayed to smoltcp on
-    /// completion. A retransmit replaces it, so the SYN-ACK always acknowledges
-    /// the guest's latest sequence number.
+    /// The last SYN accepted for this flow, replayed to smoltcp on completion.
+    /// A retransmit with the same 4-tuple replaces it.
     syn_frame: Vec<u8>,
     /// The connect task, aborted when this entry is dropped so no host
     /// connection opens after the flow or the stack is gone.
@@ -883,7 +882,11 @@ fn parse_guest_syn(frame: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
             return None;
         }
     };
-    if tcp_repr.control != TcpControl::Syn || tcp_repr.ack_number.is_some() {
+    // A zero MSS makes smoltcp ignore the SYN.
+    if tcp_repr.control != TcpControl::Syn
+        || tcp_repr.ack_number.is_some()
+        || tcp_repr.max_seg_size == Some(0)
+    {
         return None;
     }
 
@@ -916,6 +919,9 @@ pub struct Stack {
     /// its SYN-ACK only for a connection that is really open. On failure the
     /// SYN is replayed with no socket, which smoltcp answers with RST.
     pending_connects: HashMap<(IpEndpoint, IpEndpoint), PendingConnect>,
+    /// Flows whose socket has not finished the handshake. A guest RST in that
+    /// window turns the socket back into a listener, see `reap_dead_flows`.
+    half_open: Vec<(IpEndpoint, IpEndpoint)>,
     /// Sockets a prior `pump_flows` call aborted (to make smoltcp emit a
     /// final RST for the corresponding flow) but hasn't freed yet. Removal
     /// is deferred one poll cycle so the egress loop between the abort and
@@ -1028,6 +1034,7 @@ impl Stack {
             egress_check: Arc::from(egress_check),
             flows: HashMap::new(),
             pending_connects: HashMap::new(),
+            half_open: Vec::new(),
             sockets_pending_removal: Vec::new(),
             half_close_timeout: HALF_CLOSE_TIMEOUT,
             connect_timeout: CONNECT_TIMEOUT,
@@ -1170,9 +1177,10 @@ impl Stack {
                 .poll_ingress_single(now, &mut self.device, &mut self.sockets)
             {
                 PollIngressSingleResult::None => break,
-                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::PacketProcessed => self.reap_dead_flows(),
                 PollIngressSingleResult::SocketStateChanged => {
                     result = PollResult::SocketStateChanged;
+                    self.reap_dead_flows();
                 }
             }
         }
@@ -1210,8 +1218,8 @@ impl Stack {
         }
         if self.pending_connects.contains_key(&(src, dst)) {
             // A SYN retransmit while the connect is still running. It carries
-            // the same 4-tuple, so the egress decision is the same: keep only
-            // the newest SYN so the SYN-ACK matches the guest's latest ISN.
+            // the same 4-tuple, so the egress decision is the same: hold this
+            // SYN in place of the earlier one.
             if let Some(frame) = self.recv_guest_frame(0)
                 && parse_guest_syn(&frame) == Some((src, dst))
                 && let Some(pending) = self.pending_connects.get_mut(&(src, dst))
@@ -1365,11 +1373,7 @@ impl Stack {
             let syn_frame = std::mem::take(&mut pending.syn_frame);
             match pending.outcome.take() {
                 Some(Ok(stream)) => self.admit_flow(key, stream, syn_frame, now),
-                _ => {
-                    if !self.is_listening_on(key.1) {
-                        self.feed_ingress(syn_frame, now);
-                    }
-                }
+                _ => self.feed_ingress(syn_frame, now),
             }
         }
     }
@@ -1382,19 +1386,6 @@ impl Stack {
         self.interface
             .poll_ingress_single(now, &mut self.device, &mut self.sockets);
         self.device.replay.clear();
-    }
-
-    /// True if a TCP socket in `Listen` state is bound to `dst`.
-    fn is_listening_on(&self, dst: IpEndpoint) -> bool {
-        self.sockets.iter().any(|(_, socket)| match socket {
-            smoltcp::socket::Socket::Tcp(tcp) => {
-                let endpoint = tcp.listen_endpoint();
-                tcp.state() == tcp::State::Listen
-                    && endpoint.port == dst.port
-                    && endpoint.addr == Some(dst.addr)
-            }
-            _ => false,
-        })
     }
 
     /// Opens a listening socket for a flow whose host side is connected,
@@ -1459,6 +1450,29 @@ impl Stack {
                 },
             },
         );
+        self.half_open.push(key);
+    }
+
+    /// Drops every half-open flow whose socket went back to `Listen`, which
+    /// smoltcp does when the guest answers the SYN-ACK with an RST. Such a
+    /// socket would take the next SYN to its destination and bridge that
+    /// connection to the old flow's host stream. The slot, socket and host
+    /// stream are freed at once, before any other frame is processed.
+    fn reap_dead_flows(&mut self) {
+        for key in std::mem::take(&mut self.half_open) {
+            let Some(flow) = self.flows.get(&key) else {
+                continue;
+            };
+            match self.sockets.get::<tcp::Socket>(flow.handle).state() {
+                tcp::State::SynReceived => self.half_open.push(key),
+                tcp::State::Listen => {
+                    if let Some(flow) = self.flows.remove(&key) {
+                        self.sockets.remove(flow.handle);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Advances every flow's lifecycle by one step: for every `Established`
