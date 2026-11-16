@@ -130,8 +130,7 @@ impl Daemon {
         let log = data_dir.path().join("wardd.log");
         let daemon_log = std::fs::File::create(&log).expect("create daemon log");
 
-        // Use assert_cmd to resolve the workspace's built wardd binary.
-        // This works regardless of debug/release profile.
+        // The built wardd binary, whatever the debug/release profile.
         let mut cmd = wardd_command();
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())

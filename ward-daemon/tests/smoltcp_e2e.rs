@@ -17,9 +17,8 @@
 
 mod common;
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
-use assert_cmd::prelude::*;
 use predicates::prelude::*;
 
 #[test]
