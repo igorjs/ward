@@ -218,6 +218,10 @@ struct SandboxState {
     /// Host process running this sandbox's microVM. `None` in stub builds.
     #[cfg(feature = "krunvm")]
     shim: Option<super::vmshim::ShimProcess>,
+    /// Which boot `shim` is. Bumped by every boot, so a report about an
+    /// older VM can be told from one about the current VM.
+    #[cfg(feature = "krunvm")]
+    generation: u64,
     /// Live smoltcp stack task. `None` when egress mode is Deny, when the
     /// network backend is `None`, or when the `krunvm` feature is
     /// disabled.
@@ -312,6 +316,9 @@ pub struct KrunvmBackend {
     /// Where watchers report VM host processes that ended on their own.
     #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
     vm_exit_tx: tokio::sync::mpsc::UnboundedSender<super::VmExit>,
+    /// Last boot generation handed out, across all sandboxes.
+    #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
+    boot_generation: std::sync::atomic::AtomicU64,
     /// Taken by the manager through `take_vm_exits`.
     vm_exit_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<super::VmExit>>>,
 }
@@ -360,38 +367,38 @@ impl KrunvmBackend {
             image_store,
             boot_vms,
             vm_exit_tx,
+            boot_generation: std::sync::atomic::AtomicU64::new(0),
             vm_exit_rx: std::sync::Mutex::new(Some(vm_exit_rx)),
         }
     }
 
-    /// Report the VM host process behind sandbox `id` when it ends. A VM that
-    /// ended because it was stopped is reported too; the receiver tells it
-    /// apart through `vm_exit_is_current`, since a stop takes the shim out
-    /// of the sandbox's state first.
+    /// Make `vm` the sandbox's VM and report it when it ends. A VM that
+    /// ended because it was stopped is reported too; the manager tells that
+    /// apart by the generation, since a stop takes the shim out of the state.
     #[cfg(feature = "krunvm")]
-    fn watch_vm(
-        &self,
-        id: &str,
-        vm_id: u32,
-        mut exit: tokio::sync::watch::Receiver<Option<super::vmshim::ShimExit>>,
-    ) {
+    fn install_vm(&self, id: &str, state: &mut SandboxState, vm: BootedVm) {
+        use std::sync::atomic::Ordering;
+        let generation = self.boot_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut exit = vm.shim.exit_watch();
         let tx = self.vm_exit_tx.clone();
-        let id = id.to_string();
+        let sandbox_id = id.to_string();
         tokio::spawn(async move {
             let Ok(ended) = exit.wait_for(Option::is_some).await.map(|e| *e) else {
                 return;
             };
-            let ended = ended.unwrap_or(super::vmshim::ShimExit {
-                code: None,
-                signal: None,
-            });
+            let Some(ended) = ended else { return };
             let _ = tx.send(super::VmExit {
-                sandbox_id: id,
-                vm_id,
+                sandbox_id,
+                generation,
                 code: ended.code,
                 signal: ended.signal,
+                ran_for: ended.ran_for,
             });
         });
+        state.generation = generation;
+        state.shim = Some(vm.shim);
+        state.smoltcp = vm.smoltcp;
+        state.egress = vm.egress;
     }
 
     /// Constructor for tests that need to inject a custom `ImageStore`
@@ -501,32 +508,28 @@ impl Backend for KrunvmBackend {
             paused: false,
         };
 
-        #[cfg(feature = "krunvm")]
-        let (shim, smoltcp, egress) = match booted {
-            Some(vm) => (Some(vm.shim), vm.smoltcp, vm.egress),
-            None => (None, None, None),
-        };
-        #[cfg(feature = "krunvm")]
-        let watched = shim.as_ref().map(|s| (s.pid(), s.exit_watch()));
-        let state = SandboxState {
+        #[cfg_attr(not(feature = "krunvm"), allow(unused_mut))]
+        let mut state = SandboxState {
             info: info.clone(),
             vm_size: Some(VmSize::of(&opts.resources)),
             opts: opts.clone(),
             rootfs,
             blocked,
             #[cfg(feature = "krunvm")]
-            shim,
+            shim: None,
             #[cfg(feature = "krunvm")]
-            smoltcp,
+            generation: 0,
             #[cfg(feature = "krunvm")]
-            egress,
+            smoltcp: None,
+            #[cfg(feature = "krunvm")]
+            egress: None,
         };
+        #[cfg(feature = "krunvm")]
+        if let Some(vm) = booted {
+            self.install_vm(&id, &mut state, vm);
+        }
 
         self.sandboxes.write().await.insert(id, state);
-        #[cfg(feature = "krunvm")]
-        if let Some((vm_id, exit)) = watched {
-            self.watch_vm(&info.id, vm_id, exit);
-        }
         Ok(info)
     }
 
@@ -692,6 +695,8 @@ impl Backend for KrunvmBackend {
             #[cfg(feature = "krunvm")]
             shim: None,
             #[cfg(feature = "krunvm")]
+            generation: 0,
+            #[cfg(feature = "krunvm")]
             smoltcp: None,
             #[cfg(feature = "krunvm")]
             egress: None,
@@ -745,10 +750,7 @@ impl Backend for KrunvmBackend {
         };
         #[cfg(feature = "krunvm")]
         if let Some(vm) = booted {
-            self.watch_vm(id, vm.shim.pid(), vm.shim.exit_watch());
-            state.shim = Some(vm.shim);
-            state.smoltcp = vm.smoltcp;
-            state.egress = vm.egress;
+            self.install_vm(id, state, vm);
         }
         state.info.status = SandboxStatus::Running;
         state.vm_size = Some(VmSize::of(&state.opts.resources));
@@ -769,8 +771,50 @@ impl Backend for KrunvmBackend {
         let sandboxes = self.sandboxes.read().await;
         sandboxes
             .get(&exit.sandbox_id)
-            .and_then(|state| state.shim.as_ref())
-            .is_some_and(|shim| shim.pid() == exit.vm_id)
+            .is_some_and(|state| state.shim.is_some() && state.generation == exit.generation)
+    }
+
+    #[cfg(feature = "krunvm")]
+    async fn release_dead_vm(&self, exit: &super::VmExit) -> bool {
+        let id = exit.sandbox_id.as_str();
+        let (shim, smoltcp) = {
+            let mut sandboxes = self.sandboxes.write().await;
+            let Some(state) = sandboxes.get_mut(id) else {
+                return false;
+            };
+            if state.shim.is_none() || state.generation != exit.generation {
+                return false;
+            }
+            state.egress = None;
+            state.vm_size = None;
+            state.info.paused = false;
+            state.info.status = SandboxStatus::Stopped;
+            // Still under the sandbox lock, so a newer boot cannot have
+            // bound the socket or registered processes yet.
+            let _ = std::fs::remove_file(self.agent_socket_path(id));
+            self.processes
+                .write()
+                .await
+                .retain(|_, record| record.sandbox_id != id);
+            (state.shim.take(), state.smoltcp.take())
+        };
+        teardown_vm(id, shim, smoltcp).await;
+        true
+    }
+
+    #[cfg(feature = "krunvm")]
+    async fn dead_vm(&self, id: &str) -> Option<super::VmExit> {
+        let sandboxes = self.sandboxes.read().await;
+        let state = sandboxes.get(id)?;
+        let shim = state.shim.as_ref()?;
+        let ended = (*shim.exit_watch().borrow())?;
+        Some(super::VmExit {
+            sandbox_id: id.to_string(),
+            generation: state.generation,
+            code: ended.code,
+            signal: ended.signal,
+            ran_for: ended.ran_for,
+        })
     }
 
     #[cfg(feature = "krunvm")]
@@ -2679,5 +2723,179 @@ mod tests {
         // Assert
         assert!(result.is_err());
         assert!(!outside.join("evil").exists(), "file escaped the rootfs");
+    }
+
+    /// Tests of the VM death watcher, with a `sleep` process standing in for
+    /// the VM host process.
+    #[cfg(feature = "krunvm")]
+    mod vm_watch {
+        use super::{BootedVm, KrunvmBackend, ProcessRecord, backend_in_tempdir, create_sandbox};
+        use crate::backend::Backend;
+        use crate::backend::VmExit;
+        use crate::backend::vmshim::{ShimExit, ShimProcess};
+
+        const SIGKILL_NUMBER: i32 = 9;
+        const FAKE_VM_LIFETIME_SECS: &str = "60";
+        const REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        async fn fake_shim() -> ShimProcess {
+            let child = tokio::process::Command::new("sleep")
+                .arg(FAKE_VM_LIFETIME_SECS)
+                .stdin(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sleep");
+            ShimProcess::watch(child, b"{}\n").await.expect("watch")
+        }
+
+        /// Make `shim` the VM of `id`, as a boot does, and return its generation.
+        async fn boot(backend: &KrunvmBackend, id: &str, shim: ShimProcess) -> u64 {
+            let mut sandboxes = backend.sandboxes.write().await;
+            let state = sandboxes.get_mut(id).expect("sandbox");
+            let vm = BootedVm {
+                shim,
+                smoltcp: None,
+                egress: None,
+            };
+            backend.install_vm(id, state, vm);
+            state.generation
+        }
+
+        fn kill(shim: &ShimProcess) {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(shim.pid() as i32).expect("pid"),
+                rustix::process::Signal::KILL,
+            )
+            .expect("kill");
+        }
+
+        async fn ended(shim: &ShimProcess) -> ShimExit {
+            let mut exit = shim.exit_watch();
+            let seen = tokio::time::timeout(REPORT_WAIT, exit.wait_for(Option::is_some))
+                .await
+                .expect("exit seen")
+                .expect("watch open");
+            seen.expect("some")
+        }
+
+        fn exit_of(id: &str, generation: u64) -> VmExit {
+            VmExit {
+                sandbox_id: id.to_string(),
+                generation,
+                code: None,
+                signal: Some(SIGKILL_NUMBER),
+                ran_for: std::time::Duration::ZERO,
+            }
+        }
+
+        async fn shim_running(backend: &KrunvmBackend, id: &str) -> bool {
+            let sandboxes = backend.sandboxes.read().await;
+            sandboxes[id].shim.as_ref().is_some_and(|s| s.is_running())
+        }
+
+        #[tokio::test]
+        async fn given_report_about_an_older_boot_when_released_then_the_newer_vm_is_untouched() {
+            // Arrange
+            let backend = backend_in_tempdir();
+            create_sandbox(&backend, "sb1").await;
+            let first = boot(&backend, "sb1", fake_shim().await).await;
+            backend.end_vm("sb1").await.expect("end the first VM");
+            let second = boot(&backend, "sb1", fake_shim().await).await;
+
+            // Act
+            let stale_current = backend.vm_exit_is_current(&exit_of("sb1", first)).await;
+            let stale_released = backend.release_dead_vm(&exit_of("sb1", first)).await;
+
+            // Assert
+            assert_ne!(first, second);
+            assert!(!stale_current);
+            assert!(!stale_released);
+            assert!(backend.vm_exit_is_current(&exit_of("sb1", second)).await);
+            assert!(shim_running(&backend, "sb1").await);
+        }
+
+        #[tokio::test]
+        async fn given_current_boot_that_died_when_released_then_its_resources_go_once() {
+            // Arrange
+            let backend = backend_in_tempdir();
+            create_sandbox(&backend, "sb1").await;
+            let shim = fake_shim().await;
+            let watch = shim.exit_watch();
+            kill(&shim);
+            let generation = boot(&backend, "sb1", shim).await;
+            let (tx, _rx) = tokio::sync::mpsc::channel::<()>(1);
+            backend.processes.write().await.insert(
+                "pid-1".to_string(),
+                ProcessRecord {
+                    sandbox_id: "sb1".to_string(),
+                    kill_tx: tx,
+                },
+            );
+            let mut watch = watch;
+            watch.wait_for(Option::is_some).await.expect("exit");
+
+            // Act
+            let first = backend.release_dead_vm(&exit_of("sb1", generation)).await;
+            let second = backend.release_dead_vm(&exit_of("sb1", generation)).await;
+
+            // Assert
+            assert!(first);
+            assert!(!second);
+            assert!(backend.sandboxes.read().await["sb1"].shim.is_none());
+            assert!(backend.processes.read().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn given_vm_killed_from_outside_when_watched_then_the_manager_side_gets_one_report() {
+            // Arrange
+            let backend = backend_in_tempdir();
+            create_sandbox(&backend, "sb1").await;
+            let mut reports = backend.take_vm_exits().expect("receiver");
+            let shim = fake_shim().await;
+            let generation = boot(&backend, "sb1", shim).await;
+
+            // Act
+            {
+                let sandboxes = backend.sandboxes.read().await;
+                kill(sandboxes["sb1"].shim.as_ref().expect("shim"));
+            }
+            let report = tokio::time::timeout(REPORT_WAIT, reports.recv())
+                .await
+                .expect("a report")
+                .expect("open channel");
+
+            // Assert
+            assert_eq!(report.sandbox_id, "sb1");
+            assert_eq!(report.generation, generation);
+            assert_eq!(report.signal, Some(SIGKILL_NUMBER));
+            assert!(backend.vm_exit_is_current(&report).await);
+        }
+
+        #[tokio::test]
+        async fn given_vm_that_died_before_anyone_looked_when_asked_then_its_exit_is_returned() {
+            // Arrange
+            let backend = backend_in_tempdir();
+            create_sandbox(&backend, "sb1").await;
+            let shim = fake_shim().await;
+            let alive = backend.dead_vm("sb1").await;
+            let generation = boot(&backend, "sb1", shim).await;
+            assert!(alive.is_none());
+            let living = backend.dead_vm("sb1").await;
+            let probe = {
+                let sandboxes = backend.sandboxes.read().await;
+                let shim = sandboxes["sb1"].shim.as_ref().expect("shim");
+                kill(shim);
+                ended(shim).await
+            };
+
+            // Act
+            let dead = backend.dead_vm("sb1").await.expect("dead VM");
+
+            // Assert
+            assert!(living.is_none());
+            assert_eq!(dead.generation, generation);
+            assert_eq!(dead.signal, probe.signal);
+            assert_eq!(dead.signal, Some(SIGKILL_NUMBER));
+        }
     }
 }

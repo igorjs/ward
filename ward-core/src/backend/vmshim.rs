@@ -229,20 +229,27 @@ pub struct ShimExit {
     pub code: Option<i32>,
     /// Signal that ended the process, when one did.
     pub signal: Option<i32>,
+    /// How long the process lived.
+    pub ran_for: Duration,
 }
 
 impl ShimExit {
-    fn of(status: std::io::Result<std::process::ExitStatus>) -> Self {
+    fn of(status: std::io::Result<std::process::ExitStatus>, ran_for: Duration) -> Self {
         use std::os::unix::process::ExitStatusExt;
         match status {
             Ok(status) => Self {
                 code: status.code(),
                 signal: status.signal(),
+                ran_for,
             },
-            Err(_) => Self {
-                code: None,
-                signal: None,
-            },
+            Err(e) => {
+                tracing::warn!("cannot read how the VM host process ended: {e}");
+                Self {
+                    code: None,
+                    signal: None,
+                    ran_for,
+                }
+            }
         }
     }
 }
@@ -298,7 +305,7 @@ impl ShimProcess {
     }
 
     /// Start watching `child` and give it `payload` on its stdin.
-    async fn watch(mut child: Child, payload: &[u8]) -> std::io::Result<Self> {
+    pub(super) async fn watch(mut child: Child, payload: &[u8]) -> std::io::Result<Self> {
         let pid = child
             .id()
             .ok_or_else(|| std::io::Error::other("VM host process ended at start"))?;
@@ -308,7 +315,12 @@ impl ShimProcess {
             .ok_or_else(|| std::io::Error::other("shim stdin was not piped"))?;
         let (stop, stop_rx) = oneshot::channel();
         let (exit_tx, exit) = watch::channel(None);
-        tokio::spawn(supervise(child, stop_rx, exit_tx));
+        tokio::spawn(supervise(
+            child,
+            stop_rx,
+            exit_tx,
+            std::time::Instant::now(),
+        ));
         let mut shim = Self {
             pid,
             stdin: None,
@@ -322,7 +334,8 @@ impl ShimProcess {
         Ok(shim)
     }
 
-    /// Process id of the VM host process.
+    /// Process id of the VM host process, for tests that signal it.
+    #[cfg(test)]
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -345,7 +358,7 @@ impl ShimProcess {
         }
         let ended = self.exit.wait_for(Option::is_some);
         if tokio::time::timeout(STOP_WAIT, ended).await.is_err() {
-            tracing::warn!("VM host process did not exit after kill");
+            tracing::warn!(pid = self.pid, "VM host process did not exit after kill");
         }
     }
 }
@@ -356,6 +369,7 @@ async fn supervise(
     mut child: Child,
     stop: oneshot::Receiver<()>,
     exit: watch::Sender<Option<ShimExit>>,
+    started: std::time::Instant,
 ) {
     let ended = tokio::select! {
         status = child.wait() => Some(status),
@@ -368,7 +382,7 @@ async fn supervise(
             child.wait().await
         }
     };
-    let _ = exit.send(Some(ShimExit::of(status)));
+    let _ = exit.send(Some(ShimExit::of(status, started.elapsed())));
 }
 
 fn clear_close_on_exec(fd: RawFd) -> std::io::Result<()> {
