@@ -222,7 +222,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -330,7 +330,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -418,7 +418,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - uses: taiki-e/install-action@56545b37b57562edd73171cb6c62cc509db4c34e # v2.81.7
         with:
-          tool: cargo-nextest
+          tool: cargo-nextest@0.9.137
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -442,6 +442,9 @@ jobs:
         run: RUSTFLAGS=-Dwarnings cargo test -p ward-daemon --features krunvm --test smoltcp_e2e --no-run
       - name: Bundle tests with the libraries embedded
         run: cargo nextest run -p ward-bundle --features embed
+      - name: Bundle doc tests with the libraries embedded
+        # nextest does not run doc tests.
+        run: cargo test --doc -p ward-bundle --features embed
 
   # ── Real microVM end-to-end ──────────────────────────────────────────
   # Boots real Linux guests through the shipped code path: wardd, the
