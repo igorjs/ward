@@ -2195,50 +2195,80 @@ impl SandboxManager {
 
         crate::validate::egress_domains(&domains)?;
         let id = self.resolve(id).await?;
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(&id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
-        match entry.meta.options.egress.mode {
-            EgressMode::Open => return Ok(Vec::new()),
-            EgressMode::Deny => {
-                return Err(ApiError::InvalidRequest(
-                    "sandbox was created with egress deny; recreate it with --egress allowlist"
-                        .into(),
-                ));
-            }
-            EgressMode::Allowlist => {}
-        }
+        // Serialises with other allowlist and limit updates of this sandbox,
+        // so the backend call below can run without the `entries` lock.
+        let lock = self.update_lock(&id);
+        let _held = lock.lock().await;
 
-        let mut added: Vec<String> = Vec::new();
-        for domain in domains {
-            if !entry.meta.options.egress.domains.contains(&domain) && !added.contains(&domain) {
-                added.push(domain);
+        let added = {
+            let mut entries = self.entries.write().await;
+            let entry = entries
+                .get_mut(&id)
+                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+            match entry.meta.options.egress.mode {
+                EgressMode::Open => return Ok(Vec::new()),
+                EgressMode::Deny => {
+                    return Err(ApiError::InvalidRequest(
+                        "sandbox was created with egress deny; recreate it with --egress allowlist"
+                            .into(),
+                    ));
+                }
+                EgressMode::Allowlist => {}
             }
-        }
-        if added.is_empty() {
-            return Ok(added);
-        }
-        let total = entry.meta.options.egress.domains.len() + added.len();
-        if total > crate::validate::MAX_EGRESS_DOMAINS {
-            return Err(ApiError::InvalidRequest(format!(
-                "the allowlist is limited to {} domains",
-                crate::validate::MAX_EGRESS_DOMAINS
-            )));
-        }
 
-        let mut next = entry.meta.clone();
-        next.options.egress.domains.extend(added.iter().cloned());
-        self.persist(next.clone()).await?;
-        entry.meta = next;
-        self.backend
-            .add_egress_allow(&id, &added)
-            .await
-            .map_err(backend_err)?;
+            let mut added: Vec<String> = Vec::new();
+            for domain in domains {
+                if !entry.meta.options.egress.domains.contains(&domain) && !added.contains(&domain)
+                {
+                    added.push(domain);
+                }
+            }
+            if added.is_empty() {
+                return Ok(added);
+            }
+            let total = entry.meta.options.egress.domains.len() + added.len();
+            if total > crate::validate::MAX_EGRESS_DOMAINS {
+                return Err(ApiError::InvalidRequest(format!(
+                    "the allowlist is limited to {} domains",
+                    crate::validate::MAX_EGRESS_DOMAINS
+                )));
+            }
+
+            let mut next = entry.meta.clone();
+            next.options.egress.domains.extend(added.iter().cloned());
+            self.persist(next.clone()).await?;
+            entry.meta = next;
+            added
+        };
+
+        // The record is written first, so the recorded list is never shorter
+        // than what the VM allows.
+        if let Err(e) = self.backend.add_egress_allow(&id, &added).await {
+            self.forget_egress_domains(&id, &added).await;
+            return Err(backend_err(e));
+        }
         tracing::info!(sandbox = %id, added = added.len(), "egress allowlist extended");
-        self.events
-            .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
+        if let Some(entry) = self.entries.read().await.get(&id) {
+            self.events
+                .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
+        }
         Ok(added)
+    }
+
+    /// Take `domains` back out of the record after the backend refused them.
+    async fn forget_egress_domains(&self, id: &str, domains: &[String]) {
+        let mut entries = self.entries.write().await;
+        let Some(entry) = entries.get_mut(id) else {
+            return;
+        };
+        let mut next = entry.meta.clone();
+        next.options.egress.domains.retain(|d| !domains.contains(d));
+        match self.persist(next.clone()).await {
+            Ok(()) => entry.meta = next,
+            Err(e) => {
+                tracing::warn!(sandbox = %id, error = %e, "cannot take refused egress hosts out of the record");
+            }
+        }
     }
 
     /// Give sandbox `reference` the name `new_name`. Fails when another
@@ -6392,6 +6422,17 @@ pub(crate) mod tests {
     struct BootGate {
         inner: Arc<crate::backend::krunvm::KrunvmBackend>,
         fail_start: Arc<AtomicBool>,
+        egress: Arc<EgressGate>,
+    }
+
+    /// Controls `add_egress_allow` on a `BootGate`: it can park the call
+    /// until released, or fail it.
+    #[derive(Default)]
+    struct EgressGate {
+        block: AtomicBool,
+        fail: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -6436,6 +6477,20 @@ pub(crate) mod tests {
         }
         async fn count(&self) -> crate::backend::Result<usize> {
             self.inner.count().await
+        }
+        async fn add_egress_allow(
+            &self,
+            sandbox_id: &str,
+            domains: &[String],
+        ) -> crate::backend::Result<()> {
+            if self.egress.block.load(Ordering::SeqCst) {
+                self.egress.entered.notify_one();
+                self.egress.release.notified().await;
+            }
+            if self.egress.fail.load(Ordering::SeqCst) {
+                return Err(BackendError::Spawn("egress refused".into()));
+            }
+            self.inner.add_egress_allow(sandbox_id, domains).await
         }
         async fn exec(
             &self,
@@ -6511,6 +6566,16 @@ pub(crate) mod tests {
         path: &std::path::Path,
         max_sandboxes: usize,
     ) -> (Arc<SandboxManager>, Arc<AtomicBool>) {
+        let (manager, fail_start, _) = manager_with_gates(path, max_sandboxes);
+        (manager, fail_start)
+    }
+
+    /// A persisting manager whose backend boot and egress updates can be
+    /// held or made to fail.
+    fn manager_with_gates(
+        path: &std::path::Path,
+        max_sandboxes: usize,
+    ) -> (Arc<SandboxManager>, Arc<AtomicBool>, Arc<EgressGate>) {
         use crate::backend::image::ImageStore;
         use crate::backend::krunvm::KrunvmBackend;
         let store = Arc::new(ImageStore::with_puller(
@@ -6519,12 +6584,14 @@ pub(crate) mod tests {
             Arc::new(FakePuller),
         ));
         let fail_start = Arc::new(AtomicBool::new(false));
+        let egress = Arc::new(EgressGate::default());
         let backend: Arc<dyn Backend> = Arc::new(BootGate {
             inner: Arc::new(KrunvmBackend::with_image_store_for_test(
                 path.to_path_buf(),
                 store,
             )),
             fail_start: Arc::clone(&fail_start),
+            egress: Arc::clone(&egress),
         });
         let manager = SandboxManager::new(
             backend,
@@ -6534,7 +6601,7 @@ pub(crate) mod tests {
             crate::config::NetworkBackendChoice::Smoltcp,
         )
         .with_data_dir(path.to_path_buf());
-        (Arc::new(manager), fail_start)
+        (Arc::new(manager), fail_start, egress)
     }
 
     async fn status_of(mgr: &SandboxManager, id: &str) -> SandboxStatus {
