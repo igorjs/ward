@@ -197,9 +197,9 @@ impl SandboxManager {
                     }
                     Ok(Some(next))
                 },
-                |entry| {
-                    self.events
-                        .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
+                {
+                    let events = self.events.clone();
+                    move |entry| events.emit(SandboxEvent::new(EventAction::Update, &entry.meta))
                 },
             )
             .await

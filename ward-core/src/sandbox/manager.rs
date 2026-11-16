@@ -614,8 +614,11 @@ fn rearm_exited_ttl(
 /// again or is already gone.
 async fn remove_if_still_ended(teardown: &Teardown, id: &str) {
     let removed = {
+        // A start that has written its record but not adopted it holds this.
+        let _persisting = teardown.lock_persist(id).await;
         let mut entries = teardown.entries.write().await;
         let Some(entry) = entries.get_mut(id) else {
+            teardown.forget_persist_lock(id);
             return;
         };
         if !has_ended(&entry.meta.status) {
@@ -774,12 +777,15 @@ async fn mark_exited_on_main_end(
                     Ok(current == Some(true)
                         && entry.meta.status == crate::protocol::SandboxStatus::Running)
                 },
-                |entry| {
-                    let mut died =
-                        SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
-                    died.reason = entry.meta.end_reason;
-                    teardown.events.emit(died);
-                    request_restart(&teardown, entry, code);
+                {
+                    let teardown = teardown.clone();
+                    move |entry| {
+                        let mut died =
+                            SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                        died.reason = entry.meta.end_reason;
+                        teardown.events.emit(died);
+                        request_restart(&teardown, entry, code);
+                    }
                 },
             )
             .await;
@@ -826,6 +832,7 @@ fn request_restart(teardown: &Teardown, entry: &SandboxEntry, code: i32) {
 /// A start since the exit was recorded owns the sandbox now, so it stays.
 async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
     let removed = {
+        let _persisting = teardown.lock_persist(id).await;
         let mut entries = teardown.entries.write().await;
         let exited = entries
             .get(id)
@@ -2334,9 +2341,9 @@ impl SandboxManager {
                     next.options.spec.name = new_name.to_string();
                     Ok(Some(next))
                 },
-                |entry| {
-                    self.events
-                        .emit(SandboxEvent::new(EventAction::Rename, &entry.meta));
+                {
+                    let events = self.events.clone();
+                    move |entry| events.emit(SandboxEvent::new(EventAction::Rename, &entry.meta))
                 },
             )
             .await?;
@@ -3142,20 +3149,26 @@ impl SandboxManager {
         comms: CommunicationPolicy,
     ) -> Result<()> {
         let teardown = self.teardown();
-        teardown
-            .lock_persist(id)
-            .await
+        // Kept until the policy is registered, so a stop cannot slip in
+        // between and have its deregistration undone.
+        let guard = teardown.lock_persist(id).await;
+        guard
             .commit_status(
                 crate::protocol::SandboxStatus::Running,
                 persist::ExitUpdate::Keep,
                 persist::ReasonUpdate::Auto,
                 |_| Ok(true),
-                |entry| {
-                    entry.runs_started += 1;
-                    self.run_changes.send_replace(());
+                {
+                    let run_changes = Arc::clone(&self.run_changes);
+                    move |entry| {
+                        entry.runs_started += 1;
+                        run_changes.send_replace(());
+                    }
                 },
             )
             .await?;
+        #[cfg(test)]
+        crate::sandbox::store::gate::pass_async("after-running-commit", id).await;
         let entries = self.entries.read().await;
         if !entries.contains_key(id) {
             return Err(ApiError::SandboxNotFound(id.to_string()));
@@ -3193,7 +3206,10 @@ impl SandboxManager {
                     next.manually_stopped = true;
                     Ok(Some(next))
                 },
-                |entry| rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now()),
+                {
+                    let teardown = teardown.clone();
+                    move |entry| rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now())
+                },
             )
             .await?;
         Ok(left)
@@ -3224,9 +3240,12 @@ impl SandboxManager {
                     next.manually_stopped = false;
                     Ok(Some(next))
                 },
-                |entry| {
-                    rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now());
-                    entry.meta.options.comms.clone()
+                {
+                    let teardown = teardown.clone();
+                    move |entry| {
+                        rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now());
+                        entry.meta.options.comms.clone()
+                    }
                 },
             )
             .await
@@ -3327,6 +3346,7 @@ impl SandboxManager {
         let result = {
             let _persisting = teardown.persist_lock(id).lock_owned().await;
             let result = teardown.backend.remove_sandbox(id).await;
+            // A cancelled removal leaves this entry behind, which is small and harmless.
             teardown.persist_locks.lock_unpoisoned().remove(id);
             result
         };

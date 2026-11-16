@@ -49,11 +49,12 @@ pub(super) fn status_meta(
 }
 
 /// Held while one sandbox's record changes, so two writers for it never
-/// interleave and the file always matches memory.
-pub(super) struct PersistGuard<'a> {
-    teardown: &'a Teardown,
-    id: &'a str,
-    _held: tokio::sync::OwnedMutexGuard<()>,
+/// interleave and the file always matches memory. Clones share the lock.
+#[derive(Clone)]
+pub(super) struct PersistGuard {
+    teardown: Teardown,
+    id: String,
+    _held: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl Teardown {
@@ -62,41 +63,50 @@ impl Teardown {
         Arc::clone(locks.entry(id.to_string()).or_default())
     }
 
-    pub(super) async fn lock_persist<'a>(&'a self, id: &'a str) -> PersistGuard<'a> {
+    /// Drop the lock entry of a sandbox that is gone.
+    pub(super) fn forget_persist_lock(&self, id: &str) {
+        self.persist_locks.lock_unpoisoned().remove(id);
+    }
+
+    // A caller dropped while it waits here leaves the map entry until the
+    // sandbox is removed, which is harmless.
+    pub(super) async fn lock_persist(&self, id: &str) -> PersistGuard {
         let held = self.persist_lock(id).lock_owned().await;
         PersistGuard {
-            teardown: self,
-            id,
-            _held: held,
+            teardown: self.clone(),
+            id: id.to_string(),
+            _held: Arc::new(held),
         }
     }
 
     /// Change one sandbox's record, see [`PersistGuard::commit`].
-    pub(super) async fn commit_with<R>(
+    pub(super) async fn commit_with<R: Send + 'static>(
         &self,
         id: &str,
         plan: impl FnOnce(&SandboxEntry) -> Result<Option<SandboxMeta>>,
-        adopt: impl FnOnce(&mut SandboxEntry) -> R,
+        adopt: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
     ) -> Result<Option<R>> {
         self.lock_persist(id).await.commit(plan, adopt).await
     }
 }
 
-impl PersistGuard<'_> {
+impl PersistGuard {
     /// Build the next record from the current one with `plan`, write it
     /// with no map lock held, then adopt it and run `adopt` under the write
     /// lock. A plan that returns `None` changes nothing. A failed write
     /// leaves memory and disk as they were. `plan` runs under a read lock
     /// and the guard keeps every other writer of this sandbox out, so what
-    /// it saw is still true when the record is adopted.
-    pub(super) async fn commit<R>(
+    /// it saw is still true when the record is adopted. The write and the
+    /// adoption run in their own task, so a caller that is dropped midway
+    /// cannot leave the file ahead of memory or free the lock early.
+    pub(super) async fn commit<R: Send + 'static>(
         &self,
         plan: impl FnOnce(&SandboxEntry) -> Result<Option<SandboxMeta>>,
-        adopt: impl FnOnce(&mut SandboxEntry) -> R,
+        adopt: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
     ) -> Result<Option<R>> {
         let next = {
             let entries = self.teardown.entries.read().await;
-            let Some(entry) = entries.get(self.id) else {
+            let Some(entry) = entries.get(&self.id) else {
                 return Err(self.gone());
             };
             match plan(entry)? {
@@ -104,30 +114,36 @@ impl PersistGuard<'_> {
                 None => return Ok(None),
             }
         };
-        persist_meta(self.teardown.store.as_ref(), next.clone()).await?;
-        let mut entries = self.teardown.entries.write().await;
-        let Some(entry) = entries.get_mut(self.id) else {
-            // Removal waits for this guard before it deletes the record.
-            return Err(self.gone());
-        };
-        entry.meta = next;
-        Ok(Some(adopt(entry)))
+        let guard = self.clone();
+        let write = tokio::spawn(async move {
+            persist_meta(guard.teardown.store.as_ref(), next.clone()).await?;
+            let mut entries = guard.teardown.entries.write().await;
+            let Some(entry) = entries.get_mut(&guard.id) else {
+                // Removal waits for this guard before it deletes the record.
+                return Err(guard.gone());
+            };
+            entry.meta = next;
+            Ok(Some(adopt(entry)))
+        });
+        write
+            .await
+            .map_err(|e| ApiError::Internal(format!("record write task: {e}")))?
     }
 
     /// Move to `status` if `check` agrees, and re-arm the exited TTL.
-    pub(super) async fn commit_status<R>(
+    pub(super) async fn commit_status<R: Send + 'static>(
         &self,
         status: SandboxStatus,
         exit_code: ExitUpdate,
         reason: ReasonUpdate,
         check: impl FnOnce(&SandboxEntry) -> Result<bool>,
-        extra: impl FnOnce(&mut SandboxEntry) -> R,
+        extra: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
     ) -> Result<Option<R>> {
-        let teardown = self.teardown;
+        let teardown = self.teardown.clone();
         self.commit(
             |entry| Ok(check(entry)?.then(|| status_meta(&entry.meta, status, exit_code, reason))),
-            |entry| {
-                rearm_exited_ttl(teardown, entry, std::time::SystemTime::now());
+            move |entry| {
+                rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now());
                 extra(entry)
             },
         )
@@ -135,10 +151,7 @@ impl PersistGuard<'_> {
     }
 
     fn gone(&self) -> ApiError {
-        self.teardown
-            .persist_locks
-            .lock_unpoisoned()
-            .remove(self.id);
-        ApiError::SandboxNotFound(self.id.to_string())
+        self.teardown.forget_persist_lock(&self.id);
+        ApiError::SandboxNotFound(self.id.clone())
     }
 }
