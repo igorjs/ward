@@ -22,6 +22,7 @@ use smoltcp::wire::{
     EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
     TcpSeqNumber,
 };
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use ward_net::smoltcp_backend::{Connector, MAX_PENDING_CONNECTS, Resolver, Stack};
@@ -193,15 +194,27 @@ fn build_tcp_syn_frame_from(src_port: u16) -> Vec<u8> {
 
 /// Same as [`build_tcp_syn_frame_from`] with an explicit initial sequence number.
 fn build_tcp_syn_with_seq(src_port: u16, seq_number: TcpSeqNumber) -> Vec<u8> {
+    build_tcp_syn_custom(src_port, DEST_PORT, seq_number, GATEWAY_MAC, None)
+}
+
+/// A SYN with every field a test may need to vary: the destination port, the
+/// Ethernet destination MAC and the MSS option.
+fn build_tcp_syn_custom(
+    src_port: u16,
+    dst_port: u16,
+    seq_number: TcpSeqNumber,
+    dst_mac: EthernetAddress,
+    max_seg_size: Option<u16>,
+) -> Vec<u8> {
     let tcp_repr = TcpRepr {
         src_port,
-        dst_port: DEST_PORT,
+        dst_port,
         control: TcpControl::Syn,
         seq_number,
         ack_number: None,
         window_len: 65535,
         window_scale: None,
-        max_seg_size: None,
+        max_seg_size,
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
@@ -219,7 +232,7 @@ fn build_tcp_syn_with_seq(src_port: u16, seq_number: TcpSeqNumber) -> Vec<u8> {
 
     let eth_repr = EthernetRepr {
         src_addr: GUEST_MAC,
-        dst_addr: GATEWAY_MAC,
+        dst_addr: dst_mac,
         ethertype: EthernetProtocol::Ipv4,
     };
 
@@ -1703,4 +1716,199 @@ async fn given_pending_connect_when_stack_is_dropped_then_connect_task_is_aborte
         dropped.load(std::sync::atomic::Ordering::SeqCst),
         "the connect future must be dropped with the stack"
     );
+}
+
+/// A MAC that is not the interface's.
+const OTHER_MAC: EthernetAddress = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x99]);
+
+#[tokio::test]
+async fn given_three_flows_ready_together_when_one_to_a_shared_destination_fails_then_it_never_reaches_the_other_listener()
+ {
+    let listener_g = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_b = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let connector: Box<dyn Connector> = Box::new(SequenceConnector {
+        answers: Mutex::new(VecDeque::from([
+            Some(listener_g.local_addr().unwrap()),
+            None,
+            Some(listener_b.local_addr().unwrap()),
+        ])),
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // Keys sort G < F < B. G goes to another port, F and B share one.
+    let other_port = DEST_PORT + 1;
+    write_frame(
+        &guest_fd,
+        &build_tcp_syn_custom(40_000, other_port, TcpSeqNumber(0), GATEWAY_MAC, None),
+    );
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(40_001));
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(40_002));
+    stack.poll();
+    assert_eq!(stack.pending_connect_count_for_test(), 3);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let seen = drain_guest(&mut stack, &guest_fd, Duration::from_millis(400)).await;
+
+    let failed: Vec<_> = seen.iter().filter(|s| s.dst_port == 40_001).collect();
+    assert!(
+        failed.iter().any(|s| s.control == TcpControl::Rst),
+        "denied flow is reset: {failed:?}"
+    );
+    assert!(
+        failed.iter().all(|s| s.control != TcpControl::Syn),
+        "and never accepted: {failed:?}"
+    );
+    assert!(syn_ack_for(&seen, 40_000).is_some(), "flow G is accepted");
+    let syn_ack = syn_ack_for(&seen, 40_002).expect("flow B is accepted");
+    let ack = syn_ack.seq_number + 1;
+    let (stream_b, _) = listener_b.accept().await.unwrap();
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame_from(40_002, TcpSeqNumber(1), ack, &[]),
+    );
+    stack.poll();
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame_from(40_002, TcpSeqNumber(1), ack, b"from b"),
+    );
+    let got = poll_until_stream_bytes(&mut stack, &stream_b, Duration::from_secs(2)).await;
+    assert_eq!(
+        got.as_deref(),
+        Some(&b"from b"[..]),
+        "B reaches its own host stream"
+    );
+}
+
+#[tokio::test]
+async fn given_syn_to_another_mac_when_polled_then_no_connect_and_a_later_flow_still_connects() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let connector: Box<dyn Connector> = Box::new(SequenceConnector {
+        answers: Mutex::new(VecDeque::from([Some(listener.local_addr().unwrap())])),
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    write_frame(
+        &guest_fd,
+        &build_tcp_syn_custom(GUEST_SRC_PORT, DEST_PORT, TcpSeqNumber(0), OTHER_MAC, None),
+    );
+    let seen = drain_guest(&mut stack, &guest_fd, Duration::from_millis(200)).await;
+    assert!(seen.is_empty(), "smoltcp drops it silently: {seen:?}");
+    assert_eq!(
+        stack.pending_connect_count_for_test(),
+        0,
+        "no egress check or connect starts"
+    );
+
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(OTHER_SRC_PORT));
+    let syn_ack = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert!(
+        syn_ack.is_some(),
+        "a later flow to the same destination connects"
+    );
+}
+
+#[tokio::test]
+async fn given_pending_connect_when_replacement_syn_has_a_bad_mac_then_the_original_is_kept_and_nothing_blocks()
+ {
+    let listener_a = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_b = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let connector: Box<dyn Connector> = Box::new(SequenceConnector {
+        answers: Mutex::new(VecDeque::from([
+            Some(listener_a.local_addr().unwrap()),
+            Some(listener_b.local_addr().unwrap()),
+        ])),
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // No await between the polls, so the connect task has not finished yet.
+    write_frame(
+        &guest_fd,
+        &build_tcp_syn_with_seq(GUEST_SRC_PORT, TcpSeqNumber(0)),
+    );
+    stack.poll();
+    write_frame(
+        &guest_fd,
+        &build_tcp_syn_custom(
+            GUEST_SRC_PORT,
+            DEST_PORT,
+            TcpSeqNumber(500),
+            OTHER_MAC,
+            None,
+        ),
+    );
+    stack.poll();
+    let seen = drain_guest(&mut stack, &guest_fd, Duration::from_millis(300)).await;
+    let syn_ack = syn_ack_for(&seen, GUEST_SRC_PORT).expect("the original SYN is answered");
+    assert_eq!(syn_ack.ack_number, Some(TcpSeqNumber(1)));
+    assert_eq!(stack.pending_connect_count_for_test(), 0);
+
+    write_frame(&guest_fd, &build_tcp_syn_frame_from(OTHER_SRC_PORT));
+    let later = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert!(
+        later.is_some(),
+        "a later flow to the same destination connects"
+    );
+}
+
+#[tokio::test]
+async fn given_syn_smoltcp_does_not_accept_when_connect_succeeds_then_no_flow_no_pending_and_host_stream_closed()
+ {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let connector: Box<dyn Connector> = Box::new(SequenceConnector {
+        answers: Mutex::new(VecDeque::from([Some(listener.local_addr().unwrap())])),
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // smoltcp leaves a listener alone when the SYN carries a zero MSS.
+    write_frame(
+        &guest_fd,
+        &build_tcp_syn_custom(
+            GUEST_SRC_PORT,
+            DEST_PORT,
+            TcpSeqNumber(0),
+            GATEWAY_MAC,
+            Some(0),
+        ),
+    );
+    let seen = drain_guest(&mut stack, &guest_fd, Duration::from_millis(400)).await;
+
+    assert!(
+        seen.is_empty(),
+        "no SYN-ACK for a SYN smoltcp did not take: {seen:?}"
+    );
+    assert_eq!(stack.flow_count_for_test(), 0);
+    assert_eq!(stack.pending_connect_count_for_test(), 0);
+    let (mut host_stream, _) = listener.accept().await.unwrap();
+    let mut buf = [0u8; 8];
+    let read = tokio::time::timeout(Duration::from_secs(1), host_stream.read(&mut buf))
+        .await
+        .expect("the host stream is dropped, so the read ends");
+    assert_eq!(read.unwrap(), 0, "host stream closed with no flow");
 }

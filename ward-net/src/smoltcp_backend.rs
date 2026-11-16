@@ -24,7 +24,7 @@
 //! `attach`/`detach` on [`SmoltcpBackend`] are unused by that path (see
 //! their own doc comments below).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -326,6 +326,9 @@ const INTERFACE_HARDWARE_ADDR: EthernetAddress =
 /// an interface with no assigned address only accepts broadcast traffic.
 const INTERFACE_ADDR: IpAddress = IpAddress::v4(10, 0, 2, 2);
 const INTERFACE_PREFIX_LEN: u8 = 24;
+/// Subnet broadcast address of the interface, which smoltcp refuses as a TCP
+/// source.
+const INTERFACE_SUBNET_BROADCAST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 255);
 
 /// Port the guest-facing DNS relay socket listens on.
 const DNS_SERVER_PORT: u16 = 53;
@@ -622,6 +625,14 @@ const HOST_READER_CHANNEL_CAPACITY: usize = 16;
 /// `Stack::flows`. A flow only enters `Stack::flows` once the egress check and
 /// the host connect have both succeeded.
 enum FlowState {
+    /// The connector resolved successfully. Bytes read from the flow's
+    /// `tcp::Socket` receive buffer are handed to the spawned host-io
+    /// task over `to_host_tx`, which owns the `TcpStream` exclusively and
+    /// performs the actual (timeout-wrapped) writes. Bytes that task reads
+    /// from the host arrive over `from_host_rx`; `pending_from_host` holds
+    /// a chunk `pump_flows` already dequeued but could only partially hand
+    /// to the guest's `tcp::Socket` send buffer, so the remainder isn't
+    /// lost between ticks.
     Established {
         to_host_tx: mpsc::Sender<Vec<u8>>,
         from_host_rx: mpsc::Receiver<Vec<u8>>,
@@ -637,12 +648,6 @@ enum FlowState {
         host_failed: Arc<AtomicBool>,
         /// Last time bytes moved in either direction.
         last_activity: std::time::Instant,
-        /// Set once smoltcp has taken the flow's SYN and the socket's remote
-        /// endpoint was checked against the flow key. smoltcp hands a SYN to
-        /// any listener on the destination, so this guards against a socket
-        /// answering another flow's SYN and being bridged to the wrong host
-        /// stream.
-        verified: bool,
     },
 }
 
@@ -836,16 +841,35 @@ fn is_private_or_local(ip: IpAddr) -> bool {
 
 /// Parses `frame` as a fresh guest TCP SYN (SYN set, no ACK), returning its
 /// (guest, destination) endpoint pair.
+///
+/// A SYN that smoltcp's ingress would drop before TCP dispatch (not addressed
+/// to the interface MAC, fragmented, or with a source that is not a unicast
+/// host address) is rejected here, so it never starts an egress check or a host
+/// connect.
 fn parse_guest_syn(frame: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
     let eth_frame = EthernetFrame::new_checked(frame).ok()?;
-    if eth_frame.ethertype() != EthernetProtocol::Ipv4 {
+    if eth_frame.dst_addr() != INTERFACE_HARDWARE_ADDR
+        || eth_frame.ethertype() != EthernetProtocol::Ipv4
+    {
         return None;
     }
     let ip_packet = Ipv4Packet::new_checked(eth_frame.payload()).ok()?;
-    if ip_packet.next_header() != IpProtocol::Tcp {
+    if ip_packet.next_header() != IpProtocol::Tcp
+        || ip_packet.more_frags()
+        || ip_packet.frag_offset() != 0
+    {
         return None;
     }
     let ip_repr = Ipv4Repr::parse(&ip_packet, &ChecksumCapabilities::default()).ok()?;
+    let src = ip_repr.src_addr;
+    if src.is_unspecified()
+        || src.is_broadcast()
+        || src.is_multicast()
+        || src == INTERFACE_SUBNET_BROADCAST
+        || ip_repr.dst_addr.is_unspecified()
+    {
+        return None;
+    }
     let tcp_packet = TcpPacket::new_checked(ip_packet.payload()).ok()?;
     let tcp_repr = match TcpRepr::parse(
         &tcp_packet,
@@ -1139,7 +1163,7 @@ impl Stack {
 
         let mut result = PollResult::None;
         loop {
-            self.resolve_pending_connects();
+            self.resolve_pending_connects(now);
             while self.poll_flows() {}
             match self
                 .interface
@@ -1304,33 +1328,18 @@ impl Stack {
         true
     }
 
-    /// Finishes pending connects whose task has reported, in key order. On
-    /// success the flow gets a listening socket and its held SYN is replayed,
-    /// so smoltcp sends the SYN-ACK now. On failure the SYN is replayed with
-    /// no socket listening, so smoltcp answers it with an RST and the guest
-    /// never sees an accept.
-    ///
-    /// smoltcp gives a SYN to the first listener on the destination whatever
-    /// the source, so only one flow per destination is handled at a time: it is
-    /// admitted or reset here, and the next flow to that destination waits
-    /// until `poll` has fed the replayed SYN to smoltcp. A failed flow is
-    /// never replayed while another flow's listener could answer it.
-    fn resolve_pending_connects(&mut self) {
-        let mut busy: HashSet<IpEndpoint> = self
-            .sockets
-            .iter()
-            .filter_map(|(_, socket)| match socket {
-                smoltcp::socket::Socket::Tcp(tcp) => Some(tcp),
-                _ => None,
-            })
-            .filter(|socket| socket.state() == tcp::State::Listen)
-            .filter_map(|socket| {
-                let endpoint = socket.listen_endpoint();
-                endpoint
-                    .addr
-                    .map(|addr| IpEndpoint::new(addr, endpoint.port))
-            })
-            .collect();
+    /// Finishes pending connects whose task has reported, one at a time in
+    /// key order, only while no replayed frame is queued. Each flow is resolved
+    /// completely before the next starts. On success the flow gets a listening
+    /// socket and its held SYN goes through smoltcp's ingress at once, which
+    /// sends the SYN-ACK. On failure the SYN goes through ingress with no
+    /// socket listening, so smoltcp answers with an RST and the guest never
+    /// sees an accept. No listener outlives this call, so a replayed SYN can
+    /// never reach another flow's listener.
+    fn resolve_pending_connects(&mut self, now: Instant) {
+        if !self.device.replay.is_empty() {
+            return;
+        }
         let mut ready = Vec::new();
         for (&key, pending) in self.pending_connects.iter_mut() {
             if pending.outcome.is_none() {
@@ -1350,25 +1359,56 @@ impl Stack {
         }
         ready.sort();
         for key in ready {
-            if !busy.insert(key.1) {
-                continue;
-            }
             let Some(mut pending) = self.pending_connects.remove(&key) else {
                 continue;
             };
-            if let Some(Ok(stream)) = pending.outcome.take() {
-                self.admit_flow(key, stream);
+            let syn_frame = std::mem::take(&mut pending.syn_frame);
+            match pending.outcome.take() {
+                Some(Ok(stream)) => self.admit_flow(key, stream, syn_frame, now),
+                _ => {
+                    if !self.is_listening_on(key.1) {
+                        self.feed_ingress(syn_frame, now);
+                    }
+                }
             }
-            self.device
-                .replay
-                .push_back(std::mem::take(&mut pending.syn_frame));
         }
     }
 
-    /// Opens the listening socket for a flow whose host side is connected and
-    /// registers the flow. If the socket cannot be opened the stream is dropped
-    /// and no flow is registered, so the replayed SYN is reset.
-    fn admit_flow(&mut self, key: (IpEndpoint, IpEndpoint), stream: TcpStream) {
+    /// Hands `frame` to smoltcp's ingress now and returns once smoltcp has
+    /// consumed it, so any reply (SYN-ACK or RST) is produced before the
+    /// caller does anything else.
+    fn feed_ingress(&mut self, frame: Vec<u8>, now: Instant) {
+        self.device.replay.push_back(frame);
+        self.interface
+            .poll_ingress_single(now, &mut self.device, &mut self.sockets);
+        self.device.replay.clear();
+    }
+
+    /// True if a TCP socket in `Listen` state is bound to `dst`.
+    fn is_listening_on(&self, dst: IpEndpoint) -> bool {
+        self.sockets.iter().any(|(_, socket)| match socket {
+            smoltcp::socket::Socket::Tcp(tcp) => {
+                let endpoint = tcp.listen_endpoint();
+                tcp.state() == tcp::State::Listen
+                    && endpoint.port == dst.port
+                    && endpoint.addr == Some(dst.addr)
+            }
+            _ => false,
+        })
+    }
+
+    /// Opens a listening socket for a flow whose host side is connected,
+    /// replays its SYN through ingress and checks at once that the socket
+    /// took that SYN from that guest. Anything else (smoltcp dropped the SYN,
+    /// or the socket answered another peer) drops the socket and the host
+    /// stream and registers no flow.
+    fn admit_flow(
+        &mut self,
+        key: (IpEndpoint, IpEndpoint),
+        stream: TcpStream,
+        syn_frame: Vec<u8>,
+        now: Instant,
+    ) {
         let socket = tcp::Socket::new(
             tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
             tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER_BYTES]),
@@ -1381,6 +1421,26 @@ impl Stack {
                 "failed to open a listening socket for a new guest TCP flow"
             );
             self.sockets.remove(handle);
+            return;
+        }
+        self.feed_ingress(syn_frame, now);
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        let remote = socket.remote_endpoint();
+        if socket.state() == tcp::State::Listen || remote.is_none() {
+            tracing::warn!(
+                destination = %key.1,
+                "dropping a guest TCP flow: smoltcp did not accept its SYN"
+            );
+            self.sockets.remove(handle);
+            return;
+        }
+        if remote != Some(key.0) {
+            tracing::warn!(
+                destination = %key.1,
+                "dropping a guest TCP flow: its socket answered another peer"
+            );
+            socket.abort();
+            self.sockets_pending_removal.push(handle);
             return;
         }
         let (to_host_tx, from_host_rx, host_failed) = spawn_host_io(stream);
@@ -1396,14 +1456,13 @@ impl Stack {
                     fin_sent_at: None,
                     host_failed,
                     last_activity: std::time::Instant::now(),
-                    verified: false,
                 },
             },
         );
     }
 
-    /// Advances every flow's lifecycle by one step: for
-    /// every flow, pumps bytes in both directions between the
+    /// Advances every flow's lifecycle by one step: for every `Established`
+    /// flow, pumps bytes in both directions between the
     /// flow's `tcp::Socket` and its host-io task, guest->host by draining
     /// the socket's receive buffer into the task's write channel, host->guest
     /// by feeding the task's read channel into the socket's send buffer. A
@@ -1429,23 +1488,7 @@ impl Stack {
                     fin_sent_at,
                     host_failed,
                     last_activity,
-                    verified,
                 } => {
-                    if !*verified {
-                        let socket = self.sockets.get::<tcp::Socket>(flow.handle);
-                        if socket.state() != tcp::State::Listen {
-                            if socket.remote_endpoint() == Some(key.0) {
-                                *verified = true;
-                            } else {
-                                tracing::warn!(
-                                    destination = %key.1,
-                                    "dropping a guest TCP flow: its socket answered another peer"
-                                );
-                                to_remove.push((key, flow.handle));
-                                continue;
-                            }
-                        }
-                    }
                     match to_host_tx.try_reserve() {
                         Ok(permit) => {
                             let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
