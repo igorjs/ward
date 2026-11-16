@@ -25,7 +25,7 @@ fn is_preserved_xattr(name: &[u8]) -> bool {
 /// a filesystem without them, or a daemon that may not set file
 /// capabilities, loses them without failing the commit.
 pub(super) fn copy_xattrs(from: impl AsFd, to: impl AsFd) {
-    let Ok(size) = fs::flistxattr(&from, &mut [] as &mut [u8]) else {
+    let Ok(size) = fs::flistxattr_query(&from) else {
         return;
     };
     let mut names = vec![0u8; size];
@@ -36,7 +36,7 @@ pub(super) fn copy_xattrs(from: impl AsFd, to: impl AsFd) {
         if !is_preserved_xattr(name) {
             continue;
         }
-        let Ok(size) = fs::fgetxattr(&from, name, &mut [] as &mut [u8]) else {
+        let Ok(size) = fs::fgetxattr_query(&from, name) else {
             continue;
         };
         let mut value = vec![0u8; size];
