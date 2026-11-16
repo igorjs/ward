@@ -10,30 +10,45 @@ impl SandboxManager {
     /// Block until `condition` holds and return the main process's exit code.
     pub async fn wait_until(&self, reference: &str, condition: WaitCondition) -> Result<i32> {
         let id = self.resolve(reference).await?;
+        let baseline = self.runs_started(&id).await?;
         match condition {
             WaitCondition::NotRunning => self.wait(&id).await,
             WaitCondition::NextExit => {
-                self.await_running(&id).await?;
+                self.await_run_after(&id, baseline).await?;
                 self.wait(&id).await
             }
             WaitCondition::Removed => self.wait_removed(&id).await,
         }
     }
 
-    /// Return once the sandbox runs, so the exit that follows is the next one.
-    async fn await_running(&self, id: &str) -> Result<()> {
+    /// How many runs the sandbox has started so far.
+    pub(super) async fn runs_started(&self, id: &str) -> Result<u64> {
+        self.entries
+            .read()
+            .await
+            .get(id)
+            .map(|entry| entry.runs_started)
+            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))
+    }
+
+    /// Return once the sandbox is running, or has run since `baseline`, so
+    /// the exit that follows is the next one. A run that already ended
+    /// still counts, because its exit is the one the caller asked for.
+    pub(super) async fn await_run_after(&self, id: &str, baseline: u64) -> Result<()> {
+        let mut changes = self.run_changes.subscribe();
         loop {
-            let status = self
+            let (status, runs) = self
                 .entries
                 .read()
                 .await
                 .get(id)
-                .map(|entry| entry.meta.status.clone())
+                .map(|entry| (entry.meta.status.clone(), entry.runs_started))
                 .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-            if status == SandboxStatus::Running {
+            if status == SandboxStatus::Running || runs > baseline {
                 return Ok(());
             }
-            tokio::time::sleep(WAIT_POLL).await;
+            // The sender lives as long as the manager, so this cannot fail.
+            let _ = changes.changed().await;
         }
     }
 

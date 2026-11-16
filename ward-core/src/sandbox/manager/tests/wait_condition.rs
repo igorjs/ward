@@ -11,6 +11,7 @@ use super::*;
 use crate::pb::WaitCondition;
 
 const EXIT_CODE: i32 = 6;
+const LONG: std::time::Duration = std::time::Duration::from_secs(30);
 const SHORT: std::time::Duration = std::time::Duration::from_millis(300);
 
 fn spawn_wait_until(
@@ -58,6 +59,44 @@ async fn given_an_exited_sandbox_when_waited_for_next_exit_then_it_waits_for_the
 
     // Assert
     assert_eq!(got, EXIT_CODE);
+}
+
+/// The run starts and ends before the waiter first looks, which is what a
+/// poll sees when the run is shorter than the poll interval.
+#[tokio::test]
+async fn given_a_run_that_started_and_ended_after_the_baseline_when_awaited_then_it_counts() {
+    // Arrange
+    let mgr = host_manager(MAIN_OUTPUT_CAP);
+    let id = create_with_command(&mgr, &["sh", "-c", "exit 6"], false).await;
+    mgr.start(&id).await.expect("first start");
+    mgr.wait(&id).await.expect("first wait");
+    let baseline = mgr.runs_started(&id).await.expect("baseline");
+    mgr.start(&id).await.expect("second start");
+    mgr.wait(&id).await.expect("second wait");
+
+    // Act
+    let seen = tokio::time::timeout(LONG, mgr.await_run_after(&id, baseline)).await;
+
+    // Assert
+    assert!(seen.expect("the run was missed").is_ok());
+}
+
+#[tokio::test]
+async fn given_an_exited_sandbox_when_removed_during_a_next_exit_wait_then_it_is_not_found() {
+    // Arrange
+    let mgr = host_manager(MAIN_OUTPUT_CAP);
+    let id = create_with_command(&mgr, &["sh", "-c", "exit 6"], false).await;
+    mgr.start(&id).await.expect("start");
+    mgr.wait(&id).await.expect("wait");
+    let waiter = spawn_wait_until(&mgr, &id, WaitCondition::NextExit);
+
+    // Act
+    mgr.remove(&id).await.expect("remove");
+    let got = tokio::time::timeout(LONG, waiter).await;
+
+    // Assert
+    let err = got.expect("next-exit hung").expect("join").unwrap_err();
+    assert!(matches!(err, ApiError::SandboxNotFound(_)));
 }
 
 #[tokio::test]
