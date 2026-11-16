@@ -130,7 +130,7 @@ fn given_no_running_daemon_when_user_runs_info_then_command_fails_with_clear_err
     // spawn a daemon, simulating "user forgot to start the daemon."
     let tmp = tempfile::tempdir().unwrap();
     let bogus_socket = tmp.path().join("nowhere.sock");
-    let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
+    let mut cmd = common::ward_assert_command();
     cmd.env("WARD_SOCKET", &bogus_socket);
 
     // Act

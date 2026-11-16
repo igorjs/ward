@@ -32,8 +32,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let socket = data_dir.path().join("ward.sock");
 
-    let mut wardd = Command::cargo_bin("wardd")
-        .unwrap()
+    let mut wardd = common::wardd_command()
         .env("WARD_SOCKET", &socket)
         .env("WARD_DATA_DIR", data_dir.path())
         .env("WARD_LOG_LEVEL", "warn")
@@ -47,7 +46,7 @@ fn given_default_backend_when_sandbox_created_then_dns_and_tcp_egress_work() {
     common::wait_until_accepting(&socket, &mut wardd);
 
     let ward = || {
-        let mut cmd = assert_cmd::Command::cargo_bin("ward").unwrap();
+        let mut cmd = common::ward_assert_command();
         cmd.env("WARD_SOCKET", &socket);
         cmd
     };
