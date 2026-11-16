@@ -591,13 +591,17 @@ async fn given_a_realm_with_a_tab_in_its_scheme_when_resolved_then_the_login_is_
     assert_login_withheld_from(|other| format!("ht\ttp://{other}/token")).await;
 }
 
+/// The redirect target answers with a challenge Ward would accept (the
+/// registry's own realm). Ward's probe does not follow redirects, so it sees no
+/// challenge and sends no login; the explicit redirect rule in `plan_login` is
+/// defence in depth, and this test does not tell the two apart. The pull itself
+/// runs anonymously through oci-client, which follows the redirect.
 #[tokio::test]
-async fn given_a_v2_endpoint_that_redirects_when_resolved_then_the_login_is_not_sent_anywhere() {
+async fn given_a_v2_endpoint_that_redirects_to_an_acceptable_realm_when_resolved_then_no_login_is_sent()
+ {
     // Arrange
     let env = Env::new().await;
-    let other = other_realm().await;
-    let other_addr = other.addr;
-    let mut plan = RegistryPlan::realm_text(move |_| format!("http://{other_addr}/token"));
+    let mut plan = RegistryPlan::own_realm();
     plan.v2_redirect = Some("/elsewhere".to_string());
     let registry = plan.start().await;
     env.log_in(registry.addr, PASSWORD);
@@ -608,11 +612,58 @@ async fn given_a_v2_endpoint_that_redirects_when_resolved_then_the_login_is_not_
 
     // Assert
     assert!(outcome.is_ok(), "{outcome:?}");
-    assert!(any_basic(&[&registry, &other]).is_empty());
+    assert!(
+        any_basic(&[&registry]).is_empty(),
+        "{:?}",
+        registry.requests()
+    );
     assert!(
         registry.count("/elsewhere") >= 1,
         "oci-client followed the redirect"
     );
+    let token_requests: Vec<_> = registry
+        .requests()
+        .into_iter()
+        .filter(|r| r.target.starts_with("/token"))
+        .collect();
+    assert!(token_requests.iter().all(|r| r.authorization.is_none()));
+}
+
+/// A realm written with escapes or a tab that, once parsed, names the
+/// registry's own host is accepted and used. A wrong parse would judge or
+/// request a different URL and the login would not reach `/token`.
+async fn assert_realm_judged_and_used_as_parsed(
+    realm_for: impl Fn(SocketAddr) -> String + Send + Sync + 'static,
+) {
+    // Arrange
+    let env = Env::new().await;
+    let registry = RegistryPlan::realm_text(realm_for).start().await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+
+    // Act
+    let digest = puller
+        .resolve_digest(&reference(registry.addr))
+        .await
+        .expect("resolve");
+
+    // Assert
+    assert_eq!(digest, Some(manifest().1));
+    let with_password = requests_with_password(&[&registry], PASSWORD);
+    assert_eq!(with_password.len(), 1, "{:?}", registry.requests());
+    assert!(with_password[0].target.starts_with("/token"));
+}
+
+#[tokio::test]
+async fn given_an_escaped_realm_naming_the_registrys_own_host_when_resolved_then_the_unescaped_url_is_used()
+ {
+    assert_realm_judged_and_used_as_parsed(|own| format!(r"\h\t\t\p://{own}/token")).await;
+}
+
+#[tokio::test]
+async fn given_a_realm_with_a_tab_in_its_scheme_naming_the_registrys_own_host_when_resolved_then_the_parsed_url_is_used()
+ {
+    assert_realm_judged_and_used_as_parsed(|own| format!("ht\ttp://{own}/token")).await;
 }
 
 #[tokio::test]
