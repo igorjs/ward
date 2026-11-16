@@ -182,8 +182,14 @@ async fn perform_arp_handshake(stack: &mut Stack, guest_fd: &OwnedFd) {
 /// IPv4/TCP checksum so the checksum validation smoltcp runs by default on
 /// ingress accepts it.
 fn build_tcp_syn_frame() -> Vec<u8> {
+    build_tcp_syn_frame_from(GUEST_SRC_PORT)
+}
+
+/// Same as [`build_tcp_syn_frame`] with an explicit guest source port, so a
+/// test can open many distinct flows.
+fn build_tcp_syn_frame_from(src_port: u16) -> Vec<u8> {
     let tcp_repr = TcpRepr {
-        src_port: GUEST_SRC_PORT,
+        src_port,
         dst_port: DEST_PORT,
         control: TcpControl::Syn,
         seq_number: TcpSeqNumber(0),
@@ -1130,4 +1136,209 @@ async fn given_host_reset_while_guest_uploads_when_polled_then_guest_gets_rst_no
     // Assert
     assert!(saw_rst, "a cut upload must reset the guest");
     assert!(!saw_fin);
+}
+
+/// Expected cap on connects in flight, mirroring `MAX_PENDING_CONNECTS`.
+const MAX_PENDING_CONNECTS: usize = 64;
+
+/// Fake `Connector` that fails every connect with the given error kind,
+/// standing in for a closed host port.
+struct FailingConnector(io::ErrorKind);
+
+#[async_trait::async_trait]
+impl Connector for FailingConnector {
+    async fn connect(&self, _addr: SocketAddr) -> io::Result<TcpStream> {
+        Err(io::Error::from(self.0))
+    }
+}
+
+fn deny_all_egress(_domain: &str, _port: u16) -> Pin<Box<dyn Future<Output = bool> + Send>> {
+    Box::pin(async { false })
+}
+
+/// Polls `stack` for `budget` and returns the control flag of every TCP
+/// segment the guest received, plus whether it carried an ACK-less SYN reply.
+async fn collect_guest_controls(
+    stack: &mut Stack,
+    guest_fd: &OwnedFd,
+    budget: Duration,
+) -> Vec<TcpControl> {
+    let mut seen = Vec::new();
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        stack.poll();
+        while let Some(frame) = try_read_frame(guest_fd) {
+            if EthernetFrame::new_checked(&frame)
+                .map(|f| f.ethertype() == EthernetProtocol::Ipv4)
+                .unwrap_or(false)
+            {
+                seen.push(parse_tcp_segment(&frame).control);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    seen
+}
+
+#[tokio::test]
+async fn given_egress_denied_when_guest_syns_then_guest_gets_rst_and_never_a_syn_ack() {
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let called_with = Arc::new(Mutex::new(None));
+    let connector: Box<dyn Connector> = Box::new(RecordingConnector {
+        called_with: Arc::clone(&called_with),
+    });
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(deny_all_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    write_frame(&guest_fd, &build_tcp_syn_frame());
+    let seen = collect_guest_controls(&mut stack, &guest_fd, Duration::from_millis(500)).await;
+
+    assert!(
+        !seen.contains(&TcpControl::Syn),
+        "a denied destination must never be accepted, saw {seen:?}"
+    );
+    assert!(
+        seen.contains(&TcpControl::Rst),
+        "guest should be reset, saw {seen:?}"
+    );
+    assert!(
+        called_with.lock().unwrap().is_none(),
+        "the connector must not run for a denied destination"
+    );
+}
+
+#[tokio::test]
+async fn given_host_port_refused_when_guest_syns_then_guest_gets_rst_and_never_a_syn_ack() {
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let connector: Box<dyn Connector> =
+        Box::new(FailingConnector(io::ErrorKind::ConnectionRefused));
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    write_frame(&guest_fd, &build_tcp_syn_frame());
+    let seen = collect_guest_controls(&mut stack, &guest_fd, Duration::from_millis(500)).await;
+
+    assert!(
+        !seen.contains(&TcpControl::Syn),
+        "a refused host connect must never be accepted, saw {seen:?}"
+    );
+    assert!(
+        seen.contains(&TcpControl::Rst),
+        "guest should be reset, saw {seen:?}"
+    );
+    assert_eq!(
+        stack.flow_count_for_test(),
+        0,
+        "a failed connect must free its slot"
+    );
+}
+
+/// Fake `Connector` that waits for a release signal before dialing the
+/// loopback listener, so a test controls when the host connect finishes.
+struct GatedConnector {
+    gate: Mutex<Option<oneshot::Receiver<()>>>,
+    listener_addr: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl Connector for GatedConnector {
+    async fn connect(&self, _addr: SocketAddr) -> io::Result<TcpStream> {
+        let gate = self.gate.lock().unwrap().take().expect("connect runs once");
+        let _ = gate.await;
+        TcpStream::connect(self.listener_addr).await
+    }
+}
+
+#[tokio::test]
+async fn given_allowed_destination_when_connect_is_slow_then_syn_ack_waits_for_the_connect_and_data_flows()
+ {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let listener_addr = listener.local_addr().unwrap();
+    let (release_tx, release_rx) = oneshot::channel();
+    let connector: Box<dyn Connector> = Box::new(GatedConnector {
+        gate: Mutex::new(Some(release_rx)),
+        listener_addr,
+    });
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    write_frame(&guest_fd, &build_tcp_syn_frame());
+    let early = collect_guest_controls(&mut stack, &guest_fd, Duration::from_millis(300)).await;
+    assert!(
+        early.is_empty(),
+        "no reply before the host connect finishes, saw {early:?}"
+    );
+    assert_eq!(stack.pending_connect_count_for_test(), 1);
+
+    release_tx.send(()).unwrap();
+    let syn_ack = poll_until_syn_ack(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("SYN-ACK once the host connect has succeeded");
+    let (host_stream, _) = listener.accept().await.unwrap();
+
+    let client_next_seq = TcpSeqNumber(1);
+    let server_next_seq = syn_ack.seq_number + 1;
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame(client_next_seq, server_next_seq, &[]),
+    );
+    stack.poll();
+    write_frame(
+        &guest_fd,
+        &build_tcp_ack_frame(client_next_seq, server_next_seq, b"ping"),
+    );
+    let got = poll_until_stream_bytes(&mut stack, &host_stream, Duration::from_secs(2)).await;
+    assert_eq!(got.as_deref(), Some(&b"ping"[..]));
+    host_stream.try_write(b"pong").unwrap();
+    let reply = poll_until_guest_payload(&mut stack, &guest_fd, Duration::from_secs(2)).await;
+    assert_eq!(reply.as_deref(), Some(&b"pong"[..]));
+}
+
+#[tokio::test]
+async fn given_syn_burst_when_connects_hang_then_pending_connects_are_capped_and_excess_syns_dropped()
+ {
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let connector: Box<dyn Connector> = Box::new(HangingConnector);
+    let mut stack = Stack::new(
+        host_fd,
+        Box::new(NullResolver),
+        connector,
+        Box::new(always_allow_egress),
+    );
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+
+    // A small datagram socket buffer holds only a few SYNs at once, so the
+    // burst is fed in short batches with a poll between them.
+    let mut seen = Vec::new();
+    for batch in 0..((MAX_PENDING_CONNECTS + 40) / 8) {
+        for i in 0..8 {
+            write_frame(
+                &guest_fd,
+                &build_tcp_syn_frame_from(30_000 + (batch * 8 + i) as u16),
+            );
+        }
+        seen.extend(collect_guest_controls(&mut stack, &guest_fd, Duration::from_millis(20)).await);
+    }
+
+    assert_eq!(stack.pending_connect_count_for_test(), MAX_PENDING_CONNECTS);
+    assert!(
+        seen.is_empty(),
+        "held and dropped SYNs get no reply, saw {seen:?}"
+    );
 }
