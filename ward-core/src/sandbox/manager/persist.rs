@@ -104,6 +104,26 @@ impl PersistGuard {
         plan: impl FnOnce(&SandboxEntry) -> Result<Option<SandboxMeta>>,
         adopt: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
     ) -> Result<Option<R>> {
+        self.commit_saving(/* save = */ true, plan, adopt).await
+    }
+
+    /// Like [`commit`](Self::commit) but leaves the file alone, so memory
+    /// runs ahead of disk. For a fact that is already true outside the
+    /// daemon, such as a dead VM, when the disk keeps refusing the write.
+    pub(super) async fn commit_unsaved<R: Send + 'static>(
+        &self,
+        plan: impl FnOnce(&SandboxEntry) -> Result<Option<SandboxMeta>>,
+        adopt: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
+    ) -> Result<Option<R>> {
+        self.commit_saving(/* save = */ false, plan, adopt).await
+    }
+
+    async fn commit_saving<R: Send + 'static>(
+        &self,
+        save: bool,
+        plan: impl FnOnce(&SandboxEntry) -> Result<Option<SandboxMeta>>,
+        adopt: impl FnOnce(&mut SandboxEntry) -> R + Send + 'static,
+    ) -> Result<Option<R>> {
         let next = {
             let entries = self.teardown.entries.read().await;
             let Some(entry) = entries.get(&self.id) else {
@@ -116,7 +136,9 @@ impl PersistGuard {
         };
         let guard = self.clone();
         let write = tokio::spawn(async move {
-            persist_meta(guard.teardown.store.as_ref(), next.clone()).await?;
+            if save {
+                persist_meta(guard.teardown.store.as_ref(), next.clone()).await?;
+            }
             let mut entries = guard.teardown.entries.write().await;
             let Some(entry) = entries.get_mut(&guard.id) else {
                 // Removal waits for this guard before it deletes the record.

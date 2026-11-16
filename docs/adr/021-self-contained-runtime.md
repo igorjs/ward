@@ -15,7 +15,7 @@ ADR-003 chose libkrun and linked it from the host's shared libraries (`brew inst
 
 1. **Embed the runtime.** `ward-bundle` downloads the pinned libkrun release at build time, verifies it against `vendor/libkrun-checksums.txt`, cross-compiles `ward-agent` as a static musl binary, and embeds all three (gzip) in the binaries. At first run ward unpacks libkrun and libkrunfw to `~/.ward/runtime/libs-<id>` (override with `WARD_RUNTIME_DIR`) and loads them with `dlopen` (`libloading`). The agent is copied into each sandbox's rootfs. Ward reuses an unpacked library only if the current user owns it, it is not a symlink and it is not group or other writable. `ward-core` no longer links libkrun.
 2. **One host process per microVM.** The ward binary re-executes itself with `__ward-vm-shim`, reads a JSON `VmSpec` from stdin and enters the VM. The parent keeps the child's stdin open for the VM's lifetime. EOF means the parent is gone, so the child exits. Stopping a sandbox kills its child. Guest console output goes to the parent's stderr, not its stdout.
-3. **The guest agent is the VM's init process.** It mounts virtiofs shares, configures `eth0` statically (10.0.2.15/24, gateway and DNS 10.0.2.2, served by the in-process smoltcp stack) and serves exec over vsock.
+3. **The guest agent is the VM's main process.** libkrun's `init.krun` is PID 1: it forks the agent, reaps every orphaned process and ends the VM when the agent exits. The agent mounts virtiofs shares, configures `eth0` statically (10.0.2.15/24, gateway and DNS 10.0.2.2, served by the in-process smoltcp stack) and serves exec over vsock.
 4. **Every release ships the real backend.** The stub backend stays the default for plain `cargo build`.
 
 ## Consequences

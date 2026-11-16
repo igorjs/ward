@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{oneshot, watch};
 
 use super::krun_ffi;
 
@@ -221,12 +222,50 @@ fn boot(spec: &VmSpec) -> Result<(), String> {
     Ok(())
 }
 
+/// How a VM host process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShimExit {
+    /// Exit code, when the process exited by itself.
+    pub code: Option<i32>,
+    /// Signal that ended the process, when one did.
+    pub signal: Option<i32>,
+    /// How long the process lived.
+    pub ran_for: Duration,
+}
+
+impl ShimExit {
+    fn of(status: std::io::Result<std::process::ExitStatus>, ran_for: Duration) -> Self {
+        use std::os::unix::process::ExitStatusExt;
+        match status {
+            Ok(status) => Self {
+                code: status.code(),
+                signal: status.signal(),
+                ran_for,
+            },
+            Err(e) => {
+                tracing::warn!("cannot read how the VM host process ended: {e}");
+                Self {
+                    code: None,
+                    signal: None,
+                    ran_for,
+                }
+            }
+        }
+    }
+}
+
 /// Handle to a running VM host process.
+///
+/// A task owns the child and waits on it, so its exit is seen when it
+/// happens and the child is always reaped.
 #[derive(Debug)]
 pub struct ShimProcess {
-    child: Child,
+    pid: u32,
     /// Held open on purpose: the shim stops when this pipe closes.
     stdin: Option<ChildStdin>,
+    /// Asks the task to kill the child. Dropping it does the same.
+    stop: Option<oneshot::Sender<()>>,
+    exit: watch::Receiver<Option<ShimExit>>,
 }
 
 impl ShimProcess {
@@ -258,39 +297,92 @@ impl ShimProcess {
                 cmd.pre_exec(move || clear_close_on_exec(raw));
             }
         }
-        let mut child = cmd.spawn()?;
+        let mut payload = serde_json::to_vec(spec).map_err(std::io::Error::other)?;
+        payload.push(b'\n');
+        let child = cmd.spawn()?;
         drop(inherit_fd);
+        Self::watch(child, &payload).await
+    }
 
+    /// Start watching `child` and give it `payload` on its stdin.
+    pub(super) async fn watch(mut child: Child, payload: &[u8]) -> std::io::Result<Self> {
+        let pid = child
+            .id()
+            .ok_or_else(|| std::io::Error::other("VM host process ended at start"))?;
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| std::io::Error::other("shim stdin was not piped"))?;
-        let mut payload = serde_json::to_vec(spec).map_err(std::io::Error::other)?;
-        payload.push(b'\n');
-        stdin.write_all(&payload).await?;
-        stdin.flush().await?;
-        Ok(Self {
+        let (stop, stop_rx) = oneshot::channel();
+        let (exit_tx, exit) = watch::channel(None);
+        tokio::spawn(supervise(
             child,
-            stdin: Some(stdin),
-        })
+            stop_rx,
+            exit_tx,
+            std::time::Instant::now(),
+        ));
+        let mut shim = Self {
+            pid,
+            stdin: None,
+            stop: Some(stop),
+            exit,
+        };
+        // On an error `shim` drops here, which kills and reaps the child.
+        stdin.write_all(payload).await?;
+        stdin.flush().await?;
+        shim.stdin = Some(stdin);
+        Ok(shim)
+    }
+
+    /// Process id of the VM host process, for tests that signal it.
+    #[cfg(test)]
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// True while the child has not exited.
-    pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+    pub fn is_running(&self) -> bool {
+        self.exit.borrow().is_none()
+    }
+
+    /// Follows the child's exit. Holds `Some` once it has ended.
+    pub fn exit_watch(&self) -> watch::Receiver<Option<ShimExit>> {
+        self.exit.clone()
     }
 
     /// Stop the VM: close the control pipe, kill the child and reap it.
     pub async fn stop(&mut self) {
         self.stdin.take();
-        let _ = self.child.start_kill();
-        if tokio::time::timeout(STOP_WAIT, self.child.wait())
-            .await
-            .is_err()
-        {
-            tracing::warn!("VM host process did not exit after kill");
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let ended = self.exit.wait_for(Option::is_some);
+        if tokio::time::timeout(STOP_WAIT, ended).await.is_err() {
+            tracing::warn!(pid = self.pid, "VM host process did not exit after kill");
         }
     }
+}
+
+/// Wait for `child` and publish how it ended. A stop request, or the handle
+/// going away, kills it first.
+async fn supervise(
+    mut child: Child,
+    stop: oneshot::Receiver<()>,
+    exit: watch::Sender<Option<ShimExit>>,
+    started: std::time::Instant,
+) {
+    let ended = tokio::select! {
+        status = child.wait() => Some(status),
+        _ = stop => None,
+    };
+    let status = match ended {
+        Some(status) => status,
+        None => {
+            let _ = child.start_kill();
+            child.wait().await
+        }
+    };
+    let _ = exit.send(Some(ShimExit::of(status, started.elapsed())));
 }
 
 fn clear_close_on_exec(fd: RawFd) -> std::io::Result<()> {
@@ -357,6 +449,58 @@ mod tests {
         // The test binary's own argv never carries SHIM_ARG, so this must
         // return instead of exiting the test process.
         run_if_requested();
+    }
+
+    const FAKE_SHIM_LIFETIME_SECS: &str = "60";
+    const EXIT_WAIT: Duration = Duration::from_secs(30);
+
+    /// A long-lived child that stands in for the VM host process.
+    async fn fake_shim() -> ShimProcess {
+        let child = Command::new("sleep")
+            .arg(FAKE_SHIM_LIFETIME_SECS)
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        ShimProcess::watch(child, b"{}\n").await.expect("watch")
+    }
+
+    #[tokio::test]
+    async fn given_shim_killed_from_outside_when_watched_then_the_exit_is_reported_at_once() {
+        // Arrange
+        let shim = fake_shim().await;
+        let mut exit = shim.exit_watch();
+        assert!(shim.is_running());
+
+        // Act
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(shim.pid() as i32).expect("pid"),
+            rustix::process::Signal::KILL,
+        )
+        .expect("kill");
+        let ended = tokio::time::timeout(EXIT_WAIT, exit.wait_for(Option::is_some))
+            .await
+            .expect("exit seen")
+            .expect("watch open")
+            .expect("some");
+
+        // Assert
+        assert_eq!(ended.signal, Some(crate::signal::SIGKILL));
+        assert_eq!(ended.code, None);
+        assert!(!shim.is_running());
+    }
+
+    #[tokio::test]
+    async fn given_running_shim_when_stopped_then_it_is_reaped_and_reported() {
+        // Arrange
+        let mut shim = fake_shim().await;
+
+        // Act
+        shim.stop().await;
+
+        // Assert
+        assert!(!shim.is_running());
+        assert!(shim.exit_watch().borrow().is_some());
     }
 
     #[test]

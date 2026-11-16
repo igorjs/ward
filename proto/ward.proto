@@ -431,6 +431,8 @@ enum EndReason {
   END_REASON_OOM = 3;
   END_REASON_TIMEOUT = 4;
   END_REASON_EGRESS_POLICY = 5;
+  // The VM host process died without a stop being asked for.
+  END_REASON_VM_DIED = 6;
 }
 
 enum SandboxStatus {

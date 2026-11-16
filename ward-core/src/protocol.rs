@@ -548,6 +548,8 @@ pub enum EndReason {
     Oom,
     Timeout,
     EgressPolicy,
+    /// The VM host process died without a stop being asked for.
+    VmDied,
 }
 
 impl EndReason {
@@ -559,6 +561,7 @@ impl EndReason {
             Self::Oom => "oom",
             Self::Timeout => "timeout",
             Self::EgressPolicy => "egress-policy",
+            Self::VmDied => "vm-died",
         }
     }
 }

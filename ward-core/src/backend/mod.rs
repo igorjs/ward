@@ -45,6 +45,21 @@ pub enum BackendError {
     AddressInUse(String),
 }
 
+/// A sandbox's VM host process ended without a stop having been asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmExit {
+    pub sandbox_id: String,
+    /// Which boot of the sandbox ended, so a report that outlived a stop and
+    /// a new start is not mistaken for the new VM dying.
+    pub generation: u64,
+    /// Exit code of the VM host process, when it exited by itself.
+    pub code: Option<i32>,
+    /// Signal that ended the VM host process, when one did.
+    pub signal: Option<i32>,
+    /// How long the VM host process lived.
+    pub ran_for: std::time::Duration,
+}
+
 /// Tar chunks buffered between the two ends of a file copy.
 pub const COPY_CHANNEL_CAPACITY: usize = 4;
 
@@ -259,6 +274,33 @@ pub trait Backend: Send + Sync + 'static {
     async fn start_sandbox(&self, id: &str) -> Result<()>;
 
     async fn count(&self) -> Result<usize>;
+
+    /// Reports of VM host processes that ended on their own. Handed out
+    /// once; `None` when the backend has no VM to watch or already gave it.
+    fn take_vm_exits(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<VmExit>> {
+        None
+    }
+
+    /// Whether `exit` is about the VM the sandbox has now, not an older one.
+    async fn vm_exit_is_current(&self, _exit: &VmExit) -> bool {
+        true
+    }
+
+    /// Release what the dead VM of `exit` held: its network stack, agent
+    /// socket and exec processes. The generation check and the hand-over of
+    /// the VM happen under one lock, so a report about an older boot never
+    /// touches a newer VM. Returns false when `exit` is not the sandbox's
+    /// current boot, and nothing was released.
+    async fn release_dead_vm(&self, _exit: &VmExit) -> bool {
+        true
+    }
+
+    /// The exit of the sandbox's current VM if it already ended and nobody
+    /// released it. Catches a death that happened before the manager was
+    /// ready to act on its report.
+    async fn dead_vm(&self, _id: &str) -> Option<VmExit> {
+        None
+    }
 
     /// Change the limits of sandbox `id`. A running VM keeps its size, so a
     /// memory or CPU limit above it is refused; the guest applies the new

@@ -113,6 +113,7 @@ impl Runtime {
             .with_data_dir(data_dir.clone()),
         );
         sandbox_manager.spawn_restart_supervisor();
+        sandbox_manager.spawn_vm_exit_watcher();
         sandbox_manager.spawn_health_supervisor();
         sandbox_manager.restore().await;
         Self {
