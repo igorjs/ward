@@ -10,8 +10,9 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine;
 use flate2::Compression;
@@ -28,8 +29,10 @@ const OTHER_PASSWORD: &str = "other-pw";
 const REPOSITORY: &str = "team/app";
 const HEADER_END: &[u8] = b"\r\n\r\n";
 const LONG_LIVED_TOKEN_SECS: u64 = 300;
-/// Shorter than the margin before which Ward replaces a token.
-const SHORT_LIVED_TOKEN_SECS: u64 = 5;
+/// Below the floor Ward raises a token lifetime to.
+const TINY_TOKEN_SECS: u64 = 1;
+const FIFO_HOLD: Duration = Duration::from_millis(400);
+const TICK: Duration = Duration::from_millis(50);
 const OCI_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// Tests share the process environment, so they run one after another.
@@ -238,6 +241,10 @@ struct RegistryPlan {
     revoked: Arc<Mutex<Vec<String>>>,
     /// Where `/token` redirects to, instead of answering.
     token_redirect: Option<String>,
+    /// Answer `/token` with this status instead of a token.
+    token_status: Option<u16>,
+    /// Answer `/v2/` with 404 and no challenge while set.
+    v2_broken: Arc<AtomicBool>,
     minted: Arc<AtomicUsize>,
     password: Arc<Mutex<String>>,
     /// Layers of the image, bottom first.
@@ -254,6 +261,8 @@ impl RegistryPlan {
             expires_in: LONG_LIVED_TOKEN_SECS,
             revoked: Arc::default(),
             token_redirect: None,
+            token_status: None,
+            v2_broken: Arc::default(),
             minted: Arc::default(),
             password: Arc::new(Mutex::new(PASSWORD.to_string())),
             layers: Vec::new(),
@@ -291,13 +300,18 @@ impl RegistryPlan {
     fn answer(&self, addr: SocketAddr, req: &Recorded, published: &Published) -> Reply {
         let challenge = (self.challenge)(addr);
         let unauthorized = || {
-            let reply = Reply::new(401);
-            match &challenge {
-                Some(value) => reply.header("WWW-Authenticate", value.clone()),
-                None => reply,
-            }
+            // One header per line of the challenge text.
+            challenge
+                .iter()
+                .flat_map(|value| value.lines())
+                .fold(Reply::new(401), |reply, line| {
+                    reply.header("WWW-Authenticate", line)
+                })
         };
         if req.target == "/v2/" {
+            if self.v2_broken.load(Ordering::SeqCst) {
+                return Reply::new(404);
+            }
             if let Some(location) = &self.v2_redirect {
                 return Reply::new(307).header("Location", location.clone());
             }
@@ -313,6 +327,9 @@ impl RegistryPlan {
         if req.target.starts_with("/token") {
             if let Some(location) = &self.token_redirect {
                 return Reply::new(307).header("Location", location.clone());
+            }
+            if let Some(status) = self.token_status {
+                return Reply::new(status);
             }
             let current = basic(&self.password.lock().expect("password"));
             let n = self.minted.fetch_add(1, Ordering::SeqCst) + 1;
@@ -378,6 +395,10 @@ impl Env {
             _guard: guard,
             _dir: dir,
         }
+    }
+
+    fn dir(&self) -> &std::path::Path {
+        self._dir.path()
     }
 
     fn log_in(&self, registry: SocketAddr, password: &str) {
@@ -493,34 +514,26 @@ async fn given_two_calls_when_the_token_is_long_lived_then_one_client_and_one_to
 }
 
 #[tokio::test]
-async fn given_a_token_near_its_end_when_the_next_call_starts_then_a_new_token_is_fetched() {
+async fn given_a_token_with_a_tiny_lifetime_when_the_next_call_starts_then_the_floor_keeps_it_in_use()
+ {
     // Arrange
     let env = Env::new().await;
     let mut plan = RegistryPlan::own_realm();
-    plan.expires_in = SHORT_LIVED_TOKEN_SECS;
+    plan.expires_in = TINY_TOKEN_SECS;
     let registry = plan.start().await;
     env.log_in(registry.addr, PASSWORD);
     let puller = OciPuller::with_http_registry(registry.addr.to_string());
 
     // Act
-    puller
-        .resolve_digest(&reference(registry.addr))
-        .await
-        .expect("first");
-    puller
-        .resolve_digest(&reference(registry.addr))
-        .await
-        .expect("second");
+    for _ in 0..3 {
+        puller
+            .resolve_digest(&reference(registry.addr))
+            .await
+            .expect("resolve");
+    }
 
     // Assert
-    assert_eq!(registry.count("/token"), 2);
-    let bearers: Vec<_> = registry
-        .requests()
-        .into_iter()
-        .filter(|r| r.target.contains("/manifests/"))
-        .filter_map(|r| r.authorization)
-        .collect();
-    assert_eq!(bearers, ["Bearer tok-1", "Bearer tok-2"]);
+    assert_eq!(registry.count("/token"), 1);
 }
 
 #[tokio::test]
@@ -532,7 +545,8 @@ async fn given_a_token_the_registry_revoked_when_a_request_gets_401_then_a_new_t
     plan.revoked.lock().expect("revoked").push("tok-1".into());
     let registry = plan.start().await;
     env.log_in(registry.addr, PASSWORD);
-    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+    let puller = OciPuller::with_http_registry(registry.addr.to_string())
+        .with_token_request_interval(Duration::ZERO);
 
     // Act
     let digest = puller
@@ -809,7 +823,8 @@ async fn given_a_token_that_ends_between_layers_when_pulled_then_one_new_token_c
     plan.revoke_after_first_layer = true;
     let registry = plan.start().await;
     env.log_in(registry.addr, PASSWORD);
-    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+    let puller = OciPuller::with_http_registry(registry.addr.to_string())
+        .with_token_request_interval(Duration::ZERO);
     let staging = tempfile::tempdir().expect("tempdir");
     let dest = staging.path().join("rootfs");
     std::fs::create_dir_all(&dest).expect("rootfs");
@@ -841,4 +856,188 @@ async fn given_a_token_that_ends_between_layers_when_pulled_then_one_new_token_c
     assert_eq!(blob_tokens.last().map(String::as_str), Some("Bearer tok-2"));
     let with_password = requests_with_password(&[&registry], PASSWORD);
     assert!(with_password.iter().all(|r| r.target.starts_with("/token")));
+}
+
+#[tokio::test]
+async fn given_a_401_right_after_a_fresh_token_when_resolved_then_the_login_is_not_sent_again() {
+    // Arrange
+    let env = Env::new().await;
+    let plan = RegistryPlan::own_realm();
+    plan.revoked.lock().expect("revoked").push("tok-1".into());
+    let registry = plan.start().await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+
+    // Act
+    let outcome = puller.resolve_digest(&reference(registry.addr)).await;
+
+    // Assert
+    assert!(outcome.is_err());
+    assert_eq!(registry.count("/token"), 1);
+}
+
+#[tokio::test]
+async fn given_a_v2_endpoint_that_fails_without_a_challenge_when_resolved_then_nothing_is_cached() {
+    // Arrange
+    let env = Env::new().await;
+    let plan = RegistryPlan::own_realm();
+    plan.v2_broken.store(true, Ordering::SeqCst);
+    let registry = plan.start().await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+
+    // Act
+    let failed = puller.resolve_digest(&reference(registry.addr)).await;
+    plan.v2_broken.store(false, Ordering::SeqCst);
+    let recovered = puller.resolve_digest(&reference(registry.addr)).await;
+
+    // Assert
+    assert!(failed.is_err());
+    assert!(recovered.is_ok(), "{recovered:?}");
+    assert_eq!(requests_with_password(&[&registry], PASSWORD).len(), 1);
+    let manifest_request = registry
+        .requests()
+        .into_iter()
+        .find(|r| r.target.contains("/manifests/"))
+        .expect("manifest request");
+    assert_eq!(
+        manifest_request.authorization.as_deref(),
+        Some("Bearer tok-1")
+    );
+}
+
+#[tokio::test]
+async fn given_check_login_against_a_basic_challenge_when_run_then_it_is_refused_and_says_why() {
+    // Arrange
+    let _env = Env::new().await;
+    let registry = RegistryPlan::new(|_| Some(r#"Basic realm="registry""#.to_string()))
+        .start()
+        .await;
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+    let login = Credentials {
+        username: USERNAME.to_string(),
+        password: PASSWORD.to_string(),
+    };
+
+    // Act
+    let outcome = puller.check_login(&registry.addr.to_string(), &login).await;
+
+    // Assert
+    let message = outcome.expect_err("refused").to_string();
+    assert!(
+        message.contains("refused") && message.contains("Basic"),
+        "{message}"
+    );
+    assert!(any_basic(&[&registry]).is_empty());
+}
+
+#[tokio::test]
+async fn given_a_token_service_that_answers_403_when_checking_a_login_then_the_credentials_are_refused()
+ {
+    // Arrange
+    let _env = Env::new().await;
+    let mut plan = RegistryPlan::own_realm();
+    plan.token_status = Some(403);
+    let registry = plan.start().await;
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+    let login = Credentials {
+        username: USERNAME.to_string(),
+        password: PASSWORD.to_string(),
+    };
+
+    // Act
+    let outcome = puller.check_login(&registry.addr.to_string(), &login).await;
+
+    // Assert
+    let message = outcome.expect_err("refused").to_string();
+    assert!(message.contains("did not accept"), "{message}");
+}
+
+#[tokio::test]
+async fn given_a_basic_header_before_a_bearer_one_when_resolved_then_the_bearer_realm_is_used() {
+    // Arrange
+    let env = Env::new().await;
+    let registry = RegistryPlan::new(|addr| {
+        Some(format!(
+            "Basic realm=\"registry\"\nBearer realm=\"http://{addr}/token\",service=\"registry\""
+        ))
+    })
+    .start()
+    .await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+
+    // Act
+    let outcome = puller.resolve_digest(&reference(registry.addr)).await;
+
+    // Assert
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(requests_with_password(&[&registry], PASSWORD).len(), 1);
+}
+
+#[tokio::test]
+async fn given_a_bad_bearer_header_before_a_good_one_when_resolved_then_the_login_is_withheld() {
+    // Arrange
+    let env = Env::new().await;
+    let other = other_realm().await;
+    let other_addr = other.addr;
+    let registry = RegistryPlan::new(move |addr| {
+        Some(format!(
+            "Bearer realm=\"http://{other_addr}/token\"\nBearer realm=\"http://{addr}/token\""
+        ))
+    })
+    .start()
+    .await;
+    env.log_in(registry.addr, PASSWORD);
+    let puller = OciPuller::with_http_registry(registry.addr.to_string());
+
+    // Act
+    let _ = puller.resolve_digest(&reference(registry.addr)).await;
+
+    // Assert
+    assert!(any_basic(&[&registry, &other]).is_empty());
+    assert!(other.requests().iter().all(|r| r.authorization.is_none()));
+}
+
+/// The login file is a FIFO nobody has opened, so reading it blocks. On a
+/// single-thread runtime a timer still has to fire while it does.
+#[tokio::test(flavor = "current_thread")]
+async fn given_a_login_file_that_blocks_when_resolved_then_the_runtime_keeps_running() {
+    // Arrange
+    let env = Env::new().await;
+    let registry = RegistryPlan::new(|_| None).start().await;
+    let fifo = env.dir().join("config.json");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    let released = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let released = released.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(FIFO_HOLD);
+            released.store(true, Ordering::SeqCst);
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        })
+    };
+    let puller = Arc::new(OciPuller::with_http_registry(registry.addr.to_string()));
+    let resolving = tokio::spawn({
+        let (puller, reference) = (puller.clone(), reference(registry.addr));
+        async move {
+            let _ = puller.resolve_digest(&reference).await;
+        }
+    });
+
+    // Act
+    tokio::time::sleep(TICK).await;
+    let released_when_the_timer_fired = released.load(Ordering::SeqCst);
+    resolving.await.expect("resolve task");
+    writer.join().expect("writer");
+
+    // Assert
+    assert!(
+        !released_when_the_timer_fired,
+        "the login lookup blocked the runtime"
+    );
 }

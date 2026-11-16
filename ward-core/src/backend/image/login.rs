@@ -19,6 +19,13 @@ const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
 /// The lifetime Docker's token spec assumes when `expires_in` is absent.
 const DEFAULT_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
 const MAX_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+/// A shorter `expires_in` is raised to this, so a token service cannot make
+/// Ward send the password again for every request.
+const MIN_TOKEN_LIFETIME: Duration = Duration::from_secs(60);
+/// The longest one login request may take in all, however slowly the body
+/// arrives. The read timeout alone restarts with every byte.
+pub(super) const LOGIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BASIC_SCHEME: &str = "Basic";
 const BEARER_SCHEME: &str = "Bearer";
 const HTTPS_SCHEME: &str = "https";
 const HTTP_SCHEME: &str = "http";
@@ -50,37 +57,59 @@ pub(super) enum Challenge {
     Unusable(&'static str),
 }
 
-/// Read the first challenge of the header the way oci-client does, through
-/// the same parser, and fail closed on anything odd.
-pub(super) fn parse_challenge(header: Option<&reqwest::header::HeaderValue>) -> Challenge {
-    let Some(header) = header else {
-        return Challenge::None;
-    };
-    let Ok(text) = header.to_str() else {
-        return Challenge::Unusable("the challenge is not text");
-    };
+/// All `WWW-Authenticate` headers as one challenge list. A header that is
+/// not text makes the registry unusable.
+fn challenge_from_headers(headers: &reqwest::header::HeaderMap) -> Challenge {
+    let mut texts = Vec::new();
+    for value in headers.get_all(reqwest::header::WWW_AUTHENTICATE) {
+        match value.to_str() {
+            Ok(text) => texts.push(text),
+            Err(_) => return Challenge::Unusable("the challenge is not text"),
+        }
+    }
+    if texts.is_empty() {
+        Challenge::None
+    } else {
+        parse_challenge(&texts.join(", "))
+    }
+}
+
+/// Read the first Bearer challenge with the parser oci-client uses, and fail
+/// closed on anything odd.
+fn parse_challenge(text: &str) -> Challenge {
+    let mut saw_basic = false;
     let mut seen_any = false;
     for parsed in ChallengeParser::new(text) {
         let Ok(challenge) = parsed else {
             return Challenge::Unusable("the challenge cannot be parsed");
         };
         seen_any = true;
+        if challenge.scheme.eq_ignore_ascii_case(BASIC_SCHEME) {
+            saw_basic = true;
+        }
         if !challenge.scheme.eq_ignore_ascii_case(BEARER_SCHEME) {
             continue;
         }
         let (mut realm, mut service) = (None, None);
         for (key, value) in &challenge.params {
-            if key.eq_ignore_ascii_case("realm") {
-                realm = Some(value.to_unescaped());
+            let slot = if key.eq_ignore_ascii_case("realm") {
+                &mut realm
             } else if key.eq_ignore_ascii_case("service") {
-                service = Some(value.to_unescaped());
+                &mut service
+            } else {
+                continue;
+            };
+            if slot.replace(value.to_unescaped()).is_some() {
+                return Challenge::Unusable("the challenge repeats a parameter");
             }
         }
         if let Some(realm) = realm {
             return Challenge::Bearer(BearerChallenge { realm, service });
         }
     }
-    if seen_any {
+    if saw_basic {
+        Challenge::Unusable("the registry asks for Basic authentication, which is not supported")
+    } else if seen_any {
         Challenge::Unusable("the registry does not use a token service")
     } else {
         Challenge::Unusable("the challenge is empty")
@@ -110,8 +139,9 @@ pub(super) fn acceptable_realm(realm: &str, registry: &str, registry_is_http: bo
 
 /// A client for the login requests. It never follows a redirect, so a login
 /// cannot be passed on to another host.
-fn login_client() -> Result<reqwest::Client, reqwest::Error> {
+fn login_client(timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
+        .timeout(timeout)
         .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
         .read_timeout(REGISTRY_READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -128,8 +158,9 @@ pub(super) async fn plan_login(
     registry_is_http: bool,
     repository: &str,
     credentials: &Credentials,
+    timeout: Duration,
 ) -> Result<LoginPlan, OciDistributionError> {
-    let client = login_client()?;
+    let client = login_client(timeout)?;
     let scheme = if registry_is_http {
         HTTP_SCHEME
     } else {
@@ -144,7 +175,17 @@ pub(super) async fn plan_login(
             "the registry redirects its /v2/ endpoint",
         ));
     }
-    let bearer = match parse_challenge(response.headers().get(reqwest::header::WWW_AUTHENTICATE)) {
+    let challenge = challenge_from_headers(response.headers());
+    let status = response.status();
+    // An answer that is neither success nor a challenge says nothing about
+    // whether a login is needed, so it is an error and nothing is cached.
+    if challenge == Challenge::None
+        && !status.is_success()
+        && status != reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Err(token_status_error(status));
+    }
+    let bearer = match challenge {
         Challenge::None => return Ok(LoginPlan::NoLoginNeeded),
         Challenge::Unusable(reason) => return Ok(LoginPlan::Refused(reason)),
         Challenge::Bearer(bearer) => bearer,
@@ -163,9 +204,7 @@ pub(super) async fn plan_login(
         .send()
         .await?;
     if response.status() != reqwest::StatusCode::OK {
-        return Err(OciDistributionError::AuthenticationFailure(
-            "the token service refused the login".to_string(),
-        ));
+        return Err(token_status_error(response.status()));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {
@@ -177,6 +216,22 @@ pub(super) async fn plan_login(
         body.extend_from_slice(&chunk);
     }
     parse_token_response(&body)
+}
+
+/// The error for a status a registry or token service answered with. 401 and
+/// 403 mean the credentials were refused. Anything else says nothing about
+/// them: 429 and 5xx are retried, and the rest fail the call.
+fn token_status_error(status: reqwest::StatusCode) -> OciDistributionError {
+    match status.as_u16() {
+        401 | 403 => OciDistributionError::AuthenticationFailure(
+            "the token service refused the login".to_string(),
+        ),
+        code => OciDistributionError::ServerError {
+            code,
+            url: String::new(),
+            message: "unexpected answer while logging in".to_string(),
+        },
+    }
 }
 
 fn parse_token_response(body: &[u8]) -> Result<LoginPlan, OciDistributionError> {
@@ -195,7 +250,7 @@ fn parse_token_response(body: &[u8]) -> Result<LoginPlan, OciDistributionError> 
         .get("expires_in")
         .and_then(serde_json::Value::as_u64)
         .map_or(DEFAULT_TOKEN_LIFETIME, Duration::from_secs)
-        .min(MAX_TOKEN_LIFETIME);
+        .clamp(MIN_TOKEN_LIFETIME, MAX_TOKEN_LIFETIME);
     Ok(LoginPlan::Token {
         token: token.to_string(),
         lifetime,
@@ -204,12 +259,28 @@ fn parse_token_response(body: &[u8]) -> Result<LoginPlan, OciDistributionError> 
 
 #[cfg(test)]
 mod tests {
-    use reqwest::header::HeaderValue;
+    use reqwest::header::{HeaderMap, HeaderValue, WWW_AUTHENTICATE};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
+    const TEST_LOGIN_TIMEOUT: Duration = Duration::from_millis(200);
+    const DRIP_INTERVAL: Duration = Duration::from_millis(20);
+    const DRIP_BYTES: usize = 250;
+
     fn challenge(text: &str) -> Challenge {
-        parse_challenge(Some(&HeaderValue::from_str(text).expect("header")))
+        parse_challenge(text)
+    }
+
+    fn headers(values: &[&str]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for value in values {
+            map.append(
+                WWW_AUTHENTICATE,
+                HeaderValue::from_str(value).expect("header"),
+            );
+        }
+        map
     }
 
     #[test]
@@ -236,7 +307,189 @@ mod tests {
         ));
         assert!(matches!(challenge(""), Challenge::Unusable(_)));
         assert!(matches!(challenge("Bearer"), Challenge::Unusable(_)));
-        assert_eq!(parse_challenge(None), Challenge::None);
+        assert_eq!(challenge_from_headers(&HeaderMap::new()), Challenge::None);
+    }
+
+    #[test]
+    fn given_a_basic_challenge_when_parsed_then_the_reason_names_basic() {
+        // Act
+        let parsed = challenge(r#"Basic realm="registry""#);
+
+        // Assert
+        assert!(
+            matches!(parsed, Challenge::Unusable(reason) if reason.contains("Basic")),
+            "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_repeated_realm_when_parsed_then_the_challenge_is_unusable() {
+        // Act
+        let parsed = challenge(r#"Bearer realm="https://a.example/t",realm="http://b.example/t""#);
+
+        // Assert
+        assert!(matches!(parsed, Challenge::Unusable(_)), "{parsed:?}");
+    }
+
+    #[test]
+    fn given_several_challenge_headers_when_read_then_the_first_bearer_one_is_used() {
+        // Act
+        let parsed = challenge_from_headers(&headers(&[
+            r#"Basic realm="registry""#,
+            r#"Bearer realm="https://auth.example/token",service="reg""#,
+        ]));
+
+        // Assert
+        assert!(
+            matches!(parsed, Challenge::Bearer(ref b) if b.realm == "https://auth.example/token"),
+            "{parsed:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_bad_bearer_header_before_a_good_one_when_read_then_the_bad_realm_is_judged() {
+        // Act
+        let parsed = challenge_from_headers(&headers(&[
+            r#"Bearer realm="http://other.example/token""#,
+            r#"Bearer realm="https://auth.example/token""#,
+        ]));
+
+        // Assert
+        assert!(
+            matches!(parsed, Challenge::Bearer(ref b) if b.realm == "http://other.example/token"),
+            "{parsed:?}"
+        );
+        assert!(
+            acceptable_realm("http://other.example/token", "registry.example", false).is_none()
+        );
+    }
+
+    #[test]
+    fn given_statuses_when_mapped_then_401_and_403_refuse_the_login_and_the_rest_do_not() {
+        // Assert
+        for code in [401, 403] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(matches!(
+                token_status_error(status),
+                OciDistributionError::AuthenticationFailure(_)
+            ));
+        }
+        for code in [429, 500, 503, 404] {
+            let status = reqwest::StatusCode::from_u16(code).expect("status");
+            assert!(matches!(
+                token_status_error(status),
+                OciDistributionError::ServerError { code: got, .. } if got == code
+            ));
+        }
+    }
+
+    #[test]
+    fn given_a_tiny_expires_in_when_parsed_then_the_lifetime_is_raised_to_the_floor() {
+        // Assert
+        assert!(matches!(
+            parse_token_response(br#"{"token":"t","expires_in":1}"#),
+            Ok(LoginPlan::Token { lifetime, .. }) if lifetime == MIN_TOKEN_LIFETIME
+        ));
+    }
+
+    /// A registry on loopback whose token service sends `body_bytes` of body,
+    /// one byte every `DRIP_INTERVAL` when `slowly`.
+    async fn registry_with_token_body(body_bytes: usize, slowly: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut request = [0u8; 1024];
+                    let read = stream.read(&mut request).await.unwrap_or(0);
+                    let line = String::from_utf8_lossy(&request[..read]).into_owned();
+                    let head = if line.starts_with("GET /v2/") {
+                        format!(
+                            "HTTP/1.1 401 X\r\nWWW-Authenticate: Bearer realm=\"http://{addr}/token\"\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 X\r\nContent-Length: {body_bytes}\r\n\
+                             Connection: close\r\n\r\n"
+                        )
+                    };
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    if line.starts_with("GET /v2/") {
+                        return;
+                    }
+                    for _ in 0..body_bytes {
+                        if stream.write_all(b" ").await.is_err() {
+                            return;
+                        }
+                        if slowly {
+                            tokio::time::sleep(DRIP_INTERVAL).await;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn credentials() -> Credentials {
+        Credentials {
+            username: "ada".to_string(),
+            password: "pw".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_a_token_body_over_the_cap_when_the_login_runs_then_it_fails() {
+        // Arrange
+        let addr = registry_with_token_body(MAX_TOKEN_RESPONSE_BYTES + 1024, false).await;
+
+        // Act
+        let outcome = plan_login(
+            &addr.to_string(),
+            true,
+            "team/app",
+            &credentials(),
+            LOGIN_REQUEST_TIMEOUT,
+        )
+        .await;
+
+        // Assert
+        assert!(
+            matches!(
+                outcome,
+                Err(OciDistributionError::RegistryTokenDecodeError(_))
+            ),
+            "{}",
+            outcome.is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_token_service_that_drips_when_the_login_runs_then_the_total_timeout_ends_it() {
+        // Arrange
+        let addr = registry_with_token_body(DRIP_BYTES, true).await;
+        let started = std::time::Instant::now();
+
+        // Act
+        let outcome = plan_login(
+            &addr.to_string(),
+            true,
+            "team/app",
+            &credentials(),
+            TEST_LOGIN_TIMEOUT,
+        )
+        .await;
+
+        // Assert
+        assert!(
+            matches!(&outcome, Err(OciDistributionError::RequestError(e)) if e.is_timeout()),
+            "{}",
+            outcome.is_ok()
+        );
+        assert!(started.elapsed() < DRIP_INTERVAL * DRIP_BYTES as u32);
     }
 
     #[test]
