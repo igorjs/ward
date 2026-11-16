@@ -27,6 +27,7 @@ jobs:
   # ── Formula rewrite script ───────────────────────────────────────────
   formula-script:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -45,6 +46,7 @@ jobs:
   # ── launchd plist + Homebrew formula on macOS ────────────────────────
   macos:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
@@ -107,6 +109,7 @@ jobs:
   # ── systemd unit on Linux ────────────────────────────────────────────
   linux:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:

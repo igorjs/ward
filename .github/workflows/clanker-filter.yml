@@ -44,6 +44,7 @@ jobs:
   # ambiguous. Keep this key unique across the workflow set.
   clanker-filter:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       pull-requests: write
     steps:
