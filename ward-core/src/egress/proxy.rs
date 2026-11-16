@@ -54,6 +54,17 @@ pub struct LogEntry {
 // Proxy
 // ---------------------------------------------------------------------------
 
+/// Reads the decision log of one proxy.
+#[derive(Debug, Clone)]
+pub struct LogReader(Arc<RwLock<VecDeque<LogEntry>>>);
+
+impl LogReader {
+    /// Return a snapshot of the egress log.
+    pub async fn entries(&self) -> Vec<LogEntry> {
+        self.0.read().await.iter().cloned().collect()
+    }
+}
+
 /// Per-sandbox TCP egress proxy.
 ///
 /// Intercepts outbound connections, checks them against the configured
@@ -121,7 +132,13 @@ impl EgressProxy {
 
     /// Return a snapshot of the egress log.
     pub async fn log_entries(&self) -> Vec<LogEntry> {
-        self.log.read().await.iter().cloned().collect()
+        self.log_reader().entries().await
+    }
+
+    /// A handle on the log that outlives a borrow of the proxy, so a caller
+    /// can read it after releasing the lock that guards the proxy.
+    pub fn log_reader(&self) -> LogReader {
+        LogReader(Arc::clone(&self.log))
     }
 
     /// Update the proxy policy at runtime (e.g. after a hot-patch).

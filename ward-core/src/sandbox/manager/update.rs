@@ -184,20 +184,25 @@ impl SandboxManager {
         limits: &LimitsUpdate,
         restart: Option<RestartPolicy>,
     ) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        let mut next = entry.meta.clone();
-        next.options.resources = next.options.resources.updated(limits);
-        next.options.spec.guest.cgroup = next.options.spec.guest.cgroup.updated(&limits.cgroup);
-        if let Some(restart) = restart {
-            next.options.spec.restart = restart;
-        }
-        self.persist(next.clone()).await?;
-        entry.meta = next;
-        self.events
-            .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
-        Ok(())
+        self.teardown()
+            .commit_with(
+                id,
+                |entry| {
+                    let mut next = entry.meta.clone();
+                    next.options.resources = next.options.resources.updated(limits);
+                    next.options.spec.guest.cgroup =
+                        next.options.spec.guest.cgroup.updated(&limits.cgroup);
+                    if let Some(restart) = restart {
+                        next.options.spec.restart = restart;
+                    }
+                    Ok(Some(next))
+                },
+                |entry| {
+                    self.events
+                        .emit(SandboxEvent::new(EventAction::Update, &entry.meta));
+                },
+            )
+            .await
+            .map(|_| ())
     }
 }
