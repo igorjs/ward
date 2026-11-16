@@ -19,10 +19,60 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use assert_cmd::cargo::CommandCargoExt;
 use tempfile::TempDir;
 
 const DAEMON_START_DEADLINE: Duration = Duration::from_secs(30);
+
+const BUILD_HINT: &str = "run `cargo build --workspace` before `cargo test`";
+
+/// Path to the `wardd` binary. Cargo bakes it in at compile time for the
+/// package that owns the binary, so it does not depend on where cargo
+/// places test executables.
+#[allow(dead_code)]
+pub fn wardd_path() -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_BIN_EXE_wardd"));
+    assert!(
+        path.is_file(),
+        "wardd not found at {}: {BUILD_HINT}",
+        path.display()
+    );
+    path
+}
+
+/// Path to the `ward` binary. It belongs to another package, so cargo does
+/// not export it here; it is built into the same directory as `wardd`.
+#[allow(dead_code)]
+pub fn ward_path() -> PathBuf {
+    let path = std::env::var_os("CARGO_BIN_EXE_ward")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            wardd_path().with_file_name(format!("ward{}", std::env::consts::EXE_SUFFIX))
+        });
+    assert!(
+        path.is_file(),
+        "ward not found at {}: {BUILD_HINT}",
+        path.display()
+    );
+    path
+}
+
+/// A `std` command for the `wardd` binary.
+#[allow(dead_code)]
+pub fn wardd_command() -> Command {
+    Command::new(wardd_path())
+}
+
+/// A `std` command for the `ward` CLI.
+#[allow(dead_code)]
+pub fn ward_command() -> Command {
+    Command::new(ward_path())
+}
+
+/// An `assert_cmd` command for the `ward` CLI.
+#[allow(dead_code)]
+pub fn ward_assert_command() -> assert_cmd::Command {
+    assert_cmd::Command::new(ward_path())
+}
 
 /// RAII guard around a running `wardd` subprocess. SIGKILLs the daemon on
 /// drop so failed tests do not leak zombies.
@@ -80,9 +130,8 @@ impl Daemon {
         let log = data_dir.path().join("wardd.log");
         let daemon_log = std::fs::File::create(&log).expect("create daemon log");
 
-        // Use assert_cmd to resolve the workspace's built wardd binary.
-        // This works regardless of debug/release profile.
-        let mut cmd = Command::cargo_bin("wardd").expect("locate wardd binary");
+        // The built wardd binary, whatever the debug/release profile.
+        let mut cmd = wardd_command();
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", data_dir.path())
             .env("WARD_LOG_LEVEL", "info")
@@ -124,7 +173,7 @@ impl Daemon {
     /// daemon. Tests add their own subcommand and arguments.
     #[allow(dead_code)]
     pub fn cli(&self) -> Command {
-        let mut cmd = Command::cargo_bin("ward").expect("locate ward binary");
+        let mut cmd = ward_command();
         cmd.env("WARD_SOCKET", &self.socket);
         cmd
     }
@@ -238,7 +287,7 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         let socket = dir.path().join("ward.sock");
         let prime_log_path = dir.path().join("wardd.log");
         let prime_log = std::fs::File::create(&prime_log_path).expect("create log");
-        let mut cmd = Command::cargo_bin("wardd").expect("locate wardd");
+        let mut cmd = wardd_command();
         cmd.env("WARD_SOCKET", &socket)
             .env("WARD_DATA_DIR", dir.path())
             .env("WARD_RUNTIME_DIR", shared_runtime_dir())
@@ -252,8 +301,7 @@ fn seed_image_cache(data_dir: &std::path::Path) {
         {
             std::thread::sleep(Duration::from_millis(20));
         }
-        let out = Command::cargo_bin("ward")
-            .expect("locate ward")
+        let out = ward_command()
             .env("WARD_SOCKET", &socket)
             .args(["create", &image])
             .output()
