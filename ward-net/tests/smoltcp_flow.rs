@@ -1010,7 +1010,7 @@ async fn given_idle_established_flow_when_idle_timeout_passes_then_guest_is_rese
 async fn given_flow_with_traffic_when_idle_timeout_is_short_then_activity_keeps_it_alive() {
     // Arrange
     let mut flow = establish_flow().await;
-    let idle = Duration::from_millis(400);
+    let idle = Duration::from_secs(1);
     flow.stack.set_idle_timeout_for_test(idle);
 
     // Act: host bytes arrive more often than the idle timeout, for longer
@@ -1034,4 +1034,99 @@ async fn given_flow_with_traffic_when_idle_timeout_is_short_then_activity_keeps_
         1,
         "activity resets the timer"
     );
+}
+
+/// Bytes the host sends in the stalled and slow-drain tests: more than the
+/// stack's per-flow send buffer, so the flow cannot finish by itself.
+const BULK_HOST_BYTES: usize = 64 * 1024;
+
+/// Reads every frame waiting for the guest and returns the sequence number
+/// just past the highest data byte seen, if any data arrived.
+fn drain_frames_for_end_seq(guest_fd: &OwnedFd) -> Option<TcpSeqNumber> {
+    let mut end = None;
+    while let Some(frame) = try_read_frame(guest_fd) {
+        let segment = parse_tcp_segment(&frame);
+        if !segment.payload.is_empty() {
+            end = Some(segment.seq_number + segment.payload.len());
+        }
+    }
+    end
+}
+
+#[tokio::test]
+async fn given_guest_never_drains_when_idle_timeout_passes_then_flow_is_reset_with_bytes_queued() {
+    // Arrange: the host has more bytes queued than the guest ever takes.
+    let mut flow = establish_flow().await;
+    flow.stack
+        .set_idle_timeout_for_test(Duration::from_millis(300));
+    tokio::io::AsyncWriteExt::write_all(&mut flow.host_stream, &vec![7u8; BULK_HOST_BYTES])
+        .await
+        .expect("host write");
+
+    // Act / Assert: the guest sends no ACK, so no progress is made.
+    let rst = poll_until_rst(&mut flow.stack, &flow.guest_fd, Duration::from_secs(5)).await;
+    assert!(rst.is_some(), "a flow with no progress must be reset");
+}
+
+#[tokio::test]
+async fn given_guest_drains_slowly_when_idle_timeout_is_longer_than_each_step_then_flow_survives() {
+    // Arrange
+    let mut flow = establish_flow().await;
+    let idle = Duration::from_secs(1);
+    flow.stack.set_idle_timeout_for_test(idle);
+    tokio::io::AsyncWriteExt::write_all(&mut flow.host_stream, &vec![7u8; BULK_HOST_BYTES])
+        .await
+        .expect("host write");
+
+    // Act: the guest acknowledges what it has received about every 100 ms,
+    // for longer than the idle timeout in total.
+    let start = std::time::Instant::now();
+    let mut saw_rst = false;
+    while start.elapsed() < idle * 2 {
+        flow.stack.poll();
+        if let Some(end) = drain_frames_for_end_seq(&flow.guest_fd) {
+            write_frame(
+                &flow.guest_fd,
+                &build_tcp_ack_frame(flow.guest_seq, end, &[]),
+            );
+        }
+        while let Some(frame) = try_read_frame(&flow.guest_fd) {
+            saw_rst |= parse_tcp_segment(&frame).control == TcpControl::Rst;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Assert
+    assert!(!saw_rst, "a draining guest must not be reset");
+    assert_eq!(flow.stack.flow_count_for_test(), 1);
+}
+
+#[tokio::test]
+async fn given_host_reset_while_guest_uploads_when_polled_then_guest_gets_rst_not_fin() {
+    // Arrange: the host aborts the connection while the guest is sending.
+    let mut flow = establish_flow().await;
+    set_zero_linger(&flow.host_stream);
+    drop(flow.host_stream);
+    write_frame(
+        &flow.guest_fd,
+        &build_tcp_ack_frame(flow.guest_seq, flow.server_seq, b"upload"),
+    );
+
+    // Act
+    let mut saw_fin = false;
+    let mut saw_rst = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !saw_rst {
+        flow.stack.poll();
+        while let Some(frame) = try_read_frame(&flow.guest_fd) {
+            let control = parse_tcp_segment(&frame).control;
+            saw_fin |= control == TcpControl::Fin;
+            saw_rst |= control == TcpControl::Rst;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Assert
+    assert!(saw_rst, "a cut upload must reset the guest");
+    assert!(!saw_fin);
 }

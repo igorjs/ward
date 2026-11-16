@@ -579,6 +579,8 @@ async fn given_outstanding_query_table_at_capacity_when_new_query_then_oldest_ev
 /// Octets of Ethernet (14), IPv4 without options (20) and UDP (8) headers
 /// ahead of the DNS message in a relayed response.
 const DNS_MESSAGE_OFFSET: usize = 42;
+/// Low four bits of the DNS flags word.
+const DNS_RCODE_MASK: u16 = 0x000f;
 const DNS_RCODE_NOERROR: u16 = 0;
 const DNS_RCODE_REFUSED: u16 = 5;
 const DNS_TYPE_MX: u16 = 15;
@@ -587,7 +589,7 @@ const DNS_TYPE_MX: u16 = 15;
 fn dns_rcode_and_answer_count(frame: &[u8]) -> (u16, u16) {
     let dns = &frame[DNS_MESSAGE_OFFSET..];
     let flags = u16::from_be_bytes([dns[2], dns[3]]);
-    (flags & 0x000f, u16::from_be_bytes([dns[6], dns[7]]))
+    (flags & DNS_RCODE_MASK, u16::from_be_bytes([dns[6], dns[7]]))
 }
 
 /// Resolver that counts its calls and always has an answer.
@@ -603,10 +605,33 @@ impl Resolver for CountingResolver {
     }
 }
 
+/// DNS class CH (chaos), a class the relay does not resolve.
+const DNS_CLASS_CH: u16 = 3;
+
+/// Sets the QCLASS of a query frame built by `build_dns_query_frame_of_type`
+/// and refreshes the UDP checksum.
+fn set_query_class(frame: &mut [u8], class: u16) {
+    let len = frame.len();
+    frame[len - 2..].copy_from_slice(&class.to_be_bytes());
+    let mut eth = EthernetFrame::new_unchecked(&mut frame[..]);
+    let mut ip = Ipv4Packet::new_unchecked(eth.payload_mut());
+    let mut udp = UdpPacket::new_unchecked(ip.payload_mut());
+    udp.fill_checksum(&IpAddress::Ipv4(GUEST_ADDR), &IpAddress::Ipv4(GATEWAY_ADDR));
+}
+
 /// Sends a query of `query_type` for `CANNED_DOMAIN` through a stack whose
 /// egress check allows the name only if `allow` is true, and returns the
 /// response's (RCODE, answer count) and how often the resolver ran.
 async fn relay_typed_query(query_type: DnsQueryType, allow: bool) -> ((u16, u16), usize) {
+    relay_query_frame(
+        build_dns_query_frame_of_type(CANNED_DOMAIN, query_type),
+        allow,
+    )
+    .await
+}
+
+/// Same as `relay_typed_query`, for a prebuilt query frame.
+async fn relay_query_frame(query: Vec<u8>, allow: bool) -> ((u16, u16), usize) {
     let (guest_fd, host_fd) = socketpair_dgram();
     let calls = Arc::new(AtomicUsize::new(0));
     let resolver: Box<dyn Resolver> = Box::new(CountingResolver {
@@ -618,10 +643,7 @@ async fn relay_typed_query(query_type: DnsQueryType, allow: bool) -> ((u16, u16)
     };
     let mut stack = Stack::new(host_fd, resolver, connector, Box::new(egress));
     perform_arp_handshake(&mut stack, &guest_fd).await;
-    write_frame(
-        &guest_fd,
-        &build_dns_query_frame_of_type(CANNED_DOMAIN, query_type),
-    );
+    write_frame(&guest_fd, &query);
     let response = poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
         .await
         .expect("stack should answer the query");
@@ -660,5 +682,16 @@ async fn given_denied_name_and_non_a_query_when_relayed_then_refused_as_for_type
     let (header, lookups) = relay_typed_query(DnsQueryType::Aaaa, false).await;
 
     assert_eq!(header, (DNS_RCODE_REFUSED, 0));
+    assert_eq!(lookups, 0);
+}
+
+#[tokio::test]
+async fn given_class_ch_query_when_relayed_then_noerror_with_no_answers_and_no_host_lookup() {
+    let mut query = build_dns_query_frame_of_type(CANNED_DOMAIN, DnsQueryType::A);
+    set_query_class(&mut query, DNS_CLASS_CH);
+
+    let (header, lookups) = relay_query_frame(query, true).await;
+
+    assert_eq!(header, (DNS_RCODE_NOERROR, 0));
     assert_eq!(lookups, 0);
 }
