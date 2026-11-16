@@ -116,7 +116,7 @@ On a running sandbox the limits apply at once, inside the VM: the guest agent wr
 
 ## Wait
 
-`ward wait --condition` takes `not-running` (the default), `next-exit` and `removed`, as Docker does. `next-exit` on a sandbox that is not running waits for it to be started and to exit. `removed` prints the last exit code of the main process, or 0 when it never ran a command. Ward polls the state ten times a second, so a start and exit that both happen between two polls still count as the next exit but the wait may notice them late. `next-exit` and `removed` on a sandbox that does not exist fail at once, as `not-running` does.
+`ward wait --condition` takes `not-running` (the default), `next-exit` and `removed`, as Docker does. `next-exit` on a sandbox that is not running waits for it to be started and to exit. `removed` prints the last exit code of the main process, or 0 when it never ran a command. Ward counts the runs of each sandbox, so a start and exit that both happen before the wait looks again still count as the next exit. `next-exit` and `removed` on a sandbox that does not exist fail at once, as `not-running` does.
 
 
 ## Pause

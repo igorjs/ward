@@ -115,6 +115,10 @@ struct SandboxEntry {
     listeners: Vec<PortListener>,
     /// The checks of the current run, once the sandbox has a health check.
     health: Option<health::Tracker>,
+    /// How many times the sandbox has been marked running. A `next-exit`
+    /// wait compares it to the value it saw, so a run that starts and ends
+    /// between two looks is still counted.
+    runs_started: u64,
 }
 
 /// What leaves the `entries` map when a sandbox is removed.
@@ -709,6 +713,7 @@ struct Teardown {
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
     update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
+    run_changes: Arc<watch::Sender<()>>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
     exited_ttl: Option<std::time::Duration>,
     /// Where a main process that may need starting again is reported.
@@ -932,6 +937,9 @@ pub struct SandboxManager {
     /// One lock per sandbox, held while its limits change.
     update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
+    /// Ticks when any sandbox starts running or is removed, so waits do not
+    /// have to poll for it.
+    run_changes: Arc<watch::Sender<()>>,
     forwarder: Arc<dyn PortForwarder>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
     exited_ttl: Option<std::time::Duration>,
@@ -971,6 +979,7 @@ impl SandboxManager {
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
             update_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             events: EventLog::default(),
+            run_changes: Arc::new(watch::channel(()).0),
             exited_ttl: None,
             default_limits: crate::config::DefaultLimits::default(),
             restart_tx,
@@ -1007,6 +1016,7 @@ impl SandboxManager {
             processes: Arc::clone(&self.processes),
             update_locks: Arc::clone(&self.update_locks),
             events: self.events.clone(),
+            run_changes: Arc::clone(&self.run_changes),
             exited_ttl: self.exited_ttl,
             restarts: self.restart_tx.clone(),
             volumes: self.volumes.clone(),
@@ -1461,6 +1471,7 @@ impl SandboxManager {
             meta,
             listeners: Vec::new(),
             health: None,
+            runs_started: 0,
         };
         rearm_exited_ttl(&self.teardown(), &mut entry, ended_at);
         self.entries.write().await.insert(id.clone(), entry);
@@ -1827,6 +1838,7 @@ impl SandboxManager {
                 meta,
                 listeners,
                 health: None,
+                runs_started: 0,
             },
         );
 
@@ -3123,6 +3135,8 @@ impl SandboxManager {
         let exit_code = entry.meta.exit_code;
         self.commit(entry, crate::protocol::SandboxStatus::Running, exit_code)
             .await?;
+        entry.runs_started += 1;
+        self.run_changes.send_replace(());
         self.broker.register_sandbox(id.to_string(), comms).await;
         Ok(())
     }
@@ -3252,6 +3266,7 @@ impl SandboxManager {
             .await
             .retain(|_, rec| rec.sandbox_id != id);
         teardown.mains.write().await.remove(id);
+        teardown.run_changes.send_replace(());
         teardown.broker.deregister_sandbox(id).await;
 
         // The host ports must be free before the sandbox counts as gone, so
