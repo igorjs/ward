@@ -43,6 +43,7 @@ use crate::pb::PullPolicy;
 use crate::sync::LockUnpoisoned;
 
 mod archive;
+mod login;
 mod manage;
 
 pub use archive::{ImportSpec, LoadedImage, SavedArchive};
@@ -400,7 +401,8 @@ impl PullSession {
 pub struct OciPuller {
     /// `host:port` registries reached over plain HTTP, for local test registries.
     http_registries: Vec<String>,
-    /// One client per registry, so tokens and connections outlive a call.
+    /// One client per registry and repository, so connections and tokens
+    /// outlive a call.
     clients: Mutex<HashMap<String, CachedClient>>,
 }
 
@@ -408,21 +410,48 @@ pub struct OciPuller {
 const REGISTRY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// How long a registry may stay silent mid-response before the call fails.
 const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A token with less than this left is replaced before a request uses it.
+const TOKEN_REFRESH_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A registry client and the login it was built for.
+/// SHA-256 of a stored login, to tell whether it changed without keeping it.
+type LoginFingerprint = [u8; 32];
+
+fn login_fingerprint(login: &crate::registry_auth::Credentials) -> LoginFingerprint {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(login.username.as_bytes());
+    hash.update([0]);
+    hash.update(login.password.as_bytes());
+    hash.finalize().into()
+}
+
+/// A registry client with what it presents to the registry: a bearer token
+/// or nothing. The password is never kept here, and oci-client never sees it.
 struct CachedClient {
-    /// `None` for an anonymous client.
-    credentials: Option<crate::registry_auth::Credentials>,
+    /// The stored login the token was issued for, `None` when anonymous.
+    login: Option<LoginFingerprint>,
     client: oci_client::Client,
     auth: oci_client::secrets::RegistryAuth,
+    /// When the token ends, `None` for an anonymous client.
+    expires: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for CachedClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedClient")
-            .field("credentials", &self.credentials)
+            .field("has_login", &self.login.is_some())
+            .field("expires", &self.expires)
             .finish_non_exhaustive()
     }
+}
+
+/// The client for one call, with the reference it was made for.
+#[derive(Clone)]
+struct ClientSession {
+    client: oci_client::Client,
+    image_ref: oci_client::Reference,
+    auth: oci_client::secrets::RegistryAuth,
+    has_login: bool,
 }
 
 impl OciPuller {
@@ -443,130 +472,136 @@ impl OciPuller {
     }
 
     fn new_client(&self) -> oci_client::Client {
-        oci_client::Client::new(oci_client::client::ClientConfig {
+        oci_client::Client::new(self.client_config())
+    }
+
+    fn client_config(&self) -> oci_client::client::ClientConfig {
+        oci_client::client::ClientConfig {
             platform_resolver: Some(Box::new(linux_host_arch_resolver)),
             protocol: oci_client::client::ClientProtocol::HttpsExcept(self.http_registries.clone()),
             connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
             read_timeout: Some(REGISTRY_READ_TIMEOUT),
             ..Default::default()
-        })
+        }
     }
 
     fn is_http_registry(&self, registry: &str) -> bool {
         self.http_registries.iter().any(|r| r == registry)
     }
 
-    /// Parse `reference`, enforce the registry allowlist and return the
-    /// client for its registry with the login to present.
+    /// The client for `reference`. The stored login is read on every call.
     ///
-    /// The login is read on every call. The client is reused only while the
-    /// login is unchanged, because oci-client keeps the first login it sees
-    /// for a registry, and the tokens made from it.
-    async fn client_for(
-        &self,
-        reference: &str,
-    ) -> Result<(
-        oci_client::Client,
-        oci_client::Reference,
-        oci_client::secrets::RegistryAuth,
-    )> {
+    /// A login is never handed to oci-client: Ward gets a token from the
+    /// registry's token service and gives oci-client only that. The client is
+    /// reused while the login is unchanged and the token has time left.
+    /// oci-client keeps the first auth it sees per registry and its tokens
+    /// are keyed by repository, so a new token means a new client.
+    async fn session(&self, reference: &str, refresh: bool) -> Result<ClientSession> {
         let image_ref = self.parse_reference(reference)?;
         let registry = image_ref.resolve_registry().to_string();
-        let credentials = crate::registry_auth::lookup(image_ref.registry());
-        if let Some((client, auth)) = self.cached_client(&registry, &credentials) {
-            return Ok((client, image_ref, auth));
+        let key = format!("{registry}/{}", image_ref.repository());
+        let login = crate::registry_auth::lookup(image_ref.registry());
+        let fingerprint = login.as_ref().map(login_fingerprint);
+        if !refresh && let Some(cached) = self.cached_session(&key, fingerprint, &image_ref) {
+            return Ok(cached);
         }
-        let auth = match &credentials {
-            Some(found) if self.login_may_be_sent(reference, &registry).await? => {
-                oci_client::secrets::RegistryAuth::Basic(
-                    found.username.clone(),
-                    found.password.clone(),
-                )
+        let (auth, expires) = match &login {
+            Some(login) => {
+                self.token_for(reference, &registry, image_ref.repository(), login)
+                    .await?
             }
-            Some(_) => {
-                tracing::warn!(
-                    registry,
-                    "token service is not https, pulling without the stored login"
-                );
-                oci_client::secrets::RegistryAuth::Anonymous
-            }
-            None => oci_client::secrets::RegistryAuth::Anonymous,
+            None => (oci_client::secrets::RegistryAuth::Anonymous, None),
         };
         let client = self.new_client();
-        self.remember_client(registry, credentials, &client, &auth);
-        Ok((client, image_ref, auth))
-    }
-
-    /// The client kept for `registry`, if it was built for `credentials`.
-    fn cached_client(
-        &self,
-        registry: &str,
-        credentials: &Option<crate::registry_auth::Credentials>,
-    ) -> Option<(oci_client::Client, oci_client::secrets::RegistryAuth)> {
-        let clients = self.clients.lock_unpoisoned();
-        let cached = clients.get(registry)?;
-        (&cached.credentials == credentials).then(|| (cached.client.clone(), cached.auth.clone()))
-    }
-
-    fn remember_client(
-        &self,
-        registry: String,
-        credentials: Option<crate::registry_auth::Credentials>,
-        client: &oci_client::Client,
-        auth: &oci_client::secrets::RegistryAuth,
-    ) {
         self.clients.lock_unpoisoned().insert(
-            registry,
+            key,
             CachedClient {
-                credentials,
+                login: fingerprint,
                 client: client.clone(),
                 auth: auth.clone(),
+                expires,
             },
         );
+        Ok(ClientSession {
+            client,
+            image_ref,
+            auth,
+            has_login: login.is_some(),
+        })
     }
 
-    /// Whether `registry` may be sent a login. oci-client follows the realm
-    /// of the registry's `WWW-Authenticate` header and sends the login there
-    /// without checking its scheme.
-    async fn login_may_be_sent(&self, reference: &str, registry: &str) -> Result<bool> {
+    /// The kept client for `key`, unless the login changed or its token is
+    /// about to end.
+    fn cached_session(
+        &self,
+        key: &str,
+        fingerprint: Option<LoginFingerprint>,
+        image_ref: &oci_client::Reference,
+    ) -> Option<ClientSession> {
+        let clients = self.clients.lock_unpoisoned();
+        let cached = clients.get(key)?;
+        let fresh = cached
+            .expires
+            .is_none_or(|end| end > std::time::Instant::now() + TOKEN_REFRESH_MARGIN);
+        (cached.login == fingerprint && fresh).then(|| ClientSession {
+            client: cached.client.clone(),
+            image_ref: image_ref.clone(),
+            auth: cached.auth.clone(),
+            has_login: fingerprint.is_some(),
+        })
+    }
+
+    /// A bearer token for the login, or anonymous access when the login must
+    /// not be used.
+    async fn token_for(
+        &self,
+        reference: &str,
+        registry: &str,
+        repository: &str,
+        login: &crate::registry_auth::Credentials,
+    ) -> Result<(
+        oci_client::secrets::RegistryAuth,
+        Option<std::time::Instant>,
+    )> {
         let http = self.is_http_registry(registry);
-        let challenge = with_retry(reference, || fetch_challenge(registry, http)).await?;
-        Ok(challenge_allows_login(challenge.as_deref(), http))
-    }
-}
-
-/// The `WWW-Authenticate` header a registry answers an unauthenticated
-/// `/v2/` request with.
-async fn fetch_challenge(
-    registry: &str,
-    http: bool,
-) -> std::result::Result<Option<String>, OciDistributionError> {
-    let scheme = if http { "http" } else { "https" };
-    let response = reqwest::Client::builder()
-        .connect_timeout(REGISTRY_CONNECT_TIMEOUT)
-        .read_timeout(REGISTRY_READ_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .get(format!("{scheme}://{registry}/v2/"))
-        .send()
+        let plan = with_retry(reference, || {
+            login::plan_login(registry, http, repository, login)
+        })
         .await?;
-    Ok(response
-        .headers()
-        .get(reqwest::header::WWW_AUTHENTICATE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned))
-}
+        Ok(match plan {
+            login::LoginPlan::Token { token, lifetime } => (
+                oci_client::secrets::RegistryAuth::Bearer(token),
+                Some(std::time::Instant::now() + lifetime),
+            ),
+            login::LoginPlan::NoLoginNeeded => (oci_client::secrets::RegistryAuth::Anonymous, None),
+            login::LoginPlan::Refused(reason) => {
+                tracing::warn!(registry, reason, "pulling without the stored login");
+                (oci_client::secrets::RegistryAuth::Anonymous, None)
+            }
+        })
+    }
 
-/// Whether a login may follow the challenge. A token service on plain HTTP
-/// would receive the password in clear text, so it is refused unless the
-/// registry itself is a plain-HTTP one the operator configured.
-fn challenge_allows_login(challenge: Option<&str>, registry_is_http: bool) -> bool {
-    let Some(challenge) = challenge else {
-        return true;
-    };
-    // Any plain-HTTP URL in the header is refused, so a parser difference
-    // with oci-client cannot hide the realm.
-    registry_is_http || !challenge.to_ascii_lowercase().contains("http:")
+    /// Run `request` with the client for `reference`, retrying transient
+    /// failures. When a token the registry stopped accepting causes a 401,
+    /// the token is replaced once and the request runs again.
+    async fn with_session<T, F, Fut>(&self, reference: &str, request: F) -> Result<T>
+    where
+        F: Fn(ClientSession) -> Fut,
+        Fut: std::future::Future<
+                Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
+            >,
+    {
+        let mut refresh = false;
+        loop {
+            let session = self.session(reference, refresh).await?;
+            let has_login = session.has_login;
+            match retry_raw(reference, || request(session.clone())).await {
+                Ok(value) => return Ok(value),
+                Err(e) if has_login && !refresh && is_access_denied(&e) => refresh = true,
+                Err(e) => return Err(pull_error(reference, e)),
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -602,17 +637,19 @@ impl ImagePuller for OciPuller {
 
         use oci_client::manifest;
 
-        let (client, image_ref, auth) = self.client_for(reference).await?;
         let accepted = [
             manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
             manifest::IMAGE_LAYER_MEDIA_TYPE,
         ];
 
-        let (image_manifest, digest, config_blob) = with_retry(reference, || {
-            client.pull_manifest_and_config(&image_ref, &auth)
-        })
-        .await?;
+        let (image_manifest, digest, config_blob) = self
+            .with_session(reference, |s| async move {
+                s.client
+                    .pull_manifest_and_config(&s.image_ref, &s.auth)
+                    .await
+            })
+            .await?;
         let layer_sizes: Vec<u64> = image_manifest
             .layers
             .iter()
@@ -642,9 +679,12 @@ impl ImagePuller for OciPuller {
             let id = layer_id(&layer.digest);
             session.report(&id, "Pulling fs layer");
             let blob = dest.with_file_name(format!("{id}.blob"));
-            with_retry(reference, || async {
-                let stream = client.pull_blob_stream(&image_ref, layer).await?;
-                Ok(spool(stream, &blob, u64::try_from(layer.size).unwrap_or(0)).await?)
+            self.with_session(reference, |s| {
+                let blob = &blob;
+                async move {
+                    let stream = s.client.pull_blob_stream(&s.image_ref, layer).await?;
+                    Ok(spool(stream, blob, u64::try_from(layer.size).unwrap_or(0)).await?)
+                }
             })
             .await?;
             session.report(&id, "Download complete");
@@ -675,29 +715,23 @@ impl ImagePuller for OciPuller {
         }
         let probe = format!("{registry}/{LOGIN_PROBE_REPOSITORY}");
         let image_ref = self.parse_reference(&probe)?;
-        // Credentials being tested are never stored, so this client is not shared.
-        if !self
-            .login_may_be_sent(&probe, image_ref.resolve_registry())
-            .await?
+        let resolved = image_ref.resolve_registry();
+        let http = self.is_http_registry(resolved);
+        // The login being tested is not stored yet, so nothing is cached.
+        match retry_raw(&probe, || {
+            login::plan_login(resolved, http, image_ref.repository(), credentials)
+        })
+        .await
         {
-            return Err(BackendError::Image(format!(
-                "login to {registry} refused: the registry's token service is not https"
-            )));
+            Ok(login::LoginPlan::Token { .. } | login::LoginPlan::NoLoginNeeded) => Ok(()),
+            Ok(login::LoginPlan::Refused(reason)) => Err(BackendError::Image(format!(
+                "login to {registry} refused: {reason}"
+            ))),
+            Err(e) if is_access_denied(&e) => Err(BackendError::Image(format!(
+                "login to {registry} failed: the registry did not accept the credentials"
+            ))),
+            Err(e) => Err(pull_error(&probe, e)),
         }
-        let client = self.new_client();
-        let auth = oci_client::secrets::RegistryAuth::Basic(
-            credentials.username.clone(),
-            credentials.password.clone(),
-        );
-        client
-            .auth(&image_ref, &auth, oci_client::RegistryOperation::Pull)
-            .await
-            .map(|_| ())
-            .map_err(|_| {
-                BackendError::Image(format!(
-                    "login to {registry} failed: the registry did not accept the credentials"
-                ))
-            })
     }
 
     async fn resolve_digest(&self, reference: &str) -> Result<Option<String>> {
@@ -707,9 +741,11 @@ impl ImagePuller for OciPuller {
         }
 
         use oci_client::manifest::OciManifest;
-        let (client, image_ref, auth) = self.client_for(reference).await?;
-        let (manifest, digest) =
-            with_retry(reference, || client.pull_manifest(&image_ref, &auth)).await?;
+        let (manifest, digest) = self
+            .with_session(reference, |s| async move {
+                s.client.pull_manifest(&s.image_ref, &s.auth).await
+            })
+            .await?;
         // An index points at one manifest per platform: the pull stores the
         // one for this host, so that is the digest to compare.
         Ok(match manifest {
@@ -829,17 +865,30 @@ const LOGIN_PROBE_REPOSITORY: &str = "ward/login-check:latest";
 const PULL_ATTEMPTS: u32 = 3;
 const PULL_RETRY_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn with_retry<T, F, Fut>(reference: &str, mut attempt_once: F) -> Result<T>
+async fn with_retry<T, F, Fut>(reference: &str, attempt_once: F) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<
             Output = std::result::Result<T, oci_client::errors::OciDistributionError>,
         >,
 {
+    retry_raw(reference, attempt_once)
+        .await
+        .map_err(|e| pull_error(reference, e))
+}
+
+/// `with_retry` that leaves the last error unmapped.
+async fn retry_raw<T, F, Fut>(
+    reference: &str,
+    mut attempt_once: F,
+) -> std::result::Result<T, OciDistributionError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, OciDistributionError>>,
+{
     let mut attempt = 1;
     loop {
         match attempt_once().await {
-            Ok(value) => return Ok(value),
             Err(e) if attempt < PULL_ATTEMPTS && is_unreachable(&e) => {
                 let delay = PULL_RETRY_BASE_DELAY * attempt;
                 tracing::warn!(
@@ -850,7 +899,7 @@ where
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
-            Err(e) => return Err(pull_error(reference, e)),
+            done => return done,
         }
     }
 }
@@ -949,10 +998,7 @@ fn transport_failure(
     connect_failed: bool,
     error: &(dyn std::error::Error + 'static),
 ) -> RegistryFailure {
-    use std::io::ErrorKind::{
-        AddrNotAvailable, BrokenPipe, ConnectionAborted, ConnectionRefused, ConnectionReset,
-        HostUnreachable, NetworkUnreachable, NotConnected, PermissionDenied, TimedOut,
-    };
+    use std::io::ErrorKind::{ConnectionRefused, TimedOut};
     if timed_out {
         return RegistryFailure::TimedOut;
     }
@@ -965,18 +1011,73 @@ fn transport_failure(
             return match io.kind() {
                 ConnectionRefused => RegistryFailure::Refused,
                 TimedOut => RegistryFailure::TimedOut,
-                NetworkUnreachable | HostUnreachable | ConnectionReset | ConnectionAborted
-                | NotConnected | AddrNotAvailable | PermissionDenied | BrokenPipe => {
-                    RegistryFailure::Other
-                }
-                // The resolver reports its failure as an io error whose kind
-                // is not public (`Uncategorized`), so it is what is left.
-                _ => RegistryFailure::Dns,
+                _ if is_resolver_error(io) => RegistryFailure::Dns,
+                _ => RegistryFailure::Other,
             };
         }
         source = current.source();
     }
     RegistryFailure::Other
+}
+
+/// Whether an io error is a failed name lookup. Neither std nor hyper-util
+/// names a resolver error, so it is told apart by what it lacks: the OS gave
+/// no error code (every socket failure has one) and the kind is none of the
+/// public ones, which is what an `Uncategorized` lookup failure is. A failed
+/// TLS handshake carries a public kind such as `UnexpectedEof` or `InvalidData`.
+fn is_resolver_error(io: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        AddrInUse, AddrNotAvailable, AlreadyExists, ArgumentListTooLong, BrokenPipe,
+        ConnectionAborted, ConnectionRefused, ConnectionReset, CrossesDevices, Deadlock,
+        DirectoryNotEmpty, ExecutableFileBusy, FileTooLarge, HostUnreachable, Interrupted,
+        InvalidData, InvalidFilename, InvalidInput, IsADirectory, NetworkDown, NetworkUnreachable,
+        NotADirectory, NotConnected, NotFound, NotSeekable, Other, OutOfMemory, PermissionDenied,
+        QuotaExceeded, ReadOnlyFilesystem, ResourceBusy, StaleNetworkFileHandle, StorageFull,
+        TimedOut, TooManyLinks, UnexpectedEof, Unsupported, WouldBlock, WriteZero,
+    };
+    let has_public_kind = matches!(
+        io.kind(),
+        AddrInUse
+            | AddrNotAvailable
+            | AlreadyExists
+            | ArgumentListTooLong
+            | BrokenPipe
+            | ConnectionAborted
+            | ConnectionRefused
+            | ConnectionReset
+            | CrossesDevices
+            | Deadlock
+            | DirectoryNotEmpty
+            | ExecutableFileBusy
+            | FileTooLarge
+            | HostUnreachable
+            | InvalidData
+            | InvalidFilename
+            | InvalidInput
+            | Interrupted
+            | IsADirectory
+            | NetworkDown
+            | NetworkUnreachable
+            | NotADirectory
+            | NotConnected
+            | NotFound
+            | NotSeekable
+            | Other
+            | OutOfMemory
+            | PermissionDenied
+            | QuotaExceeded
+            | ReadOnlyFilesystem
+            | ResourceBusy
+            | StaleNetworkFileHandle
+            | StorageFull
+            | TimedOut
+            | TooManyLinks
+            | UnexpectedEof
+            | Unsupported
+            | WouldBlock
+            | WriteZero
+    );
+    io.raw_os_error().is_none() && !has_public_kind
 }
 
 /// Whether the registry or the network failed to answer, or asked the client
@@ -4155,6 +4256,8 @@ mod tests {
         assert!(cache_dir_names(tmp.path()).is_empty());
     }
 
+    const TEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
     fn unavailable_message(error: BackendError) -> String {
         match error {
             BackendError::Unavailable(message) => message,
@@ -4180,13 +4283,15 @@ mod tests {
         assert!(!message.contains("registry.example"), "{message}");
     }
 
-    #[test]
-    fn given_a_lookup_failure_when_classified_then_it_is_dns() {
+    #[tokio::test]
+    async fn given_an_unresolvable_name_when_requested_then_the_message_says_dns() {
         // Arrange
-        let lookup = std::io::Error::other("failed to lookup address information");
+        let request_error = reqwest::get("http://ward-test.invalid/")
+            .await
+            .expect_err("the name does not resolve");
 
         // Act
-        let failure = transport_failure(false, true, &lookup);
+        let failure = request_failure(&request_error);
 
         // Assert
         assert_eq!(failure, RegistryFailure::Dns);
@@ -4194,15 +4299,41 @@ mod tests {
     }
 
     #[test]
-    fn given_a_connect_error_with_a_network_kind_when_classified_then_it_is_not_dns() {
+    fn given_a_connect_error_that_is_not_a_lookup_when_classified_then_it_is_not_dns() {
         // Arrange
-        let unreachable = std::io::Error::from(std::io::ErrorKind::NetworkUnreachable);
-
-        // Act
-        let failure = transport_failure(false, true, &unreachable);
+        use std::io::{Error, ErrorKind};
+        let not_lookups = [
+            Error::from(ErrorKind::NetworkUnreachable),
+            Error::from(ErrorKind::UnexpectedEof),
+            Error::from(ErrorKind::InvalidData),
+            Error::other("tls handshake failed"),
+            Error::from_raw_os_error(101),
+        ];
 
         // Assert
-        assert_eq!(failure, RegistryFailure::Other);
+        for error in &not_lookups {
+            assert_eq!(
+                transport_failure(false, true, error),
+                RegistryFailure::Other,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_the_client_config_when_built_then_connect_and_read_timeouts_are_15_and_60_seconds() {
+        // Act
+        let config = OciPuller::default().client_config();
+
+        // Assert
+        assert_eq!(
+            config.connect_timeout,
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            config.read_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
     }
 
     #[tokio::test]
@@ -4238,7 +4369,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let request_error = reqwest::Client::builder()
-            .read_timeout(std::time::Duration::from_millis(100))
+            .read_timeout(TEST_READ_TIMEOUT)
             .build()
             .expect("client")
             .get(url)
@@ -4254,78 +4385,5 @@ mod tests {
         // Assert
         assert!(retryable);
         assert!(message.contains("did not answer in time"), "{message}");
-    }
-
-    #[test]
-    fn given_a_plain_http_realm_when_the_registry_is_https_then_the_login_is_refused() {
-        // Assert
-        let http_realm = r#"Bearer realm="http://auth.example/token",service="registry""#;
-        assert!(!challenge_allows_login(Some(http_realm), false));
-        assert!(!challenge_allows_login(
-            Some(r#"Bearer realm="HTTP://auth.example/token""#),
-            false
-        ));
-        let https_realm = r#"Bearer realm="https://auth.example/token",service="registry""#;
-        assert!(challenge_allows_login(Some(https_realm), false));
-        assert!(challenge_allows_login(
-            Some(r#"Basic realm="registry""#),
-            false
-        ));
-        assert!(challenge_allows_login(None, false));
-    }
-
-    #[test]
-    fn given_an_operator_configured_http_registry_when_it_names_an_http_realm_then_the_login_is_allowed()
-     {
-        // Assert
-        let http_realm = r#"Bearer realm="http://127.0.0.1:5001/token""#;
-        assert!(challenge_allows_login(Some(http_realm), true));
-    }
-
-    #[test]
-    fn given_a_cached_client_when_the_login_changes_then_it_is_not_reused() {
-        // Arrange
-        let puller = OciPuller::default();
-        let login = Some(crate::registry_auth::Credentials {
-            username: "ada".to_string(),
-            password: "first".to_string(),
-        });
-        let changed = Some(crate::registry_auth::Credentials {
-            username: "ada".to_string(),
-            password: "second".to_string(),
-        });
-        puller.remember_client(
-            "registry.example".to_string(),
-            login.clone(),
-            &puller.new_client(),
-            &oci_client::secrets::RegistryAuth::Anonymous,
-        );
-
-        // Assert
-        assert!(puller.cached_client("registry.example", &login).is_some());
-        assert!(puller.cached_client("registry.example", &changed).is_none());
-        assert!(puller.cached_client("registry.example", &None).is_none());
-        assert!(puller.cached_client("other.example", &login).is_none());
-    }
-
-    #[test]
-    fn given_a_cached_client_when_debugged_then_the_password_is_hidden() {
-        // Arrange
-        let puller = OciPuller::default();
-        puller.remember_client(
-            "registry.example".to_string(),
-            Some(crate::registry_auth::Credentials {
-                username: "ada".to_string(),
-                password: "hunter2".to_string(),
-            }),
-            &puller.new_client(),
-            &oci_client::secrets::RegistryAuth::Anonymous,
-        );
-
-        // Act
-        let shown = format!("{puller:?}");
-
-        // Assert
-        assert!(!shown.contains("hunter2"), "{shown}");
     }
 }
