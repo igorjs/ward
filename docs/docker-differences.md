@@ -69,6 +69,8 @@ The relay answers class IN type A questions with the host's IPv4 addresses. For 
 
 A guest TCP flow is reset, not closed, when a read or write on the host connection fails mid-stream, and a clean close from the host still ends with a normal FIN. A flow that makes no progress for 15 minutes is reset: no bytes taken from the guest and none delivered to it, even if bytes are still queued. A guest that keeps reading, however slowly, is not reset.
 
+A guest TCP connection gets its SYN-ACK only after the egress policy allowed the destination and the host connect succeeded, so the guest sees the real result at once: a refused or denied destination is reset with no prior accept, and a slow host connect delays the SYN-ACK by the same time. A connect that has not finished in 10 seconds is reset. At most 64 connects can be in flight at once; further SYNs are dropped and the guest retries them.
+
 `ward egress suggest SANDBOX` has no Docker equivalent. It prints an `--allow-domain` flag for each host the sandbox was refused, and lists blocked IP addresses on stderr. The record is kept after the sandbox exits, until `rm`. 
 
 `ward egress suggest SANDBOX --apply` adds the suggested names to the sandbox's allowlist. It takes effect at once, without a restart, and the names are kept across daemon restarts. IP addresses are skipped. It works only on a sandbox created with `--egress allowlist`: a `deny` sandbox has no network device, so it must be recreated, and an `open` sandbox has nothing to add. An allowlist holds at most 256 names.
