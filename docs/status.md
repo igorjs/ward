@@ -7,7 +7,7 @@ Live status, tickets, and priorities live on the [Ward project board](https://gi
 - VM lifecycle wiring (`krun_start_enter` + shutdown signalling): complete
 - OCI image pull + unpack: complete
 - Self-contained runtime: libkrun, libkrunfw and the guest agent are embedded in the binaries; one host process per microVM
-- Guest agent (`ward-agent`): runs as the VM's init process; mounts shares, configures the network, serves exec over vsock
+- Guest agent (`ward-agent`): started by libkrun's init, which is PID 1 and reaps orphaned processes; mounts shares, configures the network, serves exec over vsock
 - Real-VM end-to-end tests run in CI on Linux/KVM (`vm-e2e`) and cover exec, env, mounts, snapshots, egress, isolation and ward-mcp
 - Cross-sandbox pub/sub broker: complete (deny default + group routing)
 - Egress: deny / allowlist / open enforced by the in-process smoltcp stack, with a private-address block

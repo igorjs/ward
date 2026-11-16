@@ -119,6 +119,7 @@ fn reason_name(info: &SandboxInfo) -> &'static str {
         EndReason::Oom => "oom",
         EndReason::Timeout => "timeout",
         EndReason::EgressPolicy => "egress-policy",
+        EndReason::VmDied => "vm-died",
     }
 }
 
@@ -1379,6 +1380,7 @@ mod tests {
     #[case::oom(EndReason::Oom, "oom", true)]
     #[case::timeout(EndReason::Timeout, "timeout", false)]
     #[case::egress(EndReason::EgressPolicy, "egress-policy", false)]
+    #[case::vm_died(EndReason::VmDied, "vm-died", false)]
     fn given_end_reason_when_inspected_then_state_names_it_and_oom_killed_follows(
         #[case] reason: EndReason,
         #[case] name: &str,

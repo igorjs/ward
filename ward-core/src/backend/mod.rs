@@ -45,6 +45,19 @@ pub enum BackendError {
     AddressInUse(String),
 }
 
+/// A sandbox's VM host process ended without a stop having been asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmExit {
+    pub sandbox_id: String,
+    /// Which VM of the sandbox ended, so a report that outlived a stop and a
+    /// new start is not mistaken for the new VM dying.
+    pub vm_id: u32,
+    /// Exit code of the VM host process, when it exited by itself.
+    pub code: Option<i32>,
+    /// Signal that ended the VM host process, when one did.
+    pub signal: Option<i32>,
+}
+
 /// Tar chunks buffered between the two ends of a file copy.
 pub const COPY_CHANNEL_CAPACITY: usize = 4;
 
@@ -259,6 +272,17 @@ pub trait Backend: Send + Sync + 'static {
     async fn start_sandbox(&self, id: &str) -> Result<()>;
 
     async fn count(&self) -> Result<usize>;
+
+    /// Reports of VM host processes that ended on their own. Handed out
+    /// once; `None` when the backend has no VM to watch or already gave it.
+    fn take_vm_exits(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<VmExit>> {
+        None
+    }
+
+    /// Whether `exit` is about the VM the sandbox has now, not an older one.
+    async fn vm_exit_is_current(&self, _exit: &VmExit) -> bool {
+        true
+    }
 
     /// Change the limits of sandbox `id`. A running VM keeps its size, so a
     /// memory or CPU limit above it is refused; the guest applies the new

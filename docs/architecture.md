@@ -204,6 +204,7 @@ When the main process ends, the manager records an `EndReason` in `State.Reason`
 | `signal` | A signal ended it. |
 | `oom` | SIGKILL plus a guest OOM kill during the run. Sets `OOMKilled`, exit code 137. |
 | `timeout` | The sandbox hit `--timeout`. It's removed, so only the `die` event carries this value. |
+| `vm-died` | The VM host process died without a stop. The sandbox is `exited` (code 128 plus the signal, else the process's own code), and its ports and network stack are released. |
 | `egress-policy` | Defined, but not recorded. Egress policy blocks connections and doesn't end a sandbox. |
 
 An exited sandbox is removed after its `--exited-ttl`, or after `WARD_EXITED_TTL_SECS` when the sandbox sets none.

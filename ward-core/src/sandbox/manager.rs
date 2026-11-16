@@ -832,6 +832,18 @@ async fn mark_exited_on_main_end(
     }
 }
 
+/// Exit code recorded when the VM host process ended with neither a code nor
+/// a signal the host could read.
+const VM_LOST_EXIT: i32 = 255;
+
+/// The exit code a dead VM host process counts as: its own code, else the
+/// shell convention for a signal, else [`VM_LOST_EXIT`].
+fn vm_exit_code(exit: &crate::backend::VmExit) -> i32 {
+    exit.code
+        .or(exit.signal.map(|signal| SIGNAL_EXIT_BASE + signal))
+        .unwrap_or(VM_LOST_EXIT)
+}
+
 /// Ask for a restart when the sandbox's policy calls for one after the run
 /// that just ended with `code`. A sandbox that removes itself never does.
 fn request_restart(teardown: &Teardown, entry: &SandboxEntry, code: i32) {
@@ -1244,6 +1256,72 @@ impl SandboxManager {
                 tokio::spawn(async move { manager.restart_after_exit(request).await });
             }
         });
+    }
+
+    /// Mark sandboxes `exited` with reason `vm-died` as soon as their VM host
+    /// process ends on its own, and free what they held. Runs until the
+    /// manager is dropped.
+    pub fn spawn_vm_exit_watcher(self: &Arc<Self>) {
+        let Some(mut exits) = self.backend.take_vm_exits() else {
+            return;
+        };
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(exit) = exits.recv().await {
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                tokio::spawn(async move { manager.handle_vm_exit(exit).await });
+            }
+        });
+    }
+
+    /// Record that the VM of `exit.sandbox_id` died, then release its ports,
+    /// egress stack and agent socket through the backend's stop. A stop, a
+    /// removal or a newer VM that got there first leaves the sandbox alone.
+    async fn handle_vm_exit(&self, exit: crate::backend::VmExit) {
+        let id = exit.sandbox_id.as_str();
+        if !self.backend.vm_exit_is_current(&exit).await {
+            return;
+        }
+        let code = vm_exit_code(&exit);
+        let teardown = self.teardown();
+        {
+            let mut entries = self.entries.write().await;
+            let Some(entry) = entries.get_mut(id) else {
+                return;
+            };
+            if entry.meta.status != crate::protocol::SandboxStatus::Running {
+                return;
+            }
+            let ended = commit_meta_ended(
+                self.store.as_ref(),
+                &teardown,
+                entry,
+                crate::protocol::SandboxStatus::Exited,
+                Some(code),
+                Some(EndReason::VmDied),
+            )
+            .await;
+            if let Err(e) = ended {
+                tracing::warn!(sandbox_id = %id, error = %e, "cannot record the VM exit");
+                return;
+            }
+            tracing::warn!(sandbox_id = %id, code = ?exit.code, signal = ?exit.signal, "VM host process died, sandbox exited");
+            let mut died = SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+            died.reason = entry.meta.end_reason;
+            self.events.emit(died);
+            request_restart(&teardown, entry, code);
+        }
+        self.close_listeners(id).await;
+        if let Err(e) = self.backend.stop_sandbox(id).await {
+            tracing::warn!(sandbox_id = %id, error = %e, "cannot release the VM that died");
+        }
+        self.processes
+            .write()
+            .await
+            .retain(|_, rec| rec.sandbox_id != id);
+        self.broker.deregister_sandbox(id).await;
     }
 
     /// Wait out the back-off, then start the sandbox again unless a stop,
@@ -3718,6 +3796,7 @@ fn end_reason_to_pb(reason: Option<EndReason>) -> PbEndReason {
         Some(EndReason::Oom) => PbEndReason::Oom,
         Some(EndReason::Timeout) => PbEndReason::Timeout,
         Some(EndReason::EgressPolicy) => PbEndReason::EgressPolicy,
+        Some(EndReason::VmDied) => PbEndReason::VmDied,
     }
 }
 
@@ -6449,6 +6528,10 @@ pub(crate) mod tests {
         inner: Arc<crate::backend::krunvm::KrunvmBackend>,
         fail_start: Arc<AtomicBool>,
         egress: Arc<EgressGate>,
+        /// VM exit reports the test feeds in; handed to the manager once.
+        vm_exits: std::sync::Mutex<Option<mpsc::UnboundedReceiver<crate::backend::VmExit>>>,
+        /// Set to make every VM exit report look like it is about an old VM.
+        vm_exits_stale: Arc<AtomicBool>,
     }
 
     /// Controls `add_egress_allow` on a `BootGate`: it can park the call
@@ -6468,6 +6551,12 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl Backend for BootGate {
+        fn take_vm_exits(&self) -> Option<mpsc::UnboundedReceiver<crate::backend::VmExit>> {
+            self.vm_exits.lock().unwrap().take()
+        }
+        async fn vm_exit_is_current(&self, _exit: &crate::backend::VmExit) -> bool {
+            !self.vm_exits_stale.load(Ordering::SeqCst)
+        }
         async fn create_sandbox(
             &self,
             id: String,
@@ -6611,6 +6700,20 @@ pub(crate) mod tests {
         path: &std::path::Path,
         max_sandboxes: usize,
     ) -> (Arc<SandboxManager>, Arc<AtomicBool>, Arc<EgressGate>) {
+        let gated = manager_with_vm_exits(path, max_sandboxes);
+        (gated.manager, gated.fail_start, gated.egress)
+    }
+
+    /// A [`manager_with_gates`] manager plus the handles that feed it VM exits.
+    struct GatedManager {
+        manager: Arc<SandboxManager>,
+        fail_start: Arc<AtomicBool>,
+        egress: Arc<EgressGate>,
+        vm_exits: mpsc::UnboundedSender<crate::backend::VmExit>,
+        vm_exits_stale: Arc<AtomicBool>,
+    }
+
+    fn manager_with_vm_exits(path: &std::path::Path, max_sandboxes: usize) -> GatedManager {
         use crate::backend::image::ImageStore;
         use crate::backend::krunvm::KrunvmBackend;
         let store = Arc::new(ImageStore::with_puller(
@@ -6620,6 +6723,8 @@ pub(crate) mod tests {
         ));
         let fail_start = Arc::new(AtomicBool::new(false));
         let egress = Arc::new(EgressGate::default());
+        let (vm_exits, vm_exits_rx) = mpsc::unbounded_channel();
+        let vm_exits_stale = Arc::new(AtomicBool::new(false));
         let backend: Arc<dyn Backend> = Arc::new(BootGate {
             inner: Arc::new(KrunvmBackend::with_image_store_for_test(
                 path.to_path_buf(),
@@ -6627,6 +6732,8 @@ pub(crate) mod tests {
             )),
             fail_start: Arc::clone(&fail_start),
             egress: Arc::clone(&egress),
+            vm_exits: std::sync::Mutex::new(Some(vm_exits_rx)),
+            vm_exits_stale: Arc::clone(&vm_exits_stale),
         });
         let manager = SandboxManager::new(
             backend,
@@ -6636,7 +6743,13 @@ pub(crate) mod tests {
             crate::config::NetworkBackendChoice::Smoltcp,
         )
         .with_data_dir(path.to_path_buf());
-        (Arc::new(manager), fail_start, egress)
+        GatedManager {
+            manager: Arc::new(manager),
+            fail_start,
+            egress,
+            vm_exits,
+            vm_exits_stale,
+        }
     }
 
     async fn status_of(mgr: &SandboxManager, id: &str) -> SandboxStatus {
@@ -6771,6 +6884,92 @@ pub(crate) mod tests {
             status_of(&reloaded, &created.id).await,
             SandboxStatus::Failed
         );
+    }
+
+    const KILLED_VM_PID: u32 = 4242;
+    const SIGKILL_SIGNAL: i32 = 9;
+    const STALE_REPORT_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn vm_killed(id: &str) -> crate::backend::VmExit {
+        crate::backend::VmExit {
+            sandbox_id: id.to_string(),
+            vm_id: KILLED_VM_PID,
+            code: None,
+            signal: Some(SIGKILL_SIGNAL),
+        }
+    }
+
+    #[tokio::test]
+    async fn given_running_sandbox_when_its_vm_dies_then_it_is_exited_with_reason_vm_died() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        mgr.spawn_vm_exit_watcher();
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        let mut reader = mgr.events().subscribe(None);
+
+        // Act
+        gated.vm_exits.send(vm_killed(&created.id)).unwrap();
+        let exited =
+            wait_until(|| async { status_of(&mgr, &created.id).await == SandboxStatus::Exited })
+                .await;
+
+        // Assert
+        assert!(exited, "the sandbox never became exited");
+        let info = mgr.get(&created.id).await.unwrap();
+        assert_eq!(info.exit_code, Some(SIGNAL_EXIT_BASE + SIGKILL_SIGNAL));
+        assert_eq!(info.end_reason, crate::pb::EndReason::VmDied as i32);
+        let mut saw_die = false;
+        while let Some(delivered) = reader.next().await {
+            if delivered.event.action == EventAction::Die {
+                saw_die = true;
+                assert_eq!(delivered.event.reason, Some(EndReason::VmDied));
+                break;
+            }
+        }
+        assert!(saw_die, "no die event");
+        let restarted = mgr.start(&created.id).await.unwrap();
+        assert_eq!(restarted.status, SandboxStatus::Running as i32);
+    }
+
+    #[tokio::test]
+    async fn given_report_about_an_older_vm_when_it_arrives_then_the_sandbox_keeps_running() {
+        // Arrange
+        let tmp = tempfile::tempdir().unwrap();
+        let gated = manager_with_vm_exits(tmp.path(), 2);
+        let mgr = gated.manager;
+        mgr.spawn_vm_exit_watcher();
+        let created = mgr.create(create_req("alpine"), "").await.unwrap();
+        gated.vm_exits_stale.store(true, Ordering::SeqCst);
+
+        // Act
+        gated.vm_exits.send(vm_killed(&created.id)).unwrap();
+        tokio::time::sleep(STALE_REPORT_SETTLE).await;
+
+        // Assert
+        assert_eq!(status_of(&mgr, &created.id).await, SandboxStatus::Running);
+    }
+
+    #[rstest::rstest]
+    #[case::own_code(Some(3), None, 3)]
+    #[case::signal(None, Some(SIGKILL_SIGNAL), 137)]
+    #[case::unknown(None, None, VM_LOST_EXIT)]
+    fn given_vm_exit_when_converted_then_code_follows_shell_convention(
+        #[case] code: Option<i32>,
+        #[case] signal: Option<i32>,
+        #[case] want: i32,
+    ) {
+        // Arrange
+        let exit = crate::backend::VmExit {
+            sandbox_id: "sb".into(),
+            vm_id: KILLED_VM_PID,
+            code,
+            signal,
+        };
+
+        // Act and assert
+        assert_eq!(vm_exit_code(&exit), want);
     }
 
     #[tokio::test]

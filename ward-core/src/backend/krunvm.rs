@@ -21,6 +21,7 @@ use crate::egress::{BlockedDestination, BlockedEgress};
 use crate::protocol::EgressMode;
 use crate::protocol::{CreateOpts, SandboxInfo, SandboxStatus, SnapshotInfo};
 use crate::sandbox::store::MetaStore;
+use crate::sync::LockUnpoisoned;
 
 /// vsock port the guest agent listens on; must match `ward-agent`.
 /// Only referenced by the krunvm-gated FFI wrappers.
@@ -308,6 +309,11 @@ pub struct KrunvmBackend {
     /// is no bootable rootfs, so no VM host process is started.
     #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
     boot_vms: bool,
+    /// Where watchers report VM host processes that ended on their own.
+    #[cfg_attr(not(feature = "krunvm"), allow(dead_code))]
+    vm_exit_tx: tokio::sync::mpsc::UnboundedSender<super::VmExit>,
+    /// Taken by the manager through `take_vm_exits`.
+    vm_exit_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<super::VmExit>>>,
 }
 
 impl KrunvmBackend {
@@ -344,6 +350,7 @@ impl KrunvmBackend {
         image_store: Arc<ImageStore>,
         boot_vms: bool,
     ) -> Self {
+        let (vm_exit_tx, vm_exit_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             sandboxes: Arc::new(RwLock::new(HashMap::new())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
@@ -352,7 +359,39 @@ impl KrunvmBackend {
             network_backend,
             image_store,
             boot_vms,
+            vm_exit_tx,
+            vm_exit_rx: std::sync::Mutex::new(Some(vm_exit_rx)),
         }
+    }
+
+    /// Report the VM host process behind sandbox `id` when it ends. A VM that
+    /// ended because it was stopped is reported too; the receiver tells it
+    /// apart through `vm_exit_is_current`, since a stop takes the shim out
+    /// of the sandbox's state first.
+    #[cfg(feature = "krunvm")]
+    fn watch_vm(
+        &self,
+        id: &str,
+        vm_id: u32,
+        mut exit: tokio::sync::watch::Receiver<Option<super::vmshim::ShimExit>>,
+    ) {
+        let tx = self.vm_exit_tx.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let Ok(ended) = exit.wait_for(Option::is_some).await.map(|e| *e) else {
+                return;
+            };
+            let ended = ended.unwrap_or(super::vmshim::ShimExit {
+                code: None,
+                signal: None,
+            });
+            let _ = tx.send(super::VmExit {
+                sandbox_id: id,
+                vm_id,
+                code: ended.code,
+                signal: ended.signal,
+            });
+        });
     }
 
     /// Constructor for tests that need to inject a custom `ImageStore`
@@ -467,6 +506,8 @@ impl Backend for KrunvmBackend {
             Some(vm) => (Some(vm.shim), vm.smoltcp, vm.egress),
             None => (None, None, None),
         };
+        #[cfg(feature = "krunvm")]
+        let watched = shim.as_ref().map(|s| (s.pid(), s.exit_watch()));
         let state = SandboxState {
             info: info.clone(),
             vm_size: Some(VmSize::of(&opts.resources)),
@@ -482,6 +523,10 @@ impl Backend for KrunvmBackend {
         };
 
         self.sandboxes.write().await.insert(id, state);
+        #[cfg(feature = "krunvm")]
+        if let Some((vm_id, exit)) = watched {
+            self.watch_vm(&info.id, vm_id, exit);
+        }
         Ok(info)
     }
 
@@ -700,6 +745,7 @@ impl Backend for KrunvmBackend {
         };
         #[cfg(feature = "krunvm")]
         if let Some(vm) = booted {
+            self.watch_vm(id, vm.shim.pid(), vm.shim.exit_watch());
             state.shim = Some(vm.shim);
             state.smoltcp = vm.smoltcp;
             state.egress = vm.egress;
@@ -712,6 +758,19 @@ impl Backend for KrunvmBackend {
     /// Count of active sandboxes.
     async fn count(&self) -> Result<usize> {
         Ok(self.sandboxes.read().await.len())
+    }
+
+    fn take_vm_exits(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<super::VmExit>> {
+        self.vm_exit_rx.lock_unpoisoned().take()
+    }
+
+    #[cfg(feature = "krunvm")]
+    async fn vm_exit_is_current(&self, exit: &super::VmExit) -> bool {
+        let sandboxes = self.sandboxes.read().await;
+        sandboxes
+            .get(&exit.sandbox_id)
+            .and_then(|state| state.shim.as_ref())
+            .is_some_and(|shim| shim.pid() == exit.vm_id)
     }
 
     #[cfg(feature = "krunvm")]
