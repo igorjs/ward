@@ -3780,6 +3780,7 @@ dependencies = [
  "proptest",
  "prost",
  "prost-types",
+ "reqwest",
  "rstest",
  "rustix",
  "serde",

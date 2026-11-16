@@ -410,6 +410,11 @@ pub struct OciPuller {
     http_registries: Vec<String>,
 }
 
+/// How long a registry may take to accept a connection.
+const REGISTRY_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a registry may stay silent mid-response before the call fails.
+const REGISTRY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl OciPuller {
     /// A puller that reaches `registry` (`host:port`) over plain HTTP.
     pub fn with_http_registry(registry: impl Into<String>) -> Self {
@@ -424,12 +429,18 @@ impl OciPuller {
             BackendError::Image(format!("invalid image reference {reference}: {e}"))
         })?;
         check_registry_allowlist(&image_ref)?;
-        let client = oci_client::Client::new(oci_client::client::ClientConfig {
+        let client = oci_client::Client::new(self.client_config());
+        Ok((client, image_ref))
+    }
+
+    fn client_config(&self) -> oci_client::client::ClientConfig {
+        oci_client::client::ClientConfig {
             platform_resolver: Some(Box::new(linux_host_arch_resolver)),
             protocol: oci_client::client::ClientProtocol::HttpsExcept(self.http_registries.clone()),
+            connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
+            read_timeout: Some(REGISTRY_READ_TIMEOUT),
             ..Default::default()
-        });
-        Ok((client, image_ref))
+        }
     }
 }
 
@@ -735,6 +746,158 @@ fn is_access_denied(e: &OciDistributionError) -> bool {
     )
 }
 
+/// What went wrong between Ward and the registry, told apart by typed
+/// checks on the error and never by its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryFailure {
+    RateLimited,
+    Dns,
+    Refused,
+    TimedOut,
+    Other,
+}
+
+/// Fixed hints, short enough to show a user. The source error stays in the log.
+const RATE_LIMITED_HINT: &str = "the registry is rate limiting pulls, \
+     'ward login' raises the limit, or try again later";
+const DNS_HINT: &str = "the registry name could not be resolved, check the name and your DNS";
+const REFUSED_HINT: &str = "the registry refused the connection, check it is running and reachable";
+const TIMED_OUT_HINT: &str = "the registry did not answer in time";
+
+fn failure_hint(failure: RegistryFailure) -> Option<&'static str> {
+    match failure {
+        RegistryFailure::RateLimited => Some(RATE_LIMITED_HINT),
+        RegistryFailure::Dns => Some(DNS_HINT),
+        RegistryFailure::Refused => Some(REFUSED_HINT),
+        RegistryFailure::TimedOut => Some(TIMED_OUT_HINT),
+        RegistryFailure::Other => None,
+    }
+}
+
+fn registry_failure(e: &OciDistributionError) -> RegistryFailure {
+    match e {
+        OciDistributionError::RequestError(request) => request_failure(request),
+        OciDistributionError::IoError(io) => match io
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+        {
+            // A body that stalled mid-download arrives wrapped in an io error.
+            Some(request) => request_failure(request),
+            None if io.kind() == std::io::ErrorKind::TimedOut => RegistryFailure::TimedOut,
+            None => RegistryFailure::Other,
+        },
+        OciDistributionError::ServerError { code, .. } if *code == TOO_MANY_REQUESTS_STATUS => {
+            RegistryFailure::RateLimited
+        }
+        OciDistributionError::RegistryError { envelope, .. }
+            if envelope
+                .errors
+                .iter()
+                .any(|e| e.code == OciErrorCode::Toomanyrequests) =>
+        {
+            RegistryFailure::RateLimited
+        }
+        _ => RegistryFailure::Other,
+    }
+}
+
+fn request_failure(e: &reqwest::Error) -> RegistryFailure {
+    if e.status()
+        .is_some_and(|s| s.as_u16() == TOO_MANY_REQUESTS_STATUS)
+    {
+        return RegistryFailure::RateLimited;
+    }
+    transport_failure(e.is_timeout(), e.is_connect(), e)
+}
+
+/// Sort a transport error by its flags and the io error at its root.
+fn transport_failure(
+    timed_out: bool,
+    connect_failed: bool,
+    error: &(dyn std::error::Error + 'static),
+) -> RegistryFailure {
+    use std::io::ErrorKind::{ConnectionRefused, TimedOut};
+    if timed_out {
+        return RegistryFailure::TimedOut;
+    }
+    if !connect_failed {
+        return RegistryFailure::Other;
+    }
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(io) = current.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                ConnectionRefused => RegistryFailure::Refused,
+                TimedOut => RegistryFailure::TimedOut,
+                _ if is_resolver_error(io) => RegistryFailure::Dns,
+                _ => RegistryFailure::Other,
+            };
+        }
+        source = current.source();
+    }
+    RegistryFailure::Other
+}
+
+/// Whether an io error is a failed name lookup. Neither std nor hyper-util
+/// names a resolver error, so it is told apart by what it lacks: the OS gave
+/// no error code (every socket failure has one) and the kind is none of the
+/// public ones, which is what an `Uncategorized` lookup failure is. A failed
+/// TLS handshake carries a public kind such as `UnexpectedEof` or `InvalidData`.
+fn is_resolver_error(io: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{
+        AddrInUse, AddrNotAvailable, AlreadyExists, ArgumentListTooLong, BrokenPipe,
+        ConnectionAborted, ConnectionRefused, ConnectionReset, CrossesDevices, Deadlock,
+        DirectoryNotEmpty, ExecutableFileBusy, FileTooLarge, HostUnreachable, Interrupted,
+        InvalidData, InvalidFilename, InvalidInput, IsADirectory, NetworkDown, NetworkUnreachable,
+        NotADirectory, NotConnected, NotFound, NotSeekable, Other, OutOfMemory, PermissionDenied,
+        QuotaExceeded, ReadOnlyFilesystem, ResourceBusy, StaleNetworkFileHandle, StorageFull,
+        TimedOut, TooManyLinks, UnexpectedEof, Unsupported, WouldBlock, WriteZero,
+    };
+    let has_public_kind = matches!(
+        io.kind(),
+        AddrInUse
+            | AddrNotAvailable
+            | AlreadyExists
+            | ArgumentListTooLong
+            | BrokenPipe
+            | ConnectionAborted
+            | ConnectionRefused
+            | ConnectionReset
+            | CrossesDevices
+            | Deadlock
+            | DirectoryNotEmpty
+            | ExecutableFileBusy
+            | FileTooLarge
+            | HostUnreachable
+            | InvalidData
+            | InvalidFilename
+            | InvalidInput
+            | Interrupted
+            | IsADirectory
+            | NetworkDown
+            | NetworkUnreachable
+            | NotADirectory
+            | NotConnected
+            | NotFound
+            | NotSeekable
+            | Other
+            | OutOfMemory
+            | PermissionDenied
+            | QuotaExceeded
+            | ReadOnlyFilesystem
+            | ResourceBusy
+            | StaleNetworkFileHandle
+            | StorageFull
+            | TimedOut
+            | TooManyLinks
+            | UnexpectedEof
+            | Unsupported
+            | WouldBlock
+            | WriteZero
+    );
+    io.raw_os_error().is_none() && !has_public_kind
+}
+
 /// Whether the registry or the network failed to answer, or asked the client
 /// to slow down. Only these are worth retrying.
 fn is_unreachable(e: &OciDistributionError) -> bool {
@@ -762,24 +925,29 @@ fn pull_error(reference: &str, e: OciDistributionError) -> BackendError {
     // The source error can carry request URLs, so it stays in the log.
     tracing::warn!(reference, error = %e, "image pull failed");
     if is_oversized(&e) {
-        BackendError::ResourceExhausted(format!(
+        return BackendError::ResourceExhausted(format!(
             "a layer of {reference} is larger than its manifest declares"
-        ))
-    } else if is_unknown_image(&e) {
-        BackendError::ImageNotFound(format!(
+        ));
+    }
+    if is_unknown_image(&e) {
+        return BackendError::ImageNotFound(format!(
             "manifest for {reference} not found: manifest unknown"
-        ))
-    } else if is_access_denied(&e) {
-        BackendError::ImageNotFound(format!(
+        ));
+    }
+    if is_access_denied(&e) {
+        return BackendError::ImageNotFound(format!(
             "pull access denied for {reference}, repository does not exist \
              or may require 'docker login'"
-        ))
-    } else if is_unreachable(&e) {
-        BackendError::Unavailable(format!("could not reach the registry for {reference}"))
-    } else {
-        BackendError::Internal(format!(
+        ));
+    }
+    match failure_hint(registry_failure(&e)) {
+        Some(hint) => BackendError::Unavailable(format!("pull {reference} failed: {hint}")),
+        None if is_unreachable(&e) => {
+            BackendError::Unavailable(format!("could not reach the registry for {reference}"))
+        }
+        None => BackendError::Internal(format!(
             "pull {reference} failed: unexpected registry response"
-        ))
+        )),
     }
 }
 
@@ -3904,5 +4072,137 @@ mod tests {
         // Assert
         assert!(error.to_string().contains("unsupported change"), "{error}");
         assert!(cache_dir_names(tmp.path()).is_empty());
+    }
+
+    const TEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+    fn unavailable_message(error: BackendError) -> String {
+        match error {
+            BackendError::Unavailable(message) => message,
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_a_429_when_the_pull_fails_then_the_message_says_rate_limited_and_names_login() {
+        // Arrange
+        let error = OciDistributionError::ServerError {
+            code: 429,
+            url: "https://registry.example/v2/".to_string(),
+            message: "slow down".to_string(),
+        };
+
+        // Act
+        let message = unavailable_message(pull_error("alpine", error));
+
+        // Assert
+        assert!(message.contains("rate limiting"), "{message}");
+        assert!(message.contains("ward login"), "{message}");
+        assert!(!message.contains("registry.example"), "{message}");
+    }
+
+    #[test]
+    fn given_a_failed_name_lookup_when_classified_then_the_message_says_dns() {
+        // Arrange
+        use std::net::ToSocketAddrs;
+        // An empty host name fails in the C resolver before any query leaves
+        // the machine, and gives the same io error as an unknown name.
+        let lookup = ("", 0).to_socket_addrs().expect_err("an empty name fails");
+
+        // Act
+        let failure = transport_failure(false, true, &lookup);
+
+        // Assert
+        assert_eq!(failure, RegistryFailure::Dns, "{lookup:?}");
+        assert_eq!(failure_hint(failure), Some(DNS_HINT));
+    }
+
+    #[test]
+    fn given_a_connect_error_that_is_not_a_lookup_when_classified_then_it_is_not_dns() {
+        // Arrange
+        use std::io::{Error, ErrorKind};
+        let not_lookups = [
+            Error::from(ErrorKind::NetworkUnreachable),
+            Error::from(ErrorKind::UnexpectedEof),
+            Error::from(ErrorKind::InvalidData),
+            Error::other("tls handshake failed"),
+            Error::from_raw_os_error(101),
+        ];
+
+        // Assert
+        for error in &not_lookups {
+            assert_eq!(
+                transport_failure(false, true, error),
+                RegistryFailure::Other,
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_the_client_config_when_built_then_connect_and_read_timeouts_are_15_and_60_seconds() {
+        // Act
+        let config = OciPuller::default().client_config();
+
+        // Assert
+        assert_eq!(
+            config.connect_timeout,
+            Some(std::time::Duration::from_secs(15))
+        );
+        assert_eq!(
+            config.read_timeout,
+            Some(std::time::Duration::from_secs(60))
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_closed_port_when_requested_then_the_message_says_refused() {
+        // Arrange
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", closed.local_addr().expect("addr"));
+        drop(closed);
+        let request_error = reqwest::get(url).await.expect_err("nothing listens");
+
+        // Act
+        let error = OciDistributionError::RequestError(request_error);
+        let retryable = is_unreachable(&error);
+        let message = unavailable_message(pull_error("alpine", error));
+
+        // Assert
+        assert!(retryable);
+        assert!(message.contains("refused the connection"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn given_a_silent_registry_when_the_read_timeout_passes_then_the_message_says_timed_out()
+    {
+        // Arrange
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", silent.local_addr().expect("addr"));
+        let _held = tokio::spawn(async move {
+            let _connection = silent.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let request_error = reqwest::Client::builder()
+            .read_timeout(TEST_READ_TIMEOUT)
+            .build()
+            .expect("client")
+            .get(url)
+            .send()
+            .await
+            .expect_err("no answer");
+
+        // Act
+        let error = OciDistributionError::RequestError(request_error);
+        let retryable = is_unreachable(&error);
+        let message = unavailable_message(pull_error("alpine", error));
+
+        // Assert
+        assert!(retryable);
+        assert!(message.contains("did not answer in time"), "{message}");
     }
 }
