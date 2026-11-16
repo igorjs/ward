@@ -7,6 +7,7 @@
 //! `Connector` rather than dialing the network itself, so a test never
 //! needs live network access to prove the flow table's addressing logic.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1038,19 +1039,20 @@ async fn given_flow_with_traffic_when_idle_timeout_is_short_then_activity_keeps_
 
 /// Bytes the host sends in the stalled and slow-drain tests: more than the
 /// stack's per-flow send buffer, so the flow cannot finish by itself.
-const BULK_HOST_BYTES: usize = 64 * 1024;
+const BULK_HOST_BYTES: usize = 128 * 1024;
 
-/// Reads every frame waiting for the guest and returns the sequence number
-/// just past the highest data byte seen, if any data arrived.
-fn drain_frames_for_end_seq(guest_fd: &OwnedFd) -> Option<TcpSeqNumber> {
-    let mut end = None;
+/// Reads every frame waiting for the guest, queues the sequence number just
+/// past each data segment in `ends`, and reports whether an RST arrived.
+fn drain_frames(guest_fd: &OwnedFd, ends: &mut VecDeque<TcpSeqNumber>) -> bool {
+    let mut saw_rst = false;
     while let Some(frame) = try_read_frame(guest_fd) {
         let segment = parse_tcp_segment(&frame);
+        saw_rst |= segment.control == TcpControl::Rst;
         if !segment.payload.is_empty() {
-            end = Some(segment.seq_number + segment.payload.len());
+            ends.push_back(segment.seq_number + segment.payload.len());
         }
     }
-    end
+    saw_rst
 }
 
 #[tokio::test]
@@ -1078,20 +1080,19 @@ async fn given_guest_drains_slowly_when_idle_timeout_is_longer_than_each_step_th
         .await
         .expect("host write");
 
-    // Act: the guest acknowledges what it has received about every 100 ms,
-    // for longer than the idle timeout in total.
+    // Act: the guest acknowledges one segment about every 100 ms, for
+    // longer than the idle timeout in total, so the host's bytes outlast it.
     let start = std::time::Instant::now();
+    let mut ends = VecDeque::new();
     let mut saw_rst = false;
     while start.elapsed() < idle * 2 {
         flow.stack.poll();
-        if let Some(end) = drain_frames_for_end_seq(&flow.guest_fd) {
+        saw_rst |= drain_frames(&flow.guest_fd, &mut ends);
+        if let Some(end) = ends.pop_front() {
             write_frame(
                 &flow.guest_fd,
                 &build_tcp_ack_frame(flow.guest_seq, end, &[]),
             );
-        }
-        while let Some(frame) = try_read_frame(&flow.guest_fd) {
-            saw_rst |= parse_tcp_segment(&frame).control == TcpControl::Rst;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
