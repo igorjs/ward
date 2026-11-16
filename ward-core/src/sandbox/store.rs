@@ -13,7 +13,7 @@ use crate::protocol::{CreateOpts, EndReason, SandboxStatus};
 /// Directory under the data dir that holds one subdirectory per sandbox.
 const SANDBOXES_DIR: &str = "sandboxes";
 const META_FILE: &str = "meta.json";
-const META_TMP_FILE: &str = "meta.json.tmp";
+pub(crate) const META_TMP_FILE: &str = "meta.json.tmp";
 const ROOTFS_DIR: &str = "rootfs";
 /// Sandbox dir mode (rwx------): the record holds env values.
 const DIR_MODE: u32 = 0o700;

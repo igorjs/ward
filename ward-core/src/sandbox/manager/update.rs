@@ -112,7 +112,7 @@ impl SandboxManager {
         result
     }
 
-    fn update_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    pub(super) fn update_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.update_locks.lock_unpoisoned();
         Arc::clone(locks.entry(id.to_string()).or_default())
     }
