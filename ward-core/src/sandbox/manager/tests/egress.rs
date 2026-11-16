@@ -240,4 +240,113 @@ async fn given_sandbox_removed_during_egress_update_when_backend_returns_then_ca
     // Assert
     assert!(result.is_err());
     assert!(mgr.list().await.unwrap().is_empty());
+    let second = restart(tmp.path()).await;
+    assert!(second.list().await.unwrap().is_empty());
+}
+
+fn seen(gate: &EgressGate) -> Vec<Vec<String>> {
+    gate.seen.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn given_first_call_refused_when_retried_then_backend_gets_host_and_record_matches() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, gate) = manager_with_gates(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let created = mgr
+        .create(request(PbMode::Allowlist, &[FIRST_HOST]), "")
+        .await
+        .unwrap();
+    gate.fail.store(true, Ordering::SeqCst);
+    mgr.add_egress_allow(&created.id, hosts(&[SECOND_HOST]))
+        .await
+        .expect_err("backend refuses");
+    gate.fail.store(false, Ordering::SeqCst);
+
+    // Act
+    let added = mgr
+        .add_egress_allow(&created.id, hosts(&[SECOND_HOST]))
+        .await
+        .unwrap();
+
+    // Assert
+    assert_eq!(added, [SECOND_HOST]);
+    assert_eq!(seen(&gate), [hosts(&[SECOND_HOST]), hosts(&[SECOND_HOST])]);
+    assert_eq!(
+        stored_domains(&mgr, &created.id).await,
+        [FIRST_HOST, SECOND_HOST]
+    );
+}
+
+#[tokio::test]
+async fn given_host_recorded_but_not_in_backend_when_added_again_then_backend_gets_it_quietly() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, gate) = manager_with_gates(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let created = mgr
+        .create(request(PbMode::Allowlist, &[FIRST_HOST]), "")
+        .await
+        .unwrap();
+    // The state a dropped call leaves: recorded, never sent.
+    mgr.entries
+        .write()
+        .await
+        .get_mut(&created.id)
+        .unwrap()
+        .meta
+        .options
+        .egress
+        .domains
+        .push(SECOND_HOST.to_string());
+    let mut reader = mgr.events().subscribe(Some(std::time::SystemTime::now()));
+
+    // Act
+    let added = mgr
+        .add_egress_allow(&created.id, hosts(&[SECOND_HOST]))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(added.is_empty());
+    assert_eq!(seen(&gate), [hosts(&[SECOND_HOST])]);
+    let event = tokio::time::timeout(std::time::Duration::from_millis(100), reader.next()).await;
+    assert!(event.is_err(), "a repair announces nothing");
+}
+
+#[tokio::test]
+async fn given_rollback_cannot_be_saved_when_backend_refuses_then_retry_repairs_the_vm() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, gate) = manager_with_gates(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let created = mgr
+        .create(request(PbMode::Allowlist, &[FIRST_HOST]), "")
+        .await
+        .unwrap();
+    let blocker = tmp
+        .path()
+        .join("sandboxes")
+        .join(&created.id)
+        .join(crate::sandbox::store::META_TMP_FILE);
+    *gate.break_store_at.lock().unwrap() = Some(blocker.clone());
+    gate.fail.store(true, Ordering::SeqCst);
+
+    // Act
+    let refused = mgr
+        .add_egress_allow(&created.id, hosts(&[SECOND_HOST]))
+        .await;
+    std::fs::remove_dir(&blocker).unwrap();
+    gate.fail.store(false, Ordering::SeqCst);
+    let retried = mgr
+        .add_egress_allow(&created.id, hosts(&[SECOND_HOST]))
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(refused.is_err());
+    assert!(retried.is_empty(), "the host was still recorded");
+    assert_eq!(seen(&gate), [hosts(&[SECOND_HOST]), hosts(&[SECOND_HOST])]);
+    assert_eq!(
+        stored_domains(&mgr, &created.id).await,
+        [FIRST_HOST, SECOND_HOST]
+    );
 }

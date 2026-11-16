@@ -2200,11 +2200,12 @@ impl SandboxManager {
         let lock = self.update_lock(&id);
         let _held = lock.lock().await;
 
-        let added = {
+        let (requested, added) = {
             let mut entries = self.entries.write().await;
-            let entry = entries
-                .get_mut(&id)
-                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
+            let Some(entry) = entries.get_mut(&id) else {
+                self.update_locks.lock_unpoisoned().remove(&id);
+                return Err(ApiError::SandboxNotFound(id));
+            };
             match entry.meta.options.egress.mode {
                 EgressMode::Open => return Ok(Vec::new()),
                 EgressMode::Deny => {
@@ -2216,15 +2217,16 @@ impl SandboxManager {
                 EgressMode::Allowlist => {}
             }
 
+            let mut requested: Vec<String> = Vec::new();
             let mut added: Vec<String> = Vec::new();
             for domain in domains {
-                if !entry.meta.options.egress.domains.contains(&domain) && !added.contains(&domain)
-                {
-                    added.push(domain);
+                if requested.contains(&domain) {
+                    continue;
                 }
-            }
-            if added.is_empty() {
-                return Ok(added);
+                if !entry.meta.options.egress.domains.contains(&domain) {
+                    added.push(domain.clone());
+                }
+                requested.push(domain);
             }
             let total = entry.meta.options.egress.domains.len() + added.len();
             if total > crate::validate::MAX_EGRESS_DOMAINS {
@@ -2234,18 +2236,27 @@ impl SandboxManager {
                 )));
             }
 
-            let mut next = entry.meta.clone();
-            next.options.egress.domains.extend(added.iter().cloned());
-            self.persist(next.clone()).await?;
-            entry.meta = next;
-            added
+            if !added.is_empty() {
+                let mut next = entry.meta.clone();
+                next.options.egress.domains.extend(added.iter().cloned());
+                self.persist(next.clone()).await?;
+                entry.meta = next;
+            }
+            (requested, added)
         };
 
         // The record is written first, so the recorded list is never shorter
-        // than what the VM allows.
-        if let Err(e) = self.backend.add_egress_allow(&id, &added).await {
-            self.forget_egress_domains(&id, &added).await;
+        // than what the VM allows. Every requested host goes to the backend,
+        // which skips duplicates, so a host recorded by an earlier call that
+        // never reached the VM is repaired here.
+        if let Err(e) = self.backend.add_egress_allow(&id, &requested).await {
+            if !added.is_empty() {
+                self.forget_egress_domains(&id, &added).await;
+            }
             return Err(backend_err(e));
+        }
+        if added.is_empty() {
+            return Ok(added);
         }
         tracing::info!(sandbox = %id, added = added.len(), "egress allowlist extended");
         if let Some(entry) = self.entries.read().await.get(&id) {
@@ -6433,6 +6444,11 @@ pub(crate) mod tests {
         fail: AtomicBool,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
+        /// The hosts of every call that reached the backend, in order.
+        seen: std::sync::Mutex<Vec<Vec<String>>>,
+        /// When set, a failing call first makes this path an unwritable
+        /// directory, so the next record write fails.
+        break_store_at: std::sync::Mutex<Option<std::path::PathBuf>>,
     }
 
     #[async_trait::async_trait]
@@ -6483,11 +6499,15 @@ pub(crate) mod tests {
             sandbox_id: &str,
             domains: &[String],
         ) -> crate::backend::Result<()> {
+            self.egress.seen.lock().unwrap().push(domains.to_vec());
             if self.egress.block.load(Ordering::SeqCst) {
                 self.egress.entered.notify_one();
                 self.egress.release.notified().await;
             }
             if self.egress.fail.load(Ordering::SeqCst) {
+                if let Some(path) = self.egress.break_store_at.lock().unwrap().take() {
+                    std::fs::create_dir(path).unwrap();
+                }
                 return Err(BackendError::Spawn("egress refused".into()));
             }
             self.inner.add_egress_allow(sandbox_id, domains).await
