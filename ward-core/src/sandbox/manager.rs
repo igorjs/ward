@@ -33,6 +33,7 @@ use crate::sync::LockUnpoisoned;
 mod update;
 
 mod pause;
+mod persist;
 mod wait_condition;
 
 mod health_monitor;
@@ -564,43 +565,6 @@ async fn persist_meta(store: Option<&MetaStore>, meta: SandboxMeta) -> Result<()
         .map_err(|e| ApiError::from_io(&format!("persist sandbox {id}"), &e))
 }
 
-/// Write the new state to disk, then adopt it in memory, so a failed write
-/// leaves the entry in its old state.
-async fn commit_meta(
-    store: Option<&MetaStore>,
-    teardown: &Teardown,
-    entry: &mut SandboxEntry,
-    status: crate::protocol::SandboxStatus,
-    exit_code: Option<i32>,
-) -> Result<()> {
-    // A new run clears the last run's reason; every other move keeps it.
-    let reason = match status {
-        crate::protocol::SandboxStatus::Creating => None,
-        _ => entry.meta.end_reason,
-    };
-    commit_meta_ended(store, teardown, entry, status, exit_code, reason).await
-}
-
-/// Like `commit_meta`, and records why the sandbox ended.
-async fn commit_meta_ended(
-    store: Option<&MetaStore>,
-    teardown: &Teardown,
-    entry: &mut SandboxEntry,
-    status: crate::protocol::SandboxStatus,
-    exit_code: Option<i32>,
-    end_reason: Option<EndReason>,
-) -> Result<()> {
-    let mut next = entry.meta.clone();
-    stamp_times(&mut next, &status, std::time::SystemTime::now());
-    next.status = status;
-    next.exit_code = exit_code;
-    next.end_reason = end_reason;
-    persist_meta(store, next.clone()).await?;
-    entry.meta = next;
-    rearm_exited_ttl(teardown, entry, std::time::SystemTime::now());
-    Ok(())
-}
-
 fn has_ended(status: &crate::protocol::SandboxStatus) -> bool {
     use crate::protocol::SandboxStatus as State;
     matches!(status, State::Exited | State::Stopped)
@@ -650,8 +614,11 @@ fn rearm_exited_ttl(
 /// again or is already gone.
 async fn remove_if_still_ended(teardown: &Teardown, id: &str) {
     let removed = {
+        // A start that has written its record but not adopted it holds this.
+        let _persisting = teardown.lock_persist(id).await;
         let mut entries = teardown.entries.write().await;
         let Some(entry) = entries.get_mut(id) else {
+            teardown.forget_persist_lock(id);
             return;
         };
         if !has_ended(&entry.meta.status) {
@@ -712,6 +679,9 @@ struct Teardown {
     backend: Arc<dyn Backend>,
     processes: Arc<RwLock<HashMap<String, ProcessRecord>>>,
     update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// One lock per sandbox, held while its record is written to disk.
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    store: Option<MetaStore>,
     events: EventLog,
     run_changes: Arc<watch::Sender<()>>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
@@ -782,7 +752,6 @@ fn event_with_code(action: EventAction, meta: &SandboxMeta, code: Option<i32>) -
 /// state, so both are left alone.
 async fn mark_exited_on_main_end(
     teardown: Teardown,
-    store: Option<MetaStore>,
     id: String,
     pid: String,
     mut exit: watch::Receiver<Option<i32>>,
@@ -796,32 +765,35 @@ async fn mark_exited_on_main_end(
         return;
     };
     {
-        let mut entries = teardown.entries.write().await;
+        let guard = teardown.lock_persist(&id).await;
         let current = teardown.mains.read().await.get(&id).map(|m| m.pid == pid);
-        let Some(entry) = entries.get_mut(&id) else {
-            return;
-        };
-        if current != Some(true) || entry.meta.status != crate::protocol::SandboxStatus::Running {
-            return;
-        }
-        match commit_meta_ended(
-            store.as_ref(),
-            &teardown,
-            entry,
-            crate::protocol::SandboxStatus::Exited,
-            Some(code),
-            raw.map(|raw| end_reason_of(raw, oom_killed.load(Ordering::Acquire))),
-        )
-        .await
-        {
-            Ok(()) => {
+        let reason = raw.map(|raw| end_reason_of(raw, oom_killed.load(Ordering::Acquire)));
+        let committed = guard
+            .commit_status(
+                crate::protocol::SandboxStatus::Exited,
+                persist::ExitUpdate::Set(Some(code)),
+                persist::ReasonUpdate::Set(reason),
+                |entry| {
+                    Ok(current == Some(true)
+                        && entry.meta.status == crate::protocol::SandboxStatus::Running)
+                },
+                {
+                    let teardown = teardown.clone();
+                    move |entry| {
+                        let mut died =
+                            SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
+                        died.reason = entry.meta.end_reason;
+                        teardown.events.emit(died);
+                        request_restart(&teardown, entry, code);
+                    }
+                },
+            )
+            .await;
+        match committed {
+            Ok(Some(())) => {
                 tracing::info!(sandbox_id = %id, code, "main process ended, sandbox exited");
-                let mut died =
-                    SandboxEvent::new(EventAction::Die, &entry.meta).with_exit_code(code);
-                died.reason = entry.meta.end_reason;
-                teardown.events.emit(died);
-                request_restart(&teardown, entry, code);
             }
+            Ok(None) | Err(ApiError::SandboxNotFound(_)) => return,
             Err(e) => tracing::warn!(sandbox_id = %id, error = %e, "cannot record the exit"),
         }
     }
@@ -860,6 +832,7 @@ fn request_restart(teardown: &Teardown, entry: &SandboxEntry, code: i32) {
 /// A start since the exit was recorded owns the sandbox now, so it stays.
 async fn auto_remove_ended(teardown: &Teardown, id: &str, pid: &str) {
     let removed = {
+        let _persisting = teardown.lock_persist(id).await;
         let mut entries = teardown.entries.write().await;
         let exited = entries
             .get(id)
@@ -936,6 +909,8 @@ pub struct SandboxManager {
     pending_names: Arc<std::sync::Mutex<HashSet<String>>>,
     /// One lock per sandbox, held while its limits change.
     update_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// One lock per sandbox, held while its record is written to disk.
+    persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
     /// Ticks when any sandbox starts running or is removed, so waits do not
     /// have to poll for it.
@@ -978,6 +953,7 @@ impl SandboxManager {
             store: None,
             pending_names: Arc::new(std::sync::Mutex::new(HashSet::new())),
             update_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             events: EventLog::default(),
             run_changes: Arc::new(watch::channel(()).0),
             exited_ttl: None,
@@ -1015,6 +991,8 @@ impl SandboxManager {
             backend: Arc::clone(&self.backend),
             processes: Arc::clone(&self.processes),
             update_locks: Arc::clone(&self.update_locks),
+            persist_locks: Arc::clone(&self.persist_locks),
+            store: self.store.clone(),
             events: self.events.clone(),
             run_changes: Arc::clone(&self.run_changes),
             exited_ttl: self.exited_ttl,
@@ -1059,20 +1037,24 @@ impl SandboxManager {
     /// settled the state and reported, so nothing changes then. Returns
     /// whether the failure was recorded.
     async fn fail_main_start(&self, id: &str) -> bool {
-        let recorded = {
-            let mut entries = self.entries.write().await;
-            let Some(entry) = entries.get_mut(id) else {
-                return false;
-            };
-            if entry.meta.status != crate::protocol::SandboxStatus::Running {
-                return false;
+        let teardown = self.teardown();
+        let recorded = teardown
+            .lock_persist(id)
+            .await
+            .commit_status(
+                crate::protocol::SandboxStatus::Failed,
+                persist::ExitUpdate::Keep,
+                persist::ReasonUpdate::Auto,
+                |entry| Ok(entry.meta.status == crate::protocol::SandboxStatus::Running),
+                |_| (),
+            )
+            .await;
+        match recorded {
+            Ok(Some(())) => {}
+            Ok(None) | Err(ApiError::SandboxNotFound(_)) => return false,
+            Err(e) => {
+                tracing::warn!(sandbox_id = %id, error = %e, "cannot record the failed state");
             }
-            let exit_code = entry.meta.exit_code;
-            self.commit(entry, crate::protocol::SandboxStatus::Failed, exit_code)
-                .await
-        };
-        if let Err(e) = recorded {
-            tracing::warn!(sandbox_id = %id, error = %e, "cannot record the failed state");
         }
         self.close_listeners(id).await;
         self.emit_event(id, EventAction::Die, Some(EXEC_FAILED_EXIT))
@@ -1268,67 +1250,85 @@ impl SandboxManager {
     /// Count the restart if the sandbox still sits in the run that ended and
     /// its policy still allows one.
     async fn claim_restart(&self, request: &RestartRequest) -> bool {
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(&request.id) else {
-            self.restart_delays.lock_unpoisoned().remove(&request.id);
-            return false;
-        };
-        let meta = &entry.meta;
-        let current = meta.status == crate::protocol::SandboxStatus::Exited
-            && !meta.manually_stopped
-            && !meta.had_secrets
-            && meta.finished_at == request.finished_at;
-        if !current
-            || !restart::wants_restart(
-                meta.options.spec.restart,
-                request.exit_code,
-                meta.restart_count,
+        let claimed = self
+            .teardown()
+            .commit_with(
+                &request.id,
+                |entry| {
+                    let meta = &entry.meta;
+                    let current = meta.status == crate::protocol::SandboxStatus::Exited
+                        && !meta.manually_stopped
+                        && !meta.had_secrets
+                        && meta.finished_at == request.finished_at;
+                    if !current
+                        || !restart::wants_restart(
+                            meta.options.spec.restart,
+                            request.exit_code,
+                            meta.restart_count,
+                        )
+                    {
+                        return Ok(None);
+                    }
+                    let mut next = meta.clone();
+                    next.restart_count += 1;
+                    Ok(Some(next))
+                },
+                |_| (),
             )
-        {
-            return false;
+            .await;
+        match claimed {
+            Ok(claimed) => claimed.is_some(),
+            Err(ApiError::SandboxNotFound(_)) => {
+                self.restart_delays.lock_unpoisoned().remove(&request.id);
+                false
+            }
+            Err(e) => {
+                tracing::warn!(sandbox_id = %request.id, error = %e, "cannot record the restart");
+                false
+            }
         }
-        let mut next = meta.clone();
-        next.restart_count += 1;
-        if let Err(e) = persist_meta(self.store.as_ref(), next.clone()).await {
-            tracing::warn!(sandbox_id = %request.id, error = %e, "cannot record the restart");
-            return false;
-        }
-        entry.meta = next;
-        true
     }
 
     /// A start by hand begins a fresh restart history.
     async fn clear_restart_history(&self, id: &str) -> Result<()> {
         self.restart_delays.lock_unpoisoned().remove(id);
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(id) else {
-            return Ok(());
-        };
-        if entry.meta.restart_count == 0 {
-            return Ok(());
-        }
-        let mut next = entry.meta.clone();
-        next.restart_count = 0;
-        persist_meta(self.store.as_ref(), next.clone()).await?;
-        entry.meta = next;
-        Ok(())
+        self.set_flags(id, |meta| {
+            (meta.restart_count != 0).then(|| meta.restart_count = 0)
+        })
+        .await
     }
 
     /// Record that a user stopped or killed the sandbox, so its policy leaves
     /// it alone until it is started again.
     async fn mark_manually_stopped(&self, id: &str) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(id) else {
-            return Ok(());
-        };
-        if entry.meta.manually_stopped {
-            return Ok(());
+        self.set_flags(id, |meta| {
+            (!meta.manually_stopped).then(|| meta.manually_stopped = true)
+        })
+        .await
+    }
+
+    /// Change a record with `change`, which returns `None` to leave it as
+    /// it is. A sandbox removed meanwhile has nothing to record.
+    async fn set_flags(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut SandboxMeta) -> Option<()>,
+    ) -> Result<()> {
+        let recorded = self
+            .teardown()
+            .commit_with(
+                id,
+                |entry| {
+                    let mut next = entry.meta.clone();
+                    Ok(change(&mut next).map(|()| next))
+                },
+                |_| (),
+            )
+            .await;
+        match recorded {
+            Err(ApiError::SandboxNotFound(_)) => Ok(()),
+            other => other.map(|_| ()),
         }
-        let mut next = entry.meta.clone();
-        next.manually_stopped = true;
-        persist_meta(self.store.as_ref(), next.clone()).await?;
-        entry.meta = next;
-        Ok(())
     }
 
     /// Record a state change and write it to disk.
@@ -1338,13 +1338,8 @@ impl SandboxManager {
         status: crate::protocol::SandboxStatus,
         exit_code: Option<i32>,
     ) -> Result<()> {
-        // The write lock is held across the save so a concurrent removal
-        // cannot delete the dir and then see this write recreate it.
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        self.commit(entry, status, exit_code).await
+        self.record_status(id, status, exit_code, persist::ReasonUpdate::Auto)
+            .await
     }
 
     /// Record a state change together with why the sandbox ended.
@@ -1355,37 +1350,34 @@ impl SandboxManager {
         exit_code: Option<i32>,
         end_reason: Option<EndReason>,
     ) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        commit_meta_ended(
-            self.store.as_ref(),
-            &self.teardown(),
-            entry,
+        self.record_status(
+            id,
             status,
             exit_code,
-            end_reason,
+            persist::ReasonUpdate::Set(end_reason),
         )
         .await
     }
 
-    /// Write the new state to disk, then adopt it in memory, so a failed
-    /// write leaves the entry in its old state.
-    async fn commit(
+    async fn record_status(
         &self,
-        entry: &mut SandboxEntry,
+        id: &str,
         status: crate::protocol::SandboxStatus,
         exit_code: Option<i32>,
+        reason: persist::ReasonUpdate,
     ) -> Result<()> {
-        commit_meta(
-            self.store.as_ref(),
-            &self.teardown(),
-            entry,
-            status,
-            exit_code,
-        )
-        .await
+        let teardown = self.teardown();
+        let guard = teardown.lock_persist(id).await;
+        guard
+            .commit_status(
+                status,
+                persist::ExitUpdate::Set(exit_code),
+                reason,
+                |_| Ok(true),
+                |_| (),
+            )
+            .await
+            .map(|_| ())
     }
 
     async fn persist(&self, meta: SandboxMeta) -> Result<()> {
@@ -2184,11 +2176,15 @@ impl SandboxManager {
     pub async fn egress_log(&self, id: &str) -> Result<Vec<crate::egress::LogEntry>> {
         let id = self.resolve(id).await?;
         let id = id.as_str();
-        let entries = self.entries.read().await;
-        let entry = entries
+        // Read after the map lock is gone, so a busy proxy log cannot stall it.
+        let log = self
+            .entries
+            .read()
+            .await
             .get(id)
+            .map(|entry| entry.egress.log_reader())
             .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        Ok(entry.egress.log_entries().await)
+        Ok(log.entries().await)
     }
 
     /// Destinations the sandbox's egress policy refused, most recent first.
@@ -2212,50 +2208,62 @@ impl SandboxManager {
         let lock = self.update_lock(&id);
         let _held = lock.lock().await;
 
-        let (requested, added) = {
-            let mut entries = self.entries.write().await;
-            let Some(entry) = entries.get_mut(&id) else {
+        let mut requested: Vec<String> = Vec::new();
+        let mut added: Vec<String> = Vec::new();
+        let mut open = false;
+        let planned = self
+            .teardown()
+            .commit_with(
+                &id,
+                |entry| {
+                    match entry.meta.options.egress.mode {
+                        EgressMode::Open => {
+                            open = true;
+                            return Ok(None);
+                        }
+                        EgressMode::Deny => {
+                            return Err(ApiError::InvalidRequest(
+                                "sandbox was created with egress deny; recreate it with --egress allowlist"
+                                    .into(),
+                            ));
+                        }
+                        EgressMode::Allowlist => {}
+                    }
+                    for domain in domains {
+                        if requested.contains(&domain) {
+                            continue;
+                        }
+                        if !entry.meta.options.egress.domains.contains(&domain) {
+                            added.push(domain.clone());
+                        }
+                        requested.push(domain);
+                    }
+                    let total = entry.meta.options.egress.domains.len() + added.len();
+                    if total > crate::validate::MAX_EGRESS_DOMAINS {
+                        return Err(ApiError::InvalidRequest(format!(
+                            "the allowlist is limited to {} domains",
+                            crate::validate::MAX_EGRESS_DOMAINS
+                        )));
+                    }
+                    if added.is_empty() {
+                        return Ok(None);
+                    }
+                    let mut next = entry.meta.clone();
+                    next.options.egress.domains.extend(added.iter().cloned());
+                    Ok(Some(next))
+                },
+                |_| (),
+            )
+            .await;
+        if let Err(e) = planned {
+            if matches!(e, ApiError::SandboxNotFound(_)) {
                 self.update_locks.lock_unpoisoned().remove(&id);
-                return Err(ApiError::SandboxNotFound(id));
-            };
-            match entry.meta.options.egress.mode {
-                EgressMode::Open => return Ok(Vec::new()),
-                EgressMode::Deny => {
-                    return Err(ApiError::InvalidRequest(
-                        "sandbox was created with egress deny; recreate it with --egress allowlist"
-                            .into(),
-                    ));
-                }
-                EgressMode::Allowlist => {}
             }
-
-            let mut requested: Vec<String> = Vec::new();
-            let mut added: Vec<String> = Vec::new();
-            for domain in domains {
-                if requested.contains(&domain) {
-                    continue;
-                }
-                if !entry.meta.options.egress.domains.contains(&domain) {
-                    added.push(domain.clone());
-                }
-                requested.push(domain);
-            }
-            let total = entry.meta.options.egress.domains.len() + added.len();
-            if total > crate::validate::MAX_EGRESS_DOMAINS {
-                return Err(ApiError::InvalidRequest(format!(
-                    "the allowlist is limited to {} domains",
-                    crate::validate::MAX_EGRESS_DOMAINS
-                )));
-            }
-
-            if !added.is_empty() {
-                let mut next = entry.meta.clone();
-                next.options.egress.domains.extend(added.iter().cloned());
-                self.persist(next.clone()).await?;
-                entry.meta = next;
-            }
-            (requested, added)
-        };
+            return Err(e);
+        }
+        if open {
+            return Ok(Vec::new());
+        }
 
         // The record is written first, so the recorded list is never shorter
         // than what the VM allows. Every requested host goes to the backend,
@@ -2280,14 +2288,20 @@ impl SandboxManager {
 
     /// Take `domains` back out of the record after the backend refused them.
     async fn forget_egress_domains(&self, id: &str, domains: &[String]) {
-        let mut entries = self.entries.write().await;
-        let Some(entry) = entries.get_mut(id) else {
-            return;
-        };
-        let mut next = entry.meta.clone();
-        next.options.egress.domains.retain(|d| !domains.contains(d));
-        match self.persist(next.clone()).await {
-            Ok(()) => entry.meta = next,
+        let forgotten = self
+            .teardown()
+            .commit_with(
+                id,
+                |entry| {
+                    let mut next = entry.meta.clone();
+                    next.options.egress.domains.retain(|d| !domains.contains(d));
+                    Ok(Some(next))
+                },
+                |_| (),
+            )
+            .await;
+        match forgotten {
+            Ok(_) | Err(ApiError::SandboxNotFound(_)) => {}
             Err(e) => {
                 tracing::warn!(sandbox = %id, error = %e, "cannot take refused egress hosts out of the record");
             }
@@ -2299,33 +2313,40 @@ impl SandboxManager {
     pub async fn rename(&self, reference: &str, new_name: &str) -> Result<PbSandboxInfo> {
         crate::validate::sandbox_name(new_name)?;
         let id = self.resolve(reference).await?;
+        // Holding the name keeps a create or another rename from taking it
+        // between the check below and the write.
         let _reservation = NameReservation::claim(&self.pending_names, new_name)
             .ok_or_else(|| name_in_use(new_name, None))?;
-        {
-            let mut entries = self.entries.write().await;
-            let holder = entries
-                .iter()
-                .find(|(_, entry)| entry.meta.options.spec.name == new_name)
-                .map(|(holder, _)| holder.clone());
-            match holder {
-                Some(holder) if holder == id => {
-                    return Err(ApiError::InvalidRequest(format!(
-                        "sandbox {id} is already named {new_name}"
-                    )));
-                }
-                Some(holder) => return Err(name_in_use(new_name, Some(&holder))),
-                None => {}
+        let holder = self
+            .entries
+            .read()
+            .await
+            .iter()
+            .find(|(_, entry)| entry.meta.options.spec.name == new_name)
+            .map(|(holder, _)| holder.clone());
+        match holder {
+            Some(holder) if holder == id => {
+                return Err(ApiError::InvalidRequest(format!(
+                    "sandbox {id} is already named {new_name}"
+                )));
             }
-            let entry = entries
-                .get_mut(&id)
-                .ok_or_else(|| ApiError::SandboxNotFound(id.clone()))?;
-            let mut next = entry.meta.clone();
-            next.options.spec.name = new_name.to_string();
-            self.persist(next.clone()).await?;
-            entry.meta = next;
-            self.events
-                .emit(SandboxEvent::new(EventAction::Rename, &entry.meta));
+            Some(holder) => return Err(name_in_use(new_name, Some(&holder))),
+            None => {}
         }
+        self.teardown()
+            .commit_with(
+                &id,
+                |entry| {
+                    let mut next = entry.meta.clone();
+                    next.options.spec.name = new_name.to_string();
+                    Ok(Some(next))
+                },
+                {
+                    let events = self.events.clone();
+                    move |entry| events.emit(SandboxEvent::new(EventAction::Rename, &entry.meta))
+                },
+            )
+            .await?;
         self.info(&id, CommandView::Argv0Only).await
     }
 
@@ -2780,7 +2801,6 @@ impl SandboxManager {
         tracing::info!(sandbox_id = %id, pid = %handle.pid, "main process started");
         tokio::spawn(mark_exited_on_main_end(
             self.teardown(),
-            self.store.clone(),
             id.to_string(),
             handle.pid.clone(),
             exit.clone(),
@@ -3120,23 +3140,39 @@ impl SandboxManager {
         })
     }
 
-    /// Commit `running` and register the comms policy under one `entries`
-    /// lock, so a concurrent cleanup cannot deregister in between and leave
-    /// the broker holding a policy for a sandbox that is gone.
+    /// Commit `running`, then register the comms policy under the `entries`
+    /// read lock, so a concurrent cleanup cannot deregister in between and
+    /// leave the broker holding a policy for a sandbox that is gone.
     async fn commit_running_and_register(
         &self,
         id: &str,
         comms: CommunicationPolicy,
     ) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        let exit_code = entry.meta.exit_code;
-        self.commit(entry, crate::protocol::SandboxStatus::Running, exit_code)
+        let teardown = self.teardown();
+        // Kept until the policy is registered, so a stop cannot slip in
+        // between and have its deregistration undone.
+        let guard = teardown.lock_persist(id).await;
+        guard
+            .commit_status(
+                crate::protocol::SandboxStatus::Running,
+                persist::ExitUpdate::Keep,
+                persist::ReasonUpdate::Auto,
+                |_| Ok(true),
+                {
+                    let run_changes = Arc::clone(&self.run_changes);
+                    move |entry| {
+                        entry.runs_started += 1;
+                        run_changes.send_replace(());
+                    }
+                },
+            )
             .await?;
-        entry.runs_started += 1;
-        self.run_changes.send_replace(());
+        #[cfg(test)]
+        crate::sandbox::store::gate::pass_async("after-running-commit", id).await;
+        let entries = self.entries.read().await;
+        if !entries.contains_key(id) {
+            return Err(ApiError::SandboxNotFound(id.to_string()));
+        }
         self.broker.register_sandbox(id.to_string(), comms).await;
         Ok(())
     }
@@ -3148,24 +3184,35 @@ impl SandboxManager {
         id: &str,
     ) -> Result<Option<(crate::protocol::SandboxStatus, SandboxMeta)>> {
         use crate::protocol::SandboxStatus as State;
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        let before = match entry.meta.status {
-            State::Stopped => return Ok(None),
-            State::Running | State::Exited => entry.meta.status.clone(),
-            ref other => return Err(wrong_state(id, other, "stop")),
-        };
-        let exit_code = entry.meta.exit_code;
-        let meta = entry.meta.clone();
-        // Saved by the commit below, and undone if that fails.
-        let was_manual = std::mem::replace(&mut entry.meta.manually_stopped, true);
-        if let Err(e) = self.commit(entry, State::Stopping, exit_code).await {
-            entry.meta.manually_stopped = was_manual;
-            return Err(e);
-        }
-        Ok(Some((before, meta)))
+        let mut left = None;
+        let teardown = self.teardown();
+        teardown
+            .lock_persist(id)
+            .await
+            .commit(
+                |entry| {
+                    let before = match entry.meta.status {
+                        State::Stopped => return Ok(None),
+                        State::Running | State::Exited => entry.meta.status.clone(),
+                        ref other => return Err(wrong_state(id, other, "stop")),
+                    };
+                    left = Some((before, entry.meta.clone()));
+                    let mut next = persist::status_meta(
+                        &entry.meta,
+                        State::Stopping,
+                        persist::ExitUpdate::Keep,
+                        persist::ReasonUpdate::Auto,
+                    );
+                    next.manually_stopped = true;
+                    Ok(Some(next))
+                },
+                {
+                    let teardown = teardown.clone();
+                    move |entry| rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now())
+                },
+            )
+            .await?;
+        Ok(left)
     }
 
     /// Move a stopped, exited or failed sandbox to `creating` and clear its
@@ -3173,31 +3220,51 @@ impl SandboxManager {
     /// or `None` when it is already running.
     async fn begin_start(&self, id: &str) -> Result<Option<CommunicationPolicy>> {
         use crate::protocol::SandboxStatus as State;
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        match entry.meta.status {
-            State::Running => return Ok(None),
-            State::Stopped | State::Exited | State::Failed => {}
-            ref other => return Err(wrong_state(id, other, "start")),
-        }
-        let was_manual = std::mem::replace(&mut entry.meta.manually_stopped, false);
-        if let Err(e) = self.commit(entry, State::Creating, None).await {
-            entry.meta.manually_stopped = was_manual;
-            return Err(e);
-        }
-        Ok(Some(entry.meta.options.comms.clone()))
+        let teardown = self.teardown();
+        teardown
+            .lock_persist(id)
+            .await
+            .commit(
+                |entry| {
+                    match entry.meta.status {
+                        State::Running => return Ok(None),
+                        State::Stopped | State::Exited | State::Failed => {}
+                        ref other => return Err(wrong_state(id, other, "start")),
+                    }
+                    let mut next = persist::status_meta(
+                        &entry.meta,
+                        State::Creating,
+                        persist::ExitUpdate::Set(None),
+                        persist::ReasonUpdate::Auto,
+                    );
+                    next.manually_stopped = false;
+                    Ok(Some(next))
+                },
+                {
+                    let teardown = teardown.clone();
+                    move |entry| {
+                        rearm_exited_ttl(&teardown, entry, std::time::SystemTime::now());
+                        entry.meta.options.comms.clone()
+                    }
+                },
+            )
+            .await
     }
 
     /// Change the state and keep the exit code.
     async fn set_state(&self, id: &str, status: crate::protocol::SandboxStatus) -> Result<()> {
-        let mut entries = self.entries.write().await;
-        let entry = entries
-            .get_mut(id)
-            .ok_or_else(|| ApiError::SandboxNotFound(id.to_string()))?;
-        let exit_code = entry.meta.exit_code;
-        self.commit(entry, status, exit_code).await
+        let teardown = self.teardown();
+        let guard = teardown.lock_persist(id).await;
+        guard
+            .commit_status(
+                status,
+                persist::ExitUpdate::Keep,
+                persist::ReasonUpdate::Auto,
+                |_| Ok(true),
+                |_| (),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Record a failed transition. A sandbox removed meanwhile is already
@@ -3274,7 +3341,15 @@ impl SandboxManager {
         if let Some(removed) = removed.as_mut() {
             close_all(std::mem::take(&mut removed.listeners)).await;
         }
-        let result = teardown.backend.remove_sandbox(id).await;
+        // A write still in flight for this sandbox lands before the backend
+        // deletes the record, and later ones find no entry.
+        let result = {
+            let _persisting = teardown.persist_lock(id).lock_owned().await;
+            let result = teardown.backend.remove_sandbox(id).await;
+            // A cancelled removal leaves this entry behind, which is small and harmless.
+            teardown.persist_locks.lock_unpoisoned().remove(id);
+            result
+        };
         if let Some(RemovedEntry { meta, .. }) = removed {
             if meta.options.spec.auto_remove {
                 release_anonymous_volumes(teardown, &meta.options.mounts).await;
@@ -9674,6 +9749,7 @@ pub(crate) mod tests {
 
     mod egress;
     mod pause;
+    mod persist;
     #[cfg(not(feature = "krunvm"))]
     mod ports;
     mod rename;

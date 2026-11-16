@@ -68,6 +68,76 @@ pub fn token_hash_eq(a: &str, b: &str) -> bool {
     a.as_bytes().ct_eq(b.as_bytes()).into()
 }
 
+/// Test gates that hold a save, or a point in the manager, until released.
+#[cfg(test)]
+pub(crate) mod gate {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// The point at the start of `MetaStore::save`.
+    pub(crate) const SAVE: &str = "save";
+
+    #[derive(Default)]
+    pub(crate) struct Gate {
+        state: Mutex<(bool, bool)>,
+        cv: Condvar,
+    }
+
+    type GateMap = HashMap<(&'static str, String), Arc<Gate>>;
+
+    static GATES: Mutex<Option<GateMap>> = Mutex::new(None);
+
+    /// Hold the first caller that reaches `point` for sandbox `id`.
+    pub(crate) fn arm(point: &'static str, id: &str) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        GATES
+            .lock()
+            .unwrap()
+            .get_or_insert_default()
+            .insert((point, id.to_string()), Arc::clone(&gate));
+        gate
+    }
+
+    fn find(point: &'static str, id: &str) -> Option<Arc<Gate>> {
+        let gates = GATES.lock().unwrap();
+        gates.as_ref()?.get(&(point, id.to_string())).cloned()
+    }
+
+    /// Block the calling thread until the gate opens.
+    pub(crate) fn pass(point: &'static str, id: &str) {
+        let Some(gate) = find(point, id) else { return };
+        let mut state = gate.state.lock().unwrap();
+        state.0 = true;
+        gate.cv.notify_all();
+        while !state.1 {
+            state = gate.cv.wait(state).unwrap();
+        }
+    }
+
+    /// Like [`pass`], for async code, which must not block its thread.
+    pub(crate) async fn pass_async(point: &'static str, id: &str) {
+        let Some(gate) = find(point, id) else { return };
+        gate.state.lock().unwrap().0 = true;
+        while !gate.state.lock().unwrap().1 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    impl Gate {
+        pub(crate) fn open(&self) {
+            self.state.lock().unwrap().1 = true;
+            self.cv.notify_all();
+        }
+
+        /// Wait until a caller is held at the gate.
+        pub(crate) async fn held(&self) {
+            while !self.state.lock().unwrap().0 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
 /// Reads and writes sandbox records under `<data>/sandboxes`.
 #[derive(Debug, Clone)]
 pub struct MetaStore {
@@ -94,6 +164,8 @@ impl MetaStore {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+        #[cfg(test)]
+        gate::pass(gate::SAVE, &meta.id);
         let dir = self.sandbox_dir(&meta.id);
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(DIR_MODE))?;
