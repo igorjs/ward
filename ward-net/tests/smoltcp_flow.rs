@@ -944,3 +944,94 @@ async fn given_established_flow_when_guest_resets_then_flow_is_removed() {
     );
     drop(flow.host_stream);
 }
+
+/// Makes dropping `stream` send an RST instead of a FIN, so the stack's host
+/// read fails with a connection reset.
+fn set_zero_linger(stream: &TcpStream) {
+    let linger = libc::linger {
+        l_onoff: 1,
+        l_linger: 0,
+    };
+    // SAFETY: the fd is a valid open socket and the pointer and length
+    // describe a valid `linger` value.
+    let ret = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            (&raw const linger).cast(),
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(ret, 0, "setsockopt(SO_LINGER) failed");
+}
+
+#[tokio::test]
+async fn given_host_resets_connection_when_polled_then_guest_gets_rst_not_fin() {
+    // Arrange
+    let mut flow = establish_flow().await;
+    set_zero_linger(&flow.host_stream);
+
+    // Act: the server aborts mid-response.
+    drop(flow.host_stream);
+    let mut saw_fin = false;
+    let mut saw_rst = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !saw_rst {
+        flow.stack.poll();
+        while let Some(frame) = try_read_frame(&flow.guest_fd) {
+            let control = parse_tcp_segment(&frame).control;
+            saw_fin |= control == TcpControl::Fin;
+            saw_rst |= control == TcpControl::Rst;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Assert
+    assert!(saw_rst, "a host read error must reset the guest");
+    assert!(!saw_fin, "a host read error must not look like a clean end");
+}
+
+#[tokio::test]
+async fn given_idle_established_flow_when_idle_timeout_passes_then_guest_is_reset() {
+    // Arrange
+    let mut flow = establish_flow().await;
+    flow.stack
+        .set_idle_timeout_for_test(Duration::from_millis(100));
+
+    // Act / Assert
+    let rst = poll_until_rst(&mut flow.stack, &flow.guest_fd, Duration::from_secs(3)).await;
+    assert!(rst.is_some(), "an idle flow must be reset");
+    assert!(poll_until_no_flows(&mut flow.stack, Duration::from_secs(3)).await);
+    drop(flow.host_stream);
+}
+
+#[tokio::test]
+async fn given_flow_with_traffic_when_idle_timeout_is_short_then_activity_keeps_it_alive() {
+    // Arrange
+    let mut flow = establish_flow().await;
+    let idle = Duration::from_millis(400);
+    flow.stack.set_idle_timeout_for_test(idle);
+
+    // Act: host bytes arrive more often than the idle timeout, for longer
+    // than the idle timeout in total.
+    let start = std::time::Instant::now();
+    while start.elapsed() < idle * 2 {
+        tokio::io::AsyncWriteExt::write_all(&mut flow.host_stream, b"x")
+            .await
+            .expect("host write");
+        for _ in 0..5 {
+            flow.stack.poll();
+            while try_read_frame(&flow.guest_fd).is_some() {}
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Assert
+    assert_eq!(
+        flow.stack.flow_count_for_test(),
+        1,
+        "activity resets the timer"
+    );
+}

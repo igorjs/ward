@@ -10,6 +10,8 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use smoltcp::phy::ChecksumCapabilities;
@@ -157,6 +159,11 @@ fn encode_dns_name(name: &str) -> Vec<u8> {
 /// to look up `domain`, with correctly computed IPv4/UDP checksums so the
 /// checksum validation smoltcp runs by default on ingress accepts it.
 fn build_dns_query_frame(domain: &str) -> Vec<u8> {
+    build_dns_query_frame_of_type(domain, DnsQueryType::A)
+}
+
+/// Same as `build_dns_query_frame`, for any query type.
+fn build_dns_query_frame_of_type(domain: &str, query_type: DnsQueryType) -> Vec<u8> {
     let raw_name = encode_dns_name(domain);
     let dns_repr = DnsRepr {
         transaction_id: QUERY_TRANSACTION_ID,
@@ -164,7 +171,7 @@ fn build_dns_query_frame(domain: &str) -> Vec<u8> {
         flags: DnsFlags::RECURSION_DESIRED,
         question: DnsQuestion {
             name: &raw_name,
-            type_: DnsQueryType::A,
+            type_: query_type,
         },
     };
     let dns_len = dns_repr.buffer_len();
@@ -567,4 +574,91 @@ async fn given_outstanding_query_table_at_capacity_when_new_query_then_oldest_ev
         "outstanding DNS query table should never exceed its cap of {MAX_PENDING_DNS_QUERIES} \
          entries, but held {outstanding}"
     );
+}
+
+/// Octets of Ethernet (14), IPv4 without options (20) and UDP (8) headers
+/// ahead of the DNS message in a relayed response.
+const DNS_MESSAGE_OFFSET: usize = 42;
+const DNS_RCODE_NOERROR: u16 = 0;
+const DNS_RCODE_REFUSED: u16 = 5;
+const DNS_TYPE_MX: u16 = 15;
+
+/// Returns the (RCODE, answer count) of a relayed DNS response frame.
+fn dns_rcode_and_answer_count(frame: &[u8]) -> (u16, u16) {
+    let dns = &frame[DNS_MESSAGE_OFFSET..];
+    let flags = u16::from_be_bytes([dns[2], dns[3]]);
+    (flags & 0x000f, u16::from_be_bytes([dns[6], dns[7]]))
+}
+
+/// Resolver that counts its calls and always has an answer.
+struct CountingResolver {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Resolver for CountingResolver {
+    async fn resolve(&self, _name: &str) -> Vec<IpAddr> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        vec![IpAddr::V4(CANNED_ANSWER)]
+    }
+}
+
+/// Sends a query of `query_type` for `CANNED_DOMAIN` through a stack whose
+/// egress check allows the name only if `allow` is true, and returns the
+/// response's (RCODE, answer count) and how often the resolver ran.
+async fn relay_typed_query(query_type: DnsQueryType, allow: bool) -> ((u16, u16), usize) {
+    let (guest_fd, host_fd) = socketpair_dgram();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver: Box<dyn Resolver> = Box::new(CountingResolver {
+        calls: Arc::clone(&calls),
+    });
+    let connector: Box<dyn Connector> = Box::new(NullConnector);
+    let egress = move |_domain: &str, _port: u16| -> Pin<Box<dyn Future<Output = bool> + Send>> {
+        Box::pin(async move { allow })
+    };
+    let mut stack = Stack::new(host_fd, resolver, connector, Box::new(egress));
+    perform_arp_handshake(&mut stack, &guest_fd).await;
+    write_frame(
+        &guest_fd,
+        &build_dns_query_frame_of_type(CANNED_DOMAIN, query_type),
+    );
+    let response = poll_until_response(&mut stack, &guest_fd, Duration::from_secs(2))
+        .await
+        .expect("stack should answer the query");
+    (
+        dns_rcode_and_answer_count(&response),
+        calls.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn given_aaaa_query_when_relayed_then_noerror_with_no_answers_and_no_host_lookup() {
+    let (header, lookups) = relay_typed_query(DnsQueryType::Aaaa, true).await;
+
+    assert_eq!(header, (DNS_RCODE_NOERROR, 0));
+    assert_eq!(lookups, 0, "a non-A question must not reach the resolver");
+}
+
+#[tokio::test]
+async fn given_mx_query_when_relayed_then_noerror_with_no_answers_and_no_host_lookup() {
+    let (header, lookups) = relay_typed_query(DnsQueryType::Unknown(DNS_TYPE_MX), true).await;
+
+    assert_eq!(header, (DNS_RCODE_NOERROR, 0));
+    assert_eq!(lookups, 0);
+}
+
+#[tokio::test]
+async fn given_a_query_when_relayed_then_one_answer_and_one_host_lookup() {
+    let (header, lookups) = relay_typed_query(DnsQueryType::A, true).await;
+
+    assert_eq!(header, (DNS_RCODE_NOERROR, 1));
+    assert_eq!(lookups, 1);
+}
+
+#[tokio::test]
+async fn given_denied_name_and_non_a_query_when_relayed_then_refused_as_for_type_a() {
+    let (header, lookups) = relay_typed_query(DnsQueryType::Aaaa, false).await;
+
+    assert_eq!(header, (DNS_RCODE_REFUSED, 0));
+    assert_eq!(lookups, 0);
 }
