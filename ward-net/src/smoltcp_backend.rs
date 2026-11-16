@@ -29,6 +29,7 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -40,9 +41,8 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpMessageType, DhcpPacket, DhcpRepr, DnsFlags, DnsPacket,
-    DnsQueryType, DnsQuestion, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
-    IpAddress, IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket,
-    TcpRepr,
+    DnsQueryType, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress,
+    IpCidr, IpEndpoint, IpProtocol, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -340,20 +340,44 @@ struct ParsedDnsQuery {
     transaction_id: u16,
     domain: String,
     question: Vec<u8>,
+    /// True for class IN type A, the only question the relay resolves.
+    wants_a_record: bool,
 }
 
 /// Parses `payload` (a UDP datagram's contents) as a DNS query, returning
-/// its transaction ID, dotted-form queried name, and raw question section.
-/// `None` for anything smoltcp's wire types can't parse as a question.
+/// its transaction ID, dotted-form queried name, raw question section, and
+/// whether it asks for class IN type A.
+/// Only the first question is read, and QDCOUNT is not checked. `None` when
+/// the header is short, the name has a compression pointer, a reserved label
+/// type or invalid UTF-8, or the name or the QTYPE/QCLASS tail is cut short.
+/// The question is read by hand because smoltcp's parser rejects any class
+/// other than IN, and such a query still deserves an answer.
 fn parse_dns_query(payload: &[u8]) -> Option<ParsedDnsQuery> {
     let packet = DnsPacket::new_checked(payload).ok()?;
-    let (_, question) = DnsQuestion::parse(packet.payload()).ok()?;
-    let domain = decode_dns_name(question.name)?;
-    let question = packet.payload().get(..question.buffer_len())?.to_vec();
+    let body = packet.payload();
+    // Walk the labels to the root label; a compression pointer has no
+    // place in a question and is refused.
+    let mut name_len = 0;
+    loop {
+        let label_len = usize::from(*body.get(name_len)?);
+        name_len += 1;
+        if label_len == 0 {
+            break;
+        }
+        if label_len & DNS_LABEL_POINTER_MASK != 0 {
+            return None;
+        }
+        name_len += label_len;
+    }
+    let domain = decode_dns_name(body.get(..name_len)?)?;
+    let question = body.get(..name_len + DNS_QUESTION_TAIL_LEN)?.to_vec();
+    let qtype = u16::from_be_bytes([body[name_len], body[name_len + 1]]);
+    let qclass = u16::from_be_bytes([body[name_len + 2], body[name_len + 3]]);
     Some(ParsedDnsQuery {
         transaction_id: packet.transaction_id(),
         domain,
         question,
+        wants_a_record: qtype == u16::from(DnsQueryType::A) && qclass == DNS_CLASS_IN,
     })
 }
 
@@ -415,6 +439,21 @@ const MAX_FLOW_ENTRIES: usize = 1024;
 /// flow slot and two socket buffers forever.
 pub(crate) const HALF_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long an established outbound flow may make no progress (no bytes
+/// taken from the guest and none delivered to it) before it is reset, even
+/// if undelivered bytes are still queued. Dead flows would otherwise hold a
+/// slot of `MAX_FLOW_ENTRIES` until the sandbox stops.
+pub(crate) const FLOW_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Top two bits of a label octet that mark a compression pointer.
+const DNS_LABEL_POINTER_MASK: usize = 0xC0;
+
+/// Octets of QTYPE and QCLASS that follow a question's name.
+const DNS_QUESTION_TAIL_LEN: usize = 4;
+
+/// DNS record class IN (RFC 1035 section 3.2.4).
+const DNS_CLASS_IN: u16 = 1;
+
 /// Hand-encodes a DNS response: header, the query's own echoed question,
 /// then one `A` record per IPv4 address in `answers` (IPv6 addresses are
 /// dropped; there is no relay-side AAAA support yet). smoltcp's wire types
@@ -447,7 +486,7 @@ fn build_dns_response(
     for addr in ipv4_answers {
         response.extend_from_slice(&NAME_POINTER_TO_QUESTION);
         response.extend_from_slice(&u16::from(DnsQueryType::A).to_be_bytes());
-        response.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
         response.extend_from_slice(&DNS_ANSWER_TTL_SECS.to_be_bytes());
         response.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
         response.extend_from_slice(&addr.octets());
@@ -580,6 +619,10 @@ enum FlowState {
         /// When ward sent its FIN. The flow is aborted if the guest has not
         /// finished closing by `Stack::half_close_timeout` after this.
         fin_sent_at: Option<std::time::Instant>,
+        /// Set by the host-io task when a host read or write failed.
+        host_failed: Arc<AtomicBool>,
+        /// Last time bytes moved in either direction.
+        last_activity: std::time::Instant,
     },
 }
 
@@ -607,7 +650,19 @@ struct Flow {
 /// channel closing) ends this task and drops both halves together,
 /// tearing down the connection as a unit instead of leaking the other
 /// direction's loop.
-fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+///
+/// The returned flag is set before the task ends when a host read or write
+/// failed or timed out, so `pump_flows` can tell an error (reset the guest)
+/// from a clean EOF (FIN).
+fn spawn_host_io(
+    stream: TcpStream,
+) -> (
+    mpsc::Sender<Vec<u8>>,
+    mpsc::Receiver<Vec<u8>>,
+    Arc<AtomicBool>,
+) {
+    let host_failed = Arc::new(AtomicBool::new(false));
+    let host_failed_task = Arc::clone(&host_failed);
     let (to_host_tx, mut to_host_rx) = mpsc::channel::<Vec<u8>>(HOST_WRITER_CHANNEL_CAPACITY);
     let (from_host_tx, from_host_rx) = mpsc::channel::<Vec<u8>>(HOST_READER_CHANNEL_CAPACITY);
     let (mut read_half, mut write_half) = stream.into_split();
@@ -622,10 +677,12 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
                             error = %err,
                             "host write failed for a guest-initiated TCP flow"
                         );
+                        host_failed_task.store(true, Ordering::Release);
                         break;
                     }
                     Err(_) => {
                         tracing::warn!("host write timed out for a guest-initiated TCP flow");
+                        host_failed_task.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -657,6 +714,7 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
                             error = %err,
                             "host read failed for a guest-initiated TCP flow"
                         );
+                        host_failed_task.store(true, Ordering::Release);
                         break;
                     }
                 }
@@ -667,7 +725,7 @@ fn spawn_host_io(stream: TcpStream) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Ve
             () = read_loop => {}
         }
     });
-    (to_host_tx, from_host_rx)
+    (to_host_tx, from_host_rx, host_failed)
 }
 
 /// True if `dst` is safe to open a guest-initiated TCP flow to: neither
@@ -760,6 +818,8 @@ pub struct Stack {
     sockets_pending_removal: Vec<SocketHandle>,
     /// See [`HALF_CLOSE_TIMEOUT`]. A field so tests can shorten it.
     half_close_timeout: std::time::Duration,
+    /// See [`FLOW_IDLE_TIMEOUT`]. A field so tests can shorten it.
+    idle_timeout: std::time::Duration,
     dns_socket_handle: SocketHandle,
     /// Queries relayed to the resolver, awaiting an answer. Capped at
     /// `MAX_PENDING_DNS_QUERIES` via `push_pending_dns_query`, oldest
@@ -860,6 +920,7 @@ impl Stack {
             flows: HashMap::new(),
             sockets_pending_removal: Vec::new(),
             half_close_timeout: HALF_CLOSE_TIMEOUT,
+            idle_timeout: FLOW_IDLE_TIMEOUT,
             dns_socket_handle,
             pending_dns_queries: VecDeque::new(),
             dhcp_socket_handle,
@@ -942,6 +1003,11 @@ impl Stack {
     /// Shortens the half-close deadline so a test need not wait a minute.
     pub fn set_half_close_timeout_for_test(&mut self, timeout: std::time::Duration) {
         self.half_close_timeout = timeout;
+    }
+
+    /// Shortens the idle deadline so a test need not wait 15 minutes.
+    pub fn set_idle_timeout_for_test(&mut self, timeout: std::time::Duration) {
+        self.idle_timeout = timeout;
     }
 
     /// Replaces the inbound flow timeouts, so a test need not wait for the
@@ -1149,13 +1215,15 @@ impl Stack {
             match &mut flow.state {
                 FlowState::Connecting(connect_rx) => match connect_rx.try_recv() {
                     Ok(Ok(stream)) => {
-                        let (to_host_tx, from_host_rx) = spawn_host_io(stream);
+                        let (to_host_tx, from_host_rx, host_failed) = spawn_host_io(stream);
                         flow.state = FlowState::Established {
                             to_host_tx,
                             from_host_rx,
                             pending_from_host: None,
                             host_closed: false,
                             fin_sent_at: None,
+                            host_failed,
+                            last_activity: std::time::Instant::now(),
                         };
                     }
                     Ok(Err(err)) => {
@@ -1177,6 +1245,8 @@ impl Stack {
                     pending_from_host,
                     host_closed,
                     fin_sent_at,
+                    host_failed,
+                    last_activity,
                 } => {
                     match to_host_tx.try_reserve() {
                         Ok(permit) => {
@@ -1186,6 +1256,7 @@ impl Stack {
                                 && !chunk.is_empty()
                             {
                                 permit.send(chunk);
+                                *last_activity = std::time::Instant::now();
                             }
                         }
                         // The host writer's channel is full: leave the bytes
@@ -1207,6 +1278,13 @@ impl Stack {
                             // The host-io task ended (error, timeout, or the
                             // stream closed): nothing more will ever arrive.
                             Err(mpsc::error::TryRecvError::Disconnected) => {
+                                if host_failed.load(Ordering::Acquire) {
+                                    // A host failure is not an end of stream: reset
+                                    // the guest instead of sending FIN. The abort
+                                    // drops host bytes still in the send buffer,
+                                    // as an RST does.
+                                    to_remove.push((key, flow.handle));
+                                }
                                 *host_closed = true;
                             }
                         }
@@ -1221,9 +1299,13 @@ impl Stack {
                             match socket.send_slice(chunk) {
                                 Ok(sent) if sent == chunk.len() => {
                                     *pending_from_host = None;
+                                    *last_activity = std::time::Instant::now();
                                 }
                                 Ok(sent) => {
                                     chunk.drain(0..sent);
+                                    if sent > 0 {
+                                        *last_activity = std::time::Instant::now();
+                                    }
                                 }
                                 Err(err) => {
                                     tracing::warn!(
@@ -1248,6 +1330,10 @@ impl Stack {
                         if !socket.is_active() || timed_out {
                             to_remove.push((key, flow.handle));
                         }
+                    }
+                    if last_activity.elapsed() >= self.idle_timeout {
+                        tracing::debug!(destination = %key.1, "resetting an idle guest TCP flow");
+                        to_remove.push((key, flow.handle));
                     }
                     // The guest reset or closed its side. Nothing can be
                     // delivered any more, even if a host chunk is still pending.
@@ -1625,6 +1711,7 @@ impl Stack {
                 transaction_id,
                 domain,
                 question,
+                wants_a_record,
             }) = parse_dns_query(&payload)
             else {
                 tracing::warn!("dropping malformed guest DNS query on UDP:53");
@@ -1636,9 +1723,14 @@ impl Stack {
             let domain_for_resolve = domain.clone();
             tokio::task::spawn(async move {
                 // The host resolver is itself an outbound path, so a name
-                // the policy refuses is never handed to it.
+                // the policy refuses is never handed to it. Any other type
+                // gets an empty answer and no host lookup.
                 let answers = if egress_check(&domain_for_resolve, DNS_SERVER_PORT).await {
-                    Some(resolver.resolve(&domain_for_resolve).await)
+                    if wants_a_record {
+                        Some(resolver.resolve(&domain_for_resolve).await)
+                    } else {
+                        Some(Vec::new())
+                    }
                 } else {
                     tracing::debug!(
                         domain = %domain_for_resolve,
@@ -2037,6 +2129,55 @@ mod tests {
     /// task lifecycle, not its egress decisions: always allows.
     fn always_allow_egress(_domain: &str, _port: u16) -> EgressCheckFuture {
         Box::pin(async { true })
+    }
+
+    /// Wire-format query for `a.b` with the given QTYPE and QCLASS.
+    fn query_bytes(qtype: u16, qclass: u16) -> Vec<u8> {
+        let mut bytes = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(&[1, b'a', 1, b'b', 0]);
+        bytes.extend_from_slice(&qtype.to_be_bytes());
+        bytes.extend_from_slice(&qclass.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn given_dns_queries_when_parsed_then_only_class_in_type_a_wants_a_record() {
+        let wants = |qtype, qclass| {
+            parse_dns_query(&query_bytes(qtype, qclass))
+                .expect("well-formed query")
+                .wants_a_record
+        };
+
+        assert!(wants(1, DNS_CLASS_IN));
+        assert!(!wants(28, DNS_CLASS_IN), "AAAA");
+        assert!(!wants(15, DNS_CLASS_IN), "MX");
+        assert!(!wants(1, 3), "class CH");
+    }
+
+    /// A query header (one question) followed by `body`.
+    fn with_header(body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    #[test]
+    fn given_malformed_question_when_parsed_then_none() {
+        let cases: [(&str, Vec<u8>); 6] = [
+            (
+                "compression pointer",
+                with_header(&[0xC0, 0x0C, 0, 1, 0, 1]),
+            ),
+            ("label type 0x40", with_header(&[0x41, b'a', 0, 0, 1, 0, 1])),
+            ("label type 0x80", with_header(&[0x81, b'a', 0, 0, 1, 0, 1])),
+            ("truncated name", with_header(&[5, b'a', b'b'])),
+            ("missing tail", with_header(&[1, b'a', 0])),
+            ("unterminated name", with_header(&[1, b'a', 1, b'b'])),
+        ];
+
+        for (name, payload) in cases {
+            assert!(parse_dns_query(&payload).is_none(), "{name}");
+        }
     }
 
     #[tokio::test]

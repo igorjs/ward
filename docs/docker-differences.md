@@ -65,6 +65,10 @@ These flags of `ward run` and `ward create` are enforced by the guest agent when
 
 Ward has three modes: `deny` (default), `allowlist` and `open`. In `allowlist` mode the sandbox's DNS resolver answers REFUSED for any name not on the list. The host resolver is an outbound path, so it does not see those names.
 
+The relay answers class IN type A questions with the host's IPv4 addresses. For any other type (AAAA, MX, TXT, SRV, HTTPS and so on) it answers NOERROR with no records and does not ask the host, so a client that asks for AAAA falls back to A and an MX or TXT lookup gets an empty answer, not a wrong one. A name the egress policy denies still gets REFUSED, whatever the type. DNS over TCP is not served.
+
+A guest TCP flow is reset, not closed, when a read or write on the host connection fails mid-stream, and a clean close from the host still ends with a normal FIN. A flow that makes no progress for 15 minutes is reset: no bytes taken from the guest and none delivered to it, even if bytes are still queued. A guest that keeps reading, however slowly, is not reset.
+
 `ward egress suggest SANDBOX` has no Docker equivalent. It prints an `--allow-domain` flag for each host the sandbox was refused, and lists blocked IP addresses on stderr. The record is kept after the sandbox exits, until `rm`. 
 
 `ward egress suggest SANDBOX --apply` adds the suggested names to the sandbox's allowlist. It takes effect at once, without a restart, and the names are kept across daemon restarts. IP addresses are skipped. It works only on a sandbox created with `--egress allowlist`: a `deny` sandbox has no network device, so it must be recreated, and an `open` sandbox has nothing to add. An allowlist holds at most 256 names.
