@@ -60,3 +60,16 @@ id = "GHSA-qwgh-2vcv-g2f7"
 # Ward never catches a panic from a hash callback and the hashers do not panic.
 # Re-evaluate when the RustCrypto crates move to digest 0.11.
 reason = "block-buffer 0.10.4 has no patched release in its line; needs a caught panic in a hash callback, which Ward never does. Transitive via digest 0.10."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+# chrono 0.4.45: "unmaintained" informational advisory (no CVSS, no
+# exploit). All versions are affected, so there is no fixed release.
+# Pulled in transitively via:
+#   ward-core -> oci-client -> chrono
+# oci-client uses chrono only to type the `created` timestamp of an OCI
+# image config (oci-client/src/config.rs). Ward does not use chrono
+# itself, and unmaintained status is not a vulnerability.
+# Re-evaluate when oci-client moves to jiff or time. Mirror of the entry
+# in deny.toml.
+reason = "Informational (unmaintained) advisory, no CVSS / no exploit, no fixed version. Transitive via oci-client, which only parses an image config timestamp."
