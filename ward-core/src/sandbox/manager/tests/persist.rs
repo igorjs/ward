@@ -358,36 +358,6 @@ async fn given_a_stop_mid_write_when_the_main_process_ends_then_only_one_die_is_
     assert!(extra.is_err(), "a second die or event followed the stop");
 }
 
-// Passes without the persist lock too: the name reservation decides this.
-#[tokio::test]
-async fn given_two_sandboxes_when_renamed_to_one_name_together_then_exactly_one_wins() {
-    // Arrange
-    let tmp = tempfile::tempdir().unwrap();
-    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
-    let first = mgr.create(named_req(), "").await.unwrap();
-    let second = mgr
-        .create(
-            CreateSandboxRequest {
-                name: "web3".into(),
-                ..create_req("alpine")
-            },
-            "",
-        )
-        .await
-        .unwrap();
-    let spawn_rename = |id: String| {
-        let mgr = Arc::clone(&mgr);
-        tokio::spawn(async move { mgr.rename(&id, RENAMED).await })
-    };
-
-    // Act
-    let (a, b) = (spawn_rename(first.id), spawn_rename(second.id));
-    let results = [a.await.unwrap(), b.await.unwrap()];
-
-    // Assert
-    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
-}
-
 #[tokio::test]
 async fn given_a_failed_write_when_a_state_change_is_recorded_then_memory_keeps_the_old_state() {
     // Arrange
@@ -465,4 +435,91 @@ async fn given_a_start_mid_write_when_the_exited_ttl_fires_then_the_sandbox_is_k
         memory_status(&mgr, &created.id).await,
         ProtoStatus::Creating
     );
+}
+
+// Fails if the auto-removal decides without the persist lock.
+#[cfg(not(feature = "krunvm"))]
+#[tokio::test]
+async fn given_a_start_mid_write_when_the_auto_removal_runs_then_the_sandbox_is_kept() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, _) = host_manager_in(MAIN_OUTPUT_CAP, false, Some(tmp.path().to_path_buf()));
+    let id = create_with_command(&mgr, &["sh", "-c", "exit 0"], false).await;
+    wait_for_status(&mgr, &id, SandboxStatus::Exited).await;
+    let ended_pid = mgr.main_pid(&id).await.expect("main pid");
+    let held = gate::arm(gate::SAVE, &id);
+    let (starter, start_id) = (Arc::clone(&mgr), id.clone());
+    let start = tokio::spawn(async move { starter.begin_start(&start_id).await });
+    held.held().await;
+    let (teardown, remove_id) = (mgr.teardown(), id.clone());
+    let removal =
+        tokio::spawn(async move { auto_remove_ended(&teardown, &remove_id, &ended_pid).await });
+
+    // Act
+    assert_blocked(&removal, "auto-removal").await;
+    held.open();
+    start.await.unwrap().unwrap();
+    removal.await.unwrap();
+
+    // Assert
+    assert_eq!(memory_status(&mgr, &id).await, ProtoStatus::Creating);
+}
+
+// Fails if the policy is registered in the caller's own future.
+#[tokio::test]
+async fn given_a_caller_dropped_after_the_running_commit_when_the_task_ends_then_the_policy_is_registered()
+ {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let created = mgr.create(named_req(), "").await.unwrap();
+    let comms = mgr
+        .entries
+        .read()
+        .await
+        .get(&created.id)
+        .unwrap()
+        .meta
+        .options
+        .comms
+        .clone();
+    mgr.broker.deregister_sandbox(&created.id).await;
+    let held = gate::arm("after-running-commit", &created.id);
+    let (starter, id) = (Arc::clone(&mgr), created.id.clone());
+    let start = tokio::spawn(async move { starter.commit_running_and_register(&id, comms).await });
+    held.held().await;
+
+    // Act
+    start.abort();
+    held.open();
+    drop(mgr.teardown().lock_persist(&created.id).await);
+
+    // Assert
+    let published = mgr
+        .broker
+        .publish(&created.id, "topic", bytes::Bytes::new())
+        .await;
+    assert!(
+        !matches!(published, Err(ApiError::SandboxNotFound(_))),
+        "{published:?}"
+    );
+}
+
+// Fails if the stop runs in the caller's own future.
+#[cfg(not(feature = "krunvm"))]
+#[tokio::test]
+async fn given_a_caller_dropped_while_stopping_when_the_stop_ends_then_the_sandbox_is_stopped() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, _) = host_manager_in(MAIN_OUTPUT_CAP, false, Some(tmp.path().to_path_buf()));
+    let id = create_with_command(&mgr, &["sh", "-c", "trap '' TERM; sleep 30"], false).await;
+    let (stopper, stop_id) = (Arc::clone(&mgr), id.clone());
+    let stop = tokio::spawn(async move { stopper.stop_within(&stop_id, Some(1)).await });
+    wait_for_status(&mgr, &id, SandboxStatus::Stopping).await;
+
+    // Act
+    stop.abort();
+
+    // Assert
+    wait_for_status(&mgr, &id, SandboxStatus::Stopped).await;
 }

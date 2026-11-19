@@ -88,14 +88,32 @@ pub(crate) mod gate {
     static GATES: Mutex<Option<GateMap>> = Mutex::new(None);
 
     /// Hold the first caller that reaches `point` for sandbox `id`.
-    pub(crate) fn arm(point: &'static str, id: &str) -> Arc<Gate> {
+    pub(crate) fn arm(point: &'static str, id: &str) -> Armed {
         let gate = Arc::new(Gate::default());
         GATES
             .lock()
             .unwrap()
             .get_or_insert_default()
             .insert((point, id.to_string()), Arc::clone(&gate));
-        gate
+        Armed(gate)
+    }
+
+    /// An armed gate that opens when dropped, so a failed assertion cannot
+    /// leave a held caller blocked and hang the test.
+    pub(crate) struct Armed(Arc<Gate>);
+
+    impl std::ops::Deref for Armed {
+        type Target = Gate;
+
+        fn deref(&self) -> &Gate {
+            &self.0
+        }
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            self.0.open();
+        }
     }
 
     fn find(point: &'static str, id: &str) -> Option<Arc<Gate>> {
