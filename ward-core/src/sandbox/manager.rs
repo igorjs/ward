@@ -450,8 +450,6 @@ pub const STOP_GRACE_SECONDS: u64 = 10;
 /// The pid `kill_process` accepts for the sandbox's main process.
 pub const MAIN_PROCESS_PID: &str = "0";
 
-/// How often `wait` looks at the recorded state.
-const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 use crate::protocol::BYTES_PER_MIB;
 
 /// One reading of a running sandbox's resource use.
@@ -971,8 +969,8 @@ pub struct SandboxManager {
     /// One lock per sandbox, held while its record is written to disk.
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     events: EventLog,
-    /// Ticks when any sandbox starts running or is removed, so waits do not
-    /// have to poll for it.
+    /// Ticks when any sandbox record changes or a sandbox is removed, so
+    /// waits do not have to poll for it.
     run_changes: Arc<watch::Sender<()>>,
     forwarder: Arc<dyn PortForwarder>,
     /// Daemon-wide exited TTL for sandboxes that set none. `None` is off.
@@ -1277,7 +1275,7 @@ impl SandboxManager {
             .map(|(id, _)| id.clone())
             .collect();
         for id in due {
-            if let Err(e) = self.start_resolved(&id).await {
+            if let Err(e) = self.start_detached(&id).await {
                 tracing::warn!(sandbox_id = %id, error = %e, "cannot restart sandbox at boot");
             }
         }
@@ -1499,7 +1497,7 @@ impl SandboxManager {
             return;
         }
         tracing::info!(sandbox_id = %request.id, "restarting sandbox per its restart policy");
-        if let Err(e) = self.start_resolved(&request.id).await {
+        if let Err(e) = self.start_detached(&request.id).await {
             tracing::warn!(sandbox_id = %request.id, error = %e, "cannot restart sandbox");
         }
     }
@@ -2637,7 +2635,7 @@ impl SandboxManager {
 
     /// Stop a sandbox: the VM goes away and the rootfs stays. Stopping a
     /// stopped sandbox succeeds without doing anything.
-    pub async fn stop(&self, reference: &str) -> Result<PbSandboxInfo> {
+    pub async fn stop(self: &Arc<Self>, reference: &str) -> Result<PbSandboxInfo> {
         self.stop_within(reference, None).await
     }
 
@@ -2645,7 +2643,7 @@ impl SandboxManager {
     /// after SIGTERM: `None` keeps the default, 0 forces it at once and a
     /// negative value waits as long as it takes.
     pub async fn stop_within(
-        &self,
+        self: &Arc<Self>,
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
@@ -2655,7 +2653,7 @@ impl SandboxManager {
     /// Like [`stop_within`](Self::stop_within), asking the main process to
     /// end with `signal` instead of the sandbox's stop signal.
     pub async fn stop_with_signal(
-        &self,
+        self: &Arc<Self>,
         reference: &str,
         grace_seconds: Option<i32>,
         signal: Option<&str>,
@@ -2663,12 +2661,33 @@ impl SandboxManager {
         let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         let grace = self.grace_for(&id, grace_seconds).await;
-        self.stop_resolved(&id, grace, signal).await?;
-        let info = self.info(&id, CommandView::Full).await?;
-        if self.is_auto_remove(&id).await {
-            self.remove(&id).await?;
-        }
-        Ok(info)
+        // The auto-removal joins the stop in one task, so a caller that is
+        // dropped between them cannot leave an auto-remove sandbox stopped.
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.stop_detached(&id, grace, signal).await?;
+            // The stop took effect, so a failure here is logged for a caller
+            // that has gone.
+            let info = manager
+                .info(&id, CommandView::Full)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(sandbox_id = %id, error = %e, "cannot read the sandbox after stopping it");
+                })?;
+            if manager.is_auto_remove(&id).await {
+                match manager.remove(&id).await {
+                    // Removed meanwhile, which is what the caller wanted.
+                    Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(sandbox_id = %id, error = %e, "cannot auto-remove the sandbox after stopping it");
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(info)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("stop and remove task: {e}")))?
     }
 
     async fn is_auto_remove(&self, id: &str) -> bool {
@@ -2681,7 +2700,7 @@ impl SandboxManager {
 
     /// Boot a stopped, exited or failed sandbox again. Starting a running
     /// sandbox succeeds without doing anything.
-    pub async fn start(&self, reference: &str) -> Result<PbSandboxInfo> {
+    pub async fn start(self: &Arc<Self>, reference: &str) -> Result<PbSandboxInfo> {
         let id = self.resolve(reference).await?;
         if self.recorded_status(&id).await? != crate::protocol::SandboxStatus::Running {
             self.refuse_if_had_secrets(&id).await?;
@@ -2693,14 +2712,14 @@ impl SandboxManager {
 
     /// Stop, then start. A failed sandbox has no VM to stop, so it only
     /// starts.
-    pub async fn restart(&self, reference: &str) -> Result<PbSandboxInfo> {
+    pub async fn restart(self: &Arc<Self>, reference: &str) -> Result<PbSandboxInfo> {
         self.restart_within(reference, None).await
     }
 
     /// Like [`restart`](Self::restart), with the stop grace of
     /// [`stop_within`](Self::stop_within).
     pub async fn restart_within(
-        &self,
+        self: &Arc<Self>,
         reference: &str,
         grace_seconds: Option<i32>,
     ) -> Result<PbSandboxInfo> {
@@ -2710,8 +2729,10 @@ impl SandboxManager {
 
     /// Like [`restart_within`](Self::restart_within), with the stop signal
     /// of [`stop_with_signal`](Self::stop_with_signal).
+    /// The stop and the start are two tasks, so a caller dropped between
+    /// them leaves the sandbox stopped. The restart is not atomic.
     pub async fn restart_with_signal(
-        &self,
+        self: &Arc<Self>,
         reference: &str,
         grace_seconds: Option<i32>,
         signal: Option<&str>,
@@ -2786,7 +2807,23 @@ impl SandboxManager {
             .unwrap_or(SIGTERM)
     }
 
+    /// Runs the stop in a task of its own, so a caller that is dropped does
+    /// not abandon it halfway. A panic in the task is not covered and can
+    /// leave the sandbox in `stopping`.
     async fn stop_resolved(
+        self: &Arc<Self>,
+        id: &str,
+        grace: Option<std::time::Duration>,
+        signal: Option<i32>,
+    ) -> Result<()> {
+        let manager = Arc::clone(self);
+        let id = id.to_string();
+        tokio::spawn(async move { manager.stop_detached(&id, grace, signal).await })
+            .await
+            .map_err(|e| ApiError::Internal(format!("stop task: {e}")))?
+    }
+
+    async fn stop_detached(
         &self,
         id: &str,
         grace: Option<std::time::Duration>,
@@ -2888,7 +2925,18 @@ impl SandboxManager {
         })
     }
 
-    async fn start_resolved(&self, id: &str) -> Result<()> {
+    /// Runs the start in a task of its own, so a caller that is dropped does
+    /// not abandon it halfway. A panic in the task is not covered and can
+    /// leave the sandbox in `creating`.
+    async fn start_resolved(self: &Arc<Self>, id: &str) -> Result<()> {
+        let manager = Arc::clone(self);
+        let id = id.to_string();
+        tokio::spawn(async move { manager.start_detached(&id).await })
+            .await
+            .map_err(|e| ApiError::Internal(format!("start task: {e}")))?
+    }
+
+    async fn start_detached(&self, id: &str) -> Result<()> {
         let Some(comms) = self.begin_start(id).await? else {
             tracing::info!(sandbox_id = %id, "sandbox already running");
             return Ok(());
@@ -3081,6 +3129,9 @@ impl SandboxManager {
                 oom_killed,
             },
         );
+        // A waiter that woke on the `running` record needs this entry to
+        // follow the run's exit.
+        self.run_changes.send_replace(());
         Ok(())
     }
 
@@ -3246,6 +3297,7 @@ impl SandboxManager {
     pub async fn wait(&self, reference: &str) -> Result<i32> {
         use crate::protocol::SandboxStatus as State;
         let id = self.resolve(reference).await?;
+        let mut changes = self.run_changes.subscribe();
         let mut live: Option<watch::Receiver<Option<i32>>> = None;
         loop {
             let recorded = self.entries.read().await.get(&id).map(|entry| {
@@ -3283,7 +3335,8 @@ impl SandboxManager {
                 }
                 State::Creating | State::Stopping => {}
             }
-            tokio::time::sleep(WAIT_POLL).await;
+            // The sender lives as long as the manager, so this cannot fail.
+            let _ = changes.changed().await;
         }
     }
 
@@ -3458,13 +3511,7 @@ impl SandboxManager {
                 persist::ExitUpdate::Keep,
                 persist::ReasonUpdate::Auto,
                 |_| Ok(true),
-                {
-                    let run_changes = Arc::clone(&self.run_changes);
-                    move |entry| {
-                        entry.runs_started += 1;
-                        run_changes.send_replace(());
-                    }
-                },
+                |entry| entry.runs_started += 1,
             )
             .await?;
         self.vm_exit_codes
@@ -10249,7 +10296,7 @@ pub(crate) mod tests {
             let (mgr, id) = (Arc::clone(&mgr), id.clone());
             async move { (mgr.wait(&id).await, status_of(&mgr, &id).await) }
         });
-        let early = tokio::time::timeout(WAIT_POLL * 3, &mut waiter).await;
+        let early = tokio::time::timeout(TEST_POLL_STEP * 3, &mut waiter).await;
         assert!(early.is_err(), "wait returned while the sandbox ran");
 
         // Act

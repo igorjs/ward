@@ -145,7 +145,9 @@ impl PersistGuard {
                 return Err(guard.gone());
             };
             entry.meta = next;
-            Ok(Some(adopt(entry)))
+            let adopted = adopt(entry);
+            guard.teardown.run_changes.send_replace(());
+            Ok(Some(adopted))
         });
         write
             .await
