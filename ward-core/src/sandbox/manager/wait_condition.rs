@@ -2,7 +2,7 @@
 
 //! `wait` with Docker's conditions: `not-running`, `next-exit` and `removed`.
 
-use super::{ApiError, Result, SandboxManager, WAIT_POLL, decode_wait_status, watch};
+use super::{ApiError, Result, SandboxManager, decode_wait_status, watch};
 use crate::pb::WaitCondition;
 use crate::protocol::SandboxStatus;
 
@@ -55,6 +55,7 @@ impl SandboxManager {
     /// Return the last exit code once the sandbox is gone, or 0 when it never
     /// ran a command.
     async fn wait_removed(&self, id: &str) -> Result<i32> {
+        let mut changes = self.run_changes.subscribe();
         let mut live: Option<watch::Receiver<Option<i32>>> = None;
         let mut last = None;
         loop {
@@ -75,7 +76,8 @@ impl SandboxManager {
             if status == SandboxStatus::Running && live.is_none() {
                 live = self.running_main_exit(id).await;
             }
-            tokio::time::sleep(WAIT_POLL).await;
+            // The sender lives as long as the manager, so this cannot fail.
+            let _ = changes.changed().await;
         }
     }
 }

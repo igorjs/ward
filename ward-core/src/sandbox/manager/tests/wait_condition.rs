@@ -169,3 +169,48 @@ async fn given_an_unknown_sandbox_when_waited_for_removed_then_it_is_not_found()
     // Assert
     assert!(matches!(err, ApiError::SandboxNotFound(_)));
 }
+
+// Fails if `wait` falls back to polling the record.
+#[tokio::test]
+async fn given_a_record_changed_without_a_tick_when_waited_then_wait_sleeps_until_the_tick() {
+    // Arrange
+    let mgr = host_manager(MAIN_OUTPUT_CAP);
+    let id = create_with_command(&mgr, &[], false).await;
+    let waiter = tokio::spawn({
+        let (mgr, id) = (Arc::clone(&mgr), id.clone());
+        async move { mgr.wait(&id).await }
+    });
+    tokio::time::sleep(SHORT).await;
+    mgr.entries.write().await.get_mut(&id).unwrap().meta.status = ProtoStatus::Stopped;
+
+    // Act
+    tokio::time::sleep(SHORT).await;
+    let slept = !waiter.is_finished();
+    mgr.run_changes.send_replace(());
+
+    // Assert
+    assert!(slept, "wait looked at the record without a tick");
+    assert_eq!(waiter.await.unwrap().unwrap(), 0);
+}
+
+// Fails if the main process entry lands without a tick: a waiter that woke
+// on the `running` record would never learn about the run's main process.
+#[tokio::test]
+async fn given_a_start_held_before_its_main_process_when_it_registers_then_the_notifier_ticks() {
+    // Arrange
+    let mgr = host_manager(MAIN_OUTPUT_CAP);
+    let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+    mgr.stop(&id).await.unwrap();
+    let held = crate::sandbox::store::gate::arm("after-running-commit", &id);
+    let (starter, start_id) = (Arc::clone(&mgr), id.clone());
+    let start = tokio::spawn(async move { starter.start(&start_id).await });
+    held.held().await;
+    let ticks = mgr.run_changes.subscribe();
+
+    // Act
+    held.open();
+    start.await.unwrap().unwrap();
+
+    // Assert
+    assert!(ticks.has_changed().unwrap());
+}

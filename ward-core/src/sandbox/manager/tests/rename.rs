@@ -143,3 +143,24 @@ async fn given_renamed_sandbox_when_daemon_restarts_then_new_name_is_kept() {
     // Assert
     assert_eq!(second.resolve(NEW_NAME).await.unwrap(), created.id);
 }
+
+// Passes without the persist lock too: the name reservation decides this.
+#[tokio::test]
+async fn given_two_sandboxes_when_renamed_to_one_name_together_then_exactly_one_wins() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let first = mgr.create(named(OLD_NAME), "").await.unwrap();
+    let second = mgr.create(named(OTHER_NAME), "").await.unwrap();
+    let spawn_rename = |id: String| {
+        let mgr = Arc::clone(&mgr);
+        tokio::spawn(async move { mgr.rename(&id, NEW_NAME).await })
+    };
+
+    // Act
+    let (a, b) = (spawn_rename(first.id), spawn_rename(second.id));
+    let results = [a.await.unwrap(), b.await.unwrap()];
+
+    // Assert
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+}
