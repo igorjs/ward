@@ -311,25 +311,6 @@ fn given_memory_and_cpus_when_create_then_guest_sees_them() {
 }
 
 #[test]
-fn given_a_sandbox_when_a_process_sets_the_clock_then_it_fails_and_normal_commands_work() {
-    require_vm!();
-    let d = Daemon::spawn_vm();
-    let id = create(&d, &[]);
-
-    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06'");
-    let hardening = sh(
-        &d,
-        &id,
-        "grep -E '^(NoNewPrivs|Seccomp):' /proc/self/status | tr -d '\\t' | tr '\\n' ' '",
-    );
-    let normal = exec(&d, &id, &["echo", "still works"]);
-
-    assert_ne!(set.exit, 0, "the clock was set: {}", set.stderr);
-    assert_eq!(hardening.stdout.trim(), "NoNewPrivs:1 Seccomp:2");
-    assert_eq!((normal.stdout.as_str(), normal.exit), ("still works\n", 0));
-}
-
-#[test]
 fn given_proc_and_dev_when_inspected_then_guest_has_usable_pseudo_filesystems() {
     require_vm!();
     let d = Daemon::spawn_vm();
@@ -931,6 +912,56 @@ fn exec_as(d: &Daemon, id: &str, user: &str, argv: &[&str]) -> Finished {
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         exit: out.status.code().expect("exit code"),
     }
+}
+
+/// `Seccomp:2` is filter mode, and the mask is the 14 kept capabilities.
+const HARDENING_STATUS: &str = "NoNewPrivs:1 Seccomp:2 CapBnd:00000000a80425fb";
+const STATUS_SCRIPT: &str = "grep -E '^(NoNewPrivs|Seccomp|CapBnd):' /proc/self/status \
+                             | tr -d '\\t' | tr '\\n' ' '";
+
+#[test]
+fn given_a_root_exec_when_it_reads_its_status_then_the_filter_and_cap_mask_are_set() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let status = sh(&d, &id, STATUS_SCRIPT);
+    let namespace = sh(&d, &id, "unshare -U true");
+    let normal = exec(&d, &id, &["echo", "still works"]);
+
+    assert_eq!(status.stdout.trim(), HARDENING_STATUS);
+    assert_ne!(namespace.exit, 0, "a user namespace was created");
+    assert_eq!((normal.stdout.as_str(), normal.exit), ("still works\n", 0));
+}
+
+#[test]
+fn given_a_sandbox_when_a_process_sets_the_clock_then_it_fails() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06'");
+
+    assert_ne!(set.exit, 0, "the clock was set: {}", set.stderr);
+}
+
+#[test]
+fn given_a_user_exec_when_it_reads_its_status_then_the_filter_is_set_after_the_drop() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    sh(&d, &id, ADD_USER);
+
+    let status = exec_as(&d, &id, "1000", &["sh", "-c", STATUS_SCRIPT]);
+    let namespace = exec_as(&d, &id, "1000", &["unshare", "-U", "true"]);
+
+    assert_eq!(status.exit, 0, "{}", status.stderr);
+    assert!(
+        status.stdout.contains("NoNewPrivs:1 Seccomp:2"),
+        "{}",
+        status.stdout
+    );
+    assert_ne!(namespace.exit, 0, "a user namespace was created");
 }
 
 #[test]

@@ -28,9 +28,9 @@ mod archive;
 mod cgroup;
 pub mod cgroup_limits;
 mod freezer;
-// Only the Linux build installs the filter; other hosts compile it for the tests.
 pub mod guest_mounts;
 pub mod guest_network;
+// Only the Linux build installs the filter; other hosts compile it for the tests.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod hardening;
 mod limits;
@@ -550,6 +550,15 @@ static CHILD_RLIMITS: OnceLock<Vec<(rustix::process::Resource, rustix::process::
 static CHILD_GROUPS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Remember the limits and groups every process the agent starts gets.
+/// Whether the guest kernel can install the seccomp filter workloads get.
+#[must_use]
+pub fn seccomp_available() -> bool {
+    #[cfg(target_os = "linux")]
+    return hardening::seccomp_available();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 pub fn set_process_limits(ulimits: &[process_limits::GuestUlimit], groups: &[String]) {
     #[cfg(target_os = "linux")]
     let _ = CHILD_RLIMITS.set(process_limits::kernel_limits(ulimits));

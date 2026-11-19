@@ -200,6 +200,7 @@ mod linux {
     use super::{
         CAP_SCAN_LIMIT, CLONE_NEWUSER, KEPT_CAPS, Rule, SockFilter, Target, Verdict, build_program,
     };
+    use crate::user::{Step, tag};
     use std::io;
 
     #[cfg(target_arch = "x86_64")]
@@ -215,9 +216,9 @@ mod linux {
 
     // Missing from libc on some targets.
     #[cfg(target_arch = "x86_64")]
-    const SYS_KEXEC_FILE_LOAD: i64 = 320;
+    pub(super) const SYS_KEXEC_FILE_LOAD: i64 = 320;
     #[cfg(target_arch = "aarch64")]
-    const SYS_KEXEC_FILE_LOAD: i64 = 294;
+    pub(super) const SYS_KEXEC_FILE_LOAD: i64 = 294;
 
     /// The system calls a workload may not make.
     pub(super) fn default_rules() -> Vec<Rule> {
@@ -253,6 +254,10 @@ mod linux {
             libc::SYS_keyctl,
             libc::SYS_add_key,
             libc::SYS_request_key,
+            // Runtimes (libuv, liburing users) fall back when it fails.
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
         ];
         let mut rules: Vec<Rule> = nrs.into_iter().map(Rule::deny).collect();
         // User namespaces hand out full capabilities inside them.
@@ -291,10 +296,10 @@ mod linux {
         /// for the child between fork and exec: it does not allocate. Any
         /// failure is returned so the workload never runs half hardened.
         pub fn apply(&self) -> io::Result<()> {
-            drop_bounding_caps()?;
+            drop_bounding_caps().map_err(|e| tag(Step::CapDrop, e))?;
             // SAFETY: plain prctl calls with integer arguments.
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-                return Err(io::Error::last_os_error());
+                return Err(tag(Step::NoNewPrivs, io::Error::last_os_error()));
             }
             let prog = libc::sock_fprog {
                 len: u16::try_from(self.filter.len()).map_err(|_| io::ErrorKind::InvalidInput)?,
@@ -312,10 +317,16 @@ mod linux {
                 )
             };
             if rc != 0 {
-                return Err(io::Error::last_os_error());
+                return Err(tag(Step::Seccomp, io::Error::last_os_error()));
             }
             Ok(())
         }
+    }
+
+    /// Whether the guest kernel can install a seccomp filter.
+    pub fn seccomp_available() -> bool {
+        // SAFETY: PR_GET_SECCOMP takes no arguments; EINVAL means no seccomp.
+        unsafe { libc::prctl(libc::PR_GET_SECCOMP) >= 0 }
     }
 
     fn drop_bounding_caps() -> io::Result<()> {
@@ -339,7 +350,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::Hardening;
+pub use linux::{Hardening, seccomp_available};
 
 #[cfg(test)]
 mod tests {
@@ -491,6 +502,15 @@ mod tests {
         ] {
             assert_eq!(go(nr, NO_ARGS), SECCOMP_RET_ALLOW, "syscall {nr}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_the_kexec_file_load_number_when_checked_then_it_matches_the_kernel_table() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(super::linux::SYS_KEXEC_FILE_LOAD, 320);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(super::linux::SYS_KEXEC_FILE_LOAD, 294);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

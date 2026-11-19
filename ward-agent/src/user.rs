@@ -269,6 +269,9 @@ pub enum Step {
     SetGid,
     SetUid,
     ChangeDir,
+    CapDrop,
+    NoNewPrivs,
+    Seccomp,
 }
 
 impl Step {
@@ -278,10 +281,21 @@ impl Step {
             Self::SetGid => "setgid",
             Self::SetUid => "setuid",
             Self::ChangeDir => "chdir",
+            Self::CapDrop => "capability drop",
+            Self::NoNewPrivs => "no_new_privs",
+            Self::Seccomp => "seccomp install",
         }
     }
 
-    const ALL: [Step; 4] = [Self::SetGroups, Self::SetGid, Self::SetUid, Self::ChangeDir];
+    const ALL: [Step; 7] = [
+        Self::SetGroups,
+        Self::SetGid,
+        Self::SetUid,
+        Self::ChangeDir,
+        Self::CapDrop,
+        Self::NoNewPrivs,
+        Self::Seccomp,
+    ];
 }
 
 /// The step number lives above the errno bits of the error code.
@@ -291,7 +305,7 @@ const ERRNO_MASK: i32 = (1 << STEP_SHIFT) - 1;
 /// Mark `err` with the failed `step`. The standard library hands a
 /// `pre_exec` failure to the parent as its bare OS error code, so the step
 /// rides in the high bits of that code and costs no allocation in the child.
-fn tag(step: Step, err: std::io::Error) -> std::io::Error {
+pub(crate) fn tag(step: Step, err: std::io::Error) -> std::io::Error {
     match err.raw_os_error() {
         Some(errno) => std::io::Error::from_raw_os_error(((step as i32) << STEP_SHIFT) | errno),
         None => err,

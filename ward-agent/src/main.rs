@@ -48,6 +48,11 @@ async fn main() -> std::io::Result<()> {
             "sandbox cgroup NOT set up: no pids limit and OOM kills counted guest-wide"
         ),
     }
+    if !ward_agent::seccomp_available() {
+        tracing::warn!(
+            "guest kernel has no seccomp: every workload will fail to start with \"seccomp install\""
+        );
+    }
     ward_agent::apply_cgroup_limits(&args.cgroup_settings)
         .map_err(|e| std::io::Error::other(format!("cannot apply the cgroup limits: {e}")))?;
     ward_agent::set_process_limits(&args.ulimits, &args.group_add);
