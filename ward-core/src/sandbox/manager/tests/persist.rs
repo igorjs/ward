@@ -530,3 +530,32 @@ async fn given_a_caller_dropped_while_stopping_when_the_stop_ends_then_the_sandb
     // Assert
     wait_for_status(&mgr, &id, SandboxStatus::Stopped).await;
 }
+
+// Fails if the auto-removal runs in the caller's own future.
+#[cfg(not(feature = "krunvm"))]
+#[tokio::test]
+async fn given_a_caller_dropped_while_stopping_an_auto_remove_sandbox_when_the_stop_ends_then_it_is_removed()
+ {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let (mgr, _, _) = host_manager_in(MAIN_OUTPUT_CAP, false, Some(tmp.path().to_path_buf()));
+    let req = CreateSandboxRequest {
+        image: "alpine".into(),
+        command: vec!["sleep".into(), "30".into()],
+        auto_remove: true,
+        ..Default::default()
+    };
+    let id = mgr.create(req, "").await.unwrap().id;
+    let held = gate::arm(gate::SAVE, &id);
+    let (stopper, stop_id) = (Arc::clone(&mgr), id.clone());
+    let stop = tokio::spawn(async move { stopper.stop(&stop_id).await });
+    held.held().await;
+
+    // Act
+    stop.abort();
+    held.open();
+    let removed = tokio::time::timeout(LONG, until_removed_from_map(&mgr, &id)).await;
+
+    // Assert
+    assert!(removed.is_ok(), "the sandbox was not removed");
+}

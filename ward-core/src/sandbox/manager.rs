@@ -2666,9 +2666,23 @@ impl SandboxManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             manager.stop_detached(&id, grace, signal).await?;
-            let info = manager.info(&id, CommandView::Full).await?;
+            // The stop took effect, so a failure here is logged for a caller
+            // that has gone.
+            let info = manager
+                .info(&id, CommandView::Full)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(sandbox_id = %id, error = %e, "cannot read the sandbox after stopping it");
+                })?;
             if manager.is_auto_remove(&id).await {
-                manager.remove(&id).await?;
+                match manager.remove(&id).await {
+                    // Removed meanwhile, which is what the caller wanted.
+                    Ok(()) | Err(ApiError::SandboxNotFound(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(sandbox_id = %id, error = %e, "cannot auto-remove the sandbox after stopping it");
+                        return Err(e);
+                    }
+                }
             }
             Ok(info)
         })
@@ -2715,6 +2729,8 @@ impl SandboxManager {
 
     /// Like [`restart_within`](Self::restart_within), with the stop signal
     /// of [`stop_with_signal`](Self::stop_with_signal).
+    /// The stop and the start are two tasks, so a caller dropped between
+    /// them leaves the sandbox stopped. The restart is not atomic.
     pub async fn restart_with_signal(
         self: &Arc<Self>,
         reference: &str,
