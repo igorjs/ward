@@ -915,7 +915,8 @@ fn exec_as(d: &Daemon, id: &str, user: &str, argv: &[&str]) -> Finished {
 }
 
 /// `Seccomp:2` is filter mode, and the mask is the 14 kept capabilities.
-const HARDENING_STATUS: &str = "NoNewPrivs:1 Seccomp:2 CapBnd:00000000a80425fb";
+/// In the order /proc/self/status prints them.
+const HARDENING_STATUS: &str = "CapBnd:00000000a80425fb NoNewPrivs:1 Seccomp:2";
 const STATUS_SCRIPT: &str = "grep -E '^(NoNewPrivs|Seccomp|CapBnd):' /proc/self/status \
                              | tr -d '\\t' | tr '\\n' ' '";
 
@@ -940,9 +941,15 @@ fn given_a_sandbox_when_a_process_sets_the_clock_then_it_fails() {
     let d = Daemon::spawn_vm();
     let id = create(&d, &[]);
 
-    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06'");
+    // Busybox date exits 0 even when it cannot set the clock.
+    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06' 2>&1; date +%Y");
 
-    assert_ne!(set.exit, 0, "the clock was set: {}", set.stderr);
+    assert!(
+        set.stdout.contains("Operation not permitted"),
+        "no refusal: {}",
+        set.stdout
+    );
+    assert_ne!(set.stdout.lines().last(), Some("2001"), "the clock moved");
 }
 
 #[test]

@@ -329,6 +329,48 @@ mod linux {
         unsafe { libc::prctl(libc::PR_GET_SECCOMP) >= 0 }
     }
 
+    fn is_root() -> bool {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// Whether `CAP_SETPCAP` is in the effective set.
+    fn has_setpcap() -> bool {
+        const VERSION_3: u32 = 0x2008_0522;
+        const CAP_SETPCAP: u32 = 8;
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        let mut header = Header {
+            version: VERSION_3,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: both pointers refer to live structs of the sizes capget expects.
+        let rc = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+        // A failed probe counts as holding the cap, so the drop error stays fatal.
+        rc != 0 || data[0].effective & (1 << CAP_SETPCAP) != 0
+    }
+
+    /// A process that is not root and lacks `CAP_SETPCAP` has no bounding set
+    /// to give up, so EPERM is expected. Anything else stays fatal.
+    pub(super) fn tolerate_drop_error(errno: Option<i32>, root: bool, setpcap: bool) -> bool {
+        errno == Some(libc::EPERM) && !root && !setpcap
+    }
+
     fn drop_bounding_caps() -> io::Result<()> {
         for cap in 0..=CAP_SCAN_LIMIT {
             if KEPT_CAPS.contains(&cap) {
@@ -341,6 +383,9 @@ mod linux {
                 // EINVAL marks the first number past the kernel's last cap.
                 if err.raw_os_error() == Some(libc::EINVAL) {
                     break;
+                }
+                if tolerate_drop_error(err.raw_os_error(), is_root(), has_setpcap()) {
+                    return Ok(());
                 }
                 return Err(err);
             }
@@ -502,6 +547,18 @@ mod tests {
         ] {
             assert_eq!(go(nr, NO_ARGS), SECCOMP_RET_ALLOW, "syscall {nr}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn given_a_failed_cap_drop_when_root_or_holding_setpcap_then_it_stays_fatal() {
+        let tolerate = super::linux::tolerate_drop_error;
+        assert!(tolerate(Some(libc::EPERM), false, false));
+        assert!(!tolerate(Some(libc::EPERM), true, false));
+        assert!(!tolerate(Some(libc::EPERM), true, true));
+        assert!(!tolerate(Some(libc::EPERM), false, true));
+        assert!(!tolerate(Some(libc::EBUSY), false, false));
+        assert!(!tolerate(None, false, false));
     }
 
     #[cfg(target_os = "linux")]
