@@ -311,6 +311,25 @@ fn given_memory_and_cpus_when_create_then_guest_sees_them() {
 }
 
 #[test]
+fn given_a_sandbox_when_a_process_sets_the_clock_then_it_fails_and_normal_commands_work() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06'");
+    let hardening = sh(
+        &d,
+        &id,
+        "grep -E '^(NoNewPrivs|Seccomp):' /proc/self/status | tr -d '\\t' | tr '\\n' ' '",
+    );
+    let normal = exec(&d, &id, &["echo", "still works"]);
+
+    assert_ne!(set.exit, 0, "the clock was set: {}", set.stderr);
+    assert_eq!(hardening.stdout.trim(), "NoNewPrivs:1 Seccomp:2");
+    assert_eq!((normal.stdout.as_str(), normal.exit), ("still works\n", 0));
+}
+
+#[test]
 fn given_proc_and_dev_when_inspected_then_guest_has_usable_pseudo_filesystems() {
     require_vm!();
     let d = Daemon::spawn_vm();

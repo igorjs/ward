@@ -28,8 +28,11 @@ mod archive;
 mod cgroup;
 pub mod cgroup_limits;
 mod freezer;
+// Only the Linux build installs the filter; other hosts compile it for the tests.
 pub mod guest_mounts;
 pub mod guest_network;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hardening;
 mod limits;
 mod oom;
 pub mod process_limits;
@@ -570,6 +573,31 @@ fn apply_child_limits(cmd: &mut Command) {
     let _ = cmd;
 }
 
+/// The hardening every child gets, built once.
+#[cfg(target_os = "linux")]
+static CHILD_HARDENING: OnceLock<Result<hardening::Hardening, String>> = OnceLock::new();
+
+/// Make the child drop capabilities and install the seccomp filter before it
+/// runs. This comes before the privilege drop, which needs `CAP_SETPCAP` to
+/// still be in effect for the bounding set. A failure fails the spawn.
+fn harden_child(cmd: &mut Command) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let hardening = CHILD_HARDENING
+            .get_or_init(hardening::Hardening::new)
+            .clone()
+            .map_err(std::io::Error::other)?;
+        // SAFETY: the closure runs between fork and exec and only makes
+        // prctl system calls, which do not allocate.
+        unsafe {
+            cmd.pre_exec(move || hardening.apply());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+    Ok(())
+}
+
 /// Give a child with no `--user` its supplementary groups.
 fn apply_root_groups(cmd: &mut Command, gids: Vec<u32>) {
     if gids.is_empty() {
@@ -613,6 +641,7 @@ fn spawn_child(
     join_pids_cgroup(&mut cmd);
     apply_child_limits(&mut cmd);
     apply_root_groups(&mut cmd, root_groups.to_vec());
+    harden_child(&mut cmd)?;
     if let Some(identity) = identity
         && !exec.env.contains_key(HOME_ENV)
     {

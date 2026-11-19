@@ -6,6 +6,14 @@ Ward copies Docker's command line where it can. This page lists the places it do
 
 Ward runs each sandbox in a microVM, not in Linux namespaces. The guest has its own kernel. Docker flags that change host privileges have no meaning there. `ward run` and `ward create` refuse `--privileged`, `--cap-add`, `--cap-drop`, `--security-opt`, `--device`, `--network` (and `--net`), `--ipc`, `--pid`, `--uts`, `--userns` and `--cgroupns` with a one line reason, and reject any other flag not listed in their `--help`. `--privileged=false` is accepted, as it changes nothing. Network access is set with `--egress` instead.
 
+## Guest hardening
+
+Every process the guest agent starts (the main process and each exec) gets a second layer inside the VM, which stays the real boundary. Before the process runs, the agent keeps only Docker's default capabilities in the bounding set (chown, dac_override, fowner, fsetid, kill, setgid, setuid, setpcap, net_bind_service, net_raw, sys_chroot, mknod, audit_write, setfcap), sets `no_new_privs` and installs a seccomp filter. If any step fails, the process does not start, so nothing runs half hardened.
+
+The filter is a deny list, so common tools keep working. These calls fail with `EPERM`: `clock_settime`, `clock_adjtime`, `settimeofday`, `adjtimex` (so `date -s` fails), `kexec_load`, `kexec_file_load`, `init_module`, `finit_module`, `delete_module`, `reboot`, `swapon`, `swapoff`, `mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`, `bpf`, `perf_event_open`, `keyctl`, `add_key`, `request_key`, and `unshare`, `setns` or `clone` with a user namespace flag. `clone3` fails with `ENOSYS`, so libc falls back to `clone`. A call through another ABI (32 bit or x32 on x86_64) kills the process.
+
+What stops working inside a sandbox: mounting filesystems, setuid programs that gain rights (`sudo`, or `su` from a non-root user), rootless container tools and browser sandboxes that need user namespaces. `ptrace` is not filtered, because a filter cannot tell your own processes from others. The guest kernel needs seccomp. Linux guests only.
+
 ## Build
 
 There is no `ward build` and no Dockerfile support yet. Ward runs images from a registry. `ward commit` saves a sandbox as a local image. Design work is in [#202](https://github.com/igorjs/ward/issues/202) and [#203](https://github.com/igorjs/ward/issues/203).
