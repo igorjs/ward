@@ -30,6 +30,9 @@ pub mod cgroup_limits;
 mod freezer;
 pub mod guest_mounts;
 pub mod guest_network;
+// Only the Linux build installs the filter; other hosts compile it for the tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod hardening;
 mod limits;
 mod oom;
 pub mod process_limits;
@@ -215,6 +218,73 @@ fn command_file_exists(exec: &Exec) -> bool {
         .or_else(|| std::env::var_os("PATH"))
         .unwrap_or_default();
     std::env::split_paths(&path).any(|dir| dir.join(command).exists())
+}
+
+/// Magic numbers of the program formats the kernel runs without help.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const KNOWN_FORMATS: [&[u8]; 2] = [b"\x7fELF", b"#!"];
+/// Directory whose presence means extra binary formats may be registered.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const BINFMT_MISC_DIR: &str = "/proc/sys/fs/binfmt_misc";
+
+/// Whether `head` starts with a format the kernel can execute.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn has_known_format(head: &[u8]) -> bool {
+    KNOWN_FORMATS.iter().any(|magic| head.starts_with(magic))
+}
+
+/// Fail with ENOEXEC for a command file the kernel cannot execute. glibc's
+/// `execvp` answers ENOEXEC by running the file with `/bin/sh`, which lets a
+/// workload run a non-program as a script and report success. The musl target
+/// has no such fallback, so only gnu needs this check.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn refuse_unknown_format(exec: &Exec) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    const EXEC_BITS: u32 = 0o111;
+    if std::path::Path::new(BINFMT_MISC_DIR)
+        .join("status")
+        .exists()
+    {
+        return Ok(());
+    }
+    let command = &exec.command[0];
+    let candidates: Vec<std::path::PathBuf> = if command.contains('/') {
+        vec![std::path::PathBuf::from(command)]
+    } else {
+        let path = exec
+            .env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(command))
+            .collect()
+    };
+    let workdir = std::path::Path::new(&exec.working_dir);
+    for candidate in candidates {
+        let candidate = if candidate.is_relative() && !exec.working_dir.is_empty() {
+            workdir.join(candidate)
+        } else {
+            candidate
+        };
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() || meta.permissions().mode() & EXEC_BITS == 0 {
+            continue;
+        }
+        let mut head = [0u8; 4];
+        let read = std::fs::File::open(&candidate)
+            .and_then(|mut f| f.read(&mut head))
+            .unwrap_or(0);
+        if read > 0 && !has_known_format(&head[..read]) {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOEXEC));
+        }
+        break;
+    }
+    Ok(())
 }
 
 /// Exit code for a command that could not be started, as a shell reports it.
@@ -547,6 +617,15 @@ static CHILD_RLIMITS: OnceLock<Vec<(rustix::process::Resource, rustix::process::
 static CHILD_GROUPS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Remember the limits and groups every process the agent starts gets.
+/// Whether the guest kernel can install the seccomp filter workloads get.
+#[must_use]
+pub fn seccomp_available() -> bool {
+    #[cfg(target_os = "linux")]
+    return hardening::seccomp_available();
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 pub fn set_process_limits(ulimits: &[process_limits::GuestUlimit], groups: &[String]) {
     #[cfg(target_os = "linux")]
     let _ = CHILD_RLIMITS.set(process_limits::kernel_limits(ulimits));
@@ -568,6 +647,31 @@ fn apply_child_limits(cmd: &mut Command) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = cmd;
+}
+
+/// The hardening every child gets, built once.
+#[cfg(target_os = "linux")]
+static CHILD_HARDENING: OnceLock<Result<hardening::Hardening, String>> = OnceLock::new();
+
+/// Make the child drop capabilities and install the seccomp filter before it
+/// runs. This comes before the privilege drop, which needs `CAP_SETPCAP` to
+/// still be in effect for the bounding set. A failure fails the spawn.
+fn harden_child(cmd: &mut Command) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let hardening = CHILD_HARDENING
+            .get_or_init(hardening::Hardening::new)
+            .clone()
+            .map_err(std::io::Error::other)?;
+        // SAFETY: the closure runs between fork and exec and only makes
+        // prctl system calls, which do not allocate.
+        unsafe {
+            cmd.pre_exec(move || hardening.apply());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+    Ok(())
 }
 
 /// Give a child with no `--user` its supplementary groups.
@@ -602,6 +706,8 @@ fn spawn_child(
     identity: Option<&user::Identity>,
     root_groups: &[u32],
 ) -> std::io::Result<(Child, ChildIo)> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    refuse_unknown_format(exec)?;
     let mut cmd = Command::new(&exec.command[0]);
     cmd.args(&exec.command[1..]);
     let workdir = (!exec.working_dir.is_empty()).then_some(exec.working_dir.as_str());
@@ -613,6 +719,7 @@ fn spawn_child(
     join_pids_cgroup(&mut cmd);
     apply_child_limits(&mut cmd);
     apply_root_groups(&mut cmd, root_groups.to_vec());
+    harden_child(&mut cmd)?;
     if let Some(identity) = identity
         && !exec.env.contains_key(HOME_ENV)
     {
@@ -1299,6 +1406,15 @@ mod tests {
             err.iter().any(|l| l.contains("spawn failed")),
             "expected spawn-failure line, got {err:?}"
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn given_program_headers_when_checked_then_only_elf_and_shebang_are_known() {
+        assert!(has_known_format(b"\x7fELF\x02"));
+        assert!(has_known_format(b"#!/bin/sh"));
+        assert!(!has_known_format(&[0u8; 4]));
+        assert!(!has_known_format(b"echo hi"));
     }
 
     #[tokio::test]

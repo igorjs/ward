@@ -914,6 +914,63 @@ fn exec_as(d: &Daemon, id: &str, user: &str, argv: &[&str]) -> Finished {
     }
 }
 
+/// `Seccomp:2` is filter mode, and the mask is the 14 kept capabilities.
+/// In the order /proc/self/status prints them.
+const HARDENING_STATUS: &str = "CapBnd:00000000a80425fb NoNewPrivs:1 Seccomp:2";
+const STATUS_SCRIPT: &str = "grep -E '^(NoNewPrivs|Seccomp|CapBnd):' /proc/self/status \
+                             | tr -d '\\t' | tr '\\n' ' '";
+
+#[test]
+fn given_a_root_exec_when_it_reads_its_status_then_the_filter_and_cap_mask_are_set() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    let status = sh(&d, &id, STATUS_SCRIPT);
+    let namespace = sh(&d, &id, "unshare -U true");
+    let normal = exec(&d, &id, &["echo", "still works"]);
+
+    assert_eq!(status.stdout.trim(), HARDENING_STATUS);
+    assert_ne!(namespace.exit, 0, "a user namespace was created");
+    assert_eq!((normal.stdout.as_str(), normal.exit), ("still works\n", 0));
+}
+
+#[test]
+fn given_a_sandbox_when_a_process_sets_the_clock_then_it_fails() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+
+    // Busybox date exits 0 even when it cannot set the clock.
+    let set = sh(&d, &id, "date -s '2001-02-03 04:05:06' 2>&1; date +%Y");
+
+    assert!(
+        set.stdout.contains("Operation not permitted"),
+        "no refusal: {}",
+        set.stdout
+    );
+    assert_ne!(set.stdout.lines().last(), Some("2001"), "the clock moved");
+}
+
+#[test]
+fn given_a_user_exec_when_it_reads_its_status_then_the_filter_is_set_after_the_drop() {
+    require_vm!();
+    let d = Daemon::spawn_vm();
+    let id = create(&d, &[]);
+    sh(&d, &id, ADD_USER);
+
+    let status = exec_as(&d, &id, "1000", &["sh", "-c", STATUS_SCRIPT]);
+    let namespace = exec_as(&d, &id, "1000", &["unshare", "-U", "true"]);
+
+    assert_eq!(status.exit, 0, "{}", status.stderr);
+    assert!(
+        status.stdout.contains("NoNewPrivs:1 Seccomp:2"),
+        "{}",
+        status.stdout
+    );
+    assert_ne!(namespace.exit, 0, "a user namespace was created");
+}
+
 #[test]
 fn given_user_1000_when_run_then_id_u_prints_1000() {
     require_vm!();
