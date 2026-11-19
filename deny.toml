@@ -28,6 +28,12 @@ ignore = [
     # public keys and never holds an EC private key, so no secret-dependent
     # operation runs. Mirror of the entry in osv-scanner.toml.
     "RUSTSEC-2026-0387",
+    # chrono 0.4.45 (RUSTSEC-2026-0543): "unmaintained" informational
+    # advisory with no CVSS and no exploit. All versions are affected, so
+    # no fixed release exists. Pulled in via oci-client, which uses it only
+    # to type the `created` timestamp of an OCI image config. Ward does
+    # not call chrono itself. Mirror of the entry in osv-scanner.toml.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]
