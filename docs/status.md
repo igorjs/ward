@@ -14,4 +14,4 @@ Live status, tickets, and priorities live on the [Ward project board](https://gi
 - Volumes: host directories mounted into guests through virtiofs; `-v NAME:/path` and `--mount type=volume` work
 - Snapshots: disk-level archive/restore + `from_snapshot` shipped; live checkpoint/restore tracked by [#29](https://github.com/igorjs/ward/issues/29)
 - First signed release (v0.1.0): release smoke-test ([#4](https://github.com/igorjs/ward/issues/4)), then cut v0.1.0 ([#5](https://github.com/igorjs/ward/issues/5))
-- Embedded / daemonless runtime mode: planned per [ADR-016](adr/016-embedded-mode-microvms.md) (daemon stays for fleet use; CLI default flips to embedded). Bundles userspace networking via `smoltcp` (closes [#32](https://github.com/igorjs/ward/issues/32)) and rootless operation on macOS + Linux.
+- Embedded / daemonless runtime mode: planned per [ADR-016](adr/016-embedded-mode-microvms.md) (daemon stays for fleet use; the CLI stays daemon-only for stateful commands, and embedded is the default for the SDK and `ward-mcp`). Bundles userspace networking via `smoltcp` (closes [#32](https://github.com/igorjs/ward/issues/32)) and rootless operation on macOS + Linux.
