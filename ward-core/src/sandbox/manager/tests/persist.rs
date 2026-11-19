@@ -512,13 +512,15 @@ async fn given_a_caller_dropped_while_stopping_when_the_stop_ends_then_the_sandb
     // Arrange
     let tmp = tempfile::tempdir().unwrap();
     let (mgr, _, _) = host_manager_in(MAIN_OUTPUT_CAP, false, Some(tmp.path().to_path_buf()));
-    let id = create_with_command(&mgr, &["sh", "-c", "trap '' TERM; sleep 30"], false).await;
+    let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+    let held = gate::arm(gate::SAVE, &id);
     let (stopper, stop_id) = (Arc::clone(&mgr), id.clone());
-    let stop = tokio::spawn(async move { stopper.stop_within(&stop_id, Some(1)).await });
-    wait_for_status(&mgr, &id, SandboxStatus::Stopping).await;
+    let stop = tokio::spawn(async move { stopper.stop(&stop_id).await });
+    held.held().await;
 
     // Act
     stop.abort();
+    held.open();
 
     // Assert
     wait_for_status(&mgr, &id, SandboxStatus::Stopped).await;
