@@ -465,44 +465,49 @@ async fn given_a_start_mid_write_when_the_auto_removal_runs_then_the_sandbox_is_
     assert_eq!(memory_status(&mgr, &id).await, ProtoStatus::Creating);
 }
 
-// Fails if the policy is registered in the caller's own future.
+// Fails if the start runs in the caller's own future.
+#[cfg(not(feature = "krunvm"))]
 #[tokio::test]
 async fn given_a_caller_dropped_after_the_running_commit_when_the_task_ends_then_the_policy_is_registered()
  {
     // Arrange
-    let tmp = tempfile::tempdir().unwrap();
-    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
-    let created = mgr.create(named_req(), "").await.unwrap();
-    let comms = mgr
-        .entries
-        .read()
-        .await
-        .get(&created.id)
-        .unwrap()
-        .meta
-        .options
-        .comms
-        .clone();
-    mgr.broker.deregister_sandbox(&created.id).await;
-    let held = gate::arm("after-running-commit", &created.id);
-    let (starter, id) = (Arc::clone(&mgr), created.id.clone());
-    let start = tokio::spawn(async move { starter.commit_running_and_register(&id, comms).await });
+    let mgr = host_manager(MAIN_OUTPUT_CAP);
+    let id = create_with_command(&mgr, &["sleep", "30"], false).await;
+    mgr.stop(&id).await.unwrap();
+    let held = gate::arm("after-running-commit", &id);
+    let (starter, start_id) = (Arc::clone(&mgr), id.clone());
+    let start = tokio::spawn(async move { starter.start(&start_id).await });
     held.held().await;
 
     // Act
     start.abort();
     held.open();
-    drop(mgr.teardown().lock_persist(&created.id).await);
+    drop(mgr.teardown().lock_persist(&id).await);
 
     // Assert
-    let published = mgr
-        .broker
-        .publish(&created.id, "topic", bytes::Bytes::new())
-        .await;
+    let published = mgr.broker.publish(&id, "topic", bytes::Bytes::new()).await;
     assert!(
         !matches!(published, Err(ApiError::SandboxNotFound(_))),
         "{published:?}"
     );
+}
+
+// Fails if a committed record does not tick the notifier waits sleep on.
+#[tokio::test]
+async fn given_a_record_commit_when_it_lands_then_the_run_notifier_ticks() {
+    // Arrange
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = manager_on(tmp.path(), MAX_MANAGER_SANDBOXES);
+    let created = mgr.create(named_req(), "").await.unwrap();
+    let ticks = mgr.run_changes.subscribe();
+
+    // Act
+    mgr.record_state(&created.id, ProtoStatus::Stopped, None)
+        .await
+        .unwrap();
+
+    // Assert
+    assert!(ticks.has_changed().unwrap());
 }
 
 // Fails if the stop runs in the caller's own future.

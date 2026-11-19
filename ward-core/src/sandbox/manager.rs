@@ -990,7 +990,7 @@ pub struct SandboxManager {
         std::sync::Mutex<Option<mpsc::UnboundedReceiver<(crate::backend::VmExit, u32)>>>,
     /// Exit codes of recent VM deaths, so a `wait` that finds the sandbox
     /// already removed can still report them. Oldest first.
-    vm_exit_codes: Arc<std::sync::Mutex<std::collections::VecDeque<(String, i32)>>>,
+    vm_exit_codes: std::sync::Mutex<std::collections::VecDeque<(String, i32)>>,
 }
 
 impl SandboxManager {
@@ -1030,7 +1030,7 @@ impl SandboxManager {
             restart_delays: std::sync::Mutex::new(HashMap::new()),
             vm_exit_retry_tx,
             vm_exit_retry_rx: std::sync::Mutex::new(Some(vm_exit_retry_rx)),
-            vm_exit_codes: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            vm_exit_codes: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -2661,12 +2661,19 @@ impl SandboxManager {
         let signal = parse_stop_override(signal)?;
         let id = self.resolve(reference).await?;
         let grace = self.grace_for(&id, grace_seconds).await;
-        self.stop_resolved(&id, grace, signal).await?;
-        let info = self.info(&id, CommandView::Full).await?;
-        if self.is_auto_remove(&id).await {
-            self.remove(&id).await?;
-        }
-        Ok(info)
+        // The auto-removal joins the stop in one task, so a caller that is
+        // dropped between them cannot leave an auto-remove sandbox stopped.
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            manager.stop_detached(&id, grace, signal).await?;
+            let info = manager.info(&id, CommandView::Full).await?;
+            if manager.is_auto_remove(&id).await {
+                manager.remove(&id).await?;
+            }
+            Ok(info)
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("stop and remove task: {e}")))?
     }
 
     async fn is_auto_remove(&self, id: &str) -> bool {
@@ -2784,8 +2791,9 @@ impl SandboxManager {
             .unwrap_or(SIGTERM)
     }
 
-    /// Runs the stop in a task of its own, so a caller that is dropped
-    /// cannot leave the sandbox in `stopping`.
+    /// Runs the stop in a task of its own, so a caller that is dropped does
+    /// not abandon it halfway. A panic in the task is not covered and can
+    /// leave the sandbox in `stopping`.
     async fn stop_resolved(
         self: &Arc<Self>,
         id: &str,
@@ -2901,8 +2909,9 @@ impl SandboxManager {
         })
     }
 
-    /// Runs the start in a task of its own, so a caller that is dropped
-    /// cannot leave the sandbox in `creating`.
+    /// Runs the start in a task of its own, so a caller that is dropped does
+    /// not abandon it halfway. A panic in the task is not covered and can
+    /// leave the sandbox in `creating`.
     async fn start_resolved(self: &Arc<Self>, id: &str) -> Result<()> {
         let manager = Arc::clone(self);
         let id = id.to_string();
@@ -3104,6 +3113,9 @@ impl SandboxManager {
                 oom_killed,
             },
         );
+        // A waiter that woke on the `running` record needs this entry to
+        // follow the run's exit.
+        self.run_changes.send_replace(());
         Ok(())
     }
 
@@ -3474,37 +3486,29 @@ impl SandboxManager {
         comms: CommunicationPolicy,
     ) -> Result<()> {
         let teardown = self.teardown();
-        let vm_exit_codes = Arc::clone(&self.vm_exit_codes);
-        let id = id.to_string();
-        // A task of its own, so a caller that is dropped between the commit
-        // and the registration cannot leave a running sandbox with no policy.
-        tokio::spawn(async move {
-            // Kept until the policy is registered, so a stop cannot slip in
-            // between and have its deregistration undone.
-            let guard = teardown.lock_persist(&id).await;
-            guard
-                .commit_status(
-                    crate::protocol::SandboxStatus::Running,
-                    persist::ExitUpdate::Keep,
-                    persist::ReasonUpdate::Auto,
-                    |_| Ok(true),
-                    |entry| entry.runs_started += 1,
-                )
-                .await?;
-            vm_exit_codes
-                .lock_unpoisoned()
-                .retain(|(known, _)| *known != id);
-            #[cfg(test)]
-            crate::sandbox::store::gate::pass_async("after-running-commit", &id).await;
-            let entries = teardown.entries.read().await;
-            if !entries.contains_key(&id) {
-                return Err(ApiError::SandboxNotFound(id));
-            }
-            teardown.broker.register_sandbox(id, comms).await;
-            Ok(())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("start task: {e}")))?
+        // Kept until the policy is registered, so a stop cannot slip in
+        // between and have its deregistration undone.
+        let guard = teardown.lock_persist(id).await;
+        guard
+            .commit_status(
+                crate::protocol::SandboxStatus::Running,
+                persist::ExitUpdate::Keep,
+                persist::ReasonUpdate::Auto,
+                |_| Ok(true),
+                |entry| entry.runs_started += 1,
+            )
+            .await?;
+        self.vm_exit_codes
+            .lock_unpoisoned()
+            .retain(|(known, _)| known != id);
+        #[cfg(test)]
+        crate::sandbox::store::gate::pass_async("after-running-commit", id).await;
+        let entries = self.entries.read().await;
+        if !entries.contains_key(id) {
+            return Err(ApiError::SandboxNotFound(id.to_string()));
+        }
+        self.broker.register_sandbox(id.to_string(), comms).await;
+        Ok(())
     }
 
     /// Move a running or exited sandbox to `stopping` and return the state it
