@@ -1,6 +1,6 @@
 # ADR-017: License Posture for Embedded SDK Distribution
 
-**Status:** Proposed
+**Status:** Accepted (implemented 2026-06-25 in `ward-proto/`)
 **Date:** 2026-06-04
 **Authors:** Igor
 
